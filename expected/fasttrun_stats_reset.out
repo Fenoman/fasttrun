@@ -1,0 +1,128 @@
+--
+-- fasttrun_stats_reset — после fasttruncate статистика для планировщика
+-- в памяти процесса (rd_rel) сбрасывается в ноль, а pg_class на диске
+-- остаётся нетронутым (и значит, сообщения инвалидации общего кэша
+-- не генерируются).
+--
+CREATE EXTENSION fasttrun;
+-- ----------------------------------------------------------------------
+-- Подготовка: создаём временную таблицу, заполняем, делаем штатный
+-- ANALYZE.  После ANALYZE и pg_class, и rd_rel должны показывать
+-- одинаковые ненулевые значения.
+-- ----------------------------------------------------------------------
+CREATE TEMP TABLE t_stats (a int, b text);
+INSERT INTO t_stats SELECT g, 'val-' || g FROM generate_series(1, 1000) g;
+ANALYZE t_stats;
+-- На всякий случай отметим: pg_class показывает реальные значения
+SELECT
+    relpages > 0 AS pgclass_has_pages,
+    reltuples > 0 AS pgclass_has_tuples
+FROM pg_class
+WHERE relname = 't_stats' AND relpersistence = 't';
+ pgclass_has_pages | pgclass_has_tuples 
+-------------------+--------------------
+ t                 | t
+(1 row)
+
+-- ... и rd_rel тоже
+SELECT
+    relpages > 0 AS rdrel_has_pages,
+    reltuples > 0 AS rdrel_has_tuples
+FROM fasttrun_relstats('t_stats');
+ rdrel_has_pages | rdrel_has_tuples 
+-----------------+------------------
+ t               | t
+(1 row)
+
+-- ----------------------------------------------------------------------
+-- 1. fasttruncate должен сбросить статистику в памяти процесса в ноль
+-- ----------------------------------------------------------------------
+SELECT fasttruncate('t_stats');
+ fasttruncate 
+--------------
+ 
+(1 row)
+
+SELECT relpages, reltuples FROM fasttrun_relstats('t_stats');
+ relpages | reltuples 
+----------+-----------
+        0 |         0
+(1 row)
+
+-- ----------------------------------------------------------------------
+-- 2. А pg_class на диске должен остаться со СТАРЫМИ значениями.
+--    Это доказывает, что fasttruncate не пишет в системный каталог
+--    и не генерирует сообщения инвалидации общего кэша для
+--    статистики.
+--
+--    Читаем pg_class напрямую через последовательное сканирование,
+--    чтобы обойти кэш relcache (то есть прочитать честно с диска).
+-- ----------------------------------------------------------------------
+SELECT
+    relpages > 0 AS pgclass_still_has_pages,
+    reltuples > 0 AS pgclass_still_has_tuples
+FROM pg_class
+WHERE relname = 't_stats' AND relpersistence = 't';
+ pgclass_still_has_pages | pgclass_still_has_tuples 
+-------------------------+--------------------------
+ t                       | t
+(1 row)
+
+-- ----------------------------------------------------------------------
+-- 3. После повторного заполнения в той же сессии rd_rel остаётся
+--    обнулённым до следующего ANALYZE / fasttrun_analyze.
+--    Планировщик при этом будет использовать оценку плотности
+--    по умолчанию, которая считается из ширины строки и текущего
+--    числа страниц на диске.
+-- ----------------------------------------------------------------------
+INSERT INTO t_stats SELECT g, 'second-' || g FROM generate_series(1, 200) g;
+SELECT relpages, reltuples FROM fasttrun_relstats('t_stats');
+ relpages | reltuples 
+----------+-----------
+        0 |         0
+(1 row)
+
+-- ----------------------------------------------------------------------
+-- 4. Сценарий "пулер сессий передал backend новому клиенту":
+--    делаем fasttruncate, потом заполняем заново — и наследие
+--    предыдущего клиента в виде устаревшей статистики не должно
+--    просачиваться.
+-- ----------------------------------------------------------------------
+SELECT fasttruncate('t_stats');
+ fasttruncate 
+--------------
+ 
+(1 row)
+
+SELECT relpages, reltuples FROM fasttrun_relstats('t_stats');
+ relpages | reltuples 
+----------+-----------
+        0 |         0
+(1 row)
+
+INSERT INTO t_stats SELECT g, 'third-' || g FROM generate_series(1, 50) g;
+SELECT relpages, reltuples FROM fasttrun_relstats('t_stats');
+ relpages | reltuples 
+----------+-----------
+        0 |         0
+(1 row)
+
+-- ----------------------------------------------------------------------
+-- 5. fasttrun_relstats на несуществующей таблице — NULL без ошибки
+-- ----------------------------------------------------------------------
+SELECT * FROM fasttrun_relstats('temp_nope_xyz');
+ relpages | reltuples 
+----------+-----------
+          |          
+(1 row)
+
+-- ----------------------------------------------------------------------
+-- 6. fasttrun_relstats на постоянной (не временной) таблице — ошибка
+-- ----------------------------------------------------------------------
+CREATE TABLE t_persistent_stats (a int);
+SELECT * FROM fasttrun_relstats('t_persistent_stats');
+ERROR:  fasttrun_relstats: relation "t_persistent_stats" is not a local temporary table
+-- Очистка
+DROP TABLE t_stats;
+DROP TABLE t_persistent_stats;
+DROP EXTENSION fasttrun;

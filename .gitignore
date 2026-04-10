@@ -1,0 +1,30 @@
+# Build artifacts
+*.o
+*.so
+*.dylib
+*.bc
+*.lo
+*.la
+
+# pg_regress artifacts
+results/
+log/
+tmp_check/
+tmp_check_iso/
+output_iso/
+regression.diffs
+regression.out
+isolation.diffs
+isolation.out
+
+# Editor / OS noise
+*.swp
+*.swo
+.DS_Store
+.idea/
+.vscode/
+
+# Old backups
+*.save
+*.bak
+*.orig
