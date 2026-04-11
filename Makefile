@@ -28,7 +28,8 @@ REGRESS = fasttrun_basic \
           fasttrun_analyze \
           fasttrun_migration \
           fasttrun_bench \
-          fasttrun_stats
+          fasttrun_stats \
+          fasttrun_tracking
 
 PG_CONFIG ?= pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)

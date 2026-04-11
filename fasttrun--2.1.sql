@@ -57,3 +57,25 @@ CREATE OR REPLACE FUNCTION fasttrun_inspect_stats(rel_name text)
 RETURNS SETOF pg_catalog.pg_statistic
 AS 'MODULE_PATHNAME', 'fasttrun_inspect_stats'
 LANGUAGE C STRICT VOLATILE;
+
+-- Tracking: top-N самых создаваемых temp tables (shared memory)
+CREATE OR REPLACE FUNCTION fasttrun_hot_temp_tables(
+    n int DEFAULT 100,
+    OUT relname text,
+    OUT create_count bigint,
+    OUT last_create timestamptz)
+RETURNS SETOF record
+AS 'MODULE_PATHNAME', 'fasttrun_hot_temp_tables'
+LANGUAGE C STRICT VOLATILE;
+
+-- Прогрев: создаёт top-N temp tables через create_temp_table
+CREATE OR REPLACE FUNCTION fasttrun_prewarm()
+RETURNS int
+AS 'MODULE_PATHNAME', 'fasttrun_prewarm'
+LANGUAGE C VOLATILE;
+
+-- Сброс статистики создания temp tables
+CREATE OR REPLACE FUNCTION fasttrun_reset_temp_stats()
+RETURNS void
+AS 'MODULE_PATHNAME', 'fasttrun_reset_temp_stats'
+LANGUAGE C VOLATILE;

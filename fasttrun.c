@@ -52,7 +52,13 @@
 #include "utils/sortsupport.h"
 #include "utils/syscache.h"
 #include "utils/typcache.h"
+#include "utils/timestamp.h"
 #include "utils/varlena.h"
+#include "storage/ipc.h"
+#include "storage/lwlock.h"
+#include "storage/shmem.h"
+#include "executor/spi.h"
+#include "tcop/utility.h"
 
 
 #ifdef PG_MODULE_MAGIC
@@ -64,13 +70,21 @@ PG_FUNCTION_INFO_V1(fasttrun_analyze);
 PG_FUNCTION_INFO_V1(fasttrun_relstats);
 PG_FUNCTION_INFO_V1(fasttrun_collect_stats);
 PG_FUNCTION_INFO_V1(fasttrun_inspect_stats);
+PG_FUNCTION_INFO_V1(fasttrun_hot_temp_tables);
+PG_FUNCTION_INFO_V1(fasttrun_prewarm);
+PG_FUNCTION_INFO_V1(fasttrun_reset_temp_stats);
 Datum	fasttruncate(PG_FUNCTION_ARGS);
 Datum	fasttrun_analyze(PG_FUNCTION_ARGS);
 Datum	fasttrun_relstats(PG_FUNCTION_ARGS);
 Datum	fasttrun_collect_stats(PG_FUNCTION_ARGS);
 Datum	fasttrun_inspect_stats(PG_FUNCTION_ARGS);
+Datum	fasttrun_hot_temp_tables(PG_FUNCTION_ARGS);
+Datum	fasttrun_prewarm(PG_FUNCTION_ARGS);
+Datum	fasttrun_reset_temp_stats(PG_FUNCTION_ARGS);
 
 void _PG_init(void);
+
+static int fasttrun_track_cmp_desc(const void *a, const void *b);
 
 /* GUCs */
 static bool		fasttrun_auto_collect_stats = true;
@@ -2820,6 +2834,444 @@ fasttrun_inspect_stats(PG_FUNCTION_ARGS)
 	return (Datum) 0;
 }
 
+/* ================================================================
+ * Temp table creation tracking — shared memory + ProcessUtility hook.
+ *
+ * Counts how often each temp table name is created across all
+ * backends.  Used by fasttrun_prewarm() to pre-create only the
+ * hottest tables at session init, instead of all 8000.
+ *
+ * Requires shared_preload_libraries for shmem allocation.
+ * ================================================================ */
+
+#define FASTTRUN_TRACK_MAX		8192
+#define FASTTRUN_TRACK_FILE		"pg_stat/fasttrun_temp_stats"
+#define FASTTRUN_TRACK_MAGIC	0x46545354	/* "FTST" */
+
+typedef struct FasttrunTrackEntry
+{
+	char			relname[NAMEDATALEN];	/* hash key */
+	int64			create_count;
+	TimestampTz		last_create;
+} FasttrunTrackEntry;
+
+static HTAB			   *fasttrun_track_htab = NULL;
+static LWLockId			fasttrun_track_lock;
+static bool				fasttrun_track_enabled = true;
+static int				fasttrun_prewarm_count = 500;
+static char			   *fasttrun_prewarm_schema = "dummy_tmp";
+static ProcessUtility_hook_type prev_utility_hook = NULL;
+static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
+static shmem_request_hook_type prev_shmem_request_hook = NULL;
+
+/* Shmem request hook — called during postmaster startup. */
+static void
+fasttrun_shmem_request(void)
+{
+	if (prev_shmem_request_hook)
+		prev_shmem_request_hook();
+	RequestAddinShmemSpace(hash_estimate_size(FASTTRUN_TRACK_MAX,
+											  sizeof(FasttrunTrackEntry)));
+	RequestNamedLWLockTranche("fasttrun", 1);
+}
+
+/* Save tracking stats to disk. Called at server shutdown. */
+static void
+fasttrun_track_save(int code, Datum arg)
+{
+	FILE			   *f;
+	HASH_SEQ_STATUS		status;
+	FasttrunTrackEntry *entry;
+	int32				magic = FASTTRUN_TRACK_MAGIC;
+	int32				count = 0;
+
+	if (fasttrun_track_htab == NULL)
+		return;
+
+	LWLockAcquire(fasttrun_track_lock, LW_SHARED);
+
+	f = AllocateFile(FASTTRUN_TRACK_FILE ".tmp", PG_BINARY_W);
+	if (f == NULL)
+	{
+		LWLockRelease(fasttrun_track_lock);
+		ereport(LOG, (errmsg("fasttrun: could not save temp stats")));
+		return;
+	}
+
+	fwrite(&magic, sizeof(magic), 1, f);
+	/* placeholder for count — will rewrite */
+	fwrite(&count, sizeof(count), 1, f);
+
+	hash_seq_init(&status, fasttrun_track_htab);
+	while ((entry = hash_seq_search(&status)) != NULL)
+	{
+		if (entry->create_count > 0)
+		{
+			fwrite(entry, sizeof(FasttrunTrackEntry), 1, f);
+			count++;
+		}
+	}
+
+	LWLockRelease(fasttrun_track_lock);
+
+	/* rewrite count */
+	fseek(f, sizeof(magic), SEEK_SET);
+	fwrite(&count, sizeof(count), 1, f);
+
+	FreeFile(f);
+	(void) durable_rename(FASTTRUN_TRACK_FILE ".tmp",
+						  FASTTRUN_TRACK_FILE, LOG);
+}
+
+/* Load tracking stats from disk. Called at shmem startup. */
+static void
+fasttrun_track_load(void)
+{
+	FILE			   *f;
+	int32				magic, count;
+	int					i;
+
+	f = AllocateFile(FASTTRUN_TRACK_FILE, PG_BINARY_R);
+	if (f == NULL)
+		return;		/* no saved stats — fresh start */
+
+	if (fread(&magic, sizeof(magic), 1, f) != 1 || magic != FASTTRUN_TRACK_MAGIC)
+	{
+		FreeFile(f);
+		return;
+	}
+	if (fread(&count, sizeof(count), 1, f) != 1 || count < 0)
+	{
+		FreeFile(f);
+		return;
+	}
+
+	for (i = 0; i < count && i < FASTTRUN_TRACK_MAX; i++)
+	{
+		FasttrunTrackEntry	buf;
+		FasttrunTrackEntry *entry;
+		bool				found;
+
+		if (fread(&buf, sizeof(buf), 1, f) != 1)
+			break;
+
+		entry = hash_search(fasttrun_track_htab, buf.relname,
+							HASH_ENTER, &found);
+		if (!found)
+		{
+			entry->create_count = buf.create_count;
+			entry->last_create = buf.last_create;
+		}
+		else
+		{
+			entry->create_count += buf.create_count;
+			if (buf.last_create > entry->last_create)
+				entry->last_create = buf.last_create;
+		}
+	}
+
+	FreeFile(f);
+}
+
+/* Shared memory startup: create hash table + load from disk. */
+static void
+fasttrun_shmem_startup(void)
+{
+	HASHCTL		ctl;
+
+	if (prev_shmem_startup_hook)
+		prev_shmem_startup_hook();
+
+	LWLockAcquire(AddinShmemInitLock, LW_EXCLUSIVE);
+
+	memset(&ctl, 0, sizeof(ctl));
+	ctl.keysize = NAMEDATALEN;
+	ctl.entrysize = sizeof(FasttrunTrackEntry);
+
+	fasttrun_track_htab = ShmemInitHash("fasttrun temp track",
+										FASTTRUN_TRACK_MAX,
+										FASTTRUN_TRACK_MAX,
+										&ctl,
+										HASH_ELEM | HASH_STRINGS);
+
+	/* Allocate LWLock */
+	fasttrun_track_lock = (LWLockId) GetNamedLWLockTranche("fasttrun");
+
+	LWLockRelease(AddinShmemInitLock);
+
+	/* Load saved stats */
+	if (!IsUnderPostmaster)
+	{
+		fasttrun_track_load();
+		on_shmem_exit(fasttrun_track_save, (Datum) 0);
+	}
+}
+
+/* ProcessUtility hook: track CREATE TEMP TABLE. */
+static void
+fasttrun_utility_hook(PlannedStmt *pstmt,
+					  const char *queryString,
+					  bool readOnlyTree,
+					  ProcessUtilityContext context,
+					  ParamListInfo params,
+					  QueryEnvironment *queryEnv,
+					  DestReceiver *dest,
+					  QueryCompletion *qc)
+{
+	Node   *parsetree = pstmt->utilityStmt;
+
+	/* Track CREATE TEMP TABLE before execution. */
+	if (fasttrun_track_enabled && fasttrun_track_htab != NULL &&
+		nodeTag(parsetree) == T_CreateStmt)
+	{
+		CreateStmt *stmt = (CreateStmt *) parsetree;
+
+		if (stmt->relation->relpersistence == RELPERSISTENCE_TEMP)
+		{
+			/*
+			 * Only track tables created via LIKE from the dummy schema.
+			 * User-created tables (CREATE TEMP TABLE foo (id int, ...))
+			 * don't have a matching dummy and would break prewarm.
+			 */
+			ListCell   *lc;
+			bool		from_dummy = false;
+
+			foreach(lc, stmt->tableElts)
+			{
+				if (IsA(lfirst(lc), TableLikeClause))
+				{
+					TableLikeClause *like = (TableLikeClause *) lfirst(lc);
+
+					if (like->relation->schemaname != NULL &&
+						strcmp(like->relation->schemaname,
+							   fasttrun_prewarm_schema) == 0)
+					{
+						from_dummy = true;
+						break;
+					}
+				}
+			}
+
+			if (from_dummy)
+			{
+				FasttrunTrackEntry *entry;
+				bool	found;
+
+				LWLockAcquire(fasttrun_track_lock, LW_EXCLUSIVE);
+				entry = hash_search(fasttrun_track_htab,
+									stmt->relation->relname,
+									HASH_ENTER_NULL, &found);
+				if (entry != NULL)
+				{
+					if (!found)
+					{
+						entry->create_count = 0;
+						entry->last_create = 0;
+					}
+					entry->create_count++;
+					entry->last_create = GetCurrentTimestamp();
+				}
+				LWLockRelease(fasttrun_track_lock);
+			}
+		}
+	}
+
+	/* Chain to next hook or standard ProcessUtility. */
+	if (prev_utility_hook)
+		prev_utility_hook(pstmt, queryString, readOnlyTree, context,
+						  params, queryEnv, dest, qc);
+	else
+		standard_ProcessUtility(pstmt, queryString, readOnlyTree, context,
+								params, queryEnv, dest, qc);
+}
+
+/* SQL: fasttrun_hot_temp_tables(n) — returns top-N most created temp tables. */
+Datum
+fasttrun_hot_temp_tables(PG_FUNCTION_ARGS)
+{
+	int32				limit = PG_GETARG_INT32(0);
+	ReturnSetInfo	   *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	TupleDesc			tupdesc;
+	Tuplestorestate	   *tupstore;
+	MemoryContext		per_query_cxt, oldcxt;
+	HASH_SEQ_STATUS		status;
+	FasttrunTrackEntry *entry;
+	FasttrunTrackEntry *sorted;
+	int					count = 0;
+	int					alloc = 256;
+	int					i;
+
+	if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo) ||
+		(rsinfo->allowedModes & SFRM_Materialize) == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("set-valued function called in context that cannot accept a set")));
+
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("function returning record called in context that cannot accept type record")));
+
+	per_query_cxt = rsinfo->econtext->ecxt_per_query_memory;
+	oldcxt = MemoryContextSwitchTo(per_query_cxt);
+	tupdesc = CreateTupleDescCopy(tupdesc);
+	tupstore = tuplestore_begin_heap(true, false, work_mem);
+	rsinfo->returnMode = SFRM_Materialize;
+	rsinfo->setResult = tupstore;
+	rsinfo->setDesc = tupdesc;
+	MemoryContextSwitchTo(oldcxt);
+
+	if (fasttrun_track_htab == NULL)
+		return (Datum) 0;
+
+	/* Collect all entries into a sortable array. */
+	sorted = palloc(sizeof(FasttrunTrackEntry) * alloc);
+
+	LWLockAcquire(fasttrun_track_lock, LW_SHARED);
+	hash_seq_init(&status, fasttrun_track_htab);
+	while ((entry = hash_seq_search(&status)) != NULL)
+	{
+		if (entry->create_count <= 0)
+			continue;
+		if (count >= alloc)
+		{
+			alloc *= 2;
+			sorted = repalloc(sorted, sizeof(FasttrunTrackEntry) * alloc);
+		}
+		memcpy(&sorted[count++], entry, sizeof(FasttrunTrackEntry));
+	}
+	LWLockRelease(fasttrun_track_lock);
+
+	/* Sort by create_count DESC. */
+	qsort(sorted, count, sizeof(FasttrunTrackEntry),
+		  fasttrun_track_cmp_desc);
+
+	/* Emit top-N rows. */
+	if (limit <= 0 || limit > count)
+		limit = count;
+
+	for (i = 0; i < limit; i++)
+	{
+		Datum		values[3];
+		bool		nulls[3] = {false, false, false};
+
+		values[0] = CStringGetTextDatum(sorted[i].relname);
+		values[1] = Int64GetDatum(sorted[i].create_count);
+		values[2] = TimestampTzGetDatum(sorted[i].last_create);
+
+		tuplestore_putvalues(tupstore, tupdesc, values, nulls);
+	}
+
+	pfree(sorted);
+	return (Datum) 0;
+}
+
+/* qsort comparator: descending by create_count. */
+static int
+fasttrun_track_cmp_desc(const void *a, const void *b)
+{
+	const FasttrunTrackEntry *ea = (const FasttrunTrackEntry *) a;
+	const FasttrunTrackEntry *eb = (const FasttrunTrackEntry *) b;
+
+	if (eb->create_count > ea->create_count) return 1;
+	if (eb->create_count < ea->create_count) return -1;
+	return 0;
+}
+
+/* SQL: fasttrun_prewarm() — creates top-N temp tables via create_temp_table. */
+Datum
+fasttrun_prewarm(PG_FUNCTION_ARGS)
+{
+	int		limit = fasttrun_prewarm_count;
+	int		created = 0;
+	int		count = 0;
+	int		alloc = 256;
+	int		i;
+	FasttrunTrackEntry *sorted;
+	HASH_SEQ_STATUS		status;
+	FasttrunTrackEntry *entry;
+
+	if (fasttrun_track_htab == NULL)
+		PG_RETURN_INT32(0);
+
+	sorted = palloc(sizeof(FasttrunTrackEntry) * alloc);
+
+	LWLockAcquire(fasttrun_track_lock, LW_SHARED);
+	hash_seq_init(&status, fasttrun_track_htab);
+	while ((entry = hash_seq_search(&status)) != NULL)
+	{
+		if (entry->create_count <= 0)
+			continue;
+		if (count >= alloc)
+		{
+			alloc *= 2;
+			sorted = repalloc(sorted, sizeof(FasttrunTrackEntry) * alloc);
+		}
+		memcpy(&sorted[count++], entry, sizeof(FasttrunTrackEntry));
+	}
+	LWLockRelease(fasttrun_track_lock);
+
+	qsort(sorted, count, sizeof(FasttrunTrackEntry),
+		  fasttrun_track_cmp_desc);
+
+	if (limit <= 0 || limit > count)
+		limit = count;
+
+	{
+		/* Verify dummy schema exists; if not, skip all prewarm. */
+		Oid		nspOid = get_namespace_oid(fasttrun_prewarm_schema, true);
+
+		for (i = 0; i < limit; i++)
+		{
+			int		ret;
+
+			/* Skip if no matching dummy table in the schema. */
+			if (nspOid == InvalidOid ||
+				get_relname_relid(sorted[i].relname, nspOid) == InvalidOid)
+				continue;
+
+			ret = SPI_connect();
+			if (ret != SPI_OK_CONNECT)
+				elog(ERROR, "fasttrun_prewarm: SPI_connect failed");
+
+			SPI_execute_with_args(
+				"SELECT create_temp_table($1)",
+				1,
+				(Oid[]) { TEXTOID },
+				(Datum[]) { CStringGetTextDatum(sorted[i].relname) },
+				NULL, false, 0);
+
+			SPI_finish();
+			created++;
+		}
+	}
+
+	pfree(sorted);
+	PG_RETURN_INT32(created);
+}
+
+/* SQL: fasttrun_reset_temp_stats() — clears all tracking counters. */
+Datum
+fasttrun_reset_temp_stats(PG_FUNCTION_ARGS)
+{
+	HASH_SEQ_STATUS		status;
+	FasttrunTrackEntry *entry;
+
+	if (fasttrun_track_htab == NULL)
+		PG_RETURN_VOID();
+
+	LWLockAcquire(fasttrun_track_lock, LW_EXCLUSIVE);
+	hash_seq_init(&status, fasttrun_track_htab);
+	while ((entry = hash_seq_search(&status)) != NULL)
+		hash_search(fasttrun_track_htab, entry->relname, HASH_REMOVE, NULL);
+	LWLockRelease(fasttrun_track_lock);
+
+	/* Remove the on-disk file too. */
+	(void) unlink(FASTTRUN_TRACK_FILE);
+
+	PG_RETURN_VOID();
+}
+
 /* Define GUCs and install the planner hook. */
 void
 _PG_init(void)
@@ -2932,4 +3384,49 @@ _PG_init(void)
 	get_relation_stats_hook = fasttrun_get_relation_stats_hook;
 	prev_get_attavgwidth_hook = get_attavgwidth_hook;
 	get_attavgwidth_hook = fasttrun_get_attavgwidth_hook;
+
+	/* Tracking GUCs */
+	DefineCustomBoolVariable("fasttrun.track_temp_creates",
+							 "Track CREATE TEMP TABLE frequency in shared memory",
+							 NULL,
+							 &fasttrun_track_enabled,
+							 true,
+							 PGC_SUSET,
+							 0,
+							 NULL, NULL, NULL);
+
+	DefineCustomIntVariable("fasttrun.prewarm_count",
+							"Number of hottest temp tables to pre-create in fasttrun_prewarm()",
+							NULL,
+							&fasttrun_prewarm_count,
+							500,
+							0,
+							FASTTRUN_TRACK_MAX,
+							PGC_USERSET,
+							0,
+							NULL, NULL, NULL);
+
+	DefineCustomStringVariable("fasttrun.prewarm_schema",
+							   "Schema with dummy (template) tables for prewarm tracking",
+							   "Only CREATE TEMP TABLE ... (LIKE <schema>.xxx) "
+							   "will be tracked. Tables created without LIKE from "
+							   "this schema are ignored.",
+							   &fasttrun_prewarm_schema,
+							   "dummy_tmp",
+							   PGC_SUSET,
+							   0,
+							   NULL, NULL, NULL);
+
+	/* Shared memory + utility hook — only when loaded via shared_preload_libraries. */
+	if (process_shared_preload_libraries_in_progress)
+	{
+		prev_shmem_request_hook = shmem_request_hook;
+		shmem_request_hook = fasttrun_shmem_request;
+
+		prev_shmem_startup_hook = shmem_startup_hook;
+		shmem_startup_hook = fasttrun_shmem_startup;
+
+		prev_utility_hook = ProcessUtility_hook;
+		ProcessUtility_hook = fasttrun_utility_hook;
+	}
 }
