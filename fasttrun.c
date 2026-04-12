@@ -9,9 +9,11 @@
  */
 #include "postgres.h"
 
+#include <ctype.h>
 #include <errno.h>
 #include <fmgr.h>
 #include <funcapi.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "access/amapi.h"
@@ -52,6 +54,7 @@
 #include "utils/sortsupport.h"
 #include "utils/syscache.h"
 #include "utils/typcache.h"
+#include "pgtime.h"
 #include "utils/timestamp.h"
 #include "utils/varlena.h"
 #include "storage/ipc.h"
@@ -85,6 +88,7 @@ Datum	fasttrun_reset_temp_stats(PG_FUNCTION_ARGS);
 void _PG_init(void);
 
 static int fasttrun_track_cmp_desc(const void *a, const void *b);
+static void fasttrun_track_schedule_assign_hook(const char *newval, void *extra);
 
 /* GUCs */
 static bool		fasttrun_auto_collect_stats = true;
@@ -2860,9 +2864,243 @@ static LWLockId			fasttrun_track_lock;
 static bool				fasttrun_track_enabled = true;
 static int				fasttrun_prewarm_count = 500;
 static char			   *fasttrun_prewarm_schema = "dummy_tmp";
+static char			   *fasttrun_track_schedule = "";
 static ProcessUtility_hook_type prev_utility_hook = NULL;
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 static shmem_request_hook_type prev_shmem_request_hook = NULL;
+
+/*
+ * Track schedule: tracking is only active inside the configured time
+ * windows.  Empty schedule = always active (default).
+ */
+#define FASTTRUN_SCHED_MAX_WINDOWS 8
+
+typedef struct
+{
+	uint8		day_mask;		/* bit 0=Sun, 1=Mon, ..., 6=Sat */
+	uint16		start_min;		/* minutes since midnight */
+	uint16		end_min;
+} FasttrunSchedWindow;
+
+static FasttrunSchedWindow fasttrun_sched_windows[FASTTRUN_SCHED_MAX_WINDOWS];
+static int		fasttrun_sched_window_count = 0;
+
+/* Parse day token: "mon", "tue", ..., "sun". Returns 0-6 or -1 on error. */
+static int
+fasttrun_sched_parse_day(const char *tok, int len)
+{
+	static const char *days[7] = { "sun", "mon", "tue", "wed", "thu", "fri", "sat" };
+	int			i;
+
+	if (len != 3)
+		return -1;
+	for (i = 0; i < 7; i++)
+		if (pg_strncasecmp(tok, days[i], 3) == 0)
+			return i;
+	return -1;
+}
+
+/* Parse "HH:MM" into minutes since midnight (0-1440). Returns -1 on error. */
+static int
+fasttrun_sched_parse_time(const char *s, const char *end)
+{
+	int			h = 0, m = 0;
+
+	if (end - s != 5 || s[2] != ':')
+		return -1;
+	if (!isdigit((unsigned char) s[0]) || !isdigit((unsigned char) s[1]) ||
+		!isdigit((unsigned char) s[3]) || !isdigit((unsigned char) s[4]))
+		return -1;
+	h = (s[0] - '0') * 10 + (s[1] - '0');
+	m = (s[3] - '0') * 10 + (s[4] - '0');
+	if (h > 24 || m > 59 || (h == 24 && m > 0))
+		return -1;
+	return h * 60 + m;
+}
+
+/*
+ * Parse schedule string into out_windows[]. Returns number of windows,
+ * or -1 on parse error. Empty string is valid (returns 0).
+ *
+ * Format: "mon-fri 08:00-18:00; sat 10:00-14:00"
+ */
+static int
+fasttrun_sched_parse(const char *input,
+					 FasttrunSchedWindow *out_windows,
+					 int max_windows)
+{
+	const char *p = input;
+	int			count = 0;
+
+	if (input == NULL)
+		return 0;
+
+	/* Skip leading whitespace */
+	while (*p && isspace((unsigned char) *p))
+		p++;
+
+	if (*p == '\0')
+		return 0;
+
+	while (*p)
+	{
+		FasttrunSchedWindow w = { 0, 0, 0 };
+		const char *day_start = p;
+		const char *day_end;
+		const char *time_start;
+		const char *time_end;
+		const char *dash;
+		int			start_min, end_min;
+
+		if (count >= max_windows)
+			return -1;				/* too many windows */
+
+		/* Find end of day spec (first whitespace) */
+		while (*p && !isspace((unsigned char) *p))
+			p++;
+		day_end = p;
+
+		/* Skip whitespace between day and time */
+		while (*p && isspace((unsigned char) *p) && *p != ';')
+			p++;
+		if (*p == '\0' || *p == ';')
+			return -1;				/* missing time spec */
+
+		time_start = p;
+		while (*p && *p != ';')
+			p++;
+		time_end = p;
+		/* Trim trailing whitespace from time */
+		while (time_end > time_start && isspace((unsigned char) time_end[-1]))
+			time_end--;
+
+		/* Parse day spec: comma-separated list of days or day ranges */
+		{
+			const char *dp = day_start;
+
+			while (dp < day_end)
+			{
+				const char *tok_start = dp;
+				const char *tok_end;
+				const char *day_dash;
+				int			d1, d2, d;
+
+				while (dp < day_end && *dp != ',')
+					dp++;
+				tok_end = dp;
+				if (*dp == ',')
+					dp++;
+
+				day_dash = memchr(tok_start, '-', tok_end - tok_start);
+				if (day_dash)
+				{
+					d1 = fasttrun_sched_parse_day(tok_start, day_dash - tok_start);
+					d2 = fasttrun_sched_parse_day(day_dash + 1,
+												  tok_end - day_dash - 1);
+					if (d1 < 0 || d2 < 0)
+						return -1;
+					if (d1 <= d2)
+					{
+						for (d = d1; d <= d2; d++)
+							w.day_mask |= (1 << d);
+					}
+					else
+					{
+						/* Wrap around: fri-mon means fri, sat, sun, mon */
+						for (d = d1; d <= 6; d++)
+							w.day_mask |= (1 << d);
+						for (d = 0; d <= d2; d++)
+							w.day_mask |= (1 << d);
+					}
+				}
+				else
+				{
+					d1 = fasttrun_sched_parse_day(tok_start, tok_end - tok_start);
+					if (d1 < 0)
+						return -1;
+					w.day_mask |= (1 << d1);
+				}
+			}
+		}
+
+		/* Parse time spec: HH:MM-HH:MM */
+		dash = memchr(time_start, '-', time_end - time_start);
+		if (!dash)
+			return -1;
+		start_min = fasttrun_sched_parse_time(time_start, dash);
+		end_min = fasttrun_sched_parse_time(dash + 1, time_end);
+		if (start_min < 0 || end_min < 0)
+			return -1;
+		if (end_min <= start_min)
+			return -1;				/* no midnight crossing */
+
+		w.start_min = (uint16) start_min;
+		w.end_min = (uint16) end_min;
+		out_windows[count++] = w;
+
+		/* Skip window separator */
+		if (*p == ';')
+			p++;
+		while (*p && isspace((unsigned char) *p))
+			p++;
+	}
+
+	return count;
+}
+
+/* Return true if current local time is within any schedule window. */
+static bool
+fasttrun_schedule_is_active_now(void)
+{
+	pg_time_t	now;
+	struct pg_tm *tm;
+	int			weekday, minute_of_day;
+	int			i;
+
+	if (fasttrun_sched_window_count == 0)
+		return true;				/* no schedule = always active */
+
+	now = (pg_time_t) time(NULL);
+	tm = pg_localtime(&now, log_timezone);
+	if (tm == NULL)
+		return true;				/* tz error — fall back to active */
+
+	weekday = tm->tm_wday;			/* 0=Sunday */
+	minute_of_day = tm->tm_hour * 60 + tm->tm_min;
+
+	for (i = 0; i < fasttrun_sched_window_count; i++)
+	{
+		FasttrunSchedWindow *w = &fasttrun_sched_windows[i];
+
+		if ((w->day_mask & (1 << weekday)) &&
+			minute_of_day >= w->start_min &&
+			minute_of_day < w->end_min)
+			return true;
+	}
+
+	return false;
+}
+
+/* GUC assign hook: parse schedule string, apply to static state. */
+static void
+fasttrun_track_schedule_assign_hook(const char *newval, void *extra)
+{
+	FasttrunSchedWindow	parsed[FASTTRUN_SCHED_MAX_WINDOWS];
+	int		n;
+
+	n = fasttrun_sched_parse(newval, parsed, FASTTRUN_SCHED_MAX_WINDOWS);
+	if (n < 0)
+	{
+		ereport(WARNING,
+				(errmsg("fasttrun: invalid track_schedule \"%s\", tracking will stay always-on",
+						newval)));
+		fasttrun_sched_window_count = 0;
+		return;
+	}
+
+	memcpy(fasttrun_sched_windows, parsed, sizeof(parsed));
+	fasttrun_sched_window_count = n;
+}
 
 /* Shmem request hook — called during postmaster startup. */
 static void
@@ -3052,7 +3290,7 @@ fasttrun_utility_hook(PlannedStmt *pstmt,
 				}
 			}
 
-			if (from_dummy)
+			if (from_dummy && fasttrun_schedule_is_active_now())
 			{
 				FasttrunTrackEntry *entry;
 				bool	found;
@@ -3416,6 +3654,20 @@ _PG_init(void)
 							   PGC_SUSET,
 							   0,
 							   NULL, NULL, NULL);
+
+	DefineCustomStringVariable("fasttrun.track_schedule",
+							   "Time windows when CREATE TEMP TABLE tracking is active",
+							   "Format: 'mon-fri 08:00-18:00; sat 10:00-14:00'. "
+							   "Empty string means tracking is always active. "
+							   "Invalid format is logged as WARNING and falls back "
+							   "to always-active.",
+							   &fasttrun_track_schedule,
+							   "",
+							   PGC_SUSET,
+							   0,
+							   NULL,
+							   fasttrun_track_schedule_assign_hook,
+							   NULL);
 
 	/* Shared memory + utility hook — only when loaded via shared_preload_libraries. */
 	if (process_shared_preload_libraries_in_progress)

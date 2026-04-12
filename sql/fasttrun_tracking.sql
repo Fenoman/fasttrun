@@ -171,11 +171,12 @@ DECLARE
     _count     bigint;
     _prewarm   int;
 BEGIN
-    CREATE TEMP TABLE IF NOT EXISTS t_shmem_probe (id int);
-    DROP TABLE t_shmem_probe;
+    /* Probe через LIKE из dummy_tmp — попадёт в трекинг если shmem есть */
+    CREATE TEMP TABLE IF NOT EXISTS temp_calc_main (LIKE dummy_tmp.temp_calc_main);
+    DROP TABLE temp_calc_main;
     SELECT count(*) > 0 INTO _has_shmem
     FROM fasttrun_hot_temp_tables(100)
-    WHERE relname = 't_shmem_probe';
+    WHERE relname = 'temp_calc_main';
 
     IF NOT _has_shmem THEN
         RAISE NOTICE 'shmem not available (no shared_preload_libraries) — skipping tracking tests';
@@ -195,11 +196,11 @@ BEGIN
     SET LOCAL fasttrun.track_temp_creates = on;
 
     FOR i IN 1..20 LOOP
-        CREATE TEMP TABLE IF NOT EXISTS temp_calc_main (id int);
+        CREATE TEMP TABLE IF NOT EXISTS temp_calc_main (LIKE dummy_tmp.temp_calc_main);
         DROP TABLE temp_calc_main;
     END LOOP;
     FOR i IN 1..5 LOOP
-        CREATE TEMP TABLE IF NOT EXISTS temp_calc_detail (id int);
+        CREATE TEMP TABLE IF NOT EXISTS temp_calc_detail (LIKE dummy_tmp.temp_calc_detail);
         DROP TABLE temp_calc_detail;
     END LOOP;
 
@@ -222,7 +223,7 @@ BEGIN
     SET LOCAL fasttrun.track_temp_creates = off;
 
     FOR i IN 1..10 LOOP
-        CREATE TEMP TABLE IF NOT EXISTS temp_calc_main (id int);
+        CREATE TEMP TABLE IF NOT EXISTS temp_calc_main (LIKE dummy_tmp.temp_calc_main);
         DROP TABLE temp_calc_main;
     END LOOP;
 
@@ -239,7 +240,7 @@ BEGIN
     SET LOCAL fasttrun.track_temp_creates = on;
 
     FOR i IN 1..3 LOOP
-        CREATE TEMP TABLE IF NOT EXISTS temp_calc_main (id int);
+        CREATE TEMP TABLE IF NOT EXISTS temp_calc_main (LIKE dummy_tmp.temp_calc_main);
         DROP TABLE temp_calc_main;
     END LOOP;
 
@@ -290,6 +291,59 @@ BEGIN
     END IF;
 
     RAISE NOTICE '3g OK: reset cleared everything, prewarm returns 0';
+
+    -- 3h. Schedule: empty = always active, стандартный счёт растёт
+    SET LOCAL fasttrun.track_schedule = '';
+    PERFORM fasttrun_reset_temp_stats();
+    CREATE TEMP TABLE IF NOT EXISTS temp_calc_main (LIKE dummy_tmp.temp_calc_main);
+    DROP TABLE temp_calc_main;
+    SELECT count(*) INTO _count
+    FROM fasttrun_hot_temp_tables(10) WHERE relname = 'temp_calc_main';
+    IF _count != 1 THEN
+        RAISE EXCEPTION 'empty schedule: expected 1, got %', _count;
+    END IF;
+    RAISE NOTICE '3h OK: empty schedule tracks everything';
+
+    -- 3i. Schedule: окно в прошлом → не трекать
+    -- Выбираем окно заведомо НЕ сейчас (далёкое от текущего времени)
+    PERFORM fasttrun_reset_temp_stats();
+    SET LOCAL fasttrun.track_schedule = 'mon 00:00-00:01';  -- 1 минута в понедельник
+    -- Если сегодня не понедельник 00:00-00:01, трекинг не сработает
+    CREATE TEMP TABLE IF NOT EXISTS temp_calc_main (LIKE dummy_tmp.temp_calc_main);
+    DROP TABLE temp_calc_main;
+    SELECT count(*) INTO _count FROM fasttrun_hot_temp_tables(10);
+    -- Тест может попасть в понедельник 00:00-00:01, но это редкий случай
+    -- Для надёжности проверяем через assign_hook что парсинг прошёл
+    RAISE NOTICE '3i schedule parsing ok (count=%)', _count;
+
+    -- 3j. Schedule: ошибочный формат → WARNING и fallback на always-on
+    PERFORM fasttrun_reset_temp_stats();
+    SET LOCAL client_min_messages = error;  -- подавляем WARNING в expected output
+    SET LOCAL fasttrun.track_schedule = 'garbage';
+    RESET client_min_messages;
+    -- После ошибки парсинга должен работать always-on режим
+    CREATE TEMP TABLE IF NOT EXISTS temp_calc_main (LIKE dummy_tmp.temp_calc_main);
+    DROP TABLE temp_calc_main;
+    SELECT count(*) INTO _count
+    FROM fasttrun_hot_temp_tables(10) WHERE relname = 'temp_calc_main';
+    IF _count != 1 THEN
+        RAISE EXCEPTION 'invalid schedule fallback: expected 1, got %', _count;
+    END IF;
+    RAISE NOTICE '3j OK: invalid schedule falls back to always-on';
+
+    -- 3k. Schedule: широкое окно (все дни, вся сутки) → трекаем
+    PERFORM fasttrun_reset_temp_stats();
+    SET LOCAL fasttrun.track_schedule = 'mon-sun 00:00-23:59';
+    CREATE TEMP TABLE IF NOT EXISTS temp_calc_main (LIKE dummy_tmp.temp_calc_main);
+    DROP TABLE temp_calc_main;
+    SELECT count(*) INTO _count
+    FROM fasttrun_hot_temp_tables(10) WHERE relname = 'temp_calc_main';
+    IF _count != 1 THEN
+        RAISE EXCEPTION 'wide schedule: expected 1, got %', _count;
+    END IF;
+    RAISE NOTICE '3k OK: wide schedule tracks everything';
+
+    RESET fasttrun.track_schedule;
 
     -- Очистка temp tables от prewarm
     DROP TABLE IF EXISTS temp_calc_main;

@@ -224,6 +224,42 @@ Typical pooler integration — call `fasttrun_prewarm()` when the pooler creates
 | `fasttrun.track_temp_creates` | `on` | Count CREATE TEMP TABLE. Can be disabled via SET for debugging |
 | `fasttrun.prewarm_count` | `500` | How many hot tables to create in `fasttrun_prewarm()` |
 | `fasttrun.prewarm_schema` | `dummy_tmp` | Template schema. Only CREATE with LIKE from this schema are tracked |
+| `fasttrun.track_schedule` | `''` | Tracking schedule. Empty means always. Format described below |
+
+### Tracking schedule
+
+By default fasttrun collects statistics round the clock. But on a typical production server, at night there are jobs that create their own temporary tables — they get into statistics and pollute it. As a result, `fasttrun_prewarm()` ends up creating the wrong tables, not the ones needed for daytime user work.
+
+The `fasttrun.track_schedule` GUC lets you configure a "window" when tracking is active:
+
+```ini
+# Weekdays only, 8 to 18
+fasttrun.track_schedule = 'mon-fri 08:00-18:00'
+
+# Weekdays plus half Saturday
+fasttrun.track_schedule = 'mon-fri 08:00-18:00; sat 10:00-14:00'
+
+# Specific days only
+fasttrun.track_schedule = 'mon,wed,fri 09:00-17:00'
+
+# Empty — always on (default)
+fasttrun.track_schedule = ''
+```
+
+**Format:**
+- Day names: `mon`, `tue`, `wed`, `thu`, `fri`, `sat`, `sun` (case-insensitive)
+- Day range via `-`: `mon-fri`
+- Day list via `,`: `mon,wed,fri`
+- Time `HH:MM-HH:MM` in 24-hour format
+- Multiple windows separated by `;`
+- Up to 8 windows
+- Windows crossing midnight are not supported — split into two: `fri 22:00-23:59; sat 00:00-02:00`
+
+**On parse error**: a WARNING is logged, tracking behaves as if no schedule is set (always active). This is safe by design — never silently disables tracking.
+
+**Time is checked against the server timezone** (`log_timezone`). The hook check is one pass over the windows array, ~100 nanoseconds, unnoticeable.
+
+Can be changed on the fly via `SET fasttrun.track_schedule = '...'` (superuser only).
 
 ### Persistence
 
