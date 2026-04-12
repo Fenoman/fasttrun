@@ -1,5 +1,7 @@
 # fasttrun
 
+> English version is available: [README_EN.md](README_EN.md)
+
 Расширение для PostgreSQL 16 / 17 / 18.
 
 Быстрый `TRUNCATE` и `ANALYZE` для временных таблиц — **без единого сообщения инвалидации** в общую очередь (sinval).
