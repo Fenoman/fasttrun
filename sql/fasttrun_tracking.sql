@@ -165,6 +165,8 @@ FROM temp_calc_main ORDER BY link DESC LIMIT 1;
 -- ======================================================================
 
 -- Probe: создаём temp table и проверяем записался ли он в трекинг
+-- Выключаем расписание на сессию, чтобы тест не зависел от времени запуска
+SET fasttrun.track_schedule = '';
 DO $$
 DECLARE
     _has_shmem bool;

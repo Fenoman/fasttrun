@@ -213,7 +213,7 @@ SELECT fasttrun_prewarm();
 SELECT fasttrun_reset_temp_stats();
 ```
 
-`fasttrun_prewarm()` берёт top-N из собранной статистики (N задаётся через `fasttrun.prewarm_count`, по умолчанию 500) и для каждой таблицы вызывает `create_temp_table()`. Если таблица уже есть — просто очищает через `fasttruncate`. Перед вызовом prewarm проверяет, что для таблицы существует чучело в схеме `fasttrun.prewarm_schema` — если чучела нет, таблица пропускается без ошибки.
+`fasttrun_prewarm()` берёт top-N из собранной статистики (N задаётся через `fasttrun.prewarm_count`, по умолчанию 1000) и для каждой таблицы вызывает `create_temp_table()`. Если таблица уже есть — просто очищает через `fasttruncate`. Перед вызовом prewarm проверяет, что для таблицы существует чучело в схеме `fasttrun.prewarm_schema` — если чучела нет, таблица пропускается без ошибки.
 
 **Что попадает в статистику**: только таблицы, созданные через `CREATE TEMP TABLE ... (LIKE dummy_tmp.xxx ...)`. Если разработчик создаёт temp table напрямую (`CREATE TEMP TABLE foo (id int, ...)`), без LIKE из схемы чучел — она в статистику не попадает и не мешает прогреву.
 
@@ -224,9 +224,9 @@ SELECT fasttrun_reset_temp_stats();
 | Параметр | По умолчанию | Описание |
 |---|---|---|
 | `fasttrun.track_temp_creates` | `on` | Считать CREATE TEMP TABLE. Можно отключить через SET для отладки |
-| `fasttrun.prewarm_count` | `500` | Сколько горячих таблиц создавать в `fasttrun_prewarm()` |
+| `fasttrun.prewarm_count` | `1000` | Сколько горячих таблиц создавать в `fasttrun_prewarm()` |
 | `fasttrun.prewarm_schema` | `dummy_tmp` | Схема с таблицами-шаблонами. Трекаются только CREATE с LIKE из этой схемы |
-| `fasttrun.track_schedule` | `''` | Расписание сбора статистики. Пусто — всегда. Формат см. ниже |
+| `fasttrun.track_schedule` | `'mon-fri 08:00-18:00'` | Расписание сбора статистики. Пусто — всегда. Формат см. ниже |
 
 ### Расписание сбора статистики
 

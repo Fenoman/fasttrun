@@ -211,7 +211,7 @@ SELECT fasttrun_prewarm();
 SELECT fasttrun_reset_temp_stats();
 ```
 
-`fasttrun_prewarm()` takes top-N from the collected statistics (N is set via `fasttrun.prewarm_count`, 500 by default) and calls `create_temp_table()` for each. If the table already exists — just clears it via `fasttruncate`. Before calling prewarm checks that a template for the table exists in the `fasttrun.prewarm_schema` schema — if there is no template, the table is skipped without error.
+`fasttrun_prewarm()` takes top-N from the collected statistics (N is set via `fasttrun.prewarm_count`, 1000 by default) and calls `create_temp_table()` for each. If the table already exists — just clears it via `fasttruncate`. Before calling prewarm checks that a template for the table exists in the `fasttrun.prewarm_schema` schema — if there is no template, the table is skipped without error.
 
 **What goes into statistics**: only tables created via `CREATE TEMP TABLE ... (LIKE dummy_tmp.xxx ...)`. If a developer creates a temp table directly (`CREATE TEMP TABLE foo (id int, ...)`), without LIKE from the template schema — it does not go into statistics and does not interfere with prewarming.
 
@@ -222,9 +222,9 @@ Typical pooler integration — call `fasttrun_prewarm()` when the pooler creates
 | Parameter | Default | Description |
 |---|---|---|
 | `fasttrun.track_temp_creates` | `on` | Count CREATE TEMP TABLE. Can be disabled via SET for debugging |
-| `fasttrun.prewarm_count` | `500` | How many hot tables to create in `fasttrun_prewarm()` |
+| `fasttrun.prewarm_count` | `1000` | How many hot tables to create in `fasttrun_prewarm()` |
 | `fasttrun.prewarm_schema` | `dummy_tmp` | Template schema. Only CREATE with LIKE from this schema are tracked |
-| `fasttrun.track_schedule` | `''` | Tracking schedule. Empty means always. Format described below |
+| `fasttrun.track_schedule` | `'mon-fri 08:00-18:00'` | Tracking schedule. Empty means always. Format described below |
 
 ### Tracking schedule
 

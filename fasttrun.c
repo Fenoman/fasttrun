@@ -2862,9 +2862,9 @@ typedef struct FasttrunTrackEntry
 static HTAB			   *fasttrun_track_htab = NULL;
 static LWLockId			fasttrun_track_lock;
 static bool				fasttrun_track_enabled = true;
-static int				fasttrun_prewarm_count = 500;
+static int				fasttrun_prewarm_count = 1000;
 static char			   *fasttrun_prewarm_schema = "dummy_tmp";
-static char			   *fasttrun_track_schedule = "";
+static char			   *fasttrun_track_schedule = "mon-fri 08:00-18:00";
 static ProcessUtility_hook_type prev_utility_hook = NULL;
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 static shmem_request_hook_type prev_shmem_request_hook = NULL;
@@ -3637,7 +3637,7 @@ _PG_init(void)
 							"Number of hottest temp tables to pre-create in fasttrun_prewarm()",
 							NULL,
 							&fasttrun_prewarm_count,
-							500,
+							1000,
 							0,
 							FASTTRUN_TRACK_MAX,
 							PGC_USERSET,
@@ -3662,7 +3662,7 @@ _PG_init(void)
 							   "Invalid format is logged as WARNING and falls back "
 							   "to always-active.",
 							   &fasttrun_track_schedule,
-							   "",
+							   "mon-fri 08:00-18:00",
 							   PGC_SUSET,
 							   0,
 							   NULL,
