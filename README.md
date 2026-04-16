@@ -179,7 +179,7 @@ PERFORM fasttruncate('temp_xxx');
 
 ### Как включить
 
-Добавить fasttrun в `shared_preload_libraries` (порядок не важен, можно в конец):
+Добавить fasttrun в `shared_preload_libraries` **последним в списке**:
 
 ```ini
 # postgresql.conf
@@ -187,6 +187,8 @@ shared_preload_libraries = 'ptrack,citus_columnar,timescaledb,...,fasttrun'
 ```
 
 Перезапустить PostgreSQL. Это нужно один раз — fasttrun выделит кусочек разделяемой памяти под счётчики.
+
+> **Почему именно последним.** fasttrun регистрирует `planner_hook`, который реинжектит `relpages`/`reltuples` временных таблиц в `rd_rel` перед планированием. В цепочке хуков PostgreSQL расширение, загруженное последним, вызывается первым — значит статистика будет свежей ещё до того, как её прочитают планировщики Citus, TimescaleDB, pgpro_stats и остальных. Если поставить раньше — фикс всё равно работает, но Citus/TSDB могут успеть прочитать `rd_rel` с устаревшими значениями.
 
 ### Что если не прописать
 

@@ -177,7 +177,7 @@ When working with a pooler, a backend serves hundreds of clients. Each client ca
 
 ### How to enable
 
-Add fasttrun to `shared_preload_libraries` (order doesn't matter, you can append it):
+Add fasttrun to `shared_preload_libraries` **as the last entry**:
 
 ```ini
 # postgresql.conf
@@ -185,6 +185,8 @@ shared_preload_libraries = 'ptrack,citus_columnar,timescaledb,...,fasttrun'
 ```
 
 Restart PostgreSQL. You need this once — fasttrun will allocate a chunk of shared memory for the counters.
+
+> **Why last.** fasttrun registers a `planner_hook` that re-injects `relpages`/`reltuples` for temp tables into `rd_rel` before planning. In the PostgreSQL hook chain the extension loaded last runs first — so the stats are refreshed before Citus, TimescaleDB, pgpro_stats or other planners read them. Loading fasttrun earlier still works, but those extensions may read stale `rd_rel` values before our hook fires.
 
 ### What if you don't enable it
 
