@@ -104,6 +104,18 @@ fasttrun_analyze vs ANALYZE (4 columns)           ~230x faster
 
 Under load the gap is even wider — regular `ANALYZE` forces all other backends to drain the sinval queue, while `fasttrun_analyze` puts nothing into it.
 
+## Production impact
+
+One of our production clusters (64 CPU, 75+ backends, thousands of `CREATE TEMP TABLE` per day) before the fasttrun rework:
+
+![CPU before fasttrun](docs/images/prod-cpu-before.png)
+
+As you can see, CPU is under heavy pressure — the cluster was burning cycles draining the sinval queue in `ReceiveSharedInvalidMessages`. After the fasttrun rewrite (`fasttruncate` + `fasttrun_analyze`):
+
+![CPU after fasttrun](docs/images/prod-cpu-after.png)
+
+Same workload, same hardware: CPU idle stays around ~88%, per-node peaks don't exceed 40%. The numbers match the expectation from the description above — kill the sinval storm and you're left with the useful CPU budget.
+
 ## Installation
 
 ```bash

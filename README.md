@@ -106,6 +106,18 @@ fasttrun_analyze vs ANALYZE (4 колонки)           ~230x быстрее
 
 Под нагрузкой разрыв ещё больше — обычный `ANALYZE` заставляет все остальные бэкенды обрабатывать очередь sinval, а `fasttrun_analyze` туда ничего не кладёт.
 
+## Эффект на проде
+
+Один из наших прод-кластеров (64 CPU, 75+ бэкендов, тысячи `CREATE TEMP TABLE` в день) до переработки fasttrun:
+
+![CPU до fasttrun](docs/images/prod-cpu-before.png)
+
+CPU как видим под сильным прессингом, кластер был перегружен обработкой sinval-очереди в `ReceiveSharedInvalidMessages`. После переписывания fasttrun (`fasttruncate` + `fasttrun_analyze`):
+
+![CPU после fasttrun](docs/images/prod-cpu-after.png)
+
+Тот же workload, то же железо, CPU idle держится на ~88%, пики нагрузки отдельных нод не превышают 40%. Цифры совпадают с ожиданием из описания выше: устранили sinval-шторм — остался только полезный CPU-бюджет.
+
 ## Установка
 
 ```bash
