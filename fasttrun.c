@@ -34,6 +34,7 @@
 #include "common/relpath.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
+#include "optimizer/planner.h"
 #include "pgstat.h"
 #include "storage/buf_internals.h"
 #include "storage/bufmgr.h"
@@ -581,6 +582,7 @@ static HTAB			   *fasttrun_stats_cache = NULL;
 static MemoryContext	fasttrun_stats_mcxt = NULL;
 static get_relation_stats_hook_type prev_get_relation_stats_hook = NULL;
 static get_attavgwidth_hook_type prev_get_attavgwidth_hook = NULL;
+static planner_hook_type prev_planner_hook = NULL;
 
 static void
 fasttrun_stats_cache_init(void)
@@ -758,6 +760,61 @@ chain:
 	if (prev_get_attavgwidth_hook)
 		return (*prev_get_attavgwidth_hook) (relid, attnum);
 	return 0;
+}
+
+/*
+ * planner hook — re-inject cached relpages/reltuples into rd_rel for any
+ * temp relation whose rd_rel was reset to the on-disk pg_class values
+ * by a relcache rebuild (typically triggered by a sinval message from a
+ * concurrent backend).
+ *
+ * fasttrun_analyze() writes (relpages, reltuples) only into rd_rel —
+ * never into pg_class — to keep the operation sinval-free.  But rd_rel
+ * is owned by the relcache, and any RelationCacheInvalidateEntry resets
+ * it from pg_class on the next RelationIdGetRelation.  Without this
+ * hook, that wipes our analyze results: planner sees relpages=0 and
+ * picks catastrophic plans (Seq Scan over what looks like a tiny table,
+ * nested loop joins on big working sets).
+ *
+ * We walk our analyze cache and, for any entry with cached_pages > 0
+ * whose rd_rel currently shows relpages=0, push the cached values back
+ * into rd_rel.  Subsequent planning in this transaction sees the right
+ * numbers.
+ */
+static PlannedStmt *
+fasttrun_planner_hook(Query *parse, const char *query_string,
+					  int cursorOptions, ParamListInfo boundParams)
+{
+	if (fasttrun_analyze_cache != NULL)
+	{
+		HASH_SEQ_STATUS status;
+		FasttrunAnalyzeCacheEntry *entry;
+
+		hash_seq_init(&status, fasttrun_analyze_cache);
+		while ((entry = hash_seq_search(&status)) != NULL)
+		{
+			Relation rel;
+
+			if (entry->cached_pages == 0)
+				continue;
+
+			rel = RelationIdGetRelation(entry->relid);
+			if (!RelationIsValid(rel))
+				continue;
+
+			if (rel->rd_rel->relpages == 0)
+			{
+				rel->rd_rel->relpages = entry->cached_pages;
+				rel->rd_rel->reltuples = (float4) entry->cached_tuples;
+			}
+			RelationClose(rel);
+		}
+	}
+
+	if (prev_planner_hook)
+		return prev_planner_hook(parse, query_string, cursorOptions, boundParams);
+	else
+		return standard_planner(parse, query_string, cursorOptions, boundParams);
 }
 
 /*
@@ -2642,6 +2699,28 @@ fasttrun_relstats(PG_FUNCTION_ARGS)
 			 RelationGetRelationName(rel));
 	}
 
+	/*
+	 * If rd_rel shows zero pages but our analyze cache still has the
+	 * real numbers from a previous fasttrun_analyze() in this
+	 * transaction, re-inject them.  rd_rel may have been wiped by a
+	 * relcache rebuild (sinval from a concurrent backend that touched
+	 * pg_class), and the planner_hook would have done the same on the
+	 * next plan — we just do it here too so direct SQL inspection sees
+	 * the post-invalidation truth.
+	 */
+	if (fasttrun_analyze_cache != NULL && rel->rd_rel->relpages == 0)
+	{
+		FasttrunAnalyzeCacheEntry *entry;
+
+		entry = (FasttrunAnalyzeCacheEntry *)
+			hash_search(fasttrun_analyze_cache, &relOid, HASH_FIND, NULL);
+		if (entry != NULL && entry->cached_pages > 0)
+		{
+			rel->rd_rel->relpages = entry->cached_pages;
+			rel->rd_rel->reltuples = (float4) entry->cached_tuples;
+		}
+	}
+
 	values[0] = Int32GetDatum(rel->rd_rel->relpages);
 	values[1] = Float4GetDatum(rel->rd_rel->reltuples);
 
@@ -3622,6 +3701,15 @@ _PG_init(void)
 	get_relation_stats_hook = fasttrun_get_relation_stats_hook;
 	prev_get_attavgwidth_hook = get_attavgwidth_hook;
 	get_attavgwidth_hook = fasttrun_get_attavgwidth_hook;
+
+	/*
+	 * planner hook re-injects fasttrun_analyze cached relpages/reltuples
+	 * into rd_rel before planning — defends against relcache rebuilds
+	 * triggered by sinval messages from concurrent backends, which would
+	 * otherwise wipe the in-memory stats and force catastrophic plans.
+	 */
+	prev_planner_hook = planner_hook;
+	planner_hook = fasttrun_planner_hook;
 
 	/* Tracking GUCs */
 	DefineCustomBoolVariable("fasttrun.track_temp_creates",

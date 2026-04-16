@@ -1,0 +1,91 @@
+--
+-- fasttrun_relstats_survive — regression-тест: relpages/reltuples
+-- должны переживать перестроение relcache после инвалидации sinval.
+--
+-- Суть бага: fasttrun_analyze() пишет relpages/reltuples только в rd_rel
+-- (в памяти процесса), в pg_class ничего не идёт.  Когда из общей очереди
+-- sinval приходит сообщение, которое триггерит перестроение relcache,
+-- rd_rel пересобирается из pg_class (а там 0/-1), и планировщик видит
+-- 0 страниц → Seq Scan по "пустой" таблице → катастрофический
+-- Nested Loop на реальной нагрузке.
+--
+-- Статистика по колонкам выживает (отдаётся через get_relation_stats_hook
+-- из нашей хэш-таблицы), а вот relpages/reltuples — нет, они живут
+-- ТОЛЬКО в rd_rel.
+--
+-- Фикс: planner_hook реинжектит cached_pages/cached_tuples из
+-- fasttrun_analyze_cache в rd_rel перед каждым планированием.
+-- fasttrun_relstats() тоже делает re-inject напрямую, чтобы SQL-уровневая
+-- инспекция видела правду после инвалидации.
+--
+-- ВАЖНО: индекс создаётся ДО INSERT — иначе CREATE INDEX после INSERT
+-- вызвал бы index_update_stats и записал бы реальные (relpages, reltuples)
+-- в pg_class.  После этого перестроение relcache прочитало бы правильные
+-- значения и замаскировало бы баг.
+--
+
+CREATE EXTENSION fasttrun;
+
+-- ----------------------------------------------------------------------
+-- 1. Подготовка: временная таблица, индекс до INSERT, потом данные.
+--    Такой порядок гарантирует, что pg_class хранит (relpages=0,
+--    reltuples=-1) для heap-отношения — без этого баг не воспроизводится.
+-- ----------------------------------------------------------------------
+CREATE TEMP TABLE t_survive (id int, payload text);
+CREATE INDEX ON t_survive (id);
+INSERT INTO t_survive SELECT g, 'data_' || g FROM generate_series(1, 1000) g;
+
+-- Проверяем предусловие: pg_class до сих пор показывает дефолты пустой таблицы
+SELECT relpages = 0 AS pgclass_zero_pages,
+       reltuples = -1 AS pgclass_default_tuples
+  FROM pg_class WHERE oid = 't_survive'::regclass;
+
+BEGIN;
+
+-- ----------------------------------------------------------------------
+-- 2. После fasttrun_analyze rd_rel содержит реальные pages/tuples
+-- ----------------------------------------------------------------------
+SELECT fasttrun_analyze('t_survive');
+
+SELECT relpages > 0 AS has_pages,
+       reltuples = 1000 AS exact_tuples
+  FROM fasttrun_relstats('t_survive');
+
+-- ----------------------------------------------------------------------
+-- 3. Симулируем перестроение relcache через touch pg_class.
+--    UPDATE триггерит CacheInvalidateHeapTuple → инвалидация relcache
+--    нашей temp таблицы → rd_rel пересобирается из pg_class →
+--    relpages/reltuples сбрасываются в (0, -1).
+-- ----------------------------------------------------------------------
+UPDATE pg_class SET relhasindex = relhasindex
+ WHERE oid = 't_survive'::regclass;
+
+-- Любой запрос форсит AcceptInvalidationMessages, завершая перестроение.
+-- Без фикса rd_rel теперь (0, -1).
+SELECT 1 AS force_inval;
+
+-- ----------------------------------------------------------------------
+-- 4. После перестроения relcache fasttrun_relstats всё равно должна
+--    показывать корректные значения: fasttrun_relstats fix делает
+--    re-inject из кэша.
+-- ----------------------------------------------------------------------
+SELECT relpages > 0 AS pages_survive,
+       reltuples = 1000 AS tuples_survive
+  FROM fasttrun_relstats('t_survive');
+
+-- ----------------------------------------------------------------------
+-- 5. EXPLAIN должен отражать реальный размер таблицы.  С багом:
+--    планировщик видит relpages=0 / reltuples=-1 → оценка "маленькая
+--    пустая таблица" → Seq Scan с rows=1.  С фиксом: planner_hook
+--    реинжектит pages/tuples до построения плана → Bitmap Index Scan
+--    с правильной оценкой кардинальности.
+-- ----------------------------------------------------------------------
+EXPLAIN (COSTS OFF) SELECT * FROM t_survive WHERE id = 500;
+
+COMMIT;
+
+-- ----------------------------------------------------------------------
+-- Очистка
+-- ----------------------------------------------------------------------
+DROP TABLE t_survive;
+DROP EXTENSION fasttrun;

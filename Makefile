@@ -17,7 +17,9 @@ OBJS = fasttrun.o
 EXTENSION = fasttrun
 DATA = fasttrun--2.0.sql \
        fasttrun--2.1.sql \
+       fasttrun--2.1.1.sql \
        fasttrun--2.0--2.1.sql \
+       fasttrun--2.1--2.1.1.sql \
        fasttrun--unpackaged--2.0.sql
 DOCS = README.md
 PGFILEDESC = "fasttrun - sinval-free truncate and analyze for temporary tables"
@@ -29,7 +31,8 @@ REGRESS = fasttrun_basic \
           fasttrun_migration \
           fasttrun_bench \
           fasttrun_stats \
-          fasttrun_tracking
+          fasttrun_tracking \
+          fasttrun_relstats_survive
 
 PG_CONFIG ?= pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
