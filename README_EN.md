@@ -27,7 +27,7 @@ This fasttrun fork tries to solve both problems:
 | `fasttrun_prewarm()` | Creates top-N hot temp tables via `create_temp_table` | **no** |
 | `fasttrun_reset_temp_stats()` | Resets temp table creation counters | **no** |
 
-All functions:
+Functions that accept a temporary table name:
 * accept a temp table name (schema-qualified is allowed);
 * silently return an empty result if the table does not exist;
 * raise an error if the table is not temporary.
@@ -37,6 +37,8 @@ All functions:
 By default (`fasttrun.zero_sinval_truncate = on`) the physical cleanup goes through `unlink` of all fork files + a fresh `smgrcreate`. This does **not** call `CacheInvalidateSmgr` — unlike the standard `smgrtruncate`.
 
 Safe because temporary tables live in the backend's local buffer pool. Other processes don't see our relfilenode, and invalidation is useless to them.
+
+At the same time, `fasttruncate` locally invalidates the current backend plan cache. This is needed so PL/pgSQL / SPI does not reuse an old plan after truncate and refill. This step does not send anything to the shared sinval queue.
 
 Besides the table itself, `fasttruncate` handles:
 * **all indexes** — rebuilds via `ambuild` (btree metapage, hash, etc.);
@@ -127,7 +129,9 @@ make install PG_CONFIG=/path/to/pg_config
 CREATE EXTENSION fasttrun;
 ```
 
-Upgrade from version 2.0 is supported:
+By default, this installs version `2.1.2`.
+
+Upgrade from older versions `2.0` / `2.1` / `2.1.1` is supported:
 ```sql
 ALTER EXTENSION fasttrun UPDATE;
 ```
@@ -138,7 +142,7 @@ ALTER EXTENSION fasttrun UPDATE;
 make installcheck PG_CONFIG=/path/to/pg_config PGPORT=5433
 ```
 
-7 test cases via `pg_regress`:
+10 test cases via `pg_regress`:
 
 | Test | What it checks |
 |---|---|
@@ -149,6 +153,9 @@ make installcheck PG_CONFIG=/path/to/pg_config PGPORT=5433
 | `fasttrun_migration` | Upgrade path 2.0 → 2.1, including backward compatibility with `fasttruncate_c` |
 | `fasttrun_bench` | Synthetic benchmark on 1M rows × 50 columns |
 | `fasttrun_stats` | Statistics hook: EXPLAIN before/after, auto-collection, sample_rows=0/-1, refresh threshold |
+| `fasttrun_tracking` | Tracking frequently created temp tables and prewarm |
+| `fasttrun_relstats_survive` | relstats survive relcache rebuilds inside one backend |
+| `fasttrun_plan_cache_survive` | Backend-local SPI/PL/pgSQL plan cache invalidation after fasttruncate |
 
 All tests pass on PG 16.13, 17.9 and 18.3.
 
@@ -288,7 +295,7 @@ Statistics are saved to disk (`pg_stat/fasttrun_temp_stats`) on server shutdown 
 * **Sequences** — `fasttruncate` does not reset SERIAL/IDENTITY sequences (same as regular `TRUNCATE` without `RESTART IDENTITY`).
 * **Cache lives until end of transaction** — not reused across transactions.
 * **`relpages/reltuples` do not roll back on ROLLBACK** — `fasttrun_analyze` writes to `rd_rel` directly, without undo. On transaction rollback the values remain from the rolled-back data until the next `fasttrun_analyze` or `fasttruncate` call.
-* **Cached generic plans** — `fasttrun_analyze` does not invalidate plans already cached in PL/pgSQL / SPI / PREPARE. Only newly replanned queries benefit.
+* **Cached plans without `fasttruncate`** — `fasttrun_analyze` itself does not invalidate plans already cached in PL/pgSQL / SPI / PREPARE. The normal `fasttruncate` → refill → `fasttrun_analyze` cycle is safe in `2.1.2+`: `fasttruncate` performs backend-local plan-cache invalidation via `LocalExecuteInvalidationMessage`.
 * **Cost of cold-path stats collection** — ~50-150 ms for a 1M rows × 50 columns table. Can be disabled via GUC.
 
 ## Compatibility
@@ -306,11 +313,13 @@ Single source file, version differences handled via `#if PG_VERSION_NUM`.
 ```
 fasttrun.c                    # main C code (~3300 lines)
 fasttrun.control              # extension metadata
-fasttrun--2.1.sql             # current version (8 functions)
-fasttrun--2.0.sql             # legacy
-fasttrun--2.0--2.1.sql        # migration from 2.0
+fasttrun--2.1.2.sql           # current version (8 functions)
+fasttrun--2.0.sql             # old base version
+fasttrun--2.0--2.1.sql        # migration 2.0 -> 2.1
+fasttrun--2.1--2.1.1.sql      # migration 2.1 -> 2.1.1
+fasttrun--2.1.1--2.1.2.sql    # migration 2.1.1 -> 2.1.2
 Makefile                      # PGXS
 examples/                     # examples (create_temp_table)
-sql/                          # tests (8 files)
+sql/                          # tests (10 files)
 expected/                     # expected output
 ```

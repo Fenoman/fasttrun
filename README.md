@@ -29,7 +29,7 @@
 | `fasttrun_prewarm()` | Создаёт top-N горячих temp tables через `create_temp_table` | **нет** |
 | `fasttrun_reset_temp_stats()` | Сбрасывает счётчики создания temp tables | **нет** |
 
-Все функции:
+Функции, которые принимают имя временной таблицы:
 * принимают имя временной таблицы (можно с указанием схемы);
 * молча возвращают пустой результат, если таблицы нет;
 * выдают ошибку, если таблица не временная.
@@ -39,6 +39,8 @@
 По умолчанию (`fasttrun.zero_sinval_truncate = on`) физическая очистка идёт через `unlink` файлов всех fork'ов таблицы + повторный `smgrcreate`. Это **не** вызывает `CacheInvalidateSmgr` — в отличие от штатного `smgrtruncate`.
 
 Безопасно потому, что временные таблицы живут в локальном буферном пуле бэкенда. Другие процессы не видят наш relfilenode, и инвалидация им бесполезна.
+
+При этом `fasttruncate` локально сбрасывает кэш планов текущего бэкенда. Это нужно, чтобы PL/pgSQL / SPI не переиспользовал старый план после очистки и повторного наполнения таблицы. В общую очередь sinval этот шаг ничего не пишет.
 
 Помимо самой таблицы, `fasttruncate` обрабатывает:
 * **все индексы** — пересоздаёт через `ambuild` (metapage btree, hash и т.д.);
@@ -129,7 +131,9 @@ make install PG_CONFIG=/path/to/pg_config
 CREATE EXTENSION fasttrun;
 ```
 
-Поддерживается обновление с версии 2.0:
+По умолчанию будет установлена версия `2.1.2`.
+
+Поддерживается обновление со старых версий `2.0` / `2.1` / `2.1.1`:
 ```sql
 ALTER EXTENSION fasttrun UPDATE;
 ```
@@ -140,7 +144,7 @@ ALTER EXTENSION fasttrun UPDATE;
 make installcheck PG_CONFIG=/path/to/pg_config PGPORT=5433
 ```
 
-7 тест-кейсов через `pg_regress`:
+10 тест-кейсов через `pg_regress`:
 
 | Тест | Что проверяет |
 |---|---|
@@ -151,6 +155,9 @@ make installcheck PG_CONFIG=/path/to/pg_config PGPORT=5433
 | `fasttrun_migration` | Путь обновления 2.0 → 2.1, включая обратную совместимость с `fasttruncate_c` |
 | `fasttrun_bench` | Синтетический бенчмарк на 1M строк × 50 колонок |
 | `fasttrun_stats` | Хук статистики: EXPLAIN до/после, автосбор, sample_rows=0/-1, refresh threshold |
+| `fasttrun_tracking` | Трекинг часто создаваемых temp tables и prewarm |
+| `fasttrun_relstats_survive` | Сохранение relstats через relcache rebuild в рамках backend'а |
+| `fasttrun_plan_cache_survive` | Локальный сброс кэша планов SPI/PL/pgSQL после fasttruncate |
 
 Все тесты проходят на PG 16.13, 17.9 и 18.3.
 
@@ -290,7 +297,7 @@ fasttrun.track_schedule = ''
 * **Последовательности** — `fasttruncate` не сбрасывает SERIAL/IDENTITY sequence (как и обычный `TRUNCATE` без `RESTART IDENTITY`).
 * **Кэш живёт до конца транзакции** — между транзакциями не переиспользуется.
 * **`relpages/reltuples` не откатываются при ROLLBACK** — `fasttrun_analyze` пишет в `rd_rel` напрямую, без undo. При откате транзакции значения остаются от откаченных данных до следующего вызова `fasttrun_analyze` или `fasttruncate`.
-* **Cached generic plans** — `fasttrun_analyze` не инвалидирует уже закешированные планы в PL/pgSQL / SPI / PREPARE. Выигрывают только заново перепланированные запросы.
+* **Cached plans без `fasttruncate`** — сама `fasttrun_analyze` не инвалидирует уже закешированные планы в PL/pgSQL / SPI / PREPARE. Нормальный цикл `fasttruncate` → refill → `fasttrun_analyze` в `2.1.2+` безопасен: `fasttruncate` делает локальную invalidation plan cache для текущего backend'а через `LocalExecuteInvalidationMessage`.
 * **Стоимость холодного прохода со сбором статистики** — ~50-150 мс на таблицу 1M строк × 50 колонок. Можно отключить через GUC.
 
 ## Совместимость
@@ -308,11 +315,13 @@ fasttrun.track_schedule = ''
 ```
 fasttrun.c                    # основной C-код (~3300 строк)
 fasttrun.control              # метаданные расширения
-fasttrun--2.1.sql             # текущая версия (8 функций)
-fasttrun--2.0.sql             # legacy
-fasttrun--2.0--2.1.sql        # миграция с 2.0
+fasttrun--2.1.2.sql           # текущая версия (8 функций)
+fasttrun--2.0.sql             # старая базовая версия
+fasttrun--2.0--2.1.sql        # миграция 2.0 -> 2.1
+fasttrun--2.1--2.1.1.sql      # миграция 2.1 -> 2.1.1
+fasttrun--2.1.1--2.1.2.sql    # миграция 2.1.1 -> 2.1.2
 Makefile                      # PGXS
 examples/                     # примеры (create_temp_table)
-sql/                          # тесты (8 файлов)
+sql/                          # тесты (10 файлов)
 expected/                     # ожидаемый вывод
 ```

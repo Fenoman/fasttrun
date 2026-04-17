@@ -45,6 +45,7 @@
 #include "utils/fmgroids.h"
 #include "utils/guc.h"
 #include "utils/hsearch.h"
+#include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/regproc.h"
@@ -2285,6 +2286,48 @@ fasttrun_full_bypass_truncate(Relation rel)
 }
 
 /*
+ * Invalidate backend-local cached plans for heap relation `relid`.
+ * This reaches `PlanCacheRelCallback` through
+ * `LocalExecuteInvalidationMessage(SHAREDINVALRELCACHE_ID)` and does
+ * not publish anything into the shared sinval queue.  That preserves
+ * the zero-sinval contract: temp tables are private to the current
+ * backend, so other backends do not need to hear about them.
+ *
+ * Why this exists: fasttruncate physically resets the table via
+ * unlink+smgrcreate and intentionally emits no shared invalidation,
+ * which would otherwise leave cached SPI / PREPARE plans with
+ * is_valid=true and stale rowcount assumptions.  Marking those plans
+ * invalid forces the next EXECUTE to replan and pick up fresh stats
+ * through fasttrun_planner_hook.
+ *
+ * Side effect: before dispatching relcache callbacks,
+ * `LocalExecuteInvalidationMessage` calls
+ * `RelationCacheInvalidateEntry(relid)`.  For temp relations that
+ * becomes `RelationFlushRelation`, i.e. a full relcache rebuild from
+ * pg_class.  Therefore fasttruncate must call us BEFORE zeroing
+ * `rd_rel->relpages/reltuples`, otherwise the rebuild would overwrite
+ * those zeros from pg_class.  After truncate, the authoritative source
+ * of refreshed stats is fasttrun_analyze_cache, reinjected by
+ * fasttrun_planner_hook.
+ *
+ * Contract invariant: after fasttruncate, callers must run
+ * fasttrun_analyze() before relying on replanning to see real stats.
+ */
+static void
+fasttrun_invalidate_local_plan_cache(Oid relid)
+{
+	SharedInvalidationMessage msg;
+
+	/* InvalidOid would target the whole relcache; defend against that. */
+	Assert(OidIsValid(relid));
+
+	msg.rc.id = SHAREDINVALRELCACHE_ID;
+	msg.rc.dbId = MyDatabaseId;
+	msg.rc.relId = relid;
+	LocalExecuteInvalidationMessage(&msg);
+}
+
+/*
  * fasttruncate(text)
  *
  * Quickly empty a temporary table.
@@ -2383,6 +2426,14 @@ fasttruncate(PG_FUNCTION_ARGS)
 	 */
 	fasttrun_cache_seed_after_truncate(rel);
 	fasttrun_stats_cache_evict_relid(relOid, RelationGetDescr(rel)->natts);
+
+	/*
+	 * Backend-local plan cache invalidation via the zero-sinval path.
+	 * Do this BEFORE zeroing rd_rel, because
+	 * LocalExecuteInvalidationMessage may rebuild the relcache entry from
+	 * pg_class and would otherwise wipe out the in-memory zeros.
+	 */
+	fasttrun_invalidate_local_plan_cache(RelationGetRelid(rel));
 
 	/*
 	 * Zero out in-memory relpages/reltuples so the planner sees an empty

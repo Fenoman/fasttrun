@@ -1,5 +1,5 @@
 comment = 'fast transaction-unsafe truncate and in-memory analyze for temporary tables'
-default_version = '2.1.1'
+default_version = '2.1.2'
 module_pathname = '$libdir/fasttrun'
 relocatable = true
 trusted = true
