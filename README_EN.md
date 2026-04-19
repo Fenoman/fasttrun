@@ -295,6 +295,7 @@ Statistics are saved to disk (`pg_stat/fasttrun_temp_stats`) on server shutdown 
 * **Sequences** — `fasttruncate` does not reset SERIAL/IDENTITY sequences (same as regular `TRUNCATE` without `RESTART IDENTITY`).
 * **Cache lives until end of transaction** — not reused across transactions.
 * **`relpages/reltuples` do not roll back on ROLLBACK** — `fasttrun_analyze` writes to `rd_rel` directly, without undo. On transaction rollback the values remain from the rolled-back data until the next `fasttrun_analyze` or `fasttruncate` call.
+* **Expression index statistics** — not collected. Regular btree indexes on table columns use the column statistics, but indexes like `CREATE INDEX ON t ((lower(name)))` do not yet get separate expression statistics.
 * **Cached plans without `fasttruncate`** — `fasttrun_analyze` itself does not invalidate plans already cached in PL/pgSQL / SPI / PREPARE. The normal `fasttruncate` → refill → `fasttrun_analyze` cycle is safe in `2.1.2+`: `fasttruncate` performs backend-local plan-cache invalidation via `LocalExecuteInvalidationMessage`.
 * **Cost of cold-path stats collection** — ~50-150 ms for a 1M rows × 50 columns table. Can be disabled via GUC.
 

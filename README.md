@@ -297,6 +297,7 @@ fasttrun.track_schedule = ''
 * **Последовательности** — `fasttruncate` не сбрасывает SERIAL/IDENTITY sequence (как и обычный `TRUNCATE` без `RESTART IDENTITY`).
 * **Кэш живёт до конца транзакции** — между транзакциями не переиспользуется.
 * **`relpages/reltuples` не откатываются при ROLLBACK** — `fasttrun_analyze` пишет в `rd_rel` напрямую, без undo. При откате транзакции значения остаются от откаченных данных до следующего вызова `fasttrun_analyze` или `fasttruncate`.
+* **Статистика expression indexes** — не собирается. Обычные btree-индексы по колонкам работают через статистику самих колонок, но для индексов вида `CREATE INDEX ON t ((lower(name)))` отдельной статистики выражения пока нет.
 * **Cached plans без `fasttruncate`** — сама `fasttrun_analyze` не инвалидирует уже закешированные планы в PL/pgSQL / SPI / PREPARE. Нормальный цикл `fasttruncate` → refill → `fasttrun_analyze` в `2.1.2+` безопасен: `fasttruncate` делает локальную invalidation plan cache для текущего backend'а через `LocalExecuteInvalidationMessage`.
 * **Стоимость холодного прохода со сбором статистики** — ~50-150 мс на таблицу 1M строк × 50 колонок. Можно отключить через GUC.
 
