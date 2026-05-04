@@ -336,7 +336,29 @@ SELECT reltuples = 5 AS lazy17v_after_truncate FROM fasttrun_relstats('t_an_trun
 SELECT count(*) = 5 AS lazy17v_actual_count FROM t_an_trunc;
 COMMIT;
 
+-- ----------------------------------------------------------------------
+-- 18. ON COMMIT DELETE ROWS делает truncate на границе COMMIT в обход
+--     ProcessUtility hook.  Старые relpages/reltuples из fasttrun cache
+--     не должны переживать этот commit-time truncate.
+-- ----------------------------------------------------------------------
+BEGIN;
+CREATE TEMP TABLE t_an_oncommit (id int) ON COMMIT DELETE ROWS;
+CREATE INDEX t_an_oncommit_id_idx ON t_an_oncommit (id);
+INSERT INTO t_an_oncommit SELECT generate_series(1, 100);
+SELECT fasttrun_analyze('t_an_oncommit');
+SELECT reltuples = 100 AS lazy18_before_commit
+  FROM fasttrun_relstats('t_an_oncommit');
+COMMIT;
+
+SELECT count(*) = 0 AS lazy18_actual_empty FROM t_an_oncommit;
+SELECT relpages = 0 AS lazy18_pages_zero,
+       reltuples = 0 AS lazy18_tuples_zero
+  FROM fasttrun_relstats('t_an_oncommit');
+SELECT reltuples = 0 AS lazy18_index_tuples_zero
+  FROM fasttrun_relstats('t_an_oncommit_id_idx');
+
 DROP TABLE t_an_trunc;
+DROP TABLE t_an_oncommit;
 
 -- Очистка
 DROP TABLE t_an;

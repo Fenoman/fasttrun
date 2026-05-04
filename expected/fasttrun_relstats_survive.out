@@ -280,9 +280,64 @@ SELECT relpages > 0 AS track_off_pages_survive,
 
 COMMIT;
 -- ----------------------------------------------------------------------
+-- 9. Обычный ANALYZE и CREATE INDEX пишут свежие relstats в pg_class.
+--    После этого session-local fasttrun cache уже не имеет права
+--    реинжектить старые значения поверх core-статистики.
+-- ----------------------------------------------------------------------
+CREATE TEMP TABLE t_survive_regular_analyze (id int);
+INSERT INTO t_survive_regular_analyze SELECT generate_series(1, 10);
+SELECT fasttrun_analyze('t_survive_regular_analyze');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+INSERT INTO t_survive_regular_analyze SELECT generate_series(11, 100000);
+ANALYZE t_survive_regular_analyze;
+SELECT reltuples = 100000 AS pgclass_analyze_tuples
+  FROM pg_class WHERE oid = 't_survive_regular_analyze'::regclass;
+ pgclass_analyze_tuples 
+------------------------
+ t
+(1 row)
+
+SELECT reltuples = 100000 AS fasttrun_analyze_tuples
+  FROM fasttrun_relstats('t_survive_regular_analyze');
+ fasttrun_analyze_tuples 
+-------------------------
+ t
+(1 row)
+
+CREATE TEMP TABLE t_survive_create_index (id int);
+INSERT INTO t_survive_create_index SELECT generate_series(1, 10);
+SELECT fasttrun_analyze('t_survive_create_index');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+INSERT INTO t_survive_create_index SELECT generate_series(11, 100000);
+CREATE INDEX ON t_survive_create_index (id);
+SELECT reltuples = 100000 AS pgclass_create_index_tuples
+  FROM pg_class WHERE oid = 't_survive_create_index'::regclass;
+ pgclass_create_index_tuples 
+-----------------------------
+ t
+(1 row)
+
+SELECT reltuples = 100000 AS fasttrun_create_index_tuples
+  FROM fasttrun_relstats('t_survive_create_index');
+ fasttrun_create_index_tuples 
+------------------------------
+ t
+(1 row)
+
+-- ----------------------------------------------------------------------
 -- Очистка
 -- ----------------------------------------------------------------------
 DROP TABLE t_survive;
 DROP TABLE t_survive_stale;
 DROP TABLE t_survive_track_off;
+DROP TABLE t_survive_regular_analyze;
+DROP TABLE t_survive_create_index;
 DROP EXTENSION fasttrun;

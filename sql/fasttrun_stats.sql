@@ -265,6 +265,32 @@ EXPLAIN (COSTS OFF) SELECT * FROM t_release_stats WHERE grp = 50000;
 COMMIT;
 DROP TABLE t_release_stats;
 
+-- 11g. Below-threshold DML перед COMMIT: если пересбора не было, старые
+--      column stats должны остаться скрытыми и в следующей транзакции.
+--      Иначе commit обнулит collected_* и старая high-cardinality
+--      статистика снова станет "свежей" на нулевых xact counters.
+CREATE TEMP TABLE t_commit_stale_stats (id int, grp int);
+INSERT INTO t_commit_stale_stats SELECT g, g FROM generate_series(1, 100000) g;
+CREATE INDEX ON t_commit_stale_stats (grp);
+
+BEGIN;
+SELECT fasttrun_analyze('t_commit_stale_stats');
+EXPLAIN (COSTS OFF) SELECT * FROM t_commit_stale_stats WHERE grp = 1;
+
+UPDATE t_commit_stale_stats SET grp = 1 WHERE id <= 10000;  -- ниже порога 20%
+SELECT fasttrun_analyze('t_commit_stale_stats');
+
+-- Внутри транзакции stats уже скрыты: planner должен уйти на fallback.
+EXPLAIN (COSTS OFF) SELECT * FROM t_commit_stale_stats WHERE grp = 1;
+COMMIT;
+
+-- После COMMIT fallback должен сохраниться, а не воскреснуть как Index Scan
+-- на старом n_distinct=100000.
+EXPLAIN (COSTS OFF) SELECT * FROM t_commit_stale_stats WHERE grp = 1;
+SELECT count(*) = 10000 AS commit_stale_actual_grp1
+  FROM t_commit_stale_stats WHERE grp = 1;
+DROP TABLE t_commit_stale_stats;
+
 DROP TABLE t_refresh;
 
 -- ----------------------------------------------------------------------
@@ -594,6 +620,7 @@ SELECT g, g <= 100 FROM generate_series(1, 100000) g;
 CREATE INDEX t_partial_stats_true_idx ON t_partial_stats (id) WHERE flag;
 
 BEGIN;
+SET LOCAL fasttrun.sample_rows = 100000;  -- детерминируем тест plumbing partial-index relstats
 SELECT fasttrun_analyze('t_partial_stats');
 SELECT reltuples BETWEEN 50 AND 200 AS partial_small_initial
   FROM fasttrun_relstats('t_partial_stats_true_idx');

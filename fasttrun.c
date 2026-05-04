@@ -113,6 +113,7 @@ static pg_prng_state fasttrun_prng_state;
 /* Forward decls for stats infrastructure (defined below) */
 static void fasttrun_stats_cache_reset(void);
 static void fasttrun_stats_cache_commit_xact(void);
+static bool fasttrun_stats_cache_evict_relid(Oid relid);
 static void fasttrun_subxact_callback(SubXactEvent event,
 									  SubTransactionId mySubid,
 									  SubTransactionId parentSubid, void *arg);
@@ -288,6 +289,91 @@ fasttrun_relation_has_same_locator(Relation rel, FasttrunAnalyzeCacheEntry *entr
 		RelFileLocatorEquals(rel->rd_locator, entry->cached_locator);
 }
 
+/*
+ * Core ON COMMIT DELETE ROWS truncates temp-table storage during COMMIT, not
+ * through our ProcessUtility hook.  If a session-local relstats cache survives
+ * that boundary unchanged, the next plan can see rows in an empty table.  At
+ * commit we can safely make an observed empty heap authoritative and update
+ * index relstats that belong to that heap to zero tuples as well.
+ */
+static bool
+fasttrun_cache_sync_commit_empty_storage(FasttrunAnalyzeCacheEntry *entry,
+										 Oid *plan_relid)
+{
+	Relation	rel;
+	Relation	heaprel = NULL;
+	BlockNumber	pages_now;
+	bool		is_empty = false;
+	bool		changed = false;
+
+	*plan_relid = entry->relid;
+
+	if (!entry->has_relstats)
+		return false;
+
+	rel = try_relation_open(entry->relid, NoLock);
+	if (rel == NULL)
+		return false;
+
+	if (!fasttrun_relation_has_same_locator(rel, entry) ||
+		rel->rd_rel->relpersistence != RELPERSISTENCE_TEMP ||
+		!isTempNamespace(RelationGetNamespace(rel)) ||
+		!RELKIND_HAS_STORAGE(rel->rd_rel->relkind))
+	{
+		relation_close(rel, NoLock);
+		return false;
+	}
+
+	if (rel->rd_rel->relkind == RELKIND_INDEX)
+	{
+		Oid		heapid = IndexGetRelation(entry->relid, true);
+
+		if (OidIsValid(heapid))
+		{
+			heaprel = try_relation_open(heapid, NoLock);
+			if (heaprel != NULL)
+			{
+				if (heaprel->rd_rel->relpersistence == RELPERSISTENCE_TEMP &&
+					isTempNamespace(RelationGetNamespace(heaprel)) &&
+					RelationGetNumberOfBlocks(heaprel) == 0)
+				{
+					is_empty = true;
+					*plan_relid = heapid;
+				}
+			}
+		}
+	}
+	else if (rel->rd_rel->relkind == RELKIND_RELATION ||
+			 rel->rd_rel->relkind == RELKIND_TOASTVALUE)
+	{
+		is_empty = (RelationGetNumberOfBlocks(rel) == 0);
+	}
+
+	if (is_empty)
+	{
+		pages_now = RelationGetNumberOfBlocks(rel);
+		if (entry->cached_pages != pages_now ||
+			entry->cached_tuples != 0 ||
+			entry->cached_allvisible != 0)
+		{
+			entry->cached_pages = pages_now;
+			entry->cached_tuples = 0;
+			entry->cached_allvisible = 0;
+			entry->relstats_subid = InvalidSubTransactionId;
+
+			rel->rd_rel->relpages = pages_now;
+			rel->rd_rel->reltuples = 0;
+			rel->rd_rel->relallvisible = 0;
+			changed = true;
+		}
+	}
+
+	if (heaprel != NULL)
+		relation_close(heaprel, NoLock);
+	relation_close(rel, NoLock);
+	return changed;
+}
+
 static BlockNumber
 fasttrun_count_allvisible(Relation rel)
 {
@@ -355,6 +441,12 @@ fasttrun_cache_commit_xact(void)
 	hash_seq_init(&status, fasttrun_analyze_cache);
 	while ((entry = (FasttrunAnalyzeCacheEntry *) hash_seq_search(&status)) != NULL)
 	{
+		Oid		plan_relid;
+		bool	empty_storage_changed;
+
+		empty_storage_changed =
+			fasttrun_cache_sync_commit_empty_storage(entry, &plan_relid);
+
 		fasttrun_baseline_free_undo(entry);
 		fasttrun_relstats_free_undo(entry);
 
@@ -370,6 +462,15 @@ fasttrun_cache_commit_xact(void)
 		entry->stats_baseline_deleted = 0;
 		entry->stats_baseline_truncdropped = false;
 		entry->stats_baseline_subid = InvalidSubTransactionId;
+
+		if (empty_storage_changed)
+		{
+			if (OidIsValid(plan_relid))
+				fasttrun_stats_cache_evict_relid(plan_relid);
+			fasttrun_invalidate_local_plan_cache(entry->relid);
+			if (OidIsValid(plan_relid) && plan_relid != entry->relid)
+				fasttrun_invalidate_local_plan_cache(plan_relid);
+		}
 	}
 }
 
@@ -1254,6 +1355,44 @@ fasttrun_stats_cache_commit_xact(void)
 	hash_seq_init(&status, fasttrun_stats_cache);
 	while ((entry = (FasttrunStatsEntry *) hash_seq_search(&status)) != NULL)
 	{
+		FasttrunStatsKey key;
+		Relation	rel;
+		int64		ins_now = 0;
+		int64		upd_now = 0;
+		int64		del_now = 0;
+		bool		truncdropped_now = false;
+		bool		have_counters = false;
+
+		key = entry->key;
+		rel = RelationIdGetRelation(key.relid);
+		if (rel != NULL)
+		{
+			have_counters = fasttrun_read_pgstat_counters(rel, &ins_now,
+														  &upd_now, &del_now,
+														  &truncdropped_now);
+			RelationClose(rel);
+		}
+
+		/*
+		 * Preserve stats across COMMIT only if they were still fresh at the
+		 * boundary.  Below-threshold DML deliberately leaves collected_* at the
+		 * old snapshot so the planner hook hides the stale tuple; resetting that
+		 * old snapshot to zero would make it look fresh again in the next xact.
+		 */
+		if (!have_counters ||
+			ins_now != entry->collected_ins ||
+			upd_now != entry->collected_upd ||
+			del_now != entry->collected_del ||
+			truncdropped_now != entry->collected_truncdropped)
+		{
+			fasttrun_stats_entry_free_undo(entry);
+			if (entry->statsTuple != NULL)
+				heap_freetuple(entry->statsTuple);
+			(void) hash_search(fasttrun_stats_cache, &key, HASH_REMOVE, NULL);
+			fasttrun_invalidate_local_plan_cache(key.relid);
+			continue;
+		}
+
 		fasttrun_stats_entry_free_undo(entry);
 		entry->collected_ins = 0;
 		entry->collected_upd = 0;
@@ -3634,6 +3773,13 @@ fasttrun_evict_rangevar(RangeVar *rv)
 }
 
 static void
+fasttrun_evict_all_session_caches(void)
+{
+	fasttrun_cache_reset();
+	fasttrun_stats_cache_reset();
+}
+
+static void
 fasttrun_evict_utility_caches(Node *parsetree)
 {
 	if (parsetree == NULL)
@@ -3655,6 +3801,35 @@ fasttrun_evict_utility_caches(Node *parsetree)
 
 				foreach(lc, stmt->relations)
 					fasttrun_evict_rangevar((RangeVar *) lfirst(lc));
+				break;
+			}
+		case T_IndexStmt:
+			{
+				IndexStmt  *stmt = (IndexStmt *) parsetree;
+
+				fasttrun_evict_rangevar(stmt->relation);
+				break;
+			}
+		case T_VacuumStmt:
+			{
+				VacuumStmt *stmt = (VacuumStmt *) parsetree;
+				ListCell   *lc;
+
+				if (stmt->rels == NIL)
+				{
+					fasttrun_evict_all_session_caches();
+					break;
+				}
+
+				foreach(lc, stmt->rels)
+				{
+					VacuumRelation *vrel = (VacuumRelation *) lfirst(lc);
+
+					if (OidIsValid(vrel->oid))
+						fasttrun_evict_temp_relid(vrel->oid);
+					else
+						fasttrun_evict_rangevar(vrel->relation);
+				}
 				break;
 			}
 		case T_DropStmt:
