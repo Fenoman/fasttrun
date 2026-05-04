@@ -140,10 +140,11 @@ DEALLOCATE q_analyze_only;
 COMMIT;
 
 -- ----------------------------------------------------------------------
--- 3. Продвижение freshness без пересбора stats: если generic plan создан
+-- 3. Below-threshold DML без пересбора stats: если generic plan создан
 --    после UPDATE ниже порога, когда cached column stats выглядят stale,
 --    следующий fasttrun_analyze должен инвалидировать этот plan даже когда
---    relpages/reltuples не изменились и stats refresh не понадобился.
+--    relpages/reltuples не изменились.  Перепланированный запрос должен
+--    увидеть fallback к defaults, а не старые stats как "свежие".
 -- ----------------------------------------------------------------------
 CREATE TEMP TABLE t_analyze_freshness_plan (id int, grp int);
 INSERT INTO t_analyze_freshness_plan
@@ -163,9 +164,67 @@ EXPLAIN (COSTS OFF) EXECUTE q_freshness_only;
 
 SELECT fasttrun_analyze('t_analyze_freshness_plan');
 
--- Тот же prepared statement должен перепланироваться после продвижения freshness.
+-- Тот же prepared statement должен перепланироваться после смены
+-- planner-visible состояния stats.
 EXPLAIN (COSTS OFF) EXECUTE q_freshness_only;
 DEALLOCATE q_freshness_only;
+COMMIT;
+
+-- ----------------------------------------------------------------------
+-- 4. ROLLBACK TO SAVEPOINT должен инвалидировать generic plan, который
+--    родился внутри откатанной подтранзакции и видел subxact-local stats.
+--    SQL PREPARE живёт в session memory, поэтому сам rollback не обязан
+--    уничтожить prepared statement; fasttrun должен сам послать локальную
+--    invalidation при восстановлении stats cache/baseline.
+-- ----------------------------------------------------------------------
+CREATE TEMP TABLE t_savepoint_cached_plan (id int, grp int);
+INSERT INTO t_savepoint_cached_plan
+SELECT g, g FROM generate_series(1, 100000) g;
+CREATE INDEX ON t_savepoint_cached_plan (grp);
+
+BEGIN;
+SET LOCAL plan_cache_mode = force_generic_plan;
+SELECT fasttrun_analyze('t_savepoint_cached_plan');
+
+SAVEPOINT sp_plan;
+UPDATE t_savepoint_cached_plan SET grp = 1;
+SELECT fasttrun_analyze('t_savepoint_cached_plan');
+PREPARE q_savepoint_rollback AS
+SELECT * FROM t_savepoint_cached_plan WHERE grp = 1;
+
+-- План создан внутри savepoint на распределении, которое будет откатано.
+EXPLAIN (COSTS OFF) EXECUTE q_savepoint_rollback;
+ROLLBACK TO SAVEPOINT sp_plan;
+
+-- После rollback тот же prepared statement должен быть перепланирован.
+EXPLAIN (COSTS OFF) EXECUTE q_savepoint_rollback;
+DEALLOCATE q_savepoint_rollback;
+COMMIT;
+
+-- ----------------------------------------------------------------------
+-- 5. Standalone fasttrun_collect_stats тоже публикует planner-visible
+--    stats и должен инвалидировать generic plans, созданные до ручного
+--    сбора статистики.
+-- ----------------------------------------------------------------------
+CREATE TEMP TABLE t_collect_cached_plan (id int, grp int);
+INSERT INTO t_collect_cached_plan
+SELECT g, g FROM generate_series(1, 100000) g;
+CREATE INDEX ON t_collect_cached_plan (grp);
+
+BEGIN;
+SET LOCAL plan_cache_mode = force_generic_plan;
+SET LOCAL fasttrun.auto_collect_stats = off;
+SELECT fasttrun_analyze('t_collect_cached_plan');
+PREPARE q_collect_only AS
+SELECT * FROM t_collect_cached_plan WHERE grp = 50000;
+
+-- Generic plan создан до standalone collect_stats: column stats ещё нет.
+EXPLAIN (COSTS OFF) EXECUTE q_collect_only;
+SELECT fasttrun_collect_stats('t_collect_cached_plan');
+
+-- collect_stats должен инвалидировать plan cache без помощи fasttruncate.
+EXPLAIN (COSTS OFF) EXECUTE q_collect_only;
+DEALLOCATE q_collect_only;
 COMMIT;
 
 DROP FUNCTION f_outer(int, int);
@@ -174,4 +233,6 @@ DROP TABLE t_rsd_details;
 DROP TABLE t_balance_out;
 DROP TABLE t_analyze_cached_plan;
 DROP TABLE t_analyze_freshness_plan;
+DROP TABLE t_savepoint_cached_plan;
+DROP TABLE t_collect_cached_plan;
 DROP EXTENSION fasttrun;

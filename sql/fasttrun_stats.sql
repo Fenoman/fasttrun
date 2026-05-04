@@ -33,8 +33,9 @@ EXPLAIN (COSTS OFF) SELECT * FROM t_stats WHERE id = 12345;
 COMMIT;
 
 -- ----------------------------------------------------------------------
--- 2. После commit кэш очищен callback'ом границы транзакции —
---    план снова Bitmap
+-- 2. После COMMIT session-local stats остаются видимыми до DML/DDL.
+--    Это ближе к обычному ANALYZE: планы в следующей транзакции не
+--    деградируют только из-за границы транзакции.
 -- ----------------------------------------------------------------------
 EXPLAIN (COSTS OFF) SELECT * FROM t_stats WHERE id = 12345;
 
@@ -135,9 +136,9 @@ DROP TABLE t_trunc_evict;
 
 -- ----------------------------------------------------------------------
 -- 10. Самостоятельный fasttrun_collect_stats (без fasttrun_analyze)
---     не должен переживать COMMIT.  Раньше callback границы транзакции
---     регистрировался только внутри fasttrun_cache_init(), и кэш
---     статистики "протекал" через границы транзакции.
+--     должен переживать COMMIT в рамках backend'а, если после сбора
+--     не было DML.  Это ближе к обычному ANALYZE: план в следующей
+--     транзакции не должен внезапно деградировать только из-за COMMIT.
 -- ----------------------------------------------------------------------
 CREATE TEMP TABLE t_leak (id int);
 INSERT INTO t_leak SELECT generate_series(1, 100000) g;
@@ -157,11 +158,9 @@ DROP TABLE t_leak;
 --     (insert+update+delete с момента предыдущего сбора, делённая на
 --     текущий reltuples) больше fasttrun.stats_refresh_threshold
 --     (значение по умолчанию 0.2 = 20%), то очередной fasttrun_analyze
---     запускает пересбор статистики через блочную выборку.
---     Блочная выборка, а не полный проход по таблице: количество
---     строк уже посчитано через дельта-математику, пересобирать
---     нужно только статистику колонок — поэтому ~12 мс на 500k
---     строк вместо ~180 мс полного прохода через reservoir.
+--     запускает пересбор статистики через полный reservoir sample.
+--     Это дороже старой блочной выборки, зато совпадает с качеством
+--     обычного ANALYZE на физически кластеризованных и sparse heap.
 -- ----------------------------------------------------------------------
 
 -- 11a. Значительный UPDATE (churn=1.0) → пересбор → план обновляется
@@ -179,8 +178,9 @@ EXPLAIN (COSTS OFF) SELECT * FROM t_refresh WHERE grp = 1;
 COMMIT;
 
 -- 11b. Маленький DELETE при пороге по умолчанию 0.2 — 0.009% меньше
---      порога → пересбор НЕ срабатывает, но хук продвигает freshness
---      → планировщик продолжает использовать кешированную статистику.
+--      порога → пересбор НЕ срабатывает, и старая статистика НЕ
+--      объявляется свежей.  Planner откатывается к defaults до
+--      следующего реального пересбора.
 BEGIN;
 SELECT fasttrun_analyze('t_refresh');
 EXPLAIN (COSTS OFF) SELECT * FROM t_refresh WHERE grp = 1;
@@ -201,8 +201,9 @@ SELECT fasttrun_analyze('t_refresh');
 EXPLAIN (COSTS OFF) SELECT * FROM t_refresh WHERE grp = 1;
 COMMIT;
 
--- 11d. Порог = 1.0 полностью отключает пересбор, но кешированная
---      статистика остаётся видимой планировщику (freshness продвигается)
+-- 11d. Порог = 1.0 полностью отключает пересбор.  После DML старая
+--      статистика скрывается от планировщика, потому что принудительно
+--      делать её свежей было бы хуже, чем fallback к defaults.
 BEGIN;
 SET LOCAL fasttrun.stats_refresh_threshold = 1;
 SELECT fasttrun_analyze('t_refresh');
@@ -213,11 +214,12 @@ SELECT fasttrun_analyze('t_refresh');
 EXPLAIN (COSTS OFF) SELECT * FROM t_refresh WHERE grp = 999;
 COMMIT;
 
--- 11e. Below-threshold DML внутри savepoint: advance_freshness
---      пропускается (нет undo-механики), после ROLLBACK TO SAVEPOINT
---      pgstat counters откатываются к pre-savepoint значениям, а
---      collected_* не менялся → match → хук возвращает кешированные
---      stats. Без savepoint — freshness продвигается как обычно.
+-- 11e. Below-threshold DML внутри savepoint: если пересбор не был
+--      выполнен, cached stats не должны насильно становиться "свежими".
+--      После ROLLBACK TO SAVEPOINT counters откатываются к pre-savepoint,
+--      поэтому старая статистика снова видима.  Без rollback тот же
+--      below-threshold DML должен оставить stats скрытыми до реального
+--      пересбора, чтобы planner не принимал старое распределение за новое.
 BEGIN;
 SELECT fasttrun_analyze('t_refresh');
 
@@ -231,16 +233,16 @@ ROLLBACK TO sp1;
 -- менялся внутри savepoint → match)
 EXPLAIN (COSTS OFF) SELECT * FROM t_refresh WHERE grp = 1;
 
--- Теперь тот же DML без savepoint — freshness продвигается
+-- Теперь тот же DML без savepoint — stats остаются скрытыми до пересбора
 DELETE FROM t_refresh WHERE id < 5;
 SELECT fasttrun_analyze('t_refresh');
 EXPLAIN (COSTS OFF) SELECT * FROM t_refresh WHERE grp = 1;
 COMMIT;
 
 -- 11f. DML ниже порога внутри savepoint с последующим RELEASE должен
---      оставлять cached stats видимыми.  RELEASE продвигает pgstat counters
---      в родительский subxact, поэтому advance_freshness должен быть
---      undo-aware, а не полностью скипаться в subtransaction.
+--      оставлять cached stats скрытыми.  RELEASE продвигает pgstat counters
+--      в родительский subxact, а пересбора не было — значит старое
+--      распределение нельзя выдавать планировщику как свежее.
 --
 --      Используем свежую high-cardinality таблицу: с cached stats редкий
 --      equality-предикат даёт Index Scan; со stale collected_* hook
@@ -258,8 +260,7 @@ DELETE FROM t_release_stats WHERE id < 10;  -- ниже порога
 SELECT fasttrun_analyze('t_release_stats');
 RELEASE SAVEPOINT sp_release;
 
--- Со stale collected_* это откатывается к defaults (Bitmap Heap Scan).
--- Корректное поведение оставляет cached stats видимыми после RELEASE.
+-- Корректное поведение здесь — fallback к defaults, а не stale stats.
 EXPLAIN (COSTS OFF) SELECT * FROM t_release_stats WHERE grp = 50000;
 COMMIT;
 DROP TABLE t_release_stats;
@@ -344,25 +345,20 @@ COMMIT;
 DROP TABLE t_tc;
 
 -- ----------------------------------------------------------------------
--- 15. Регрессионный тест: блочная выборка для пересбора статистики
---     не должна быть смещена к началу heap-файла.
+-- 15. Регрессионный тест: пересбор статистики после delta-hit должен
+--     оставаться несмещённым и ANALYZE-подобным.
 --
---     Раньше fasttrun_scan_block_sample останавливалась как только
---     набирала sample_target tuples, а BlockSampler_Next возвращает
---     выбранные блоки в порядке возрастания номеров.  В результате
---     на физически упорядоченной таблице ранние страницы заполняли
---     reservoir целиком, и поздние страницы в выборку вообще не
---     попадали — n_distinct после пересбора схлопывался к ~1.
+--     Раньше refresh path читал только часть heap-блоков.  Даже после
+--     исправления early-stop bias это всё равно не было полной parity
+--     с ANALYZE для физически упорядоченных или разреженных таблиц.
 --
 --     Конкретный пример (его и воспроизводим): первые ~3000 строк
 --     имеют grp=1, остальные ~50000 строк имеют уникальные grp.
 --     После cold scan'а статистика честная, n_distinct высокий.
---     Затем INSERT 20000 строк запускает пересбор; если в нём остался
---     прежний bias, выборка зачерпнёт почти только grp=1 из начала
---     файла и n_distinct схлопнется к ~1.  Проверяем сам stadistinct,
---     а не точный план: на разных cost model редкий equality может быть
---     как Index Scan, так и Bitmap Heap Scan при одинаково хорошей
---     оценке rows.
+--     Затем INSERT 20000 строк запускает полный reservoir refresh.
+--     Проверяем сам stadistinct, а не точный план: на разных cost model
+--     редкий equality может быть как Index Scan, так и Bitmap Heap Scan
+--     при одинаково хорошей оценке rows.
 -- ----------------------------------------------------------------------
 CREATE TEMP TABLE t_bias (id int, grp int);
 -- Первые 3000 строк физически лежат в начале файла и все с grp=1
@@ -379,14 +375,10 @@ SELECT stadistinct < -0.1 AS cold_ndistinct_high
  WHERE staattnum = 2;
 
 -- INSERT 20000 строк → доля изменений 20k/73k ≈ 27% > 20% порога →
--- запускается пересбор статистики через блочную выборку
+-- запускается полный reservoir refresh статистики
 INSERT INTO t_bias SELECT g, g FROM generate_series(53001, 73000) g;
 SELECT fasttrun_analyze('t_bias');
--- После пересбора: n_distinct ВСЁ ЕЩЁ должен быть высоким (несмещённая
--- выборка по всем выбранным блокам).
--- Если бы блочная выборка по-прежнему стопилась после первых
--- sample_target tuples, она бы зачерпнула почти только grp=1 из
--- начала файла, n_distinct схлопнулся бы к ~1.
+-- После пересбора: n_distinct ВСЁ ЕЩЁ должен быть высоким.
 SELECT stadistinct < -0.1 AS refresh_ndistinct_high
   FROM fasttrun_inspect_stats('t_bias')
  WHERE staattnum = 2;
@@ -399,10 +391,10 @@ DROP TABLE t_bias;
 --
 --     Раньше путь пересбора в delta-hit ветке вызывал
 --     fasttrun_collect_and_store только при sample_count > 0.  После
---     mass DELETE до пустоты блочная выборка ничего не находила,
---     baseline не двигался, и каждый последующий fasttrun_analyze
---     заново входил в путь пересбора и заново платил за блочную
---     выборку, которая снова возвращала ноль строк.
+--     mass DELETE до пустоты sample ничего не находил, baseline не
+--     двигался, и каждый последующий fasttrun_analyze заново входил
+--     в путь пересбора и заново платил за полный refresh, который
+--     снова возвращал ноль строк.
 --
 --     Тут проверяем строго по структуре, а не по таймингам (тайминги
 --     нестабильны на CI): каждый шаг должен соответствовать своей
@@ -427,10 +419,12 @@ DELETE FROM t_empty_refresh;            -- table becomes empty
 SELECT fasttrun_analyze('t_empty_refresh');
 SELECT reltuples = 0 AS empty_after_first
   FROM fasttrun_relstats('t_empty_refresh');
+SELECT count(*) = 0 AS empty_refresh_stats_evicted
+  FROM fasttrun_inspect_stats('t_empty_refresh');
 
 -- Второй analyze без DML.  С багом он бы снова входил в refresh path
 -- (потому что baseline не продвинулся при первом empty refresh) и
--- снова делал бы block sample.  С фиксом — pure delta path, мгновенно.
+-- снова делал бы полный refresh.  С фиксом — pure delta path, мгновенно.
 SELECT fasttrun_analyze('t_empty_refresh');
 SELECT reltuples = 0 AS empty_after_second
   FROM fasttrun_relstats('t_empty_refresh');
@@ -452,7 +446,7 @@ DROP TABLE t_empty_refresh;
 --     откатывал.  После ROLLBACK TO SAVEPOINT pgstat счётчики
 --     возвращались к pre-DML, а baseline в analyze cache оставался
 --     "из будущего", и следующий fasttrun_analyze считал ненулевой
---     churn → лишний block-sample проход.
+--     churn → лишний refresh-проход.
 --
 --     Тест в той же форме, что и секция 13, плюс explicit проверка
 --     что пост-rollback план идентичен pre-savepoint плану — это
@@ -520,7 +514,8 @@ DROP TABLE t_cs_baseline;
 --     первый fasttrun_analyze() после паттерна
 --         fasttruncate -> refill -> fasttrun_analyze
 --     шёл по дельта-математике (а не платил за полный cold scan), и
---     при этом ещё и обновлял статистику колонок через путь пересбора.
+--     при этом ещё и обновлял статистику колонок через полный reservoir
+--     refresh.
 --
 --     Структурные проверки:
 --       - после fasttruncate + INSERT + analyze reltuples должно быть
@@ -541,8 +536,9 @@ BEGIN;
 SELECT fasttrun_analyze('t_seed_truncate');           -- cold scan, stats есть
 EXPLAIN (COSTS OFF) SELECT * FROM t_seed_truncate WHERE grp = 12345;
 
--- Полный цикл: очистка, перезаливка, analyze.  С seed первый
--- analyze здесь идёт через delta-hit + block-sample refresh.
+-- Полный цикл: очистка, перезаливка, analyze.  С seed первый analyze
+-- здесь идёт через delta-hit для rowcount + полный reservoir refresh
+-- для статистики колонок.
 SELECT fasttruncate('t_seed_truncate');
 INSERT INTO t_seed_truncate SELECT g, g FROM generate_series(1, 50000) g;
 SELECT fasttrun_analyze('t_seed_truncate');
@@ -567,7 +563,49 @@ COMMIT;
 DROP TABLE t_seed_truncate;
 
 -- ----------------------------------------------------------------------
--- 20. Регрессионный тест: ширина столбца (stawidth) собранная нашим
+-- 20. Регрессионный тест: DDL на той же temp table должен вытеснять
+--     stats cache.  pgstat DML counters при ALTER TABLE не меняются, а
+--     обычный PostgreSQL удаляет pg_statistic для затронутых колонок.
+--     fasttrun не должен отдавать старый pg_statistic-shaped tuple после
+--     смены типа / tuple descriptor.
+-- ----------------------------------------------------------------------
+CREATE TEMP TABLE t_stats_ddl (id int, v int);
+INSERT INTO t_stats_ddl SELECT g, g FROM generate_series(1, 10000) g;
+
+BEGIN;
+SELECT fasttrun_analyze('t_stats_ddl');
+SELECT count(*) = 2 AS ddl_stats_before
+  FROM fasttrun_inspect_stats('t_stats_ddl');
+ALTER TABLE t_stats_ddl ALTER COLUMN v TYPE text USING v::text;
+SELECT count(*) = 0 AS ddl_stats_evicted
+  FROM fasttrun_inspect_stats('t_stats_ddl');
+COMMIT;
+DROP TABLE t_stats_ddl;
+
+-- ----------------------------------------------------------------------
+-- 21. Регрессионный тест: relstats partial index должны обновляться
+--     вместе с fasttrun_analyze.  Обычный ANALYZE обновляет pg_class для
+--     index relation; fasttrun должен публиковать тот же planner-visible
+--     размер хотя бы в rd_rel и session-local relstats cache.
+-- ----------------------------------------------------------------------
+CREATE TEMP TABLE t_partial_stats (id int, flag bool);
+INSERT INTO t_partial_stats
+SELECT g, g <= 100 FROM generate_series(1, 100000) g;
+CREATE INDEX t_partial_stats_true_idx ON t_partial_stats (id) WHERE flag;
+
+BEGIN;
+SELECT fasttrun_analyze('t_partial_stats');
+SELECT reltuples BETWEEN 50 AND 200 AS partial_small_initial
+  FROM fasttrun_relstats('t_partial_stats_true_idx');
+UPDATE t_partial_stats SET flag = true WHERE id <= 50000;
+SELECT fasttrun_analyze('t_partial_stats');
+SELECT reltuples BETWEEN 45000 AND 55000 AS partial_large_after_analyze
+  FROM fasttrun_relstats('t_partial_stats_true_idx');
+COMMIT;
+DROP TABLE t_partial_stats;
+
+-- ----------------------------------------------------------------------
+-- 22. Регрессионный тест: ширина столбца (stawidth) собранная нашим
 --     reservoir sample должна доходить до планировщика через
 --     get_attavgwidth_hook.
 --
@@ -632,7 +670,7 @@ COMMIT;
 DROP TABLE t_width;
 
 -- ----------------------------------------------------------------------
--- 21. Регрессионный тест: skew equality предикат через std_typanalyze.
+-- 23. Регрессионный тест: skew equality предикат через std_typanalyze.
 --
 --     99000 строк со значением v=1 и 1000 строк с уникальными редкими
 --     значениями v in 2..1001.  С нашим путём через std_typanalyze
@@ -726,7 +764,7 @@ COMMIT;
 DROP TABLE t_skew;
 
 -- ----------------------------------------------------------------------
--- 22. Регрессионный тест: range предикат через std_typanalyze.
+-- 24. Регрессионный тест: range предикат через std_typanalyze.
 --
 --     100000 строк v in 1..100000.  WHERE v < 1000 — это селективность
 --     ровно 1%.  С histogram planner должен дать оценку ~1000;
@@ -790,7 +828,7 @@ COMMIT;
 DROP TABLE t_range;
 
 -- ----------------------------------------------------------------------
--- 23. ABBA cross-validation: статистика собранная нашим path должна
+-- 25. ABBA cross-validation: статистика собранная нашим path должна
 --     дать планировщику близкие оценки тому, что дал бы обычный
 --     SQL ANALYZE — на широком спектре типов данных и предикатов.
 --
@@ -922,7 +960,7 @@ COMMIT;
 DROP TABLE t_abba;
 
 -- ----------------------------------------------------------------------
--- 24. fasttrun_inspect_stats() — observability функция для production
+-- 26. fasttrun_inspect_stats() — observability функция для production
 --     debugging.  Возвращает наши кешированные statsTuple в shape
 --     pg_catalog.pg_statistic.
 --
@@ -961,14 +999,14 @@ WHERE staattnum = 2 AND (stakind1 = 1 OR stakind2 = 1 OR stakind3 = 1);
 SELECT count(*) = 0 AS empty_for_missing
 FROM fasttrun_inspect_stats('nonexistent_temp_xxx');
 
--- Empty result для пустого кэша (pg_statistic тоже пуст для temp)
+-- Empty result для таблицы без fasttrun-статистики
 SELECT count(*) = 0 AS empty_for_no_stats_yet
-FROM fasttrun_inspect_stats('t_stats');  -- эта таблица еще существует, но без stats в кэше внутри этой xact'и (другая xact её stats коммитнула)
+FROM fasttrun_inspect_stats('t_stats');
 COMMIT;
 DROP TABLE t_inspect;
 
 -- ----------------------------------------------------------------------
--- 25. fasttrun.sample_rows = -1 (auto) — sample target автоматически
+-- 27. fasttrun.sample_rows = -1 (auto) — sample target автоматически
 --     совпадает с тем, что попросил бы std_typanalyze (по умолчанию
 --     300 × default_statistics_target = 30000 при default DST=100).
 --

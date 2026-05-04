@@ -69,7 +69,7 @@ Triggers on the first call or when the delta is invalid. Fully walks the heap, c
 
 ### Column statistics refresh
 
-If after the previous collection the DML change ratio exceeded `stats_refresh_threshold` (20% by default), a block sample is launched. Not a full scan, just random blocks — the row count is already known from the delta.
+If after the previous collection the DML change ratio exceeded `stats_refresh_threshold` (20% by default), the same full reservoir sample as the cold path is launched. This is more expensive than the old block refresh, but keeps plan quality aligned with regular `ANALYZE` on clustered and sparse heaps.
 
 ### Statistics quality
 
@@ -77,7 +77,7 @@ By default (`use_typanalyze = on`) the extension calls **the same** `std_typanal
 
 The only difference is sample size. Default `sample_rows = 3000` is ~10x smaller than regular `ANALYZE`. For most tables it's enough. For a full match — `SET fasttrun.sample_rows = -1`.
 
-The cache lives until the end of the transaction (cleaned via `RegisterXactCallback`).
+`relpages/reltuples/relallvisible` and column statistics live in backend memory and survive `COMMIT`; xact-local delta state is cleared at transaction boundaries. After DML, cached column stats are hidden from the planner until a real refresh, so old distributions are not reported as fresh.
 
 ## Settings (GUC)
 
@@ -86,7 +86,7 @@ The cache lives until the end of the transaction (cleaned via `RegisterXactCallb
 | `fasttrun.auto_collect_stats` | `on` | Collect column statistics during cold `fasttrun_analyze` pass |
 | `fasttrun.sample_rows` | `3000` | Sample size. `0` — disable collection. `-1` — auto (same as regular `ANALYZE`) |
 | `fasttrun.use_typanalyze` | `on` | Use `std_typanalyze` from core (MCV/histogram/correlation). `off` — only n_distinct/null_frac/width |
-| `fasttrun.stats_refresh_threshold` | `0.2` | DML change ratio threshold for stats refresh. `0` — on any DML. `1` — refresh disabled (stats remain visible to planner) |
+| `fasttrun.stats_refresh_threshold` | `0.2` | DML change ratio threshold for stats refresh. `0` — on any DML. `1` — automatic refresh disabled; after DML cached stats are hidden until an explicit refresh |
 | `fasttrun.zero_sinval_truncate` | `on` | Direct `unlink`+`smgrcreate` instead of `smgrtruncate`. `off` — old path with 1 SMGR sinval |
 
 ## Performance
@@ -152,10 +152,10 @@ make installcheck PG_CONFIG=/path/to/pg_config PGPORT=5433
 | `fasttrun_analyze` | Delta math, savepoint rollback, TRUNCATE inside a transaction |
 | `fasttrun_migration` | Upgrade path 2.0 → 2.1, including backward compatibility with `fasttruncate_c` |
 | `fasttrun_bench` | Synthetic benchmark on 1M rows × 50 columns |
-| `fasttrun_stats` | Statistics hook: EXPLAIN before/after, auto-collection, sample_rows=0/-1, refresh threshold |
+| `fasttrun_stats` | Statistics hook: EXPLAIN before/after, auto-collection, sample_rows=0/-1, refresh threshold, DDL/TRUNCATE eviction, partial-index relstats |
 | `fasttrun_tracking` | Tracking frequently created temp tables and prewarm |
-| `fasttrun_relstats_survive` | relstats survive relcache rebuilds inside one backend |
-| `fasttrun_plan_cache_survive` | Backend-local SPI/PL/pgSQL plan cache invalidation after fasttruncate |
+| `fasttrun_relstats_survive` | relstats survive relcache rebuilds and `COMMIT` inside one backend |
+| `fasttrun_plan_cache_survive` | Backend-local SPI/PL/pgSQL plan cache invalidation after fasttruncate, analyze, collect_stats and savepoint rollback |
 
 All tests pass on PG 16.13, 17.9 and 18.3.
 
@@ -293,10 +293,10 @@ Statistics are saved to disk (`pg_stat/fasttrun_temp_stats`) on server shutdown 
 * **Not transactional** — on ROLLBACK the data is not restored.
 * **Extended statistics** (`CREATE STATISTICS`) — not supported, there is no suitable hook in the core.
 * **Sequences** — `fasttruncate` does not reset SERIAL/IDENTITY sequences (same as regular `TRUNCATE` without `RESTART IDENTITY`).
-* **Cache lives until end of transaction** — not reused across transactions.
+* **Cache is session-local only** — reused across transactions in one backend, but not across reconnects and never written to catalogs.
 * **`relpages/reltuples` do not roll back on ROLLBACK** — `fasttrun_analyze` writes to `rd_rel` directly, without undo. On transaction rollback the values remain from the rolled-back data until the next `fasttrun_analyze` or `fasttruncate` call.
 * **Expression index statistics** — not collected. Regular btree indexes on table columns use the column statistics, but indexes like `CREATE INDEX ON t ((lower(name)))` do not yet get separate expression statistics.
-* **Cached plans without `fasttruncate`** — `fasttrun_analyze` itself does not invalidate plans already cached in PL/pgSQL / SPI / PREPARE. The normal `fasttruncate` → refill → `fasttrun_analyze` cycle is safe in `2.1.2+`: `fasttruncate` performs backend-local plan-cache invalidation via `LocalExecuteInvalidationMessage`.
+* **Cached plans are invalidated only locally** — `fasttruncate`, `fasttrun_analyze`, `fasttrun_collect_stats`, DDL/TRUNCATE eviction and savepoint rollback reset the current backend plan cache, but do not send shared sinval to other backends.
 * **Cost of cold-path stats collection** — ~50-150 ms for a 1M rows × 50 columns table. Can be disabled via GUC.
 
 ## Compatibility

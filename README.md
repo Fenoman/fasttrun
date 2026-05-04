@@ -71,7 +71,7 @@ new_tuples = cached_tuples + (ins_now - cached_ins) - (del_now - cached_del)
 
 ### Пересбор колоночной статистики
 
-Если после предыдущего сбора доля изменений DML превысила `stats_refresh_threshold` (по умолчанию 20%), запускается блочная выборка. Не полный проход, а только случайные блоки — число строк уже известно из дельты.
+Если после предыдущего сбора доля изменений DML превысила `stats_refresh_threshold` (по умолчанию 20%), запускается такой же полный reservoir sample, как на холодном пути. Это дороже старого блочного refresh, но сохраняет качество планов на уровне обычного `ANALYZE` для кластеризованных и разреженных heap.
 
 ### Качество статистики
 
@@ -79,7 +79,7 @@ new_tuples = cached_tuples + (ins_now - cached_ins) - (del_now - cached_del)
 
 Единственное отличие — размер выборки. Default `sample_rows = 3000` — в ~10 раз меньше, чем у обычного `ANALYZE`. Для большинства таблиц этого хватает. Если нужен полный match — `SET fasttrun.sample_rows = -1`.
 
-Кэш живёт до конца транзакции (очищается через `RegisterXactCallback`).
+`relpages/reltuples/relallvisible` и статистика колонок живут в памяти backend'а и переживают `COMMIT`; xact-local delta-состояние очищается на границе транзакции. После DML cached column stats скрываются от планировщика до реального пересбора, чтобы старое распределение не выдавалось как свежее.
 
 ## Настройки (GUC)
 
@@ -88,7 +88,7 @@ new_tuples = cached_tuples + (ins_now - cached_ins) - (del_now - cached_del)
 | `fasttrun.auto_collect_stats` | `on` | Собирать статистику колонок при холодном проходе `fasttrun_analyze` |
 | `fasttrun.sample_rows` | `3000` | Размер выборки. `0` — отключить сбор. `-1` — авто (как у обычного `ANALYZE`) |
 | `fasttrun.use_typanalyze` | `on` | Использовать `std_typanalyze` из ядра (MCV/histogram/correlation). `off` — только n_distinct/null_frac/width |
-| `fasttrun.stats_refresh_threshold` | `0.2` | Порог доли изменений для пересбора статистики. `0` — при любом DML. `1` — пересбор не запускается (но статистика остаётся видимой планировщику) |
+| `fasttrun.stats_refresh_threshold` | `0.2` | Порог доли изменений для пересбора статистики. `0` — при любом DML. `1` — автопересбор не запускается; после DML cached stats скрываются до явного пересбора |
 | `fasttrun.zero_sinval_truncate` | `on` | Прямой `unlink`+`smgrcreate` вместо `smgrtruncate`. `off` — старый путь с 1 SMGR sinval |
 
 ## Производительность
@@ -154,10 +154,10 @@ make installcheck PG_CONFIG=/path/to/pg_config PGPORT=5433
 | `fasttrun_analyze` | Дельта-математика, откат к savepoint, TRUNCATE внутри транзакции |
 | `fasttrun_migration` | Путь обновления 2.0 → 2.1, включая обратную совместимость с `fasttruncate_c` |
 | `fasttrun_bench` | Синтетический бенчмарк на 1M строк × 50 колонок |
-| `fasttrun_stats` | Хук статистики: EXPLAIN до/после, автосбор, sample_rows=0/-1, refresh threshold |
+| `fasttrun_stats` | Хук статистики: EXPLAIN до/после, автосбор, sample_rows=0/-1, refresh threshold, DDL/TRUNCATE eviction, partial-index relstats |
 | `fasttrun_tracking` | Трекинг часто создаваемых temp tables и prewarm |
-| `fasttrun_relstats_survive` | Сохранение relstats через relcache rebuild в рамках backend'а |
-| `fasttrun_plan_cache_survive` | Локальный сброс кэша планов SPI/PL/pgSQL после fasttruncate |
+| `fasttrun_relstats_survive` | Сохранение relstats через relcache rebuild и `COMMIT` в рамках backend'а |
+| `fasttrun_plan_cache_survive` | Локальный сброс кэша планов SPI/PL/pgSQL после fasttruncate, analyze, collect_stats и savepoint rollback |
 
 Все тесты проходят на PG 16.13, 17.9 и 18.3.
 
@@ -295,10 +295,10 @@ fasttrun.track_schedule = ''
 * **Не транзакционный** — при ROLLBACK данные не восстановятся.
 * **Расширенная статистика** (`CREATE STATISTICS`) — не поддерживается, нет подходящего хука в ядре.
 * **Последовательности** — `fasttruncate` не сбрасывает SERIAL/IDENTITY sequence (как и обычный `TRUNCATE` без `RESTART IDENTITY`).
-* **Кэш живёт до конца транзакции** — между транзакциями не переиспользуется.
+* **Кэш только session-local** — сохраняется между транзакциями одного backend'а, но не переживает reconnect и не попадает в каталоги.
 * **`relpages/reltuples` не откатываются при ROLLBACK** — `fasttrun_analyze` пишет в `rd_rel` напрямую, без undo. При откате транзакции значения остаются от откаченных данных до следующего вызова `fasttrun_analyze` или `fasttruncate`.
 * **Статистика expression indexes** — не собирается. Обычные btree-индексы по колонкам работают через статистику самих колонок, но для индексов вида `CREATE INDEX ON t ((lower(name)))` отдельной статистики выражения пока нет.
-* **Cached plans без `fasttruncate`** — сама `fasttrun_analyze` не инвалидирует уже закешированные планы в PL/pgSQL / SPI / PREPARE. Нормальный цикл `fasttruncate` → refill → `fasttrun_analyze` в `2.1.2+` безопасен: `fasttruncate` делает локальную invalidation plan cache для текущего backend'а через `LocalExecuteInvalidationMessage`.
+* **Cached plans инвалидируются только локально** — `fasttruncate`, `fasttrun_analyze`, `fasttrun_collect_stats`, DDL/TRUNCATE eviction и savepoint rollback сбрасывают plan cache текущего backend'а, но не рассылают shared sinval другим backend'ам.
 * **Стоимость холодного прохода со сбором статистики** — ~50-150 мс на таблицу 1M строк × 50 колонок. Можно отключить через GUC.
 
 ## Совместимость

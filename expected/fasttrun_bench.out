@@ -13,20 +13,21 @@
 --   * fasttruncate в финале.
 --
 -- Все замеры ленивого режима выполняются ВНУТРИ одного DO-блока,
--- иначе неявная транзакция между PERFORM-вызовами закрывается,
--- callback границы транзакции стирает хэш-таблицу, и опорный снимок
--- дельты сбрасывается.
+-- иначе неявная транзакция между PERFORM-вызовами закрывается:
+-- relstats и column stats переживают COMMIT, но xact-local delta
+-- state очищается, и следующий analyze должен заново просканировать
+-- heap перед новым delta-hit циклом.
 --
 -- Жёсткие пороги внутри DO-блока (срабатывают только при регрессии):
 --   * тёплый analyze (попадание через дельту) не медленнее 5 мс;
---   * пересбор через блочную выборку после массового DML не
+--   * полный reservoir refresh после массового DML не
 --     медленнее 500 мс;
 --   * ускорение тёплый/холодный не менее 20x;
 --   * fasttruncate миллионной таблицы не медленнее 100 мс.
 -- Эти пороги намеренно консервативны: на любом современном железе
 -- (включая медленные CI-раннеры) они выполняются с большим запасом
 -- — обычные локальные значения: ускорение 1000x+, доли мс на тёплый
--- вызов, ~30-80 мс на пересбор.  При срабатывании в исключение
+-- вызов, ~50-150 мс на refresh.  При срабатывании в исключение
 -- пишется фактическая цифра, чтобы можно было быстро понять причину.
 --
 -- Вывод NOTICE с фактическими таймингами подавлен через
@@ -171,8 +172,8 @@ BEGIN
     -- ----------------------------------------------------------
     -- DELETE половины (500k) — доля изменений = 1.0 > порог 0.2
     -- по умолчанию, поэтому первый analyze запускает пересбор
-    -- статистики через блочную выборку (дельта-математика обновляет
-    -- число строк, блочная выборка обновляет n_distinct / null_frac
+    -- статистики через полный reservoir sample (дельта-математика
+    -- обновляет число строк, refresh обновляет n_distinct / null_frac
     -- / width).  Второй analyze идёт чистым попаданием в кэш через
     -- дельту, без пересбора (доля изменений = 0 после продвижения
     -- опорного снимка).
@@ -196,13 +197,13 @@ BEGIN
     PERFORM fasttrun_analyze('t_bench');
     t_after_d_warm := EXTRACT(EPOCH FROM (clock_timestamp() - t_start)) * 1000;
 
-    RAISE NOTICE 'after DELETE 500k: 1st=% ms (block-sample refresh), 2nd=% ms (pure delta)',
+    RAISE NOTICE 'after DELETE 500k: 1st=% ms (full refresh), 2nd=% ms (pure delta)',
                  round(t_after_d, 4), round(t_after_d_warm, 4);
 
-    /* Пересбор через блочную выборку на 1M строк × 50 колонок:
-     * ~30-80 мс это нормально, 500 мс — тревожный порог регрессии */
+    /* Полный refresh на 1M строк × 50 колонок:
+     * ~50-150 мс это нормально, 500 мс — тревожный порог регрессии */
     IF t_after_d > 500 THEN
-        RAISE EXCEPTION 'block-sample refresh after DELETE 500k too slow: % ms',
+        RAISE EXCEPTION 'full refresh after DELETE 500k too slow: % ms',
                         round(t_after_d, 4);
     END IF;
     IF t_after_d_warm > 5 THEN
@@ -212,7 +213,7 @@ BEGIN
 
     -- ----------------------------------------------------------
     -- UPDATE всех оставшихся 500k — доля изменений = 500k > 20%
-    -- порога: первый analyze → пересбор через блочную выборку,
+    -- порога: первый analyze → полный reservoir refresh,
     -- второй → попадание в кэш через дельту без сканирования.
     -- ----------------------------------------------------------
     UPDATE t_bench SET i01 = i01 + 1;
@@ -234,11 +235,11 @@ BEGIN
     PERFORM fasttrun_analyze('t_bench');
     t_after_u_warm := EXTRACT(EPOCH FROM (clock_timestamp() - t_start)) * 1000;
 
-    RAISE NOTICE 'after UPDATE 500k: 1st=% ms (block-sample refresh), 2nd=% ms (pure delta)',
+    RAISE NOTICE 'after UPDATE 500k: 1st=% ms (full refresh), 2nd=% ms (pure delta)',
                  round(t_after_u, 4), round(t_after_u_warm, 4);
 
     IF t_after_u > 500 THEN
-        RAISE EXCEPTION 'block-sample refresh after UPDATE 500k too slow: % ms',
+        RAISE EXCEPTION 'full refresh after UPDATE 500k too slow: % ms',
                         round(t_after_u, 4);
     END IF;
     IF t_after_u_warm > 5 THEN
@@ -527,7 +528,7 @@ BEGIN
       SELECT g, g % 1000, 'new', 'p_' || g
       FROM generate_series(100001, 150000) g;
 
-    -- Шаг 5: analyze (срабатывает пересбор через блочную выборку)
+    -- Шаг 5: analyze (срабатывает полный reservoir refresh)
     t_step := clock_timestamp();
     PERFORM fasttrun_analyze('t_prod');
     t_step5 := EXTRACT(EPOCH FROM (clock_timestamp() - t_step)) * 1000;
@@ -543,7 +544,7 @@ BEGIN
 
     -- Шаг 7: +INSERT 30k (доля изменений с момента последнего
     -- пересбора = 30k/180k = 17% < 20% → пересбор не сработает,
-    -- статистика остаётся от шага 5)
+    -- cached stats будут скрыты до реального refresh)
     INSERT INTO t_prod
       SELECT g, g % 1000, 'pending', 'p_' || g
       FROM generate_series(150001, 180000) g;
@@ -561,7 +562,7 @@ BEGIN
     -- Шаг 9: DELETE 90k строк со статусом pending+new (~50% изменений)
     DELETE FROM t_prod WHERE status IN ('pending', 'new');
 
-    -- Шаг 10: analyze (пересбор через блочную выборку)
+    -- Шаг 10: analyze (полный reservoir refresh)
     t_step := clock_timestamp();
     PERFORM fasttrun_analyze('t_prod');
     t_step10 := EXTRACT(EPOCH FROM (clock_timestamp() - t_step)) * 1000;
@@ -693,7 +694,7 @@ BEGIN
 
     -- Первый analyze клиента B на свежих данных.  fasttruncate
     -- засеял analyze cache опорным снимком pgstat счётчиков, поэтому
-    -- этот вызов идёт по delta-hit + block-sample refresh, а не по
+    -- этот вызов идёт по delta-hit + full refresh, а не по
     -- старому холодному пути.  Главное — никакого протекания
     -- статистики клиента A: число строк должно быть ровно тем,
     -- что только что вставлено.

@@ -307,6 +307,12 @@ SELECT reltuples = 100 AS lazy17_cold FROM fasttrun_relstats('t_an_trunc');
 TRUNCATE t_an_trunc;
 INSERT INTO t_an_trunc SELECT generate_series(1, 50);
 
+-- До повторного fasttrun_analyze старый session-local relstats cache уже
+-- должен быть вытеснен SQL TRUNCATE.  Иначе fasttrun_relstats/planner_hook
+-- реинжектят дорезетное reltuples=100 в новую физическую таблицу.
+SELECT reltuples <> 100 AS lazy17_truncate_evicted_before_analyze
+  FROM fasttrun_relstats('t_an_trunc');
+
 SELECT fasttrun_analyze('t_an_trunc');
 SELECT reltuples = 50 AS lazy17_after_truncate FROM fasttrun_relstats('t_an_trunc');
 SELECT count(*) = 50 AS lazy17_actual_count FROM t_an_trunc;
