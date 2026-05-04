@@ -237,6 +237,33 @@ SELECT fasttrun_analyze('t_refresh');
 EXPLAIN (COSTS OFF) SELECT * FROM t_refresh WHERE grp = 1;
 COMMIT;
 
+-- 11f. DML ниже порога внутри savepoint с последующим RELEASE должен
+--      оставлять cached stats видимыми.  RELEASE продвигает pgstat counters
+--      в родительский subxact, поэтому advance_freshness должен быть
+--      undo-aware, а не полностью скипаться в subtransaction.
+--
+--      Используем свежую high-cardinality таблицу: с cached stats редкий
+--      equality-предикат даёт Index Scan; со stale collected_* hook
+--      отвергает stats, и planner откатывается к default selectivity / Bitmap.
+CREATE TEMP TABLE t_release_stats (id int, grp int);
+INSERT INTO t_release_stats SELECT g, g FROM generate_series(1, 100000) g;
+CREATE INDEX ON t_release_stats (grp);
+
+BEGIN;
+SELECT fasttrun_analyze('t_release_stats');
+EXPLAIN (COSTS OFF) SELECT * FROM t_release_stats WHERE grp = 50000;
+
+SAVEPOINT sp_release;
+DELETE FROM t_release_stats WHERE id < 10;  -- ниже порога
+SELECT fasttrun_analyze('t_release_stats');
+RELEASE SAVEPOINT sp_release;
+
+-- Со stale collected_* это откатывается к defaults (Bitmap Heap Scan).
+-- Корректное поведение оставляет cached stats видимыми после RELEASE.
+EXPLAIN (COSTS OFF) SELECT * FROM t_release_stats WHERE grp = 50000;
+COMMIT;
+DROP TABLE t_release_stats;
+
 DROP TABLE t_refresh;
 
 -- ----------------------------------------------------------------------
@@ -329,12 +356,13 @@ DROP TABLE t_tc;
 --
 --     Конкретный пример (его и воспроизводим): первые ~3000 строк
 --     имеют grp=1, остальные ~50000 строк имеют уникальные grp.
---     После cold scan'а статистика честная, n_distinct высокий,
---     план для grp=40000 — Index Scan.  Затем INSERT 20000 строк
---     запускает пересбор; если в нём остался прежний bias, план
---     сваливается в Seq Scan.  Мы проверяем, что план НЕ меняется
---     (Index Scan сохраняется), потому что reservoir sampling по
---     всем выбранным блокам даёт честно несмещённую выборку.
+--     После cold scan'а статистика честная, n_distinct высокий.
+--     Затем INSERT 20000 строк запускает пересбор; если в нём остался
+--     прежний bias, выборка зачерпнёт почти только grp=1 из начала
+--     файла и n_distinct схлопнется к ~1.  Проверяем сам stadistinct,
+--     а не точный план: на разных cost model редкий equality может быть
+--     как Index Scan, так и Bitmap Heap Scan при одинаково хорошей
+--     оценке rows.
 -- ----------------------------------------------------------------------
 CREATE TEMP TABLE t_bias (id int, grp int);
 -- Первые 3000 строк физически лежат в начале файла и все с grp=1
@@ -345,19 +373,23 @@ CREATE INDEX ON t_bias (grp);
 
 BEGIN;
 SELECT fasttrun_analyze('t_bias');
--- После cold scan'а: n_distinct высокий → Index Scan для редкого grp
-EXPLAIN (COSTS OFF) SELECT * FROM t_bias WHERE grp = 40000;
+-- После cold scan'а: n_distinct высокий для редкого grp
+SELECT stadistinct < -0.1 AS cold_ndistinct_high
+  FROM fasttrun_inspect_stats('t_bias')
+ WHERE staattnum = 2;
 
 -- INSERT 20000 строк → доля изменений 20k/73k ≈ 27% > 20% порога →
 -- запускается пересбор статистики через блочную выборку
 INSERT INTO t_bias SELECT g, g FROM generate_series(53001, 73000) g;
 SELECT fasttrun_analyze('t_bias');
 -- После пересбора: n_distinct ВСЁ ЕЩЁ должен быть высоким (несмещённая
--- выборка по всем выбранным блокам), план остаётся Index Scan.
+-- выборка по всем выбранным блокам).
 -- Если бы блочная выборка по-прежнему стопилась после первых
 -- sample_target tuples, она бы зачерпнула почти только grp=1 из
--- начала файла, n_distinct схлопнулся бы к ~1, и здесь был бы Seq Scan.
-EXPLAIN (COSTS OFF) SELECT * FROM t_bias WHERE grp = 40000;
+-- начала файла, n_distinct схлопнулся бы к ~1.
+SELECT stadistinct < -0.1 AS refresh_ndistinct_high
+  FROM fasttrun_inspect_stats('t_bias')
+ WHERE staattnum = 2;
 COMMIT;
 DROP TABLE t_bias;
 

@@ -516,6 +516,31 @@ fasttrun_cache_seed_after_truncate(Relation rel)
 }
 
 /*
+ * Re-inject cached relpages/reltuples into rd_rel after relcache rebuilds.
+ *
+ * pg_class can contain either bootstrap defaults (0/-1) or older nonzero
+ * relstats, e.g. after CREATE INDEX wrote heap stats before a later
+ * fasttruncate/refill/analyze cycle.  Therefore the trigger condition is
+ * "current rd_rel differs from our cache", not just "relpages == 0".
+ * cached_pages=0 is authoritative too: after fasttruncate an unrelated
+ * relcache rebuild must not resurrect stale nonzero pg_class stats.
+ */
+static void
+fasttrun_reinject_relstats(Relation rel, FasttrunAnalyzeCacheEntry *entry)
+{
+	float4	cached_tuples = (float4) entry->cached_tuples;
+
+	if (rel->rd_rel->relpages == entry->cached_pages &&
+		rel->rd_rel->reltuples == cached_tuples)
+		return;
+
+	rel->rd_rel->relpages = entry->cached_pages;
+	rel->rd_rel->reltuples = cached_tuples;
+	if (entry->cached_pages == 0)
+		rel->rd_rel->relallvisible = 0;
+}
+
+/*
  * Session-local pg_statistic cache + planner hooks.
  *
  * Per-(relid, attnum) HeapTuples in pg_statistic format, returned to the
@@ -796,18 +821,11 @@ fasttrun_planner_hook(Query *parse, const char *query_string,
 		{
 			Relation rel;
 
-			if (entry->cached_pages == 0)
-				continue;
-
 			rel = RelationIdGetRelation(entry->relid);
 			if (!RelationIsValid(rel))
 				continue;
 
-			if (rel->rd_rel->relpages == 0)
-			{
-				rel->rd_rel->relpages = entry->cached_pages;
-				rel->rd_rel->reltuples = (float4) entry->cached_tuples;
-			}
+			fasttrun_reinject_relstats(rel, entry);
 			RelationClose(rel);
 		}
 	}
@@ -839,6 +857,16 @@ fasttrun_read_pgstat_counters(Relation rel,
 		*upd = 0;
 	*del = 0;
 	*truncdropped = false;
+
+	/*
+	 * relcache rebuilds leave rel->pgstat_info NULL even when tracking is
+	 * enabled and this backend already has pending xact counters for the
+	 * relation.  Associate lazily before deciding pgstat is unavailable;
+	 * otherwise a harmless relcache invalidation would make cached column
+	 * stats look stale until some later heap scan/DML reinitializes pgstat.
+	 */
+	if (!pgstat_should_count_relation(rel))
+		return false;
 
 	pgstat_info = rel->pgstat_info;
 	if (pgstat_info == NULL)
@@ -1065,17 +1093,21 @@ fasttrun_stats_cache_evict_relid(Oid relid, int natts)
  * Advance collected_* counters on all stats cache entries for relid.
  * This keeps the planner hooks' freshness check in sync after a delta-hit
  * where no re-collection happened (DML below refresh threshold).
+ * Returns true when the planner-visible freshness state changed, so callers
+ * can invalidate generic plans that were born while the cache looked stale.
  */
-static void
+static bool
 fasttrun_stats_cache_advance_freshness(Oid relid, int natts,
 									   int64 ins, int64 upd, int64 del,
 									   bool truncdropped)
 {
 	AttrNumber		attnum;
 	FasttrunStatsKey key;
+	SubTransactionId cur_subid = GetCurrentSubTransactionId();
+	bool			changed = false;
 
 	if (fasttrun_stats_cache == NULL)
-		return;
+		return false;
 
 	memset(&key, 0, sizeof(key));
 	key.relid = relid;
@@ -1090,11 +1122,49 @@ fasttrun_stats_cache_advance_freshness(Oid relid, int natts,
 			hash_search(fasttrun_stats_cache, &key, HASH_FIND, NULL);
 		if (entry == NULL)
 			continue;
+
+		if (entry->collected_ins == ins &&
+			entry->collected_upd == upd &&
+			entry->collected_del == del &&
+			entry->collected_truncdropped == truncdropped)
+			continue;
+
+		/*
+		 * Cross-subxact freshness advance needs the same undo semantics as
+		 * a full statsTuple overwrite.  We keep the current tuple in place
+		 * and save a copy for rollback; sharing the pointer with undo would
+		 * make ABORT_SUB free it before restoring.
+		 */
+		if (entry->collected_subid != cur_subid)
+		{
+			FasttrunStatsSavedState *saved;
+			MemoryContext oldcxt;
+
+			oldcxt = MemoryContextSwitchTo(fasttrun_stats_mcxt);
+			saved = (FasttrunStatsSavedState *) palloc(sizeof(*saved));
+			saved->statsTuple = entry->statsTuple != NULL
+				? heap_copytuple(entry->statsTuple)
+				: NULL;
+			MemoryContextSwitchTo(oldcxt);
+
+			saved->collected_ins = entry->collected_ins;
+			saved->collected_upd = entry->collected_upd;
+			saved->collected_del = entry->collected_del;
+			saved->collected_truncdropped = entry->collected_truncdropped;
+			saved->collected_subid = entry->collected_subid;
+			saved->older = entry->undo;
+			entry->undo = saved;
+		}
+
 		entry->collected_ins = ins;
 		entry->collected_upd = upd;
 		entry->collected_del = del;
 		entry->collected_truncdropped = truncdropped;
+		entry->collected_subid = cur_subid;
+		changed = true;
 	}
+
+	return changed;
 }
 
 /*
@@ -1912,7 +1982,7 @@ fasttrun_scan_with_sample(Relation rel, int64 *tuples_out,
  * Assumes heap AM (caller must have checked rd_tableam earlier).
  */
 static void
-fasttrun_scan_block_sample(Relation rel,
+fasttrun_scan_block_sample(Relation rel, int64 totalrows,
 						   HeapTuple *sample, int sample_target,
 						   int *sample_count_out)
 {
@@ -1932,12 +2002,12 @@ fasttrun_scan_block_sample(Relation rel,
 		return;
 
 	/*
-	 * Convert tuple-based sample_target into a block count.
-	 * Estimate density from reltuples/relpages (already published
-	 * by the delta-math path that called us).  Floor at 10 tuples
-	 * per page to avoid reading the entire heap on sparse tables.
+	 * Convert tuple-based sample_target into a block count.  Caller already
+	 * knows the current row count from delta math; use it directly instead of
+	 * rel->rd_rel, which may still contain stats from the previous fill cycle
+	 * until fasttrun_analyze publishes the new values.
 	 */
-	density = rel->rd_rel->reltuples / Max(rel->rd_rel->relpages, 1);
+	density = (double) totalrows / (double) Max(nblocks, 1);
 	if (density < 10.0)
 		density = 10.0;
 	targblocks = (BlockNumber) Min((double) sample_target / density + 1.0,
@@ -1953,12 +2023,12 @@ fasttrun_scan_block_sample(Relation rel,
 	while (BlockSampler_HasMore(&bs))
 	{
 		BlockNumber		blkno;
-
-		CHECK_FOR_INTERRUPTS();
-		blkno = BlockSampler_Next(&bs);
 		Buffer			buf;
 		Page			page;
 		OffsetNumber	off, maxoff;
+
+		CHECK_FOR_INTERRUPTS();
+		blkno = BlockSampler_Next(&bs);
 
 		buf = ReadBufferExtended(rel, MAIN_FORKNUM, blkno, RBM_NORMAL, NULL);
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
@@ -2295,10 +2365,11 @@ fasttrun_full_bypass_truncate(Relation rel)
  *
  * Why this exists: fasttruncate physically resets the table via
  * unlink+smgrcreate and intentionally emits no shared invalidation,
- * which would otherwise leave cached SPI / PREPARE plans with
- * is_valid=true and stale rowcount assumptions.  Marking those plans
- * invalid forces the next EXECUTE to replan and pick up fresh stats
- * through fasttrun_planner_hook.
+ * and fasttrun_analyze / fasttrun_collect_stats publish planner stats
+ * without touching pg_class or pg_statistic.  Without a local callback,
+ * cached SPI / PREPARE plans can keep is_valid=true and stale rowcount
+ * or column-stat assumptions.  Marking those plans invalid forces the
+ * next EXECUTE to replan and pick up fresh stats through fasttrun hooks.
  *
  * Side effect: before dispatching relcache callbacks,
  * `LocalExecuteInvalidationMessage` calls
@@ -2311,7 +2382,10 @@ fasttrun_full_bypass_truncate(Relation rel)
  * fasttrun_planner_hook.
  *
  * Contract invariant: after fasttruncate, callers must run
- * fasttrun_analyze() before relying on replanning to see real stats.
+ * fasttrun_analyze() before relying on replanning to see real nonzero
+ * stats.  The analyze path calls this helper before publishing rd_rel,
+ * so any relcache rebuild caused by the callback cannot wipe the final
+ * in-memory values.
  */
 static void
 fasttrun_invalidate_local_plan_cache(Oid relid)
@@ -2501,6 +2575,11 @@ fasttrun_analyze(PG_FUNCTION_ARGS)
 	bool			truncdropped_now = false;
 	bool			have_counters;
 	bool			scan_needed = true;
+	bool			stats_recollected = false;
+	bool			stats_freshness_advanced = false;
+	bool			need_plan_inval = false;
+	BlockNumber		old_pages;
+	float4			old_tuples;
 	FasttrunAnalyzeCacheEntry *entry;
 
 	relvar = fasttrun_make_rangevar(name);
@@ -2528,6 +2607,8 @@ fasttrun_analyze(PG_FUNCTION_ARGS)
 	}
 
 	pages_now = RelationGetNumberOfBlocks(rel);
+	old_pages = rel->rd_rel->relpages;
+	old_tuples = rel->rd_rel->reltuples;
 	have_counters = fasttrun_read_pgstat_counters(rel,
 												  &ins_now, &upd_now, &del_now,
 												  &truncdropped_now);
@@ -2591,11 +2672,15 @@ fasttrun_analyze(PG_FUNCTION_ARGS)
 				int			i;
 
 				sample = (HeapTuple *) palloc(sizeof(HeapTuple) * sample_target);
-				fasttrun_scan_block_sample(rel, sample, sample_target,
+				fasttrun_scan_block_sample(rel, tuples_count,
+										   sample, sample_target,
 										   &sample_count);
 				if (sample_count > 0)
+				{
 					fasttrun_collect_and_store(rel, sample, sample_count,
 											   tuples_count, true);
+					stats_recollected = true;
+				}
 
 				for (i = 0; i < sample_count; i++)
 					heap_freetuple(sample[i]);
@@ -2611,17 +2696,15 @@ fasttrun_analyze(PG_FUNCTION_ARGS)
 	/*
 	 * After a delta-hit, advance collected_* on cached stats entries so
 	 * the planner hooks' freshness check doesn't fall back to defaults.
-	 *
-	 * Skip inside savepoints: advance_freshness writes collected_* without
-	 * pushing subxact undo, so ROLLBACK TO SAVEPOINT would leave stale
-	 * counters.  At top level there is no rollback risk.
+	 * The helper is subxact-aware: ROLLBACK TO SAVEPOINT restores the old
+	 * freshness snapshot, while RELEASE SAVEPOINT promotes the new one.
 	 */
-	if (!scan_needed && have_counters &&
-		GetCurrentSubTransactionId() == TopSubTransactionId)
-		fasttrun_stats_cache_advance_freshness(relOid,
-											   RelationGetDescr(rel)->natts,
-											   ins_now, upd_now, del_now,
-											   truncdropped_now);
+	if (!scan_needed && have_counters)
+		stats_freshness_advanced =
+			fasttrun_stats_cache_advance_freshness(relOid,
+												   RelationGetDescr(rel)->natts,
+												   ins_now, upd_now, del_now,
+												   truncdropped_now);
 
 	if (scan_needed)
 	{
@@ -2649,6 +2732,7 @@ fasttrun_analyze(PG_FUNCTION_ARGS)
 			/* Sort needed only when reservoir sampling displaced entries. */
 			fasttrun_collect_and_store(rel, sample, sample_count, tuples_count,
 									   tuples_count > sample_target);
+			stats_recollected = true;
 		}
 
 		if (sample != NULL)
@@ -2660,10 +2744,9 @@ fasttrun_analyze(PG_FUNCTION_ARGS)
 		}
 
 		/*
-		 * Re-read counters: heap_beginscan calls pgstat_count_heap_scan
-		 * which lazily inits pgstat_info, so a pre-scan have_counters=false
-		 * may flip to true after the scan.  heap_getnext touches only
-		 * non-xact counters, so the values we read here are authoritative.
+		 * Re-read counters after the scan.  heap_getnext touches only
+		 * non-xact counters, so the values we read here are authoritative
+		 * for the tuple DML baseline.
 		 */
 		if (!have_counters)
 			have_counters = fasttrun_read_pgstat_counters(rel,
@@ -2686,6 +2769,13 @@ fasttrun_analyze(PG_FUNCTION_ARGS)
 											  del_now, truncdropped_now);
 		}
 	}
+
+	need_plan_inval = (old_pages != pages_now ||
+					   old_tuples != (float4) tuples_count ||
+					   stats_recollected ||
+					   stats_freshness_advanced);
+	if (need_plan_inval)
+		fasttrun_invalidate_local_plan_cache(relOid);
 
 	rel->rd_rel->relpages = pages_now;
 	rel->rd_rel->reltuples = (float4) tuples_count;
@@ -2751,25 +2841,17 @@ fasttrun_relstats(PG_FUNCTION_ARGS)
 	}
 
 	/*
-	 * If rd_rel shows zero pages but our analyze cache still has the
-	 * real numbers from a previous fasttrun_analyze() in this
-	 * transaction, re-inject them.  rd_rel may have been wiped by a
-	 * relcache rebuild (sinval from a concurrent backend that touched
-	 * pg_class), and the planner_hook would have done the same on the
-	 * next plan — we just do it here too so direct SQL inspection sees
-	 * the post-invalidation truth.
+	 * Re-inject cached relstats after relcache rebuilds so direct SQL
+	 * inspection sees the same values the planner hook will publish.
 	 */
-	if (fasttrun_analyze_cache != NULL && rel->rd_rel->relpages == 0)
+	if (fasttrun_analyze_cache != NULL)
 	{
 		FasttrunAnalyzeCacheEntry *entry;
 
 		entry = (FasttrunAnalyzeCacheEntry *)
 			hash_search(fasttrun_analyze_cache, &relOid, HASH_FIND, NULL);
-		if (entry != NULL && entry->cached_pages > 0)
-		{
-			rel->rd_rel->relpages = entry->cached_pages;
-			rel->rd_rel->reltuples = (float4) entry->cached_tuples;
-		}
+		if (entry != NULL)
+			fasttrun_reinject_relstats(rel, entry);
 	}
 
 	values[0] = Int32GetDatum(rel->rd_rel->relpages);
@@ -2838,8 +2920,11 @@ fasttrun_collect_stats(PG_FUNCTION_ARGS)
 	}
 
 	if (sample_count > 0)
+	{
 		fasttrun_collect_and_store(rel, sample, sample_count, tuples_count,
 								   tuples_count > sample_target);
+		fasttrun_invalidate_local_plan_cache(relOid);
+	}
 
 	for (i = 0; i < sample_count; i++)
 		heap_freetuple(sample[i]);

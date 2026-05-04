@@ -112,8 +112,66 @@ SELECT count(*) = 200000 AS second_rows_ok,
 SELECT reltuples = 200000 AS second_stats_ok
   FROM fasttrun_relstats('t_balance_out');
 
+-- ----------------------------------------------------------------------
+-- 2. Путь без fasttruncate: generic cached plan, созданный до
+--    fasttrun_analyze, должен инвалидироваться самим вызовом, который
+--    публикует статистику.  Это покрывает вызывающих, которые не используют
+--    fasttruncate в том же цикле, но всё равно заменяют ANALYZE на
+--    fasttrun_analyze.
+-- ----------------------------------------------------------------------
+CREATE TEMP TABLE t_analyze_cached_plan (id int, grp int);
+INSERT INTO t_analyze_cached_plan
+SELECT g, g FROM generate_series(1, 100000) g;
+CREATE INDEX ON t_analyze_cached_plan (grp);
+
+BEGIN;
+SET LOCAL plan_cache_mode = force_generic_plan;
+PREPARE q_analyze_only AS
+SELECT * FROM t_analyze_cached_plan WHERE grp = 50000;
+
+-- Generic plan создан до fasttrun_analyze: defaults, cached stats ещё нет.
+EXPLAIN (COSTS OFF) EXECUTE q_analyze_only;
+
+SELECT fasttrun_analyze('t_analyze_cached_plan');
+
+-- Тот же prepared statement должен перепланироваться и увидеть свежие stats.
+EXPLAIN (COSTS OFF) EXECUTE q_analyze_only;
+DEALLOCATE q_analyze_only;
+COMMIT;
+
+-- ----------------------------------------------------------------------
+-- 3. Продвижение freshness без пересбора stats: если generic plan создан
+--    после UPDATE ниже порога, когда cached column stats выглядят stale,
+--    следующий fasttrun_analyze должен инвалидировать этот plan даже когда
+--    relpages/reltuples не изменились и stats refresh не понадобился.
+-- ----------------------------------------------------------------------
+CREATE TEMP TABLE t_analyze_freshness_plan (id int, grp int);
+INSERT INTO t_analyze_freshness_plan
+SELECT g, g FROM generate_series(1, 100000) g;
+CREATE INDEX ON t_analyze_freshness_plan (grp);
+
+BEGIN;
+SET LOCAL plan_cache_mode = force_generic_plan;
+SELECT fasttrun_analyze('t_analyze_freshness_plan');
+
+UPDATE t_analyze_freshness_plan SET id = id WHERE id < 10;
+PREPARE q_freshness_only AS
+SELECT * FROM t_analyze_freshness_plan WHERE grp = 50000;
+
+-- План создан в окне, когда freshness check отвергает cached stats.
+EXPLAIN (COSTS OFF) EXECUTE q_freshness_only;
+
+SELECT fasttrun_analyze('t_analyze_freshness_plan');
+
+-- Тот же prepared statement должен перепланироваться после продвижения freshness.
+EXPLAIN (COSTS OFF) EXECUTE q_freshness_only;
+DEALLOCATE q_freshness_only;
+COMMIT;
+
 DROP FUNCTION f_outer(int, int);
 DROP FUNCTION f_inner();
 DROP TABLE t_rsd_details;
 DROP TABLE t_balance_out;
+DROP TABLE t_analyze_cached_plan;
+DROP TABLE t_analyze_freshness_plan;
 DROP EXTENSION fasttrun;

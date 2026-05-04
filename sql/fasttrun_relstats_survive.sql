@@ -77,15 +77,75 @@ SELECT relpages > 0 AS pages_survive,
 -- 5. EXPLAIN должен отражать реальный размер таблицы.  С багом:
 --    планировщик видит relpages=0 / reltuples=-1 → оценка "маленькая
 --    пустая таблица" → Seq Scan с rows=1.  С фиксом: planner_hook
---    реинжектит pages/tuples до построения плана → Bitmap Index Scan
---    с правильной оценкой кардинальности.
+--    реинжектит pages/tuples до построения плана, а column-stats hook
+--    повторно привязывает lazy pgstat_info после relcache rebuild →
+--    Index Scan с правильной оценкой кардинальности.
 -- ----------------------------------------------------------------------
 EXPLAIN (COSTS OFF) SELECT * FROM t_survive WHERE id = 500;
 
 COMMIT;
 
 -- ----------------------------------------------------------------------
+-- 6. Регрессия: pg_class может хранить СТАРЫЕ НЕНУЛЕВЫЕ
+--    relpages/reltuples.
+--
+--    Так бывает, когда индекс построили после первого заполнения:
+--    core index_update_stats записал реальные heap relstats в pg_class.
+--    Позже fasttruncate + refill + fasttrun_analyze обновляют только
+--    rd_rel.  Перестроение relcache должно реинжектить cached fasttrun
+--    stats даже если pg_class загрузил stale nonzero значения, а не только
+--    когда он загрузил zero pages.
+-- ----------------------------------------------------------------------
+CREATE TEMP TABLE t_survive_stale (id int, payload text);
+INSERT INTO t_survive_stale
+SELECT g, repeat('x', 20) FROM generate_series(1, 1000) g;
+CREATE INDEX ON t_survive_stale (id);
+
+-- Предусловие: pg_class уже хранит nonzero relstats, которые скоро
+-- станут stale.
+SELECT relpages > 0 AS pgclass_nonzero_pages,
+       reltuples = 1000 AS pgclass_old_tuples
+  FROM pg_class WHERE oid = 't_survive_stale'::regclass;
+
+BEGIN;
+SELECT fasttrun_analyze('t_survive_stale');
+SELECT fasttruncate('t_survive_stale');
+INSERT INTO t_survive_stale
+SELECT g, repeat('x', 20) FROM generate_series(1, 100000) g;
+SELECT fasttrun_analyze('t_survive_stale');
+
+SELECT relpages > 100 AS large_pages_before_inval,
+       reltuples = 100000 AS large_tuples_before_inval
+  FROM fasttrun_relstats('t_survive_stale');
+
+-- Форсируем relcache rebuild из stale pg_class (старые nonzero значения).
+UPDATE pg_class SET relhasindex = relhasindex
+ WHERE oid = 't_survive_stale'::regclass;
+SELECT 1 AS force_nonzero_inval;
+
+-- И SQL-инспекция, и planner hook должны видеть cached значения fasttrun,
+-- а не stale nonzero значения из pg_class.
+SELECT relpages > 100 AS large_pages_survive,
+       reltuples = 100000 AS large_tuples_survive
+  FROM fasttrun_relstats('t_survive_stale');
+
+EXPLAIN (COSTS OFF) SELECT * FROM t_survive_stale WHERE id = 50000;
+
+-- Соседняя регрессия: после fasttruncate cached zero pages тоже
+-- authoritative, даже если relcache rebuild перезагрузит старые nonzero
+-- stats из pg_class.
+SELECT fasttruncate('t_survive_stale');
+UPDATE pg_class SET relhasindex = relhasindex
+ WHERE oid = 't_survive_stale'::regclass;
+SELECT 1 AS force_zero_inval;
+SELECT relpages = 0 AS zero_pages_survive,
+       reltuples = 0 AS zero_tuples_survive
+  FROM fasttrun_relstats('t_survive_stale');
+COMMIT;
+
+-- ----------------------------------------------------------------------
 -- Очистка
 -- ----------------------------------------------------------------------
 DROP TABLE t_survive;
+DROP TABLE t_survive_stale;
 DROP EXTENSION fasttrun;
