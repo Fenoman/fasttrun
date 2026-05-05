@@ -40,3 +40,23 @@ REGRESS = fasttrun_basic \
 PG_CONFIG ?= pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
+
+.PHONY: check-parity check-soak check-perf-smoke check-hook-chain check-zero-sinval check-deep-local
+
+check-parity:
+	PG_CONFIG="$(PG_CONFIG)" scripts/check_fasttrun_analyze_parity.py --profile full
+	PG_CONFIG="$(PG_CONFIG)" scripts/check_fasttrun_analyze_parity.py --profile default
+
+check-soak:
+	PG_CONFIG="$(PG_CONFIG)" scripts/check_fasttrun_long_backend_soak.sh
+
+check-perf-smoke:
+	PG_CONFIG="$(PG_CONFIG)" scripts/check_fasttrun_perf_smoke.sh
+
+check-hook-chain:
+	PG_CONFIG="$(PG_CONFIG)" scripts/check_fasttrun_hook_chain.sh
+
+check-zero-sinval:
+	PG_CONFIG="$(PG_CONFIG)" scripts/check_zero_shared_sinval.sh
+
+check-deep-local: installcheck check-parity check-soak check-perf-smoke check-hook-chain check-zero-sinval

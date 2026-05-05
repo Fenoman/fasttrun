@@ -171,6 +171,40 @@ PG_CONFIG=/path/to/pg_config scripts/check_zero_shared_sinval.sh
 
 Он цепляется к backend'у и считает вызовы `SIInsertDataEntries` / `SendSharedInvalidMessages`: обычный `ANALYZE` должен дать positive control, а `fasttrun_analyze`, `fasttrun_collect_stats` и `fasttruncate` — ноль shared hits. На Ubuntu может понадобиться временно разрешить attach: `sudo sysctl -w kernel.yama.ptrace_scope=0`.
 
+После `make install` для более глубоких локальных проверок есть отдельные Linux-friendly harness scripts:
+
+```bash
+make check-parity PG_CONFIG=/path/to/pg_config
+make check-soak PG_CONFIG=/path/to/pg_config
+make check-perf-smoke PG_CONFIG=/path/to/pg_config
+make check-hook-chain PG_CONFIG=/path/to/pg_config
+make check-zero-sinval PG_CONFIG=/path/to/pg_config
+```
+
+`check-parity` запускает `scripts/check_fasttrun_analyze_parity.py` в двух режимах:
+
+| Режим | Настройки | Что доказывает |
+|---|---|---|
+| `full` | `fasttrun.sample_rows = -1`, `fasttrun.stats_refresh_threshold = 0` | Максимально близкое ANALYZE-like качество планов |
+| `default` | обычные дефолты fasttrun | Нет catastrophic/default estimates и stale stats на поддержанных сценариях |
+
+Parity harness сравнивает `EXPLAIN (FORMAT JSON)` после обычного `ANALYZE` и после `fasttrun_analyze`. Это не byte-for-byte сравнение планов: выборка может отличаться, поэтому проверяются bounded estimates по `Plan Rows`.
+
+Остальные checks:
+
+| Проверка | Что делает |
+|---|---|
+| `check-soak` | Один долгоживущий backend гоняет цикл `CREATE TEMP -> fasttrun_analyze -> DROP -> COMMIT` и проверяет `pg_backend_memory_contexts` |
+| `check-perf-smoke` | Через `bpftrace` проверяет lazy hooks, дешёвый miss-path для обычных таблиц, temp stats hit и no-DML hot path |
+| `check-hook-chain` | Поднимает best-effort prod-like preload cluster, грузит доступные расширения и проверяет, что fasttrun stats доходят до планировщика |
+| `check-zero-sinval` | Проверяет через `gdb`, что fasttrun операции не отправляют shared sinval |
+
+Полный локальный набор можно запустить одной целью:
+
+```bash
+make check-deep-local PG_CONFIG=/path/to/pg_config
+```
+
 ## Паттерн использования
 
 Пример функции `create_temp_table`, которая создаёт temp table из шаблона или очищает через `fasttruncate`, лежит в `examples/create_temp_table.sql`. Адаптируйте под свой проект.

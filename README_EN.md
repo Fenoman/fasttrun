@@ -169,6 +169,40 @@ PG_CONFIG=/path/to/pg_config scripts/check_zero_shared_sinval.sh
 
 It attaches to a backend and counts calls to `SIInsertDataEntries` / `SendSharedInvalidMessages`: regular `ANALYZE` must provide a positive control, while `fasttrun_analyze`, `fasttrun_collect_stats` and `fasttruncate` must have zero shared hits. On Ubuntu you may need to allow attach temporarily: `sudo sysctl -w kernel.yama.ptrace_scope=0`.
 
+After `make install`, there are separate Linux-friendly harness scripts for deeper local checks:
+
+```bash
+make check-parity PG_CONFIG=/path/to/pg_config
+make check-soak PG_CONFIG=/path/to/pg_config
+make check-perf-smoke PG_CONFIG=/path/to/pg_config
+make check-hook-chain PG_CONFIG=/path/to/pg_config
+make check-zero-sinval PG_CONFIG=/path/to/pg_config
+```
+
+`check-parity` runs `scripts/check_fasttrun_analyze_parity.py` in two modes:
+
+| Mode | Settings | What it proves |
+|---|---|---|
+| `full` | `fasttrun.sample_rows = -1`, `fasttrun.stats_refresh_threshold = 0` | Closest ANALYZE-like plan quality |
+| `default` | regular fasttrun defaults | No catastrophic/default estimates or stale stats on supported scenarios |
+
+The parity harness compares `EXPLAIN (FORMAT JSON)` after regular `ANALYZE` and after `fasttrun_analyze`. It is not a byte-for-byte plan comparison: samples can differ, so it checks bounded `Plan Rows` estimates.
+
+Other checks:
+
+| Check | What it does |
+|---|---|
+| `check-soak` | Runs one long-lived backend through `CREATE TEMP -> fasttrun_analyze -> DROP -> COMMIT` and checks `pg_backend_memory_contexts` |
+| `check-perf-smoke` | Uses `bpftrace` to verify lazy hooks, cheap miss-path for regular tables, temp stats hit, and no-DML hot path |
+| `check-hook-chain` | Starts a best-effort prod-like preload cluster, loads available extensions, and verifies that fasttrun stats reach the planner |
+| `check-zero-sinval` | Uses `gdb` to verify that fasttrun operations do not send shared sinval |
+
+The full local set can be run with one target:
+
+```bash
+make check-deep-local PG_CONFIG=/path/to/pg_config
+```
+
 ## Usage pattern
 
 An example `create_temp_table` function that creates a temp table from a template or clears it via `fasttruncate` is in `examples/create_temp_table.sql`. Adapt it to your project.
