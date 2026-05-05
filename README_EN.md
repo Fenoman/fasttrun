@@ -131,9 +131,9 @@ make install PG_CONFIG=/path/to/pg_config
 CREATE EXTENSION fasttrun;
 ```
 
-By default, this installs version `2.1.2`.
+By default, this installs version `2.2.0`.
 
-Upgrade from older versions `2.0` / `2.1` / `2.1.1` is supported:
+Upgrade from older versions `2.0` / `2.1` / `2.1.1` / `2.1.2` is supported:
 ```sql
 ALTER EXTENSION fasttrun UPDATE;
 ```
@@ -152,7 +152,7 @@ make installcheck PG_CONFIG=/path/to/pg_config PGPORT=5433
 | `fasttrun_silent` | Silent behavior on non-existent / non-temp tables |
 | `fasttrun_stats_reset` | `relpages/reltuples` reset after fasttruncate |
 | `fasttrun_analyze` | Delta math, savepoint rollback, TRUNCATE inside a transaction |
-| `fasttrun_migration` | Upgrade path 2.0 → 2.1, including backward compatibility with `fasttruncate_c` |
+| `fasttrun_migration` | Upgrade path 2.0 → latest, including backward compatibility with `fasttruncate_c` |
 | `fasttrun_bench` | Synthetic benchmark on 1M rows × 50 columns |
 | `fasttrun_stats` | Statistics hook: EXPLAIN before/after, auto-collection, sample_rows=0/-1, refresh threshold, DDL/TRUNCATE eviction, partial-index relstats |
 | `fasttrun_tracking` | Tracking frequently created temp tables and prewarm; has expected output for both `shared_preload_libraries` and non-preload modes |
@@ -361,11 +361,13 @@ Single source file, version differences handled via `#if PG_VERSION_NUM`.
 ```
 fasttrun.c                    # main C code (~5100 lines)
 fasttrun.control              # extension metadata
-fasttrun--2.1.2.sql           # current version (8 functions)
+fasttrun--2.2.0.sql           # current version (8 functions)
+fasttrun--2.1.2.sql           # previous version
 fasttrun--2.0.sql             # old base version
 fasttrun--2.0--2.1.sql        # migration 2.0 -> 2.1
 fasttrun--2.1--2.1.1.sql      # migration 2.1 -> 2.1.1
 fasttrun--2.1.1--2.1.2.sql    # migration 2.1.1 -> 2.1.2
+fasttrun--2.1.2--2.2.0.sql    # migration 2.1.2 -> 2.2.0
 Makefile                      # PGXS
 examples/                     # examples (create_temp_table)
 sql/                          # tests (10 files)

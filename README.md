@@ -133,9 +133,9 @@ make install PG_CONFIG=/path/to/pg_config
 CREATE EXTENSION fasttrun;
 ```
 
-По умолчанию будет установлена версия `2.1.2`.
+По умолчанию будет установлена версия `2.2.0`.
 
-Поддерживается обновление со старых версий `2.0` / `2.1` / `2.1.1`:
+Поддерживается обновление со старых версий `2.0` / `2.1` / `2.1.1` / `2.1.2`:
 ```sql
 ALTER EXTENSION fasttrun UPDATE;
 ```
@@ -154,7 +154,7 @@ make installcheck PG_CONFIG=/path/to/pg_config PGPORT=5433
 | `fasttrun_silent` | Молчаливое поведение на несуществующих / не-temp таблицах |
 | `fasttrun_stats_reset` | Сброс `relpages/reltuples` после fasttruncate |
 | `fasttrun_analyze` | Дельта-математика, откат к savepoint, TRUNCATE внутри транзакции |
-| `fasttrun_migration` | Путь обновления 2.0 → 2.1, включая обратную совместимость с `fasttruncate_c` |
+| `fasttrun_migration` | Путь обновления 2.0 → latest, включая обратную совместимость с `fasttruncate_c` |
 | `fasttrun_bench` | Синтетический бенчмарк на 1M строк × 50 колонок |
 | `fasttrun_stats` | Хук статистики: EXPLAIN до/после, автосбор, sample_rows=0/-1, refresh threshold, DDL/TRUNCATE eviction, partial-index relstats |
 | `fasttrun_tracking` | Трекинг часто создаваемых temp tables и prewarm; есть expected для режима с `shared_preload_libraries` и без него |
@@ -363,11 +363,13 @@ fasttrun.track_schedule = ''
 ```
 fasttrun.c                    # основной C-код (~5100 строк)
 fasttrun.control              # метаданные расширения
-fasttrun--2.1.2.sql           # текущая версия (8 функций)
+fasttrun--2.2.0.sql           # текущая версия (8 функций)
+fasttrun--2.1.2.sql           # предыдущая версия
 fasttrun--2.0.sql             # старая базовая версия
 fasttrun--2.0--2.1.sql        # миграция 2.0 -> 2.1
 fasttrun--2.1--2.1.1.sql      # миграция 2.1 -> 2.1.1
 fasttrun--2.1.1--2.1.2.sql    # миграция 2.1.1 -> 2.1.2
+fasttrun--2.1.2--2.2.0.sql    # миграция 2.1.2 -> 2.2.0
 Makefile                      # PGXS
 examples/                     # примеры (create_temp_table)
 sql/                          # тесты (10 файлов)
