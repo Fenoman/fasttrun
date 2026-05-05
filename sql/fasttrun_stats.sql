@@ -370,6 +370,31 @@ EXPLAIN (COSTS OFF) SELECT * FROM t_tc WHERE grp = 1;
 COMMIT;
 DROP TABLE t_tc;
 
+-- 14b. DML при временно выключенном track_counts не должен делать старую
+--      column stats свежей, если до COMMIT track_counts снова включили.
+--      При выключенном pgstat мы не видим counters, поэтому обязаны
+--      вытеснить старый stats cache, а не ждать совпадения нулевых counters.
+CREATE TEMP TABLE t_tc_toggle (id int, grp int);
+INSERT INTO t_tc_toggle SELECT g, g FROM generate_series(1, 100000) g;
+CREATE INDEX ON t_tc_toggle (grp);
+
+BEGIN;
+SELECT fasttrun_analyze('t_tc_toggle');
+EXPLAIN (COSTS OFF) SELECT * FROM t_tc_toggle WHERE grp = 1;
+
+SET LOCAL track_counts = off;
+UPDATE t_tc_toggle SET grp = 1 WHERE id <= 10000;
+SELECT fasttrun_analyze('t_tc_toggle');
+SET LOCAL track_counts = on;
+COMMIT;
+
+-- После COMMIT planner должен остаться на fallback, а не воскресить
+-- старый n_distinct=100000 как свежую статистику.
+EXPLAIN (COSTS OFF) SELECT * FROM t_tc_toggle WHERE grp = 1;
+SELECT count(*) = 10000 AS tc_toggle_actual_grp1
+  FROM t_tc_toggle WHERE grp = 1;
+DROP TABLE t_tc_toggle;
+
 -- ----------------------------------------------------------------------
 -- 15. Регрессионный тест: пересбор статистики после delta-hit должен
 --     оставаться несмещённым и ANALYZE-подобным.
@@ -606,6 +631,19 @@ ALTER TABLE t_stats_ddl ALTER COLUMN v TYPE text USING v::text;
 SELECT count(*) = 0 AS ddl_stats_evicted
   FROM fasttrun_inspect_stats('t_stats_ddl');
 COMMIT;
+
+BEGIN;
+SELECT fasttrun_analyze('t_stats_ddl');
+SELECT count(*) = 2 AS ddl_rollback_stats_before
+  FROM fasttrun_inspect_stats('t_stats_ddl');
+SAVEPOINT sp_ddl_rollback;
+ALTER TABLE t_stats_ddl ADD COLUMN payload text;
+SELECT count(*) = 0 AS ddl_rollback_stats_evicted_inside
+  FROM fasttrun_inspect_stats('t_stats_ddl');
+ROLLBACK TO SAVEPOINT sp_ddl_rollback;
+SELECT count(*) = 2 AS ddl_rollback_stats_restored
+  FROM fasttrun_inspect_stats('t_stats_ddl');
+COMMIT;
 DROP TABLE t_stats_ddl;
 
 -- ----------------------------------------------------------------------
@@ -629,7 +667,58 @@ SELECT fasttrun_analyze('t_partial_stats');
 SELECT reltuples BETWEEN 45000 AND 55000 AS partial_large_after_analyze
   FROM fasttrun_relstats('t_partial_stats_true_idx');
 COMMIT;
+
+BEGIN;
+SET LOCAL fasttrun.sample_rows = 100000;  -- пересчитываем partial-index relstats ниже порога
+SELECT fasttrun_analyze('t_partial_stats');
+UPDATE t_partial_stats SET flag = true WHERE id > 50000 AND id <= 51000;
+SELECT fasttrun_analyze('t_partial_stats');
+SELECT reltuples BETWEEN 50500 AND 51500 AS partial_delta_after_below_threshold
+  FROM fasttrun_relstats('t_partial_stats_true_idx');
+COMMIT;
 DROP TABLE t_partial_stats;
+
+-- ----------------------------------------------------------------------
+-- 21b. Горячий delta path должен обновлять relstats обычных индексов
+--      независимо от пересбора column stats.  Обычный ANALYZE обновляет
+--      pg_class и для heap, и для index relation.
+-- ----------------------------------------------------------------------
+CREATE TEMP TABLE t_index_delta (id int);
+CREATE INDEX t_index_delta_idx ON t_index_delta (id);
+INSERT INTO t_index_delta SELECT generate_series(1, 10000);
+
+BEGIN;
+SET LOCAL fasttrun.sample_rows = 100000;
+SELECT fasttrun_analyze('t_index_delta');
+SELECT reltuples = 10000 AS index_delta_initial
+  FROM fasttrun_relstats('t_index_delta_idx');
+INSERT INTO t_index_delta SELECT generate_series(10001, 11000);
+SELECT fasttrun_analyze('t_index_delta');
+SELECT reltuples = 11000 AS index_delta_after_insert
+  FROM fasttrun_relstats('t_index_delta_idx');
+DELETE FROM t_index_delta WHERE id > 10500;
+SELECT fasttrun_analyze('t_index_delta');
+SELECT reltuples = 10500 AS index_delta_after_delete
+  FROM fasttrun_relstats('t_index_delta_idx');
+COMMIT;
+DROP TABLE t_index_delta;
+
+-- ----------------------------------------------------------------------
+-- 21c. Отключение column stats не должно отключать relation-level
+--      relstats для обычных индексов: они нужны planner'у отдельно от
+--      pg_statistic-shaped tuples.
+-- ----------------------------------------------------------------------
+CREATE TEMP TABLE t_index_no_colstats (id int);
+CREATE INDEX t_index_no_colstats_idx ON t_index_no_colstats (id);
+INSERT INTO t_index_no_colstats SELECT generate_series(1, 10000);
+
+BEGIN;
+SET LOCAL fasttrun.sample_rows = 0;
+SELECT fasttrun_analyze('t_index_no_colstats');
+SELECT reltuples = 10000 AS index_no_colstats_updated
+  FROM fasttrun_relstats('t_index_no_colstats_idx');
+COMMIT;
+DROP TABLE t_index_no_colstats;
 
 -- ----------------------------------------------------------------------
 -- 22. Регрессионный тест: ширина столбца (stawidth) собранная нашим
@@ -1101,6 +1190,30 @@ END;
 $$;
 COMMIT;
 DROP TABLE t_auto_sample;
+
+-- ----------------------------------------------------------------------
+-- 28. Опции статистики колонок должны совпадать с обычным ANALYZE:
+--     SET STATISTICS 0 отключает stats по колонке, а n_distinct
+--     переопределяет вычисленный stadistinct.
+-- ----------------------------------------------------------------------
+CREATE TEMP TABLE t_attopts (id int, no_stats int, nd int);
+INSERT INTO t_attopts SELECT g, g % 10, g FROM generate_series(1, 10000) g;
+ALTER TABLE t_attopts ALTER COLUMN no_stats SET STATISTICS 0;
+ALTER TABLE t_attopts ALTER COLUMN nd SET (n_distinct = 10);
+
+BEGIN;
+SET LOCAL fasttrun.sample_rows = -1;
+SELECT fasttrun_analyze('t_attopts');
+SELECT count(*) = 2 AS attopts_stats_rows
+  FROM fasttrun_inspect_stats('t_attopts');
+SELECT count(*) = 0 AS attopts_no_stats_skipped
+  FROM fasttrun_inspect_stats('t_attopts')
+ WHERE staattnum = 2;
+SELECT stadistinct = 10 AS attopts_ndistinct_applied
+  FROM fasttrun_inspect_stats('t_attopts')
+ WHERE staattnum = 3;
+COMMIT;
+DROP TABLE t_attopts;
 
 -- Очистка
 DROP TABLE t_stats;

@@ -273,7 +273,38 @@ SELECT reltuples = 20 AS lazy16_after_release FROM fasttrun_relstats('t_an');
 COMMIT;
 
 -- ----------------------------------------------------------------------
--- 17. Регрессионный тест: ошибка ленивого режима после SQL TRUNCATE
+-- 17. fasttruncate внутри savepoint остаётся non-transactional: после
+--     ROLLBACK TO данные уже не вернутся, значит relstats тоже не должны
+--     откатиться к дорезетному состоянию.
+-- ----------------------------------------------------------------------
+CREATE TEMP TABLE t_an_ft_rollback (id int);
+INSERT INTO t_an_ft_rollback SELECT generate_series(1, 1000);
+
+BEGIN;
+SELECT fasttrun_analyze('t_an_ft_rollback');
+SELECT reltuples = 1000 AS lazy17_pre FROM fasttrun_relstats('t_an_ft_rollback');
+
+SAVEPOINT sp_ft_rollback;
+SELECT fasttruncate('t_an_ft_rollback');
+SELECT reltuples = 0 AS lazy17_after_fasttruncate
+  FROM fasttrun_relstats('t_an_ft_rollback');
+ROLLBACK TO SAVEPOINT sp_ft_rollback;
+
+SELECT count(*) = 0 AS lazy17_actual_still_empty FROM t_an_ft_rollback;
+SELECT reltuples = 0 AS lazy17_relstats_still_empty
+  FROM fasttrun_relstats('t_an_ft_rollback');
+
+UPDATE pg_class SET relhasindex = relhasindex
+ WHERE oid = 't_an_ft_rollback'::regclass;
+SELECT 1 AS lazy17_force_inval;
+SELECT reltuples = 0 AS lazy17_relstats_after_inval
+  FROM fasttrun_relstats('t_an_ft_rollback');
+COMMIT;
+
+DROP TABLE t_an_ft_rollback;
+
+-- ----------------------------------------------------------------------
+-- 18. Регрессионный тест: ошибка ленивого режима после SQL TRUNCATE
 --     (исправление приоритета P1).
 --
 --     Функция pgstat_count_truncate() сбрасывает счётчики транзакции
@@ -337,7 +368,7 @@ SELECT count(*) = 5 AS lazy17v_actual_count FROM t_an_trunc;
 COMMIT;
 
 -- ----------------------------------------------------------------------
--- 18. ON COMMIT DELETE ROWS делает truncate на границе COMMIT в обход
+-- 19. ON COMMIT DELETE ROWS делает truncate на границе COMMIT в обход
 --     ProcessUtility hook.  Старые relpages/reltuples из fasttrun cache
 --     не должны переживать этот commit-time truncate.
 -- ----------------------------------------------------------------------

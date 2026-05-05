@@ -75,9 +75,11 @@ new_tuples = cached_tuples + (ins_now - cached_ins) - (del_now - cached_del)
 
 ### Качество статистики
 
-По умолчанию (`use_typanalyze = on`) расширение вызывает **те же самые** `std_typanalyze` / type-specific `typanalyze` из ядра PostgreSQL. Поэтому собирается всё то же, что собирает обычный `ANALYZE`: MCV, histogram, correlation, type-specific stats.
+По умолчанию (`use_typanalyze = on`) расширение вызывает **те же самые** `std_typanalyze` / type-specific `typanalyze` из ядра PostgreSQL для обычных колонок heap-таблицы. Собираются MCV, histogram, correlation, type-specific stats; учитываются `ALTER COLUMN SET STATISTICS 0` и `ALTER COLUMN SET (n_distinct = ...)`.
 
-Единственное отличие — размер выборки. Default `sample_rows = 3000` — в ~10 раз меньше, чем у обычного `ANALYZE`. Для большинства таблиц этого хватает. Если нужен полный match — `SET fasttrun.sample_rows = -1`.
+Главное отличие — размер выборки. Default `sample_rows = 3000` — в ~10 раз меньше, чем у обычного `ANALYZE`. Для наиболее близкого match — `SET fasttrun.sample_rows = -1`.
+
+Есть осознанные границы: extended statistics, expression-index statistics и inherited-table statistics не собираются; ACL/RLS/security-barrier поведение обычного `ANALYZE` не воспроизводится. Расширение рассчитано на session-local temp tables, которыми владеет текущий backend.
 
 `relpages/reltuples/relallvisible` и статистика колонок живут в памяти backend'а и переживают `COMMIT`; xact-local delta-состояние очищается на границе транзакции. После DML cached column stats скрываются от планировщика до реального пересбора, чтобы старое распределение не выдавалось как свежее.
 
@@ -86,7 +88,7 @@ new_tuples = cached_tuples + (ins_now - cached_ins) - (del_now - cached_del)
 | Параметр | По умолчанию | Описание |
 |---|---|---|
 | `fasttrun.auto_collect_stats` | `on` | Собирать статистику колонок при холодном проходе `fasttrun_analyze` |
-| `fasttrun.sample_rows` | `3000` | Размер выборки. `0` — отключить сбор. `-1` — авто (как у обычного `ANALYZE`) |
+| `fasttrun.sample_rows` | `3000` | Размер выборки. `0` — отключить сбор column stats; relation-level relstats для heap и обычных индексов всё равно обновляются. `-1` — авто (как у обычного `ANALYZE`) |
 | `fasttrun.use_typanalyze` | `on` | Использовать `std_typanalyze` из ядра (MCV/histogram/correlation). `off` — только n_distinct/null_frac/width |
 | `fasttrun.stats_refresh_threshold` | `0.2` | Порог доли изменений для пересбора статистики. `0` — при любом DML. `1` — автопересбор не запускается; после DML cached stats скрываются до явного пересбора |
 | `fasttrun.zero_sinval_truncate` | `on` | Прямой `unlink`+`smgrcreate` вместо `smgrtruncate`. `off` — старый путь с 1 SMGR sinval |
@@ -155,11 +157,19 @@ make installcheck PG_CONFIG=/path/to/pg_config PGPORT=5433
 | `fasttrun_migration` | Путь обновления 2.0 → 2.1, включая обратную совместимость с `fasttruncate_c` |
 | `fasttrun_bench` | Синтетический бенчмарк на 1M строк × 50 колонок |
 | `fasttrun_stats` | Хук статистики: EXPLAIN до/после, автосбор, sample_rows=0/-1, refresh threshold, DDL/TRUNCATE eviction, partial-index relstats |
-| `fasttrun_tracking` | Трекинг часто создаваемых temp tables и prewarm |
+| `fasttrun_tracking` | Трекинг часто создаваемых temp tables и prewarm; есть expected для режима с `shared_preload_libraries` и без него |
 | `fasttrun_relstats_survive` | Сохранение relstats через relcache rebuild и `COMMIT` в рамках backend'а |
 | `fasttrun_plan_cache_survive` | Локальный сброс кэша планов SPI/PL/pgSQL после fasttruncate, analyze, collect_stats и savepoint rollback |
 
 Все тесты проходят на PG 16.13, 17.9 и 18.3.
+
+Для отдельной проверки контракта "ноль shared sinval" на Linux есть smoke-тест с `gdb`:
+
+```bash
+PG_CONFIG=/path/to/pg_config scripts/check_zero_shared_sinval.sh
+```
+
+Он цепляется к backend'у и считает вызовы `SIInsertDataEntries` / `SendSharedInvalidMessages`: обычный `ANALYZE` должен дать positive control, а `fasttrun_analyze`, `fasttrun_collect_stats` и `fasttruncate` — ноль shared hits. На Ubuntu может понадобиться временно разрешить attach: `sudo sysctl -w kernel.yama.ptrace_scope=0`.
 
 ## Паттерн использования
 
@@ -293,11 +303,14 @@ fasttrun.track_schedule = ''
 * **Только heap AM** — проверка на входе всех функций. Для columnar и прочей экзотики — ошибка.
 * **Не проверяет внешние ключи** — `fasttruncate` не сканирует `pg_constraint`. По нашему соглашению, на временных таблицах FK не создаются.
 * **Не транзакционный** — при ROLLBACK данные не восстановятся.
+* **`track_counts = on` нужен для свежести column stats** — без pgstat counters расширение обновляет только relation-level статистику, а cached column stats не отдаёт планировщику.
 * **Расширенная статистика** (`CREATE STATISTICS`) — не поддерживается, нет подходящего хука в ядре.
+* **Inheritance stats** — не поддерживается. Для временных рабочих таблиц этот путь обычно не используется.
 * **Последовательности** — `fasttruncate` не сбрасывает SERIAL/IDENTITY sequence (как и обычный `TRUNCATE` без `RESTART IDENTITY`).
 * **Кэш только session-local** — сохраняется между транзакциями одного backend'а, но не переживает reconnect и не попадает в каталоги.
-* **`relpages/reltuples` не откатываются при ROLLBACK** — `fasttrun_analyze` пишет в `rd_rel` напрямую, без undo. При откате транзакции значения остаются от откаченных данных до следующего вызова `fasttrun_analyze` или `fasttruncate`.
+* **Top-level `ROLLBACK` не делает catalog-like undo для `rd_rel`** — savepoint paths обрабатываются локально, но при откате всей транзакции значения могут жить в relcache до следующего `fasttrun_analyze`, `fasttruncate` или reconnect.
 * **Статистика expression indexes** — не собирается. Обычные btree-индексы по колонкам работают через статистику самих колонок, но для индексов вида `CREATE INDEX ON t ((lower(name)))` отдельной статистики выражения пока нет.
+* **ACL/RLS/security-barrier семантика ANALYZE не повторяется** — расширение предназначено для временных таблиц текущей сессии, а не для использования как общий security boundary.
 * **Cached plans инвалидируются только локально** — `fasttruncate`, `fasttrun_analyze`, `fasttrun_collect_stats`, DDL/TRUNCATE eviction и savepoint rollback сбрасывают plan cache текущего backend'а, но не рассылают shared sinval другим backend'ам.
 * **Стоимость холодного прохода со сбором статистики** — ~50-150 мс на таблицу 1M строк × 50 колонок. Можно отключить через GUC.
 

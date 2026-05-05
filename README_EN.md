@@ -73,9 +73,11 @@ If after the previous collection the DML change ratio exceeded `stats_refresh_th
 
 ### Statistics quality
 
-By default (`use_typanalyze = on`) the extension calls **the same** `std_typanalyze` / type-specific `typanalyze` from the PostgreSQL core. So everything that regular `ANALYZE` collects is collected: MCV, histogram, correlation, type-specific stats.
+By default (`use_typanalyze = on`) the extension calls **the same** `std_typanalyze` / type-specific `typanalyze` from the PostgreSQL core for regular heap-table columns. It collects MCV, histogram, correlation and type-specific stats; it also honors `ALTER COLUMN SET STATISTICS 0` and `ALTER COLUMN SET (n_distinct = ...)`.
 
-The only difference is sample size. Default `sample_rows = 3000` is ~10x smaller than regular `ANALYZE`. For most tables it's enough. For a full match — `SET fasttrun.sample_rows = -1`.
+The main difference is sample size. Default `sample_rows = 3000` is ~10x smaller than regular `ANALYZE`. For the closest match — `SET fasttrun.sample_rows = -1`.
+
+There are deliberate boundaries: extended statistics, expression-index statistics and inherited-table statistics are not collected; ACL/RLS/security-barrier behavior of regular `ANALYZE` is not reproduced. The extension is designed for session-local temp tables owned by the current backend.
 
 `relpages/reltuples/relallvisible` and column statistics live in backend memory and survive `COMMIT`; xact-local delta state is cleared at transaction boundaries. After DML, cached column stats are hidden from the planner until a real refresh, so old distributions are not reported as fresh.
 
@@ -84,7 +86,7 @@ The only difference is sample size. Default `sample_rows = 3000` is ~10x smaller
 | Parameter | Default | Description |
 |---|---|---|
 | `fasttrun.auto_collect_stats` | `on` | Collect column statistics during cold `fasttrun_analyze` pass |
-| `fasttrun.sample_rows` | `3000` | Sample size. `0` — disable collection. `-1` — auto (same as regular `ANALYZE`) |
+| `fasttrun.sample_rows` | `3000` | Sample size. `0` — disable column stats collection; relation-level relstats for the heap and regular indexes are still updated. `-1` — auto (same as regular `ANALYZE`) |
 | `fasttrun.use_typanalyze` | `on` | Use `std_typanalyze` from core (MCV/histogram/correlation). `off` — only n_distinct/null_frac/width |
 | `fasttrun.stats_refresh_threshold` | `0.2` | DML change ratio threshold for stats refresh. `0` — on any DML. `1` — automatic refresh disabled; after DML cached stats are hidden until an explicit refresh |
 | `fasttrun.zero_sinval_truncate` | `on` | Direct `unlink`+`smgrcreate` instead of `smgrtruncate`. `off` — old path with 1 SMGR sinval |
@@ -153,11 +155,19 @@ make installcheck PG_CONFIG=/path/to/pg_config PGPORT=5433
 | `fasttrun_migration` | Upgrade path 2.0 → 2.1, including backward compatibility with `fasttruncate_c` |
 | `fasttrun_bench` | Synthetic benchmark on 1M rows × 50 columns |
 | `fasttrun_stats` | Statistics hook: EXPLAIN before/after, auto-collection, sample_rows=0/-1, refresh threshold, DDL/TRUNCATE eviction, partial-index relstats |
-| `fasttrun_tracking` | Tracking frequently created temp tables and prewarm |
+| `fasttrun_tracking` | Tracking frequently created temp tables and prewarm; has expected output for both `shared_preload_libraries` and non-preload modes |
 | `fasttrun_relstats_survive` | relstats survive relcache rebuilds and `COMMIT` inside one backend |
 | `fasttrun_plan_cache_survive` | Backend-local SPI/PL/pgSQL plan cache invalidation after fasttruncate, analyze, collect_stats and savepoint rollback |
 
 All tests pass on PG 16.13, 17.9 and 18.3.
+
+For a separate Linux-only check of the "zero shared sinval" contract, run the `gdb` smoke test:
+
+```bash
+PG_CONFIG=/path/to/pg_config scripts/check_zero_shared_sinval.sh
+```
+
+It attaches to a backend and counts calls to `SIInsertDataEntries` / `SendSharedInvalidMessages`: regular `ANALYZE` must provide a positive control, while `fasttrun_analyze`, `fasttrun_collect_stats` and `fasttruncate` must have zero shared hits. On Ubuntu you may need to allow attach temporarily: `sudo sysctl -w kernel.yama.ptrace_scope=0`.
 
 ## Usage pattern
 
@@ -291,11 +301,14 @@ Statistics are saved to disk (`pg_stat/fasttrun_temp_stats`) on server shutdown 
 * **Heap AM only** — checked on entry of all functions. For columnar and other exotica — an error.
 * **Does not check foreign keys** — `fasttruncate` doesn't scan `pg_constraint`. By our convention, FKs are not created on temporary tables.
 * **Not transactional** — on ROLLBACK the data is not restored.
+* **`track_counts = on` is required for column stats freshness** — without pgstat counters the extension updates only relation-level statistics and does not return cached column stats to the planner.
 * **Extended statistics** (`CREATE STATISTICS`) — not supported, there is no suitable hook in the core.
+* **Inheritance stats** — not supported. Temporary work tables normally do not use this path.
 * **Sequences** — `fasttruncate` does not reset SERIAL/IDENTITY sequences (same as regular `TRUNCATE` without `RESTART IDENTITY`).
 * **Cache is session-local only** — reused across transactions in one backend, but not across reconnects and never written to catalogs.
-* **`relpages/reltuples` do not roll back on ROLLBACK** — `fasttrun_analyze` writes to `rd_rel` directly, without undo. On transaction rollback the values remain from the rolled-back data until the next `fasttrun_analyze` or `fasttruncate` call.
+* **Top-level `ROLLBACK` does not do catalog-like undo for `rd_rel`** — savepoint paths are handled locally, but after aborting the whole transaction values may live in relcache until the next `fasttrun_analyze`, `fasttruncate` or reconnect.
 * **Expression index statistics** — not collected. Regular btree indexes on table columns use the column statistics, but indexes like `CREATE INDEX ON t ((lower(name)))` do not yet get separate expression statistics.
+* **ACL/RLS/security-barrier semantics of ANALYZE are not reproduced** — the extension is meant for temporary tables in the current session, not as a general security boundary.
 * **Cached plans are invalidated only locally** — `fasttruncate`, `fasttrun_analyze`, `fasttrun_collect_stats`, DDL/TRUNCATE eviction and savepoint rollback reset the current backend plan cache, but do not send shared sinval to other backends.
 * **Cost of cold-path stats collection** — ~50-150 ms for a 1M rows × 50 columns table. Can be disabled via GUC.
 

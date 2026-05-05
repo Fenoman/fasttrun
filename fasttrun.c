@@ -46,6 +46,7 @@
 #include "storage/lmgr.h"
 #include "storage/smgr.h"
 #include "utils/array.h"
+#include "utils/attoptcache.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
 #include "utils/guc.h"
@@ -290,23 +291,26 @@ fasttrun_relation_has_same_locator(Relation rel, FasttrunAnalyzeCacheEntry *entr
 }
 
 /*
- * Core ON COMMIT DELETE ROWS truncates temp-table storage during COMMIT, not
- * through our ProcessUtility hook.  If a session-local relstats cache survives
- * that boundary unchanged, the next plan can see rows in an empty table.  At
- * commit we can safely make an observed empty heap authoritative and update
- * index relstats that belong to that heap to zero tuples as well.
+ * Some temp-table truncates happen outside ordinary transactional rollback:
+ * core ON COMMIT DELETE ROWS truncates storage during COMMIT, and
+ * fasttruncate() deliberately performs a non-transactional local storage reset.
+ * If a session-local relstats cache survives such a boundary unchanged, the
+ * next plan can see rows in an empty table.  Whenever we can observe that the
+ * underlying temp storage is empty, make that fact authoritative for heap and
+ * index relstats.
  */
 static bool
-fasttrun_cache_sync_commit_empty_storage(FasttrunAnalyzeCacheEntry *entry,
-										 Oid *plan_relid)
+fasttrun_cache_make_empty_storage_authoritative(FasttrunAnalyzeCacheEntry *entry,
+												Oid *plan_relid,
+												bool *changed)
 {
 	Relation	rel;
 	Relation	heaprel = NULL;
 	BlockNumber	pages_now;
 	bool		is_empty = false;
-	bool		changed = false;
 
 	*plan_relid = entry->relid;
+	*changed = false;
 
 	if (!entry->has_relstats)
 		return false;
@@ -354,24 +358,28 @@ fasttrun_cache_sync_commit_empty_storage(FasttrunAnalyzeCacheEntry *entry,
 		pages_now = RelationGetNumberOfBlocks(rel);
 		if (entry->cached_pages != pages_now ||
 			entry->cached_tuples != 0 ||
-			entry->cached_allvisible != 0)
-		{
-			entry->cached_pages = pages_now;
-			entry->cached_tuples = 0;
-			entry->cached_allvisible = 0;
-			entry->relstats_subid = InvalidSubTransactionId;
+			entry->cached_allvisible != 0 ||
+			rel->rd_rel->relpages != pages_now ||
+			rel->rd_rel->reltuples != 0 ||
+			rel->rd_rel->relallvisible != 0)
+			*changed = true;
 
-			rel->rd_rel->relpages = pages_now;
-			rel->rd_rel->reltuples = 0;
-			rel->rd_rel->relallvisible = 0;
-			changed = true;
-		}
+		entry->has_relstats = true;
+		entry->cached_pages = pages_now;
+		entry->cached_tuples = 0;
+		entry->cached_allvisible = 0;
+		entry->relstats_subid = InvalidSubTransactionId;
+		entry->has_delta_state = false;
+
+		rel->rd_rel->relpages = pages_now;
+		rel->rd_rel->reltuples = 0;
+		rel->rd_rel->relallvisible = 0;
 	}
 
 	if (heaprel != NULL)
 		relation_close(heaprel, NoLock);
 	relation_close(rel, NoLock);
-	return changed;
+	return is_empty;
 }
 
 static BlockNumber
@@ -443,9 +451,11 @@ fasttrun_cache_commit_xact(void)
 	{
 		Oid		plan_relid;
 		bool	empty_storage_changed;
+		bool	empty_storage_authoritative;
 
-		empty_storage_changed =
-			fasttrun_cache_sync_commit_empty_storage(entry, &plan_relid);
+		empty_storage_authoritative =
+			fasttrun_cache_make_empty_storage_authoritative(entry, &plan_relid,
+														   &empty_storage_changed);
 
 		fasttrun_baseline_free_undo(entry);
 		fasttrun_relstats_free_undo(entry);
@@ -463,7 +473,7 @@ fasttrun_cache_commit_xact(void)
 		entry->stats_baseline_truncdropped = false;
 		entry->stats_baseline_subid = InvalidSubTransactionId;
 
-		if (empty_storage_changed)
+		if (empty_storage_authoritative && empty_storage_changed)
 		{
 			if (OidIsValid(plan_relid))
 				fasttrun_stats_cache_evict_relid(plan_relid);
@@ -630,6 +640,30 @@ fasttrun_cache_store_delta_state(FasttrunAnalyzeCacheEntry *entry,
 	entry->cached_truncdropped = truncdropped;
 }
 
+static void
+fasttrun_cache_save_baseline_undo(FasttrunAnalyzeCacheEntry *entry)
+{
+	SubTransactionId cur_subid = GetCurrentSubTransactionId();
+	MemoryContext oldcxt;
+	FasttrunAnalyzeBaselineUndo *saved;
+
+	if (entry->stats_baseline_subid == cur_subid)
+		return;
+
+	oldcxt = MemoryContextSwitchTo(fasttrun_analyze_mcxt);
+	saved = (FasttrunAnalyzeBaselineUndo *) palloc(sizeof(*saved));
+	MemoryContextSwitchTo(oldcxt);
+
+	saved->has_stats_baseline = entry->has_stats_baseline;
+	saved->stats_baseline_inserted = entry->stats_baseline_inserted;
+	saved->stats_baseline_updated = entry->stats_baseline_updated;
+	saved->stats_baseline_deleted = entry->stats_baseline_deleted;
+	saved->stats_baseline_truncdropped = entry->stats_baseline_truncdropped;
+	saved->stats_baseline_subid = entry->stats_baseline_subid;
+	saved->older = entry->stats_baseline_undo;
+	entry->stats_baseline_undo = saved;
+}
+
 /*
  * Record a fresh stats-collection baseline for relid: called both
  * after a successful collect_and_store (cold scan or refresh with a
@@ -652,24 +686,7 @@ fasttrun_cache_set_stats_baseline(Oid relid, int64 ins, int64 upd, int64 del,
 	FasttrunAnalyzeCacheEntry *entry = fasttrun_cache_enter(relid);
 	SubTransactionId cur_subid = GetCurrentSubTransactionId();
 
-	if (entry->stats_baseline_subid != cur_subid)
-	{
-		MemoryContext oldcxt;
-		FasttrunAnalyzeBaselineUndo *saved;
-
-		oldcxt = MemoryContextSwitchTo(fasttrun_analyze_mcxt);
-		saved = (FasttrunAnalyzeBaselineUndo *) palloc(sizeof(*saved));
-		MemoryContextSwitchTo(oldcxt);
-
-		saved->has_stats_baseline = entry->has_stats_baseline;
-		saved->stats_baseline_inserted = entry->stats_baseline_inserted;
-		saved->stats_baseline_updated = entry->stats_baseline_updated;
-		saved->stats_baseline_deleted = entry->stats_baseline_deleted;
-		saved->stats_baseline_truncdropped = entry->stats_baseline_truncdropped;
-		saved->stats_baseline_subid = entry->stats_baseline_subid;
-		saved->older = entry->stats_baseline_undo;
-		entry->stats_baseline_undo = saved;
-	}
+	fasttrun_cache_save_baseline_undo(entry);
 
 	entry->has_stats_baseline = true;
 	entry->stats_baseline_inserted = ins;
@@ -703,6 +720,30 @@ fasttrun_cache_update_stats_baseline_if_present(Oid relid,
 	fasttrun_cache_set_stats_baseline(relid, ins, upd, del, truncdropped);
 }
 
+static void
+fasttrun_cache_mark_evicted(Oid relid)
+{
+	FasttrunAnalyzeCacheEntry *entry;
+	SubTransactionId cur_subid = GetCurrentSubTransactionId();
+
+	if (fasttrun_analyze_cache == NULL)
+		return;
+
+	entry = fasttrun_cache_lookup(relid);
+	if (entry == NULL)
+		return;
+
+	fasttrun_cache_save_relstats_undo(entry);
+	fasttrun_cache_save_baseline_undo(entry);
+
+	entry->has_relstats = false;
+	entry->has_delta_state = false;
+	entry->relstats_subid = cur_subid;
+
+	entry->has_stats_baseline = false;
+	entry->stats_baseline_subid = cur_subid;
+}
+
 /* Drop entry by relid.  Called from fasttruncate. */
 static void
 fasttrun_cache_remove(Oid relid)
@@ -733,6 +774,20 @@ fasttrun_cache_remove_rel_and_indexes(Relation rel)
 	index_oids = RelationGetIndexList(rel);
 	foreach(lc, index_oids)
 		fasttrun_cache_remove(lfirst_oid(lc));
+	list_free(index_oids);
+}
+
+static void
+fasttrun_cache_mark_rel_and_indexes_evicted(Relation rel)
+{
+	List	   *index_oids;
+	ListCell   *lc;
+
+	fasttrun_cache_mark_evicted(RelationGetRelid(rel));
+
+	index_oids = RelationGetIndexList(rel);
+	foreach(lc, index_oids)
+		fasttrun_cache_mark_evicted(lfirst_oid(lc));
 	list_free(index_oids);
 }
 
@@ -972,7 +1027,7 @@ fasttrun_get_relation_stats_hook(PlannerInfo *root, RangeTblEntry *rte,
 
 	entry = (FasttrunStatsEntry *) hash_search(fasttrun_stats_cache,
 											   &key, HASH_FIND, NULL);
-	if (entry == NULL)
+	if (entry == NULL || entry->statsTuple == NULL)
 		goto chain;
 
 	/* Freshness check: pgstat counters must match the collect-time snapshot. */
@@ -1364,6 +1419,13 @@ fasttrun_stats_cache_commit_xact(void)
 		bool		have_counters = false;
 
 		key = entry->key;
+		if (entry->statsTuple == NULL)
+		{
+			fasttrun_stats_entry_free_undo(entry);
+			(void) hash_search(fasttrun_stats_cache, &key, HASH_REMOVE, NULL);
+			continue;
+		}
+
 		rel = RelationIdGetRelation(key.relid);
 		if (rel != NULL)
 		{
@@ -1434,6 +1496,56 @@ fasttrun_stats_cache_evict_relid(Oid relid)
 	}
 
 	return removed;
+}
+
+static bool
+fasttrun_stats_cache_mark_evicted_relid(Oid relid)
+{
+	HASH_SEQ_STATUS status;
+	FasttrunStatsEntry *entry;
+	bool			changed = false;
+	SubTransactionId cur_subid = GetCurrentSubTransactionId();
+
+	if (fasttrun_stats_cache == NULL)
+		return false;
+
+	hash_seq_init(&status, fasttrun_stats_cache);
+	while ((entry = (FasttrunStatsEntry *) hash_seq_search(&status)) != NULL)
+	{
+		if (entry->key.relid != relid || entry->statsTuple == NULL)
+			continue;
+
+		if (entry->collected_subid != cur_subid)
+		{
+			MemoryContext oldcxt;
+			FasttrunStatsSavedState *saved;
+
+			oldcxt = MemoryContextSwitchTo(fasttrun_stats_mcxt);
+			saved = (FasttrunStatsSavedState *) palloc(sizeof(*saved));
+			MemoryContextSwitchTo(oldcxt);
+
+			saved->statsTuple = entry->statsTuple;	/* transfer ownership */
+			saved->collected_ins = entry->collected_ins;
+			saved->collected_upd = entry->collected_upd;
+			saved->collected_del = entry->collected_del;
+			saved->collected_truncdropped = entry->collected_truncdropped;
+			saved->collected_subid = entry->collected_subid;
+			saved->older = entry->undo;
+			entry->undo = saved;
+		}
+		else
+			heap_freetuple(entry->statsTuple);
+
+		entry->statsTuple = NULL;
+		entry->collected_ins = 0;
+		entry->collected_upd = 0;
+		entry->collected_del = 0;
+		entry->collected_truncdropped = false;
+		entry->collected_subid = cur_subid;
+		changed = true;
+	}
+
+	return changed;
 }
 
 /*
@@ -1545,6 +1657,38 @@ fasttrun_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 			{
 				if (event == SUBXACT_EVENT_ABORT_SUB)
 				{
+					Oid		plan_relid;
+					bool	empty_storage_changed;
+
+					if (fasttrun_cache_make_empty_storage_authoritative(aentry,
+																		&plan_relid,
+																		&empty_storage_changed))
+					{
+						/*
+						 * fasttruncate() is non-transactional for local
+						 * storage: after ROLLBACK TO SAVEPOINT the rows are
+						 * still gone.  Do not restore the old relstats undo
+						 * chain; make the observed empty storage the new
+						 * outer-subxact truth instead.
+						 */
+						fasttrun_relstats_free_undo(aentry);
+						fasttrun_baseline_free_undo(aentry);
+
+						aentry->has_stats_baseline = false;
+						aentry->stats_baseline_inserted = 0;
+						aentry->stats_baseline_updated = 0;
+						aentry->stats_baseline_deleted = 0;
+						aentry->stats_baseline_truncdropped = false;
+						aentry->stats_baseline_subid = InvalidSubTransactionId;
+
+						if (OidIsValid(plan_relid))
+							fasttrun_stats_cache_evict_relid(plan_relid);
+						fasttrun_invalidate_local_plan_cache(aentry->relid);
+						if (OidIsValid(plan_relid) && plan_relid != aentry->relid)
+							fasttrun_invalidate_local_plan_cache(plan_relid);
+						continue;
+					}
+
 					if (aentry->relstats_undo != NULL)
 					{
 						FasttrunAnalyzeRelstatsUndo *popped =
@@ -1653,6 +1797,47 @@ fasttrun_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
  * (build a pg_statistic-shaped HeapTuple, sans catalog write).
  * ---------------------------------------------------------------------- */
 
+static void
+fasttrun_apply_attribute_options(Relation rel, AttrNumber attnum,
+								 bool inh, float4 *stadistinct)
+{
+	AttributeOpts *aopt;
+
+	aopt = get_attribute_options(RelationGetRelid(rel), attnum);
+	if (aopt != NULL)
+	{
+		float8		n_distinct;
+
+		n_distinct = inh ? aopt->n_distinct_inherited : aopt->n_distinct;
+		if (n_distinct != 0.0)
+			*stadistinct = (float4) n_distinct;
+	}
+}
+
+static int
+fasttrun_get_attstattarget(Relation rel, AttrNumber attnum)
+{
+	HeapTuple	atttuple;
+	Datum		datum;
+	bool		isnull;
+	int			attstattarget = -1;
+
+	atttuple = SearchSysCache2(ATTNUM,
+							   ObjectIdGetDatum(RelationGetRelid(rel)),
+							   Int16GetDatum(attnum));
+	if (!HeapTupleIsValid(atttuple))
+		return -1;
+
+	datum = SysCacheGetAttr(ATTNUM, atttuple,
+							Anum_pg_attribute_attstattarget,
+							&isnull);
+	if (!isnull)
+		attstattarget = DatumGetInt16(datum);
+	ReleaseSysCache(atttuple);
+
+	return attstattarget;
+}
+
 /*
  * Standard fetch function for compute_stats — pulls a column value out
  * of one of our sample tuples.  Mirrors std_fetch_func() in core
@@ -1678,9 +1863,8 @@ fasttrun_std_fetch_func(VacAttrStatsP stats, int rownum, bool *isNull)
  *
  * PG 17 reshaped VacAttrStats: it dropped the embedded
  * `Form_pg_attribute attr` and lifted `attstattarget` into a top-level
- * field on the struct.  We don't honour custom per-column
- * attstattarget anyway (temp tables almost never set ALTER COLUMN ...
- * SET STATISTICS), so we just request the default everywhere.
+ * field on the struct.  Keep the core semantics: attstattarget=0 means
+ * "do not collect stats for this column", negative means default target.
  */
 static VacAttrStats *
 fasttrun_examine_attribute(Relation rel, int attnum, MemoryContext anl_context)
@@ -1688,11 +1872,15 @@ fasttrun_examine_attribute(Relation rel, int attnum, MemoryContext anl_context)
 	Form_pg_attribute attr = TupleDescAttr(rel->rd_att, attnum - 1);
 	HeapTuple	typtuple;
 	VacAttrStats *stats;
+	int			attstattarget;
 	int			i;
 	bool		ok;
 	MemoryContext oldcxt;
 
 	if (attr->attisdropped)
+		return NULL;
+	attstattarget = fasttrun_get_attstattarget(rel, attnum);
+	if (attstattarget == 0)
 		return NULL;
 
 	oldcxt = MemoryContextSwitchTo(anl_context);
@@ -1702,9 +1890,9 @@ fasttrun_examine_attribute(Relation rel, int attnum, MemoryContext anl_context)
 #if PG_VERSION_NUM < 170000
 	stats->attr = (Form_pg_attribute) palloc(ATTRIBUTE_FIXED_PART_SIZE);
 	memcpy(stats->attr, attr, ATTRIBUTE_FIXED_PART_SIZE);
+	stats->attr->attstattarget = attstattarget;
 #else
-	/* PG 17+: attstattarget is a top-level field; use the default. */
-	stats->attstattarget = -1;
+	stats->attstattarget = attstattarget;
 #endif
 
 	stats->attrtypid = attr->atttypid;
@@ -1911,9 +2099,9 @@ fasttrun_effective_sample_target(Relation rel)
 
 static double
 fasttrun_estimate_index_fraction(Relation heaprel, Relation indexrel,
+								 IndexInfo *indexInfo,
 								 HeapTuple *sample, int sample_count)
 {
-	IndexInfo  *indexInfo;
 	ExprState  *predicate;
 	EState	   *estate;
 	ExprContext *econtext;
@@ -1921,7 +2109,6 @@ fasttrun_estimate_index_fraction(Relation heaprel, Relation indexrel,
 	int			i;
 	int			matched = 0;
 
-	indexInfo = BuildIndexInfo(indexrel);
 	if (indexInfo->ii_Predicate == NIL)
 		return 1.0;
 	if (sample_count <= 0)
@@ -1947,27 +2134,68 @@ fasttrun_estimate_index_fraction(Relation heaprel, Relation indexrel,
 	return (double) matched / (double) sample_count;
 }
 
-static void
+static bool
+fasttrun_relation_has_partial_index(Relation rel)
+{
+	List	   *index_oids;
+	ListCell   *lc;
+	bool		found_partial = false;
+
+	index_oids = RelationGetIndexList(rel);
+	foreach(lc, index_oids)
+	{
+		Relation	indexrel;
+		IndexInfo  *indexInfo;
+
+		indexrel = index_open(lfirst_oid(lc), AccessShareLock);
+		indexInfo = BuildIndexInfo(indexrel);
+		if (indexInfo->ii_Predicate != NIL)
+			found_partial = true;
+		index_close(indexrel, AccessShareLock);
+		if (found_partial)
+			break;
+	}
+	list_free(index_oids);
+
+	return found_partial;
+}
+
+static bool
 fasttrun_update_index_relstats(Relation rel, HeapTuple *sample, int sample_count,
 							   int64 totalrows)
 {
 	List	   *index_oids;
 	ListCell   *lc;
+	bool		changed = false;
 
 	index_oids = RelationGetIndexList(rel);
 	foreach(lc, index_oids)
 	{
 		Oid			indexOid = lfirst_oid(lc);
 		Relation	indexrel;
+		IndexInfo  *indexInfo;
 		BlockNumber	index_pages;
 		double		tuple_fract;
 		int64		index_tuples;
 
 		indexrel = index_open(indexOid, AccessShareLock);
+		indexInfo = BuildIndexInfo(indexrel);
+
+		if (indexInfo->ii_Predicate != NIL && sample_count <= 0 && totalrows > 0)
+		{
+			index_close(indexrel, AccessShareLock);
+			continue;
+		}
+
 		index_pages = RelationGetNumberOfBlocks(indexrel);
-		tuple_fract = fasttrun_estimate_index_fraction(rel, indexrel,
+		tuple_fract = fasttrun_estimate_index_fraction(rel, indexrel, indexInfo,
 													   sample, sample_count);
 		index_tuples = (int64) ceil(tuple_fract * (double) totalrows);
+
+		if (indexrel->rd_rel->relpages != index_pages ||
+			indexrel->rd_rel->reltuples != (float4) index_tuples ||
+			indexrel->rd_rel->relallvisible != 0)
+			changed = true;
 
 		indexrel->rd_rel->relpages = index_pages;
 		indexrel->rd_rel->reltuples = (float4) index_tuples;
@@ -1977,6 +2205,8 @@ fasttrun_update_index_relstats(Relation rel, HeapTuple *sample, int sample_count
 		index_close(indexrel, AccessShareLock);
 	}
 	list_free(index_oids);
+
+	return changed;
 }
 
 /* qsort comparator: order HeapTuples by physical TID (block, offset). */
@@ -2035,6 +2265,9 @@ fasttrun_collect_and_store(Relation rel, HeapTuple *sample, int sample_count,
 	if (!fasttrun_read_pgstat_counters(rel, &snap_ins, &snap_upd, &snap_del,
 									   &snap_truncdropped))
 	{
+		if (fasttrun_stats_cache_evict_relid(RelationGetRelid(rel)))
+			fasttrun_invalidate_local_plan_cache(RelationGetRelid(rel));
+
 		if (!fasttrun_warned_track_counts_off)
 		{
 			ereport(WARNING,
@@ -2117,8 +2350,13 @@ fasttrun_collect_and_store(Relation rel, HeapTuple *sample, int sample_count,
 				continue;
 			}
 
-			/* Build tuple inside per_col_mcxt so intermediates are
-			 * reclaimed on the next MemoryContextReset. */
+			fasttrun_apply_attribute_options(rel, attnum, false,
+											 &stats->stadistinct);
+
+			/*
+			 * Build tuple inside per_col_mcxt so intermediates are
+			 * reclaimed on the next MemoryContextReset.
+			 */
 			stats_tuple = fasttrun_build_pg_statistic_tuple(pg_stats_desc,
 															RelationGetRelid(rel),
 															attnum, stats);
@@ -2150,6 +2388,7 @@ fasttrun_collect_and_store(Relation rel, HeapTuple *sample, int sample_count,
 		{
 			Form_pg_attribute attr = TupleDescAttr(tupdesc, a);
 			AttrNumber		   attnum = a + 1;
+			int				   attstattarget;
 			TypeCacheEntry	  *typentry;
 			SortSupportData	ssup;
 			int				   n_nonnull = 0;
@@ -2165,6 +2404,9 @@ fasttrun_collect_and_store(Relation rel, HeapTuple *sample, int sample_count,
 			HeapTuple		   stats_tuple;
 
 			if (attr->attisdropped)
+				continue;
+			attstattarget = fasttrun_get_attstattarget(rel, attnum);
+			if (attstattarget == 0)
 				continue;
 
 			typentry = lookup_type_cache(attr->atttypid, TYPECACHE_LT_OPR);
@@ -2258,6 +2500,8 @@ fasttrun_collect_and_store(Relation rel, HeapTuple *sample, int sample_count,
 														  nmultiple, totalrows);
 			}
 
+			fasttrun_apply_attribute_options(rel, attnum, false,
+											 &stadistinct);
 			MemoryContextSwitchTo(oldcxt);
 
 			stats_tuple = fasttrun_build_stats_tuple(pg_stats_desc,
@@ -2277,7 +2521,7 @@ fasttrun_collect_and_store(Relation rel, HeapTuple *sample, int sample_count,
 
 	MemoryContextDelete(per_col_mcxt);
 	table_close(pg_stats_rel, AccessShareLock);
-	fasttrun_update_index_relstats(rel, sample, sample_count, totalrows);
+	(void) fasttrun_update_index_relstats(rel, sample, sample_count, totalrows);
 
 	/*
 	 * Note: the stats-collection baseline (used by the delta-hit refresh
@@ -2835,6 +3079,7 @@ fasttrun_analyze(PG_FUNCTION_ARGS)
 	bool			scan_needed = true;
 	bool			stats_recollected = false;
 	bool			stats_visibility_changed = false;
+	bool			index_relstats_changed = false;
 	bool			need_plan_inval = false;
 	BlockNumber		allvisible_now = 0;
 	BlockNumber		old_pages;
@@ -2950,7 +3195,9 @@ fasttrun_analyze(PG_FUNCTION_ARGS)
 					{
 						if (fasttrun_stats_cache_evict_relid(relOid))
 							stats_visibility_changed = true;
-						fasttrun_update_index_relstats(rel, NULL, 0, tuples_count);
+						index_relstats_changed |=
+							fasttrun_update_index_relstats(rel, NULL, 0,
+														   tuples_count);
 					}
 
 					for (i = 0; i < sample_count; i++)
@@ -2966,6 +3213,50 @@ fasttrun_analyze(PG_FUNCTION_ARGS)
 				stats_visibility_changed = true;
 		}
 	}
+
+	if (!scan_needed && have_counters && !stats_recollected &&
+		fasttrun_sample_rows != 0 &&
+		entry != NULL && entry->has_stats_baseline &&
+		fasttrun_relation_has_partial_index(rel))
+	{
+		int64		churn;
+
+		churn = (ins_now - entry->stats_baseline_inserted)
+			+ (upd_now - entry->stats_baseline_updated)
+			+ (del_now - entry->stats_baseline_deleted);
+		if (churn < 0)
+			churn = -churn;
+
+		if (churn > 0)
+		{
+			int			sample_target = fasttrun_effective_sample_target(rel);
+
+			if (sample_target > 0)
+			{
+				HeapTuple  *sample;
+				int64		scanned_tuples = 0;
+				int			sample_count = 0;
+				int			i;
+
+				sample = (HeapTuple *) palloc(sizeof(HeapTuple) * sample_target);
+				fasttrun_scan_with_sample(rel, &scanned_tuples,
+										  sample, sample_target,
+										  &sample_count);
+				tuples_count = scanned_tuples;
+				index_relstats_changed |=
+					fasttrun_update_index_relstats(rel, sample, sample_count,
+												   tuples_count);
+
+				for (i = 0; i < sample_count; i++)
+					heap_freetuple(sample[i]);
+				pfree(sample);
+			}
+		}
+	}
+
+	if (!scan_needed && !stats_recollected)
+		index_relstats_changed |=
+			fasttrun_update_index_relstats(rel, NULL, 0, tuples_count);
 
 	/*
 	 * Below-threshold DML deliberately does NOT advance collected_*.
@@ -3015,14 +3306,15 @@ fasttrun_analyze(PG_FUNCTION_ARGS)
 		 * non-xact counters, so the values we read here are authoritative
 		 * for the tuple DML baseline.
 		 */
-			if (!have_counters)
-				have_counters = fasttrun_read_pgstat_counters(rel,
-															  &ins_now, &upd_now,
-															  &del_now,
-															  &truncdropped_now);
+		if (!have_counters)
+			have_counters = fasttrun_read_pgstat_counters(rel,
+														  &ins_now, &upd_now,
+														  &del_now,
+														  &truncdropped_now);
 
-		if (sample != NULL && sample_count == 0)
-			fasttrun_update_index_relstats(rel, NULL, 0, tuples_count);
+		if (!stats_recollected)
+			index_relstats_changed |=
+				fasttrun_update_index_relstats(rel, NULL, 0, tuples_count);
 
 		/* Populate stats baseline only when pgstat is usable. */
 		if (have_counters)
@@ -3041,7 +3333,8 @@ fasttrun_analyze(PG_FUNCTION_ARGS)
 					   old_tuples != (float4) tuples_count ||
 					   old_allvisible != (int32) allvisible_now ||
 					   stats_recollected ||
-					   stats_visibility_changed);
+					   stats_visibility_changed ||
+					   index_relstats_changed);
 	if (need_plan_inval)
 		fasttrun_invalidate_local_plan_cache(relOid);
 
@@ -3195,7 +3488,7 @@ fasttrun_collect_stats(PG_FUNCTION_ARGS)
 	}
 	else if (fasttrun_stats_cache_evict_relid(relOid))
 	{
-		fasttrun_update_index_relstats(rel, NULL, 0, tuples_count);
+		(void) fasttrun_update_index_relstats(rel, NULL, 0, tuples_count);
 		fasttrun_invalidate_local_plan_cache(relOid);
 	}
 
@@ -3749,15 +4042,15 @@ fasttrun_evict_temp_relid(Oid relid)
 	{
 		if (rel->rd_rel->relkind == RELKIND_RELATION ||
 			rel->rd_rel->relkind == RELKIND_TOASTVALUE)
-			fasttrun_cache_remove_rel_and_indexes(rel);
+			fasttrun_cache_mark_rel_and_indexes_evicted(rel);
 		else
-			fasttrun_cache_remove(relid);
+			fasttrun_cache_mark_evicted(relid);
 		relation_close(rel, NoLock);
 	}
 	else
-		fasttrun_cache_remove(relid);
+		fasttrun_cache_mark_evicted(relid);
 
-	fasttrun_stats_cache_evict_relid(relid);
+	fasttrun_stats_cache_mark_evicted_relid(relid);
 	fasttrun_invalidate_local_plan_cache(relid);
 }
 
