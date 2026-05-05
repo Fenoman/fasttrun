@@ -156,6 +156,21 @@ static bool fasttrun_read_pgstat_counters_for_hook(Oid relid,
 												   int64 *del,
 												   bool *truncdropped);
 static void fasttrun_invalidate_local_plan_cache(Oid relid);
+static bool fasttrun_get_relation_stats_hook(PlannerInfo *root,
+											 RangeTblEntry *rte,
+											 AttrNumber attnum,
+											 VariableStatData *vardata);
+static int32 fasttrun_get_attavgwidth_hook(Oid relid, AttrNumber attnum);
+static PlannedStmt *fasttrun_planner_hook(Query *parse,
+										  const char *query_string,
+										  int cursorOptions,
+										  ParamListInfo boundParams);
+static void fasttrun_ensure_planner_hook(void);
+static void fasttrun_ensure_stats_hooks(void);
+static bool fasttrun_stats_relid_exists(Oid relid);
+static void fasttrun_stats_relid_ref(Oid relid);
+static void fasttrun_stats_relid_unref(Oid relid);
+static bool fasttrun_query_contains_stats_relid(Query *query);
 
 /*
  * Build a RangeVar from a text relation name.  Fast path for bare
@@ -483,6 +498,7 @@ fasttrun_cache_commit_xact(void)
 	hash_seq_init(&status, fasttrun_analyze_cache);
 	while ((entry = (FasttrunAnalyzeCacheEntry *) hash_seq_search(&status)) != NULL)
 	{
+		Oid		relid = entry->relid;
 		Oid		plan_relid;
 		bool	empty_storage_changed;
 		bool	empty_storage_authoritative;
@@ -507,6 +523,13 @@ fasttrun_cache_commit_xact(void)
 		entry->stats_baseline_deleted = 0;
 		entry->stats_baseline_truncdropped = false;
 		entry->stats_baseline_subid = InvalidSubTransactionId;
+
+		if (!entry->has_relstats)
+		{
+			(void) hash_search(fasttrun_analyze_cache, &relid,
+							   HASH_REMOVE, NULL);
+			continue;
+		}
 
 		if (empty_storage_authoritative && empty_storage_changed)
 		{
@@ -549,6 +572,8 @@ fasttrun_cache_init(void)
 
 	if (fasttrun_analyze_cache != NULL)
 		return;
+
+	fasttrun_ensure_planner_hook();
 
 	fasttrun_analyze_mcxt = AllocSetContextCreate(TopMemoryContext,
 												  "fasttrun analyze cache",
@@ -1023,6 +1048,16 @@ typedef struct FasttrunStatsKey
 	bool		inh;
 } FasttrunStatsKey;
 
+static inline void
+fasttrun_stats_key_init(FasttrunStatsKey *key, Oid relid, AttrNumber attnum,
+						bool inh)
+{
+	memset(key, 0, sizeof(*key));
+	key->relid = relid;
+	key->attnum = attnum;
+	key->inh = inh;
+}
+
 /*
  * Saved previous version of a stats entry, pushed on every overwrite
  * that crosses a subxact boundary.  fasttrun_subxact_callback pops this
@@ -1054,11 +1089,44 @@ typedef struct FasttrunStatsEntry
 										 * at each subxact-boundary store */
 } FasttrunStatsEntry;
 
+typedef struct FasttrunStatsRelidEntry
+{
+	Oid		relid;			/* hash key — must be first */
+	int		refcount;		/* visible statsTuple entries for this relid */
+} FasttrunStatsRelidEntry;
+
 static HTAB			   *fasttrun_stats_cache = NULL;
+static HTAB			   *fasttrun_stats_relid_cache = NULL;
 static MemoryContext	fasttrun_stats_mcxt = NULL;
 static get_relation_stats_hook_type prev_get_relation_stats_hook = NULL;
 static get_attavgwidth_hook_type prev_get_attavgwidth_hook = NULL;
 static planner_hook_type prev_planner_hook = NULL;
+static bool				fasttrun_stats_hooks_installed = false;
+static bool				fasttrun_planner_hook_installed = false;
+
+static void
+fasttrun_ensure_planner_hook(void)
+{
+	if (fasttrun_planner_hook_installed)
+		return;
+
+	prev_planner_hook = planner_hook;
+	planner_hook = fasttrun_planner_hook;
+	fasttrun_planner_hook_installed = true;
+}
+
+static void
+fasttrun_ensure_stats_hooks(void)
+{
+	if (fasttrun_stats_hooks_installed)
+		return;
+
+	prev_get_relation_stats_hook = get_relation_stats_hook;
+	get_relation_stats_hook = fasttrun_get_relation_stats_hook;
+	prev_get_attavgwidth_hook = get_attavgwidth_hook;
+	get_attavgwidth_hook = fasttrun_get_attavgwidth_hook;
+	fasttrun_stats_hooks_installed = true;
+}
 
 static void
 fasttrun_stats_cache_init(void)
@@ -1067,6 +1135,9 @@ fasttrun_stats_cache_init(void)
 
 	if (fasttrun_stats_cache != NULL)
 		return;
+
+	fasttrun_ensure_planner_hook();
+	fasttrun_ensure_stats_hooks();
 
 	fasttrun_stats_mcxt = AllocSetContextCreate(TopMemoryContext,
 												"fasttrun stats cache",
@@ -1081,6 +1152,16 @@ fasttrun_stats_cache_init(void)
 									   64,
 									   &ctl,
 									   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+
+	memset(&ctl, 0, sizeof(ctl));
+	ctl.keysize = sizeof(Oid);
+	ctl.entrysize = sizeof(FasttrunStatsRelidEntry);
+	ctl.hcxt = fasttrun_stats_mcxt;
+
+	fasttrun_stats_relid_cache = hash_create("fasttrun stats relid cache",
+											 16,
+											 &ctl,
+											 HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 }
 
 /* Drop the stats HTAB + its mcxt (frees all cached tuples at once). */
@@ -1092,12 +1173,60 @@ fasttrun_stats_cache_reset(void)
 
 	hash_destroy(fasttrun_stats_cache);
 	fasttrun_stats_cache = NULL;
+	fasttrun_stats_relid_cache = NULL;
 
 	if (fasttrun_stats_mcxt != NULL)
 	{
 		MemoryContextDelete(fasttrun_stats_mcxt);
 		fasttrun_stats_mcxt = NULL;
 	}
+}
+
+static bool
+fasttrun_stats_relid_exists(Oid relid)
+{
+	if (fasttrun_stats_relid_cache == NULL)
+		return false;
+
+	return hash_search(fasttrun_stats_relid_cache, &relid,
+					   HASH_FIND, NULL) != NULL;
+}
+
+static void
+fasttrun_stats_relid_ref(Oid relid)
+{
+	FasttrunStatsRelidEntry *entry;
+	bool	found;
+
+	if (fasttrun_stats_relid_cache == NULL)
+		return;
+
+	entry = (FasttrunStatsRelidEntry *) hash_search(fasttrun_stats_relid_cache,
+													&relid,
+													HASH_ENTER, &found);
+	if (!found)
+		entry->refcount = 0;
+	entry->refcount++;
+}
+
+static void
+fasttrun_stats_relid_unref(Oid relid)
+{
+	FasttrunStatsRelidEntry *entry;
+
+	if (fasttrun_stats_relid_cache == NULL)
+		return;
+
+	entry = (FasttrunStatsRelidEntry *) hash_search(fasttrun_stats_relid_cache,
+													&relid,
+													HASH_FIND, NULL);
+	if (entry == NULL)
+		return;
+
+	entry->refcount--;
+	if (entry->refcount <= 0)
+		(void) hash_search(fasttrun_stats_relid_cache, &relid,
+						   HASH_REMOVE, NULL);
 }
 
 /* freefunc for VariableStatData — we own the tuple, no-op. */
@@ -1123,12 +1252,11 @@ fasttrun_get_relation_stats_hook(PlannerInfo *root, RangeTblEntry *rte,
 	int64			del_now = 0;
 	bool			truncdropped_now = false;
 
-	if (fasttrun_stats_cache == NULL)
+	if (fasttrun_stats_cache == NULL ||
+		!fasttrun_stats_relid_exists(rte->relid))
 		goto chain;
 
-	key.relid = rte->relid;
-	key.attnum = attnum;
-	key.inh = rte->inh;
+	fasttrun_stats_key_init(&key, rte->relid, attnum, rte->inh);
 
 	entry = (FasttrunStatsEntry *) hash_search(fasttrun_stats_cache,
 											   &key, HASH_FIND, NULL);
@@ -1184,12 +1312,12 @@ fasttrun_get_attavgwidth_hook(Oid relid, AttrNumber attnum)
 	bool				truncdropped_now = false;
 	int32				stawidth;
 
-	if (fasttrun_stats_cache == NULL)
+	if (fasttrun_stats_cache == NULL ||
+		!fasttrun_stats_relid_exists(relid))
 		goto chain;
 
-	key.relid = relid;
-	key.attnum = attnum;
-	key.inh = false;	/* matches what fasttrun_stats_cache_store writes */
+	/* matches what fasttrun_stats_cache_store writes */
+	fasttrun_stats_key_init(&key, relid, attnum, false);
 
 	entry = (FasttrunStatsEntry *) hash_search(fasttrun_stats_cache,
 											   &key, HASH_FIND, NULL);
@@ -1235,6 +1363,42 @@ chain:
  * those temp heaps plus their indexes.  This keeps unrelated cached temp
  * tables at zero cost for plans that don't reference them.
  */
+static bool
+fasttrun_query_contains_stats_relid(Query *query)
+{
+	ListCell   *lc;
+
+	if (query == NULL || fasttrun_stats_relid_cache == NULL)
+		return false;
+
+	foreach(lc, query->rtable)
+	{
+		RangeTblEntry *rte = (RangeTblEntry *) lfirst(lc);
+
+		if (rte->rtekind == RTE_RELATION)
+		{
+			if (fasttrun_stats_relid_exists(rte->relid))
+				return true;
+		}
+		else if (rte->rtekind == RTE_SUBQUERY)
+		{
+			if (fasttrun_query_contains_stats_relid(rte->subquery))
+				return true;
+		}
+	}
+
+	foreach(lc, query->cteList)
+	{
+		CommonTableExpr *cte = (CommonTableExpr *) lfirst(lc);
+
+		if (IsA(cte->ctequery, Query) &&
+			fasttrun_query_contains_stats_relid((Query *) cte->ctequery))
+			return true;
+	}
+
+	return false;
+}
+
 static PlannedStmt *
 fasttrun_planner_hook(Query *parse, const char *query_string,
 					  int cursorOptions, ParamListInfo boundParams)
@@ -1242,6 +1406,7 @@ fasttrun_planner_hook(Query *parse, const char *query_string,
 	PlannedStmt *result = NULL;
 	bool		saved_in_planner = fasttrun_in_planner;
 	int			saved_freshness_cache_used = fasttrun_freshness_cache_used;
+	bool		stats_frame_needed = false;
 
 	if (fasttrun_analyze_cache != NULL)
 	{
@@ -1251,13 +1416,17 @@ fasttrun_planner_hook(Query *parse, const char *query_string,
 			fasttrun_reinject_rte_relstats((RangeTblEntry *) lfirst(lc));
 	}
 
+	stats_frame_needed =
+		(fasttrun_stats_cache != NULL &&
+		 fasttrun_query_contains_stats_relid(parse));
+
 	/*
-	 * The freshness frame is only useful for cached column statistics.
-	 * With no stats cache, keep the planner-hook overhead to a plain hook
-	 * call plus relstats reinjection above; avoid PG_TRY/sigsetjmp on every
-	 * planned query.
+	 * The freshness frame is only useful for cached column statistics
+	 * referenced by this query.  Keep unrelated plans to a plain hook call
+	 * plus relstats reinjection above; avoid PG_TRY/sigsetjmp on ordinary
+	 * queries after a backend has used fasttrun stats at least once.
 	 */
-	if (fasttrun_stats_cache == NULL)
+	if (!stats_frame_needed)
 	{
 		if (prev_planner_hook)
 			return prev_planner_hook(parse, query_string, cursorOptions,
@@ -1504,17 +1673,17 @@ fasttrun_stats_cache_store(Oid relid, AttrNumber attnum, HeapTuple statsTuple,
 	FasttrunStatsKey	key;
 	FasttrunStatsEntry *entry;
 	bool				found;
+	bool				had_visible;
 	MemoryContext		oldcxt;
 	SubTransactionId	cur_subid = GetCurrentSubTransactionId();
 
 	fasttrun_stats_cache_init();
 
-	key.relid = relid;
-	key.attnum = attnum;
-	key.inh = false;
+	fasttrun_stats_key_init(&key, relid, attnum, false);
 
 	entry = (FasttrunStatsEntry *) hash_search(fasttrun_stats_cache,
 											   &key, HASH_ENTER, &found);
+	had_visible = (found && entry->statsTuple != NULL);
 
 	if (!found)
 	{
@@ -1554,6 +1723,9 @@ fasttrun_stats_cache_store(Oid relid, AttrNumber attnum, HeapTuple statsTuple,
 	entry->collected_del = del;
 	entry->collected_truncdropped = truncdropped;
 	entry->collected_subid = cur_subid;
+
+	if (!had_visible)
+		fasttrun_stats_relid_ref(relid);
 }
 
 /* Free the complete undo chain of an entry. */
@@ -1622,7 +1794,10 @@ fasttrun_stats_cache_commit_xact(void)
 		{
 			fasttrun_stats_entry_free_undo(entry);
 			if (entry->statsTuple != NULL)
+			{
+				fasttrun_stats_relid_unref(key.relid);
 				heap_freetuple(entry->statsTuple);
+			}
 			(void) hash_search(fasttrun_stats_cache, &key, HASH_REMOVE, NULL);
 			fasttrun_invalidate_local_plan_cache(key.relid);
 			continue;
@@ -1663,7 +1838,10 @@ fasttrun_stats_cache_evict_relid(Oid relid)
 		key = entry->key;
 		fasttrun_stats_entry_free_undo(entry);
 		if (entry->statsTuple != NULL)
+		{
+			fasttrun_stats_relid_unref(key.relid);
 			heap_freetuple(entry->statsTuple);
+		}
 		(void) hash_search(fasttrun_stats_cache, &key, HASH_REMOVE, NULL);
 		removed = true;
 	}
@@ -1687,6 +1865,8 @@ fasttrun_stats_cache_mark_evicted_relid(Oid relid)
 	{
 		if (entry->key.relid != relid || entry->statsTuple == NULL)
 			continue;
+
+		fasttrun_stats_relid_unref(relid);
 
 		if (entry->collected_subid != cur_subid)
 		{
@@ -1774,8 +1954,13 @@ fasttrun_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 					FasttrunStatsSavedState *popped = sentry->undo;
 
 					if (sentry->statsTuple != NULL)
+					{
+						fasttrun_stats_relid_unref(sentry->key.relid);
 						heap_freetuple(sentry->statsTuple);
+					}
 					sentry->statsTuple = popped->statsTuple;
+					if (sentry->statsTuple != NULL)
+						fasttrun_stats_relid_ref(sentry->key.relid);
 					sentry->collected_ins = popped->collected_ins;
 					sentry->collected_upd = popped->collected_upd;
 					sentry->collected_del = popped->collected_del;
@@ -1791,7 +1976,10 @@ fasttrun_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 					Oid		relid = sentry->key.relid;
 
 					if (sentry->statsTuple != NULL)
+					{
+						fasttrun_stats_relid_unref(relid);
 						heap_freetuple(sentry->statsTuple);
+					}
 					(void) hash_search(fasttrun_stats_cache, &sentry->key,
 									   HASH_REMOVE, NULL);
 					fasttrun_invalidate_local_plan_cache(relid);
@@ -3228,7 +3416,8 @@ fasttruncate(PG_FUNCTION_ARGS)
  *     fasttruncate).
  *
  *   * Reads the actual on-disk page count via RelationGetNumberOfBlocks
- *     (this never touches the catalog).
+ *     when the cache/delta state cannot prove that storage size is
+ *     unchanged (this never touches the catalog).
  *
  *   * Consults the lazy-mode cache.  Cache hit reuses cached_tuples +
  *     delta_ins - delta_del without touching the heap; cache hit
@@ -3546,11 +3735,15 @@ fasttrun_analyze(PG_FUNCTION_ARGS)
 		allvisible_now = entry->cached_allvisible;
 	else
 		allvisible_now = fasttrun_count_allvisible(rel);
-	entry = fasttrun_cache_store_relstats(rel, pages_now, tuples_count,
-										 allvisible_now);
-	if (have_counters)
-		fasttrun_cache_store_delta_state(entry, ins_now, upd_now, del_now,
-										 truncdropped_now);
+
+	if (!(pure_delta_noop && entry != NULL && entry->has_relstats))
+	{
+		entry = fasttrun_cache_store_relstats(rel, pages_now, tuples_count,
+											 allvisible_now);
+		if (have_counters)
+			fasttrun_cache_store_delta_state(entry, ins_now, upd_now, del_now,
+											 truncdropped_now);
+	}
 
 	need_plan_inval = (old_pages != pages_now ||
 					   old_tuples != (float4) tuples_count ||
@@ -4615,12 +4808,19 @@ fasttrun_prewarm(PG_FUNCTION_ARGS)
 	int		count = 0;
 	int		alloc = 256;
 	int		i;
+	int		min_idx = 0;
+	bool	min_idx_valid = false;
+	bool	bounded_topn;
 	FasttrunTrackEntry *sorted;
 	HASH_SEQ_STATUS		status;
 	FasttrunTrackEntry *entry;
 
 	if (fasttrun_track_htab == NULL)
 		PG_RETURN_INT32(0);
+
+	bounded_topn = (limit > 0 && limit <= FASTTRUN_TRACK_TOPN_LIMIT);
+	if (bounded_topn)
+		alloc = limit;
 
 	sorted = palloc(sizeof(FasttrunTrackEntry) * alloc);
 
@@ -4630,12 +4830,41 @@ fasttrun_prewarm(PG_FUNCTION_ARGS)
 	{
 		if (entry->create_count <= 0)
 			continue;
-		if (count >= alloc)
+
+		if (!bounded_topn)
 		{
-			alloc *= 2;
-			sorted = repalloc(sorted, sizeof(FasttrunTrackEntry) * alloc);
+			if (count >= alloc)
+			{
+				alloc *= 2;
+				sorted = repalloc(sorted, sizeof(FasttrunTrackEntry) * alloc);
+			}
+			memcpy(&sorted[count++], entry, sizeof(FasttrunTrackEntry));
 		}
-		memcpy(&sorted[count++], entry, sizeof(FasttrunTrackEntry));
+		else if (count < limit)
+		{
+			memcpy(&sorted[count], entry, sizeof(FasttrunTrackEntry));
+			if (!min_idx_valid ||
+				sorted[count].create_count < sorted[min_idx].create_count)
+			{
+				min_idx = count;
+				min_idx_valid = true;
+			}
+			count++;
+		}
+		else
+		{
+			if (entry->create_count > sorted[min_idx].create_count)
+			{
+				int		j;
+
+				memcpy(&sorted[min_idx], entry, sizeof(FasttrunTrackEntry));
+				for (j = 1, min_idx = 0; j < count; j++)
+				{
+					if (sorted[j].create_count < sorted[min_idx].create_count)
+						min_idx = j;
+				}
+			}
+		}
 	}
 	LWLockRelease(fasttrun_track_lock);
 
@@ -4700,7 +4929,7 @@ fasttrun_reset_temp_stats(PG_FUNCTION_ARGS)
 	PG_RETURN_VOID();
 }
 
-/* Define GUCs and install the planner hook. */
+/* Define GUCs and install the always-on utility hook. */
 void
 _PG_init(void)
 {
@@ -4808,21 +5037,14 @@ _PG_init(void)
 	RegisterXactCallback(fasttrun_xact_callback, NULL);
 	RegisterSubXactCallback(fasttrun_subxact_callback, NULL);
 
-	prev_get_relation_stats_hook = get_relation_stats_hook;
-	get_relation_stats_hook = fasttrun_get_relation_stats_hook;
-	prev_get_attavgwidth_hook = get_attavgwidth_hook;
-	get_attavgwidth_hook = fasttrun_get_attavgwidth_hook;
-
 	/*
-	 * planner hook re-injects fasttrun_analyze cached relpages/reltuples
-	 * into rd_rel before planning — defends against relcache rebuilds
-	 * triggered by sinval messages from concurrent backends, which would
-	 * otherwise wipe the in-memory stats and force catastrophic plans.
+	 * Planner/stats hooks are installed lazily on first use of the local
+	 * stats caches.  A backend that only loads fasttrun for tracking, or
+	 * never calls fasttrun_analyze/fasttrun_collect_stats, should not pay
+	 * a planner-hook call on unrelated queries.
 	 */
-		prev_planner_hook = planner_hook;
-		planner_hook = fasttrun_planner_hook;
-		prev_utility_hook = ProcessUtility_hook;
-		ProcessUtility_hook = fasttrun_utility_hook;
+	prev_utility_hook = ProcessUtility_hook;
+	ProcessUtility_hook = fasttrun_utility_hook;
 
 	/* Tracking GUCs */
 	DefineCustomBoolVariable("fasttrun.track_temp_creates",
