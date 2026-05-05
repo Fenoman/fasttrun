@@ -56,6 +56,7 @@
 #include "utils/memutils.h"
 #include "utils/regproc.h"
 #include "utils/rel.h"
+#include "utils/relcache.h"
 #include "utils/sampling.h"
 #include "utils/selfuncs.h"
 #include "utils/snapmgr.h"
@@ -105,6 +106,32 @@ static double	fasttrun_stats_refresh_threshold = 0.2;
 static bool		fasttrun_use_typanalyze = true;
 static bool		fasttrun_zero_sinval_truncate = true;
 
+/*
+ * Per-planning freshness cache for column-stats hooks.
+ *
+ * A single plan can ask get_relation_stats_hook dozens of times for the same
+ * temp relation (one call per predicate/column).  The expensive part is not
+ * the stats hash lookup, but reopening the relation and walking pgstat xact
+ * counters on every call.  While standard_planner runs, cache that pgstat
+ * snapshot per relid; outside planner_hook, fall back to direct reads.
+ */
+#define FASTTRUN_FRESHNESS_CACHE_SLOTS 16
+
+typedef struct FasttrunFreshnessCacheEntry
+{
+	Oid			relid;
+	bool		have;
+	int64		ins;
+	int64		upd;
+	int64		del;
+	bool		truncdropped;
+} FasttrunFreshnessCacheEntry;
+
+static bool		fasttrun_in_planner = false;
+static int		fasttrun_freshness_cache_used = 0;
+static FasttrunFreshnessCacheEntry
+				fasttrun_freshness_cache[FASTTRUN_FRESHNESS_CACHE_SLOTS];
+
 /* "Silent killer" warning — one shot per backend. */
 static bool		fasttrun_warned_track_counts_off = false;
 
@@ -124,6 +151,10 @@ static void fasttrun_collect_and_store(Relation rel, HeapTuple *sample,
 static bool fasttrun_read_pgstat_counters(Relation rel,
 										  int64 *ins, int64 *upd, int64 *del,
 										  bool *truncdropped);
+static bool fasttrun_read_pgstat_counters_for_hook(Oid relid,
+												   int64 *ins, int64 *upd,
+												   int64 *del,
+												   bool *truncdropped);
 static void fasttrun_invalidate_local_plan_cache(Oid relid);
 
 /*
@@ -172,11 +203,12 @@ fasttrun_make_rangevar(text *name)
 /*
  * Lazy-mode cache for fasttrun_analyze.
  *
- * Cached snapshot per relid: (pages, tuples, ins, del, truncdropped).
+ * Cached snapshot per relid: (pages, tuples, ins, upd, del, truncdropped).
  * On next call live row count is reconstructed by exact delta math:
  *     new_tuples = cached_tuples + (ins_now - cached_ins)
  *                                - (del_now - cached_del)
- * UPDATE doesn't change live count and is not tracked.  The planner-visible
+ * UPDATE doesn't change live count, but it is tracked so a pure no-DML hit can
+ * skip visibility-map and index-stat maintenance.  The planner-visible
  * relstats part can survive COMMIT, but the pgstat-delta part is valid only
  * inside the transaction where the xact counters were captured.  Cache
  * invalidated if: pages dropped (TRUNCATE-like), truncdropped bit changed,
@@ -209,6 +241,7 @@ typedef struct FasttrunAnalyzeRelstatsUndo
 	RelFileLocator cached_locator;
 	bool		has_delta_state;
 	int64		cached_inserted;
+	int64		cached_updated;
 	int64		cached_deleted;
 	bool		cached_truncdropped;
 	SubTransactionId relstats_subid;
@@ -237,6 +270,7 @@ typedef struct FasttrunAnalyzeCacheEntry
 	 */
 	bool		has_delta_state;
 	int64		cached_inserted;
+	int64		cached_updated;
 	int64		cached_deleted;
 	bool		cached_truncdropped;	/* OR of truncdropped over subxact stack */
 	SubTransactionId relstats_subid;
@@ -462,6 +496,7 @@ fasttrun_cache_commit_xact(void)
 
 		entry->has_delta_state = false;
 		entry->cached_inserted = 0;
+		entry->cached_updated = 0;
 		entry->cached_deleted = 0;
 		entry->cached_truncdropped = false;
 		entry->relstats_subid = InvalidSubTransactionId;
@@ -568,6 +603,7 @@ fasttrun_cache_enter(Oid relid)
 		entry->cached_allvisible = 0;
 		entry->has_delta_state = false;
 		entry->cached_inserted = 0;
+		entry->cached_updated = 0;
 		entry->cached_deleted = 0;
 		entry->cached_truncdropped = false;
 		entry->relstats_subid = InvalidSubTransactionId;
@@ -604,6 +640,7 @@ fasttrun_cache_save_relstats_undo(FasttrunAnalyzeCacheEntry *entry)
 	saved->cached_locator = entry->cached_locator;
 	saved->has_delta_state = entry->has_delta_state;
 	saved->cached_inserted = entry->cached_inserted;
+	saved->cached_updated = entry->cached_updated;
 	saved->cached_deleted = entry->cached_deleted;
 	saved->cached_truncdropped = entry->cached_truncdropped;
 	saved->relstats_subid = entry->relstats_subid;
@@ -632,10 +669,12 @@ fasttrun_cache_store_relstats(Relation rel, BlockNumber pages, int64 tuples,
 
 static void
 fasttrun_cache_store_delta_state(FasttrunAnalyzeCacheEntry *entry,
-								 int64 ins, int64 del, bool truncdropped)
+								 int64 ins, int64 upd, int64 del,
+								 bool truncdropped)
 {
 	entry->has_delta_state = true;
 	entry->cached_inserted = ins;
+	entry->cached_updated = upd;
 	entry->cached_deleted = del;
 	entry->cached_truncdropped = truncdropped;
 }
@@ -769,6 +808,9 @@ fasttrun_cache_remove_rel_and_indexes(Relation rel)
 	List	   *index_oids;
 	ListCell   *lc;
 
+	if (fasttrun_analyze_cache == NULL)
+		return;
+
 	fasttrun_cache_remove(RelationGetRelid(rel));
 
 	index_oids = RelationGetIndexList(rel);
@@ -782,6 +824,9 @@ fasttrun_cache_mark_rel_and_indexes_evicted(Relation rel)
 {
 	List	   *index_oids;
 	ListCell   *lc;
+
+	if (fasttrun_analyze_cache == NULL)
+		return;
 
 	fasttrun_cache_mark_evicted(RelationGetRelid(rel));
 
@@ -838,7 +883,8 @@ fasttrun_cache_seed_after_truncate(Relation rel)
 	cur_subid = GetCurrentSubTransactionId();
 
 	/* Delta-math state: post-truncate empty table. */
-	fasttrun_cache_store_delta_state(entry, ins_now, del_now, truncdropped_now);
+	fasttrun_cache_store_delta_state(entry, ins_now, upd_now, del_now,
+									 truncdropped_now);
 
 	/*
 	 * Stats baseline: same snapshot.  has_stats_baseline=true so the
@@ -881,6 +927,66 @@ fasttrun_reinject_relstats(Relation rel, FasttrunAnalyzeCacheEntry *entry)
 	rel->rd_rel->relpages = entry->cached_pages;
 	rel->rd_rel->reltuples = cached_tuples;
 	rel->rd_rel->relallvisible = (int32) entry->cached_allvisible;
+}
+
+static void
+fasttrun_reinject_cached_relation(Relation rel)
+{
+	FasttrunAnalyzeCacheEntry *entry;
+
+	entry = fasttrun_cache_lookup(RelationGetRelid(rel));
+	if (entry == NULL || !entry->has_relstats)
+		return;
+
+	fasttrun_reinject_relstats(rel, entry);
+}
+
+static void
+fasttrun_reinject_rte_relstats(RangeTblEntry *rte)
+{
+	Relation	rel;
+	List	   *index_oids;
+	ListCell   *lc;
+
+	if (rte->rtekind != RTE_RELATION || !OidIsValid(rte->relid))
+		return;
+
+	/*
+	 * Most queries either do not touch temp tables or touch a temp table that
+	 * fasttrun never analyzed.  Avoid relation_open on that common miss.
+	 */
+	if (fasttrun_cache_lookup(rte->relid) == NULL)
+		return;
+
+	rel = RelationIdGetRelation(rte->relid);
+	if (!RelationIsValid(rel))
+		return;
+
+	fasttrun_reinject_cached_relation(rel);
+
+	if (rel->rd_rel->relkind == RELKIND_RELATION ||
+		rel->rd_rel->relkind == RELKIND_TOASTVALUE)
+	{
+		index_oids = RelationGetIndexList(rel);
+		foreach(lc, index_oids)
+		{
+			Oid			index_oid = lfirst_oid(lc);
+			Relation	indexrel;
+
+			if (fasttrun_cache_lookup(index_oid) == NULL)
+				continue;
+
+			indexrel = RelationIdGetRelation(index_oid);
+			if (!RelationIsValid(indexrel))
+				continue;
+
+			fasttrun_reinject_cached_relation(indexrel);
+			RelationClose(indexrel);
+		}
+		list_free(index_oids);
+	}
+
+	RelationClose(rel);
 }
 
 /*
@@ -1012,7 +1118,6 @@ fasttrun_get_relation_stats_hook(PlannerInfo *root, RangeTblEntry *rte,
 {
 	FasttrunStatsKey key;
 	FasttrunStatsEntry *entry;
-	Relation		rel;
 	int64			ins_now = 0;
 	int64			upd_now = 0;
 	int64			del_now = 0;
@@ -1031,21 +1136,9 @@ fasttrun_get_relation_stats_hook(PlannerInfo *root, RangeTblEntry *rte,
 		goto chain;
 
 	/* Freshness check: pgstat counters must match the collect-time snapshot. */
-	rel = RelationIdGetRelation(rte->relid);
-	if (rel == NULL)
+	if (!fasttrun_read_pgstat_counters_for_hook(rte->relid, &ins_now, &upd_now,
+												&del_now, &truncdropped_now))
 		goto chain;
-	{
-		bool	have = fasttrun_read_pgstat_counters(rel, &ins_now, &upd_now,
-													 &del_now, &truncdropped_now);
-		RelationClose(rel);
-		/*
-		 * track_counts=off → a zeroed snapshot cannot prove freshness
-		 * (it would match any zeroed collect).  Refuse to return the
-		 * cached tuple so the planner falls back to defaults.
-		 */
-		if (!have)
-			goto chain;
-	}
 
 	if (ins_now != entry->collected_ins ||
 		upd_now != entry->collected_upd ||
@@ -1085,7 +1178,6 @@ fasttrun_get_attavgwidth_hook(Oid relid, AttrNumber attnum)
 {
 	FasttrunStatsKey	key;
 	FasttrunStatsEntry *entry;
-	Relation			rel;
 	int64				ins_now = 0;
 	int64				upd_now = 0;
 	int64				del_now = 0;
@@ -1104,16 +1196,9 @@ fasttrun_get_attavgwidth_hook(Oid relid, AttrNumber attnum)
 	if (entry == NULL || entry->statsTuple == NULL)
 		goto chain;
 
-	rel = RelationIdGetRelation(relid);
-	if (rel == NULL)
+	if (!fasttrun_read_pgstat_counters_for_hook(relid, &ins_now, &upd_now,
+												&del_now, &truncdropped_now))
 		goto chain;
-	{
-		bool	have = fasttrun_read_pgstat_counters(rel, &ins_now, &upd_now,
-													 &del_now, &truncdropped_now);
-		RelationClose(rel);
-		if (!have)
-			goto chain;
-	}
 
 	if (ins_now != entry->collected_ins ||
 		upd_now != entry->collected_upd ||
@@ -1146,37 +1231,50 @@ chain:
  * picks catastrophic plans (Seq Scan over what looks like a tiny table,
  * nested loop joins on big working sets).
  *
- * We walk our analyze cache and, for any entry whose cached relstats no
- * longer match rd_rel for the same relfilenode, push the cached values back
- * into rd_rel.  Subsequent planning in this backend sees the right numbers.
+ * We walk only the current query's rangetable and re-inject cached stats for
+ * those temp heaps plus their indexes.  This keeps unrelated cached temp
+ * tables at zero cost for plans that don't reference them.
  */
 static PlannedStmt *
 fasttrun_planner_hook(Query *parse, const char *query_string,
 					  int cursorOptions, ParamListInfo boundParams)
 {
+	PlannedStmt *result = NULL;
+	bool		saved_in_planner = fasttrun_in_planner;
+	int			saved_freshness_cache_used = fasttrun_freshness_cache_used;
+
 	if (fasttrun_analyze_cache != NULL)
 	{
-		HASH_SEQ_STATUS status;
-		FasttrunAnalyzeCacheEntry *entry;
+		ListCell   *lc;
 
-		hash_seq_init(&status, fasttrun_analyze_cache);
-		while ((entry = hash_seq_search(&status)) != NULL)
-		{
-			Relation rel;
-
-			rel = RelationIdGetRelation(entry->relid);
-			if (!RelationIsValid(rel))
-				continue;
-
-			fasttrun_reinject_relstats(rel, entry);
-			RelationClose(rel);
-		}
+		foreach(lc, parse->rtable)
+			fasttrun_reinject_rte_relstats((RangeTblEntry *) lfirst(lc));
 	}
 
-	if (prev_planner_hook)
-		return prev_planner_hook(parse, query_string, cursorOptions, boundParams);
-	else
-		return standard_planner(parse, query_string, cursorOptions, boundParams);
+	fasttrun_in_planner = true;
+	fasttrun_freshness_cache_used = 0;
+
+	PG_TRY();
+	{
+		if (prev_planner_hook)
+			result = prev_planner_hook(parse, query_string, cursorOptions,
+									   boundParams);
+		else
+			result = standard_planner(parse, query_string, cursorOptions,
+									  boundParams);
+	}
+	PG_CATCH();
+	{
+		fasttrun_in_planner = saved_in_planner;
+		fasttrun_freshness_cache_used = saved_freshness_cache_used;
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	fasttrun_in_planner = saved_in_planner;
+	fasttrun_freshness_cache_used = saved_freshness_cache_used;
+
+	return result;
 }
 
 /*
@@ -1226,6 +1324,66 @@ fasttrun_read_pgstat_counters(Relation rel,
 	}
 
 	return true;
+}
+
+static bool
+fasttrun_read_pgstat_counters_for_hook(Oid relid,
+									   int64 *ins, int64 *upd, int64 *del,
+									   bool *truncdropped)
+{
+	int		i;
+	Relation rel;
+	bool	have;
+
+	if (fasttrun_in_planner)
+	{
+		for (i = 0; i < fasttrun_freshness_cache_used; i++)
+		{
+			FasttrunFreshnessCacheEntry *slot = &fasttrun_freshness_cache[i];
+
+			if (slot->relid != relid)
+				continue;
+
+			*ins = slot->ins;
+			if (upd != NULL)
+				*upd = slot->upd;
+			*del = slot->del;
+			*truncdropped = slot->truncdropped;
+			return slot->have;
+		}
+	}
+
+	rel = RelationIdGetRelation(relid);
+	if (rel == NULL)
+	{
+		have = false;
+		*ins = 0;
+		if (upd != NULL)
+			*upd = 0;
+		*del = 0;
+		*truncdropped = false;
+	}
+	else
+	{
+		have = fasttrun_read_pgstat_counters(rel, ins, upd, del, truncdropped);
+		RelationClose(rel);
+	}
+
+	if (fasttrun_in_planner &&
+		fasttrun_freshness_cache_used < FASTTRUN_FRESHNESS_CACHE_SLOTS)
+	{
+		FasttrunFreshnessCacheEntry *slot =
+			&fasttrun_freshness_cache[fasttrun_freshness_cache_used++];
+
+		slot->relid = relid;
+		slot->have = have;
+		slot->ins = *ins;
+		slot->upd = (upd != NULL) ? *upd : 0;
+		slot->del = *del;
+		slot->truncdropped = *truncdropped;
+	}
+
+	return have;
 }
 
 /* ---- Stats sample collection: Haas-Stokes n_distinct + null_frac + width ---- */
@@ -1701,6 +1859,7 @@ fasttrun_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 						aentry->cached_locator = popped->cached_locator;
 						aentry->has_delta_state = popped->has_delta_state;
 						aentry->cached_inserted = popped->cached_inserted;
+						aentry->cached_updated = popped->cached_updated;
 						aentry->cached_deleted = popped->cached_deleted;
 						aentry->cached_truncdropped = popped->cached_truncdropped;
 						aentry->relstats_subid = popped->relstats_subid;
@@ -2145,11 +2304,9 @@ fasttrun_relation_has_partial_index(Relation rel)
 	foreach(lc, index_oids)
 	{
 		Relation	indexrel;
-		IndexInfo  *indexInfo;
 
 		indexrel = index_open(lfirst_oid(lc), AccessShareLock);
-		indexInfo = BuildIndexInfo(indexrel);
-		if (indexInfo->ii_Predicate != NIL)
+		if (RelationGetIndexPredicate(indexrel) != NIL)
 			found_partial = true;
 		index_close(indexrel, AccessShareLock);
 		if (found_partial)
@@ -2173,23 +2330,31 @@ fasttrun_update_index_relstats(Relation rel, HeapTuple *sample, int sample_count
 	{
 		Oid			indexOid = lfirst_oid(lc);
 		Relation	indexrel;
-		IndexInfo  *indexInfo;
 		BlockNumber	index_pages;
 		double		tuple_fract;
 		int64		index_tuples;
+		bool		is_partial;
 
 		indexrel = index_open(indexOid, AccessShareLock);
-		indexInfo = BuildIndexInfo(indexrel);
+		is_partial = (RelationGetIndexPredicate(indexrel) != NIL);
 
-		if (indexInfo->ii_Predicate != NIL && sample_count <= 0 && totalrows > 0)
+		if (is_partial && sample_count <= 0 && totalrows > 0)
 		{
 			index_close(indexrel, AccessShareLock);
 			continue;
 		}
 
 		index_pages = RelationGetNumberOfBlocks(indexrel);
-		tuple_fract = fasttrun_estimate_index_fraction(rel, indexrel, indexInfo,
-													   sample, sample_count);
+		if (is_partial)
+		{
+			IndexInfo  *indexInfo = BuildIndexInfo(indexrel);
+
+			tuple_fract = fasttrun_estimate_index_fraction(rel, indexrel,
+														   indexInfo, sample,
+														   sample_count);
+		}
+		else
+			tuple_fract = 1.0;
 		index_tuples = (int64) ceil(tuple_fract * (double) totalrows);
 
 		if (indexrel->rd_rel->relpages != index_pages ||
@@ -2800,7 +2965,8 @@ fasttrun_rebuild_one_index(Relation heaprel, Relation indexrel)
 static void
 fasttrun_full_bypass_truncate(Relation rel)
 {
-	ListCell   *indlist;
+	List	   *index_oids;
+	ListCell   *lc;
 	Oid			toastrelid;
 
 	/* 1. Truncate the heap itself. */
@@ -2816,31 +2982,36 @@ fasttrun_full_bypass_truncate(Relation rel)
 	 */
 	PG_TRY();
 	{
-		foreach(indlist, RelationGetIndexList(rel))
+		index_oids = RelationGetIndexList(rel);
+		foreach(lc, index_oids)
 		{
 			Relation	currentIndex;
 
-			currentIndex = index_open(lfirst_oid(indlist), AccessExclusiveLock);
+			currentIndex = index_open(lfirst_oid(lc), AccessExclusiveLock);
 			fasttrun_rebuild_one_index(rel, currentIndex);
 			index_close(currentIndex, NoLock);
 		}
+		list_free(index_oids);
 
 		toastrelid = rel->rd_rel->reltoastrelid;
 		if (OidIsValid(toastrelid))
 		{
 			Relation	toastrel = table_open(toastrelid, AccessExclusiveLock);
+			List	   *toast_index_oids;
 
 			fasttrun_smgr_bypass_truncate(toastrel);
 
-			foreach(indlist, RelationGetIndexList(toastrel))
+			toast_index_oids = RelationGetIndexList(toastrel);
+			foreach(lc, toast_index_oids)
 			{
 				Relation	currentIndex;
 
-				currentIndex = index_open(lfirst_oid(indlist),
+				currentIndex = index_open(lfirst_oid(lc),
 										  AccessExclusiveLock);
 				fasttrun_rebuild_one_index(toastrel, currentIndex);
 				index_close(currentIndex, NoLock);
 			}
+			list_free(toast_index_oids);
 
 			table_close(toastrel, NoLock);
 		}
@@ -3081,10 +3252,14 @@ fasttrun_analyze(PG_FUNCTION_ARGS)
 	bool			stats_visibility_changed = false;
 	bool			index_relstats_changed = false;
 	bool			need_plan_inval = false;
+	bool			pure_delta_noop = false;
 	BlockNumber		allvisible_now = 0;
 	BlockNumber		old_pages;
 	int32			old_allvisible;
 	float4			old_tuples;
+	int64			delta_ins = 0;
+	int64			delta_upd = 0;
+	int64			delta_del = 0;
 	FasttrunAnalyzeCacheEntry *entry = NULL;
 
 	relvar = fasttrun_make_rangevar(name);
@@ -3129,14 +3304,19 @@ fasttrun_analyze(PG_FUNCTION_ARGS)
 			&& pages_now >= entry->cached_pages
 			&& entry->cached_truncdropped == truncdropped_now)
 		{
-			int64	delta_ins = ins_now - entry->cached_inserted;
-			int64	delta_del = del_now - entry->cached_deleted;
-			int64	new_tuples = entry->cached_tuples + delta_ins - delta_del;
+			int64	new_tuples;
+
+			delta_ins = ins_now - entry->cached_inserted;
+			delta_upd = upd_now - entry->cached_updated;
+			delta_del = del_now - entry->cached_deleted;
+			new_tuples = entry->cached_tuples + delta_ins - delta_del;
 
 			if (new_tuples >= 0)
 			{
 				tuples_count = new_tuples;
 				scan_needed = false;
+				pure_delta_noop =
+					(delta_ins == 0 && delta_upd == 0 && delta_del == 0);
 			}
 		}
 	}
@@ -3216,8 +3396,7 @@ fasttrun_analyze(PG_FUNCTION_ARGS)
 
 	if (!scan_needed && have_counters && !stats_recollected &&
 		fasttrun_sample_rows != 0 &&
-		entry != NULL && entry->has_stats_baseline &&
-		fasttrun_relation_has_partial_index(rel))
+		entry != NULL && entry->has_stats_baseline)
 	{
 		int64		churn;
 
@@ -3227,7 +3406,7 @@ fasttrun_analyze(PG_FUNCTION_ARGS)
 		if (churn < 0)
 			churn = -churn;
 
-		if (churn > 0)
+		if (churn > 0 && fasttrun_relation_has_partial_index(rel))
 		{
 			int			sample_target = fasttrun_effective_sample_target(rel);
 
@@ -3254,7 +3433,7 @@ fasttrun_analyze(PG_FUNCTION_ARGS)
 		}
 	}
 
-	if (!scan_needed && !stats_recollected)
+	if (!scan_needed && !stats_recollected && !pure_delta_noop)
 		index_relstats_changed |=
 			fasttrun_update_index_relstats(rel, NULL, 0, tuples_count);
 
@@ -3322,11 +3501,14 @@ fasttrun_analyze(PG_FUNCTION_ARGS)
 											  del_now, truncdropped_now);
 	}
 
-	allvisible_now = fasttrun_count_allvisible(rel);
+	if (pure_delta_noop && entry != NULL && entry->has_relstats)
+		allvisible_now = entry->cached_allvisible;
+	else
+		allvisible_now = fasttrun_count_allvisible(rel);
 	entry = fasttrun_cache_store_relstats(rel, pages_now, tuples_count,
 										 allvisible_now);
 	if (have_counters)
-		fasttrun_cache_store_delta_state(entry, ins_now, del_now,
+		fasttrun_cache_store_delta_state(entry, ins_now, upd_now, del_now,
 										 truncdropped_now);
 
 	need_plan_inval = (old_pages != pages_now ||
@@ -3665,6 +3847,8 @@ typedef struct
 
 static FasttrunSchedWindow fasttrun_sched_windows[FASTTRUN_SCHED_MAX_WINDOWS];
 static int		fasttrun_sched_window_count = 0;
+static pg_time_t fasttrun_sched_cache_minute = (pg_time_t) -1;
+static bool		fasttrun_sched_cache_active = true;
 
 /* Parse day token: "mon", "tue", ..., "sun". Returns 0-6 or -1 on error. */
 static int
@@ -3834,6 +4018,7 @@ static bool
 fasttrun_schedule_is_active_now(void)
 {
 	pg_time_t	now;
+	pg_time_t	cache_minute;
 	struct pg_tm *tm;
 	int			weekday, minute_of_day;
 	int			i;
@@ -3842,9 +4027,17 @@ fasttrun_schedule_is_active_now(void)
 		return true;				/* no schedule = always active */
 
 	now = (pg_time_t) time(NULL);
+	cache_minute = now / 60;
+	if (fasttrun_sched_cache_minute == cache_minute)
+		return fasttrun_sched_cache_active;
+
 	tm = pg_localtime(&now, log_timezone);
 	if (tm == NULL)
+	{
+		fasttrun_sched_cache_minute = cache_minute;
+		fasttrun_sched_cache_active = true;
 		return true;				/* tz error — fall back to active */
+	}
 
 	weekday = tm->tm_wday;			/* 0=Sunday */
 	minute_of_day = tm->tm_hour * 60 + tm->tm_min;
@@ -3856,9 +4049,15 @@ fasttrun_schedule_is_active_now(void)
 		if ((w->day_mask & (1 << weekday)) &&
 			minute_of_day >= w->start_min &&
 			minute_of_day < w->end_min)
+		{
+			fasttrun_sched_cache_minute = cache_minute;
+			fasttrun_sched_cache_active = true;
 			return true;
+		}
 	}
 
+	fasttrun_sched_cache_minute = cache_minute;
+	fasttrun_sched_cache_active = false;
 	return false;
 }
 
@@ -3876,11 +4075,15 @@ fasttrun_track_schedule_assign_hook(const char *newval, void *extra)
 				(errmsg("fasttrun: invalid track_schedule \"%s\", tracking will stay always-on",
 						newval)));
 		fasttrun_sched_window_count = 0;
+		fasttrun_sched_cache_minute = (pg_time_t) -1;
+		fasttrun_sched_cache_active = true;
 		return;
 	}
 
 	memcpy(fasttrun_sched_windows, parsed, sizeof(parsed));
 	fasttrun_sched_window_count = n;
+	fasttrun_sched_cache_minute = (pg_time_t) -1;
+	fasttrun_sched_cache_active = true;
 }
 
 /* Shmem request hook — called during postmaster startup. */
