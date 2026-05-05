@@ -4021,6 +4021,8 @@ fasttrun_inspect_stats(PG_FUNCTION_ARGS)
 	/* Empty cache → empty result. */
 	if (fasttrun_stats_cache == NULL)
 		return (Datum) 0;
+	if (!fasttrun_stats_relid_exists(relOid))
+		return (Datum) 0;
 
 	hash_seq_init(&status, fasttrun_stats_cache);
 	while ((entry = (FasttrunStatsEntry *) hash_seq_search(&status)) != NULL)
@@ -4514,6 +4516,9 @@ static void
 fasttrun_evict_utility_caches(Node *parsetree)
 {
 	if (parsetree == NULL)
+		return;
+
+	if (fasttrun_analyze_cache == NULL && fasttrun_stats_cache == NULL)
 		return;
 
 	switch (nodeTag(parsetree))

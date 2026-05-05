@@ -335,7 +335,7 @@ Statistics are saved to disk (`pg_stat/fasttrun_temp_stats`) on server shutdown 
 * **Heap AM only** — checked on entry of all functions. For columnar and other exotica — an error.
 * **Does not check foreign keys** — `fasttruncate` doesn't scan `pg_constraint`. By our convention, FKs are not created on temporary tables.
 * **Not transactional** — on ROLLBACK the data is not restored.
-* **`track_counts = on` is required for column stats freshness** — without pgstat counters the extension updates only relation-level statistics and does not return cached column stats to the planner.
+* **`track_counts = on` is required for column stats freshness** — without pgstat counters the extension updates only relation-level statistics, emits a WARNING once per backend, and does not return cached column stats to the planner.
 * **Extended statistics** (`CREATE STATISTICS`) — not supported, there is no suitable hook in the core.
 * **Inheritance stats** — not supported. Temporary work tables normally do not use this path.
 * **Sequences** — `fasttruncate` does not reset SERIAL/IDENTITY sequences (same as regular `TRUNCATE` without `RESTART IDENTITY`).
@@ -359,7 +359,7 @@ Single source file, version differences handled via `#if PG_VERSION_NUM`.
 ## File structure
 
 ```
-fasttrun.c                    # main C code (~3300 lines)
+fasttrun.c                    # main C code (~5100 lines)
 fasttrun.control              # extension metadata
 fasttrun--2.1.2.sql           # current version (8 functions)
 fasttrun--2.0.sql             # old base version

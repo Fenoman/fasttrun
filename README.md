@@ -337,7 +337,7 @@ fasttrun.track_schedule = ''
 * **Только heap AM** — проверка на входе всех функций. Для columnar и прочей экзотики — ошибка.
 * **Не проверяет внешние ключи** — `fasttruncate` не сканирует `pg_constraint`. По нашему соглашению, на временных таблицах FK не создаются.
 * **Не транзакционный** — при ROLLBACK данные не восстановятся.
-* **`track_counts = on` нужен для свежести column stats** — без pgstat counters расширение обновляет только relation-level статистику, а cached column stats не отдаёт планировщику.
+* **`track_counts = on` нужен для свежести column stats** — без pgstat counters расширение обновляет только relation-level статистику, пишет WARNING один раз на backend, а cached column stats не отдаёт планировщику.
 * **Расширенная статистика** (`CREATE STATISTICS`) — не поддерживается, нет подходящего хука в ядре.
 * **Inheritance stats** — не поддерживается. Для временных рабочих таблиц этот путь обычно не используется.
 * **Последовательности** — `fasttruncate` не сбрасывает SERIAL/IDENTITY sequence (как и обычный `TRUNCATE` без `RESTART IDENTITY`).
@@ -361,7 +361,7 @@ fasttrun.track_schedule = ''
 ## Файловая структура
 
 ```
-fasttrun.c                    # основной C-код (~3300 строк)
+fasttrun.c                    # основной C-код (~5100 строк)
 fasttrun.control              # метаданные расширения
 fasttrun--2.1.2.sql           # текущая версия (8 функций)
 fasttrun--2.0.sql             # старая базовая версия
