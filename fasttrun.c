@@ -1251,6 +1251,21 @@ fasttrun_planner_hook(Query *parse, const char *query_string,
 			fasttrun_reinject_rte_relstats((RangeTblEntry *) lfirst(lc));
 	}
 
+	/*
+	 * The freshness frame is only useful for cached column statistics.
+	 * With no stats cache, keep the planner-hook overhead to a plain hook
+	 * call plus relstats reinjection above; avoid PG_TRY/sigsetjmp on every
+	 * planned query.
+	 */
+	if (fasttrun_stats_cache == NULL)
+	{
+		if (prev_planner_hook)
+			return prev_planner_hook(parse, query_string, cursorOptions,
+									 boundParams);
+		return standard_planner(parse, query_string, cursorOptions,
+								boundParams);
+	}
+
 	fasttrun_in_planner = true;
 	fasttrun_freshness_cache_used = 0;
 
@@ -3240,7 +3255,7 @@ fasttrun_analyze(PG_FUNCTION_ARGS)
 	RangeVar	   *relvar;
 	Oid				relOid;
 	Relation		rel;
-	BlockNumber		pages_now;
+	BlockNumber		pages_now = 0;
 	int64			tuples_count = 0;
 	int64			ins_now = 0;
 	int64			upd_now = 0;
@@ -3253,6 +3268,7 @@ fasttrun_analyze(PG_FUNCTION_ARGS)
 	bool			index_relstats_changed = false;
 	bool			need_plan_inval = false;
 	bool			pure_delta_noop = false;
+	bool			pages_now_known = false;
 	BlockNumber		allvisible_now = 0;
 	BlockNumber		old_pages;
 	int32			old_allvisible;
@@ -3286,7 +3302,6 @@ fasttrun_analyze(PG_FUNCTION_ARGS)
 			 RelationGetRelationName(rel));
 	}
 
-	pages_now = RelationGetNumberOfBlocks(rel);
 	old_pages = rel->rd_rel->relpages;
 	old_allvisible = rel->rd_rel->relallvisible;
 	old_tuples = rel->rd_rel->reltuples;
@@ -3301,7 +3316,6 @@ fasttrun_analyze(PG_FUNCTION_ARGS)
 		if (entry != NULL
 			&& entry->has_delta_state
 			&& fasttrun_relation_has_same_locator(rel, entry)
-			&& pages_now >= entry->cached_pages
 			&& entry->cached_truncdropped == truncdropped_now)
 		{
 			int64	new_tuples;
@@ -3313,12 +3327,39 @@ fasttrun_analyze(PG_FUNCTION_ARGS)
 
 			if (new_tuples >= 0)
 			{
-				tuples_count = new_tuples;
-				scan_needed = false;
 				pure_delta_noop =
 					(delta_ins == 0 && delta_upd == 0 && delta_del == 0);
+				if (pure_delta_noop)
+				{
+					/*
+					 * No DML means the heap size cannot have grown through
+					 * the delta path.  Use our relstats snapshot as the
+					 * authoritative value and avoid one smgrnblocks/lseek
+					 * per hot no-op fasttrun_analyze().
+					 */
+					pages_now = entry->cached_pages;
+					pages_now_known = true;
+					tuples_count = new_tuples;
+					scan_needed = false;
+				}
+				else
+				{
+					pages_now = RelationGetNumberOfBlocks(rel);
+					pages_now_known = true;
+					if (pages_now >= entry->cached_pages)
+					{
+						tuples_count = new_tuples;
+						scan_needed = false;
+					}
+				}
 			}
 		}
+	}
+
+	if (!pages_now_known)
+	{
+		pages_now = RelationGetNumberOfBlocks(rel);
+		pages_now_known = true;
 	}
 
 	/*
@@ -3812,6 +3853,7 @@ fasttrun_inspect_stats(PG_FUNCTION_ARGS)
  * ================================================================ */
 
 #define FASTTRUN_TRACK_MAX		8192
+#define FASTTRUN_TRACK_TOPN_LIMIT 1024
 #define FASTTRUN_TRACK_FILE		"pg_stat/fasttrun_temp_stats"
 #define FASTTRUN_TRACK_MAGIC	0x46545354	/* "FTST" */
 
@@ -4444,7 +4486,11 @@ fasttrun_hot_temp_tables(PG_FUNCTION_ARGS)
 	FasttrunTrackEntry *sorted;
 	int					count = 0;
 	int					alloc = 256;
+	int					output_count;
 	int					i;
+	int					min_idx = 0;
+	bool				min_idx_valid = false;
+	bool				bounded_topn;
 
 	if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo) ||
 		(rsinfo->allowedModes & SFRM_Materialize) == 0)
@@ -4469,7 +4515,11 @@ fasttrun_hot_temp_tables(PG_FUNCTION_ARGS)
 	if (fasttrun_track_htab == NULL)
 		return (Datum) 0;
 
-	/* Collect all entries into a sortable array. */
+	bounded_topn = (limit > 0 && limit <= FASTTRUN_TRACK_TOPN_LIMIT);
+	if (bounded_topn)
+		alloc = limit;
+
+	/* Collect entries into a sortable array, or keep only a bounded top-N. */
 	sorted = palloc(sizeof(FasttrunTrackEntry) * alloc);
 
 	LWLockAcquire(fasttrun_track_lock, LW_SHARED);
@@ -4478,12 +4528,41 @@ fasttrun_hot_temp_tables(PG_FUNCTION_ARGS)
 	{
 		if (entry->create_count <= 0)
 			continue;
-		if (count >= alloc)
+
+		if (!bounded_topn)
 		{
-			alloc *= 2;
-			sorted = repalloc(sorted, sizeof(FasttrunTrackEntry) * alloc);
+			if (count >= alloc)
+			{
+				alloc *= 2;
+				sorted = repalloc(sorted, sizeof(FasttrunTrackEntry) * alloc);
+			}
+			memcpy(&sorted[count++], entry, sizeof(FasttrunTrackEntry));
 		}
-		memcpy(&sorted[count++], entry, sizeof(FasttrunTrackEntry));
+		else if (count < limit)
+		{
+			memcpy(&sorted[count], entry, sizeof(FasttrunTrackEntry));
+			if (!min_idx_valid ||
+				sorted[count].create_count < sorted[min_idx].create_count)
+			{
+				min_idx = count;
+				min_idx_valid = true;
+			}
+			count++;
+		}
+		else
+		{
+			if (entry->create_count > sorted[min_idx].create_count)
+			{
+				int		j;
+
+				memcpy(&sorted[min_idx], entry, sizeof(FasttrunTrackEntry));
+				for (j = 1, min_idx = 0; j < count; j++)
+				{
+					if (sorted[j].create_count < sorted[min_idx].create_count)
+						min_idx = j;
+				}
+			}
+		}
 	}
 	LWLockRelease(fasttrun_track_lock);
 
@@ -4492,10 +4571,14 @@ fasttrun_hot_temp_tables(PG_FUNCTION_ARGS)
 		  fasttrun_track_cmp_desc);
 
 	/* Emit top-N rows. */
-	if (limit <= 0 || limit > count)
-		limit = count;
+	if (bounded_topn)
+		output_count = count;
+	else if (limit <= 0 || limit > count)
+		output_count = count;
+	else
+		output_count = limit;
 
-	for (i = 0; i < limit; i++)
+	for (i = 0; i < output_count; i++)
 	{
 		Datum		values[3];
 		bool		nulls[3] = {false, false, false};
