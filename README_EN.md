@@ -20,6 +20,7 @@ This fasttrun fork tries to solve both problems:
 |---|---|---|
 | `fasttruncate(text)` | Clears a temporary table (heap + indexes + toast) | **no** |
 | `fasttrun_analyze(text)` | Publishes `relpages/reltuples` + collects column statistics | **no** |
+| `fasttrun_analyze_bulk(VARIADIC text[])` | Batch variant of `fasttrun_analyze` for several tables in one call. Plan-cache invalidations are emitted inline per table -- the first marks affected cached SPI/PREPARE plans `is_valid=false`, and every subsequent message in the batch short-circuits in core's `PlanCacheRelCallback` on that flag -- O(1) per message. Useful in loops touching many temp tables per transaction. | **no** |
 | `fasttrun_collect_stats(text)` | Explicit column statistics collection. In 99% of cases `fasttrun_analyze` is enough — it does the same automatically on the first pass. This function is needed only if auto-collection is disabled (`auto_collect_stats=off`) or you want to force a rebuild | **no** |
 | `fasttrun_relstats(text)` | Returns current `relpages/reltuples` from process memory | **no** |
 | `fasttrun_inspect_stats(text)` | Returns cached statsTuple in `pg_statistic` format (for debugging) | **no** |
@@ -89,6 +90,7 @@ There are deliberate boundaries: extended statistics, expression-index statistic
 | `fasttrun.sample_rows` | `3000` | Sample size. `0` — disable column stats collection; relation-level relstats for the heap and regular indexes are still updated. `-1` — auto (same as regular `ANALYZE`) |
 | `fasttrun.use_typanalyze` | `on` | Use `std_typanalyze` from core (MCV/histogram/correlation). `off` — only n_distinct/null_frac/width |
 | `fasttrun.stats_refresh_threshold` | `0.2` | DML change ratio threshold for stats refresh. `0` — on any DML. `1` — automatic refresh disabled; after DML cached stats are hidden until an explicit refresh |
+| `fasttrun.invalidate_threshold` | `0.2` | `relpages`/`reltuples` drift ratio below which `fasttrun_analyze` does NOT invalidate cached SPI/PREPARE plans. Symmetric with `stats_refresh_threshold` — below 20% DML neither refresh nor plan invalidation fires. `0` — invalidate on any drift (the 2.2.0 behaviour). Invalidations triggered by a column-stats refresh, an index relstats change, or a stats-visibility flip always fire, regardless of this threshold |
 | `fasttrun.zero_sinval_truncate` | `on` | Direct `unlink`+`smgrcreate` instead of `smgrtruncate`. `off` — old path with 1 SMGR sinval |
 
 ## Performance
@@ -131,9 +133,9 @@ make install PG_CONFIG=/path/to/pg_config
 CREATE EXTENSION fasttrun;
 ```
 
-By default, this installs version `2.2.0`.
+By default, this installs version `2.3.0`.
 
-Upgrade from older versions `2.0` / `2.1` / `2.1.1` / `2.1.2` is supported:
+Upgrade from older versions `2.0` / `2.1` / `2.1.1` / `2.1.2` / `2.2.0` is supported:
 ```sql
 ALTER EXTENSION fasttrun UPDATE;
 ```
@@ -152,7 +154,7 @@ make installcheck PG_CONFIG=/path/to/pg_config PGPORT=5433
 | `fasttrun_silent` | Silent behavior on non-existent / non-temp tables |
 | `fasttrun_stats_reset` | `relpages/reltuples` reset after fasttruncate |
 | `fasttrun_analyze` | Delta math, savepoint rollback, TRUNCATE inside a transaction |
-| `fasttrun_migration` | Upgrade path 2.0 → latest, including backward compatibility with `fasttruncate_c` |
+| `fasttrun_migration` | Upgrade path 2.0 -> latest, including backward compatibility with `fasttruncate_c` |
 | `fasttrun_bench` | Synthetic benchmark on 1M rows × 50 columns |
 | `fasttrun_stats` | Statistics hook: EXPLAIN before/after, auto-collection, sample_rows=0/-1, refresh threshold, DDL/TRUNCATE eviction, partial-index relstats |
 | `fasttrun_tracking` | Tracking frequently created temp tables and prewarm; has expected output for both `shared_preload_libraries` and non-preload modes |
@@ -361,13 +363,15 @@ Single source file, version differences handled via `#if PG_VERSION_NUM`.
 ```
 fasttrun.c                    # main C code (~5100 lines)
 fasttrun.control              # extension metadata
-fasttrun--2.2.0.sql           # current version (8 functions)
+fasttrun--2.2.0.sql           # previous version
+fasttrun--2.3.0.sql           # current version (8 functions)
 fasttrun--2.1.2.sql           # previous version
 fasttrun--2.0.sql             # old base version
 fasttrun--2.0--2.1.sql        # migration 2.0 -> 2.1
 fasttrun--2.1--2.1.1.sql      # migration 2.1 -> 2.1.1
 fasttrun--2.1.1--2.1.2.sql    # migration 2.1.1 -> 2.1.2
 fasttrun--2.1.2--2.2.0.sql    # migration 2.1.2 -> 2.2.0
+fasttrun--2.2.0--2.3.0.sql    # migration 2.2.0 -> 2.3.0 (new SQL function + C-side fixes)
 Makefile                      # PGXS
 examples/                     # examples (create_temp_table)
 sql/                          # tests (10 files)

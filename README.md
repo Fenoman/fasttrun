@@ -22,6 +22,7 @@
 |---|---|---|
 | `fasttruncate(text)` | Очищает временную таблицу (heap + индексы + toast) | **нет** |
 | `fasttrun_analyze(text)` | Публикует `relpages/reltuples` + собирает статистику колонок | **нет** |
+| `fasttrun_analyze_bulk(VARIADIC text[])` | Batch-вариант `fasttrun_analyze` для нескольких таблиц за один вызов. Plan-cache invalidations идут inline на каждой таблице, но первая помечает задетые cached SPI/PREPARE планы `is_valid=false`, и каждая следующая в этом батче short-circuit'ится в core's `PlanCacheRelCallback` по этому флагу - O(1) на сообщение. Используется в циклах с многими temp таблицами в одной транзакции. | **нет** |
 | `fasttrun_collect_stats(text)` | Явный сбор статистики колонок. В 99% случаев достаточно `fasttrun_analyze` — он делает то же самое автоматически при первом проходе. Эта функция нужна только если автосбор отключён (`auto_collect_stats=off`) или хочется принудительно пересобрать статистику | **нет** |
 | `fasttrun_relstats(text)` | Возвращает текущие `relpages/reltuples` из памяти процесса | **нет** |
 | `fasttrun_inspect_stats(text)` | Возвращает кешированные statsTuple в формате `pg_statistic` (для отладки) | **нет** |
@@ -36,7 +37,7 @@
 
 ## Как работает fasttruncate
 
-По умолчанию (`fasttrun.zero_sinval_truncate = on`) физическая очистка идёт через `unlink` файлов всех fork'ов таблицы + повторный `smgrcreate`. Это **не** вызывает `CacheInvalidateSmgr` — в отличие от штатного `smgrtruncate`.
+По умолчанию (`fasttrun.zero_sinval_truncate = on`) физическая очистка идёт через `unlink` файлов всех fork'ов таблицы плюс повторный `smgrcreate`. Это **не** вызывает `CacheInvalidateSmgr` — в отличие от штатного `smgrtruncate`.
 
 Безопасно потому, что временные таблицы живут в локальном буферном пуле бэкенда. Другие процессы не видят наш relfilenode, и инвалидация им бесполезна.
 
@@ -91,6 +92,7 @@ new_tuples = cached_tuples + (ins_now - cached_ins) - (del_now - cached_del)
 | `fasttrun.sample_rows` | `3000` | Размер выборки. `0` — отключить сбор column stats; relation-level relstats для heap и обычных индексов всё равно обновляются. `-1` — авто (как у обычного `ANALYZE`) |
 | `fasttrun.use_typanalyze` | `on` | Использовать `std_typanalyze` из ядра (MCV/histogram/correlation). `off` — только n_distinct/null_frac/width |
 | `fasttrun.stats_refresh_threshold` | `0.2` | Порог доли изменений для пересбора статистики. `0` — при любом DML. `1` — автопересбор не запускается; после DML cached stats скрываются до явного пересбора |
+| `fasttrun.invalidate_threshold` | `0.2` | Порог доли изменений `relpages`/`reltuples` ниже которого `fasttrun_analyze` НЕ инвалидирует cached SPI/PREPARE планы. Симметрично `stats_refresh_threshold` — при <20% DML ни refresh, ни plan invalidation. `0` — инвалидировать на любой drift (как было в 2.2.0). Инвалидации от refresh column stats, изменения index relstats и stats visibility flip срабатывают всегда, независимо от этого порога |
 | `fasttrun.zero_sinval_truncate` | `on` | Прямой `unlink`+`smgrcreate` вместо `smgrtruncate`. `off` — старый путь с 1 SMGR sinval |
 
 ## Производительность
@@ -133,9 +135,9 @@ make install PG_CONFIG=/path/to/pg_config
 CREATE EXTENSION fasttrun;
 ```
 
-По умолчанию будет установлена версия `2.2.0`.
+По умолчанию будет установлена версия `2.3.0`.
 
-Поддерживается обновление со старых версий `2.0` / `2.1` / `2.1.1` / `2.1.2`:
+Поддерживается обновление со старых версий `2.0` / `2.1` / `2.1.1` / `2.1.2` / `2.2.0`:
 ```sql
 ALTER EXTENSION fasttrun UPDATE;
 ```
@@ -154,7 +156,7 @@ make installcheck PG_CONFIG=/path/to/pg_config PGPORT=5433
 | `fasttrun_silent` | Молчаливое поведение на несуществующих / не-temp таблицах |
 | `fasttrun_stats_reset` | Сброс `relpages/reltuples` после fasttruncate |
 | `fasttrun_analyze` | Дельта-математика, откат к savepoint, TRUNCATE внутри транзакции |
-| `fasttrun_migration` | Путь обновления 2.0 → latest, включая обратную совместимость с `fasttruncate_c` |
+| `fasttrun_migration` | Путь обновления 2.0 -> latest, включая обратную совместимость с `fasttruncate_c` |
 | `fasttrun_bench` | Синтетический бенчмарк на 1M строк × 50 колонок |
 | `fasttrun_stats` | Хук статистики: EXPLAIN до/после, автосбор, sample_rows=0/-1, refresh threshold, DDL/TRUNCATE eviction, partial-index relstats |
 | `fasttrun_tracking` | Трекинг часто создаваемых temp tables и prewarm; есть expected для режима с `shared_preload_libraries` и без него |
@@ -363,13 +365,15 @@ fasttrun.track_schedule = ''
 ```
 fasttrun.c                    # основной C-код (~5100 строк)
 fasttrun.control              # метаданные расширения
-fasttrun--2.2.0.sql           # текущая версия (8 функций)
+fasttrun--2.2.0.sql           # предыдущая версия
+fasttrun--2.3.0.sql           # текущая версия (8 функций)
 fasttrun--2.1.2.sql           # предыдущая версия
 fasttrun--2.0.sql             # старая базовая версия
 fasttrun--2.0--2.1.sql        # миграция 2.0 -> 2.1
 fasttrun--2.1--2.1.1.sql      # миграция 2.1 -> 2.1.1
 fasttrun--2.1.1--2.1.2.sql    # миграция 2.1.1 -> 2.1.2
 fasttrun--2.1.2--2.2.0.sql    # миграция 2.1.2 -> 2.2.0
+fasttrun--2.2.0--2.3.0.sql    # миграция 2.2.0 -> 2.3.0 (новая SQL-функция + C-фиксы)
 Makefile                      # PGXS
 examples/                     # примеры (create_temp_table)
 sql/                          # тесты (10 файлов)

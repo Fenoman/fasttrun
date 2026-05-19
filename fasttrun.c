@@ -79,6 +79,7 @@ PG_MODULE_MAGIC;
 
 PG_FUNCTION_INFO_V1(fasttruncate);
 PG_FUNCTION_INFO_V1(fasttrun_analyze);
+PG_FUNCTION_INFO_V1(fasttrun_analyze_bulk);
 PG_FUNCTION_INFO_V1(fasttrun_relstats);
 PG_FUNCTION_INFO_V1(fasttrun_collect_stats);
 PG_FUNCTION_INFO_V1(fasttrun_inspect_stats);
@@ -87,6 +88,7 @@ PG_FUNCTION_INFO_V1(fasttrun_prewarm);
 PG_FUNCTION_INFO_V1(fasttrun_reset_temp_stats);
 Datum	fasttruncate(PG_FUNCTION_ARGS);
 Datum	fasttrun_analyze(PG_FUNCTION_ARGS);
+Datum	fasttrun_analyze_bulk(PG_FUNCTION_ARGS);
 Datum	fasttrun_relstats(PG_FUNCTION_ARGS);
 Datum	fasttrun_collect_stats(PG_FUNCTION_ARGS);
 Datum	fasttrun_inspect_stats(PG_FUNCTION_ARGS);
@@ -103,6 +105,7 @@ static void fasttrun_track_schedule_assign_hook(const char *newval, void *extra)
 static bool		fasttrun_auto_collect_stats = true;
 static int		fasttrun_sample_rows = 3000;
 static double	fasttrun_stats_refresh_threshold = 0.2;
+static double	fasttrun_invalidate_threshold = 0.2;
 static bool		fasttrun_use_typanalyze = true;
 static bool		fasttrun_zero_sinval_truncate = true;
 
@@ -114,8 +117,18 @@ static bool		fasttrun_zero_sinval_truncate = true;
  * the stats hash lookup, but reopening the relation and walking pgstat xact
  * counters on every call.  While standard_planner runs, cache that pgstat
  * snapshot per relid; outside planner_hook, fall back to direct reads.
+ *
+ * Slot count was 16 originally.  Real plans touching 17+ temp tables (joins,
+ * CTEs, partition-by-temp-table) overflowed: subsequent relids fell through
+ * to RelationIdGetRelation + pgstat read every time.  64 covers all temp
+ * patterns I have seen on prod -- 3 KB of bss per backend is irrelevant.
+ * Linear scan is still cache-friendly at this size and beats hashing.
+ *
+ * On overflow we replace round-robin (next_evict).  Cache lives only inside
+ * one planner invocation; the reset after each plan keeps the working set
+ * fresh, so a simple FIFO is good enough.
  */
-#define FASTTRUN_FRESHNESS_CACHE_SLOTS 16
+#define FASTTRUN_FRESHNESS_CACHE_SLOTS 64
 
 typedef struct FasttrunFreshnessCacheEntry
 {
@@ -129,14 +142,61 @@ typedef struct FasttrunFreshnessCacheEntry
 
 static bool		fasttrun_in_planner = false;
 static int		fasttrun_freshness_cache_used = 0;
+static int		fasttrun_freshness_cache_next_evict = 0;
 static FasttrunFreshnessCacheEntry
 				fasttrun_freshness_cache[FASTTRUN_FRESHNESS_CACHE_SLOTS];
 
-/* "Silent killer" warning — one shot per backend. */
+/* "Silent killer" warning -- one shot per backend. */
 static bool		fasttrun_warned_track_counts_off = false;
 
 /* RNG state for reservoir sampling */
 static pg_prng_state fasttrun_prng_state;
+
+/*
+ * Relids touched in the current top transaction.
+ *
+ * Anyone who mutates the analyze or stats cache adds their relid here:
+ * fasttrun_analyze, fasttrun_collect_stats, fasttruncate, utility-eviction.
+ *
+ * The list lives in TopTransactionContext.  Postgres reclaims that
+ * context on xact end -- we only NIL the pointer.  Xact and subxact
+ * callbacks walk this list, not the full cache.  Cost becomes
+ * O(work-done-this-xact) instead of O(cache-size).
+ *
+ * Before this list existed, every COMMIT scanned every cache entry.
+ * Each entry did try_relation_open + RelationGetNumberOfBlocks plus a
+ * chain of fasttrun_invalidate_local_plan_cache calls.  A backend
+ * holding many ON-COMMIT-DELETE-ROWS temp tables paid O(cache_size)
+ * work per COMMIT.  That dominated CPU.
+ *
+ * Membership uses list_member_oid -- a flat array of Oids.  For typical
+ * temp workloads (a few dozen relids per xact at most) the linear scan
+ * beats maintaining a hash.
+ */
+static List *fasttrun_xact_touched_oids = NIL;
+
+static inline void
+fasttrun_xact_touch_relid(Oid relid)
+{
+	MemoryContext oldcxt;
+
+	if (!OidIsValid(relid))
+		return;
+	if (list_member_oid(fasttrun_xact_touched_oids, relid))
+		return;
+
+	oldcxt = MemoryContextSwitchTo(TopTransactionContext);
+	fasttrun_xact_touched_oids = lappend_oid(fasttrun_xact_touched_oids, relid);
+	MemoryContextSwitchTo(oldcxt);
+}
+
+static inline void
+fasttrun_xact_touched_clear(void)
+{
+	/* List sits in TopTransactionContext -- about to be reset, or already
+	 * was.  Just drop the pointer. */
+	fasttrun_xact_touched_oids = NIL;
+}
 
 /* Forward decls for stats infrastructure (defined below) */
 static void fasttrun_stats_cache_reset(void);
@@ -227,7 +287,7 @@ fasttrun_make_rangevar(text *name)
  * relstats part can survive COMMIT, but the pgstat-delta part is valid only
  * inside the transaction where the xact counters were captured.  Cache
  * invalidated if: pages dropped (TRUNCATE-like), truncdropped bit changed,
- * or computed new_tuples < 0.  pgstat unavailable → fall back to scan.
+ * or computed new_tuples < 0.  pgstat unavailable -> fall back to scan.
  */
 
 /*
@@ -265,7 +325,7 @@ typedef struct FasttrunAnalyzeRelstatsUndo
 
 typedef struct FasttrunAnalyzeCacheEntry
 {
-	Oid			relid;			/* hash key — must be first */
+	Oid			relid;			/* hash key -- must be first */
 
 	/*
 	 * Planner-visible relstats.  These are session-local and can survive a
@@ -302,7 +362,7 @@ typedef struct FasttrunAnalyzeCacheEntry
 	 * (a) lookup is O(1), not O(N) over the stats hash, and
 	 * (b) when a refresh on an emptied table finds zero visible
 	 *     tuples, we can still advance the baseline without leaving a
-	 *     stats-cache entry behind — otherwise the next analyze would
+	 *     stats-cache entry behind -- otherwise the next analyze would
 	 *     keep re-entering the refresh path forever.
 	 *
 	 * has_stats_baseline=false means "we never collected column stats
@@ -325,6 +385,22 @@ typedef struct FasttrunAnalyzeCacheEntry
 	bool		stats_baseline_truncdropped;
 	SubTransactionId	stats_baseline_subid;
 	FasttrunAnalyzeBaselineUndo *stats_baseline_undo;
+
+	/*
+	 * Memo for the lazy empty-storage probe in fasttrun_reinject_relstats().
+	 *
+	 * If lazy_check_subid matches GetCurrentSubTransactionId() and
+	 * lazy_check_pages matches cached_pages, storage was already verified
+	 * in this subxact.  Every later plan can skip RelationGetNumberOfBlocks.
+	 *
+	 * Reset on three events.  When cached_pages drifts (see
+	 * fasttrun_cache_store_relstats).  On xact commit -- the next xact may
+	 * see an external truncate from ON COMMIT DELETE ROWS.  And inside
+	 * fasttrun_subxact_callback for an aborted subxact -- the observation
+	 * from a rolled-back subxact is no longer trustworthy.
+	 */
+	BlockNumber		lazy_check_pages;
+	SubTransactionId lazy_check_subid;
 } FasttrunAnalyzeCacheEntry;
 
 static HTAB			   *fasttrun_analyze_cache = NULL;
@@ -419,6 +495,9 @@ fasttrun_cache_make_empty_storage_authoritative(FasttrunAnalyzeCacheEntry *entry
 		entry->cached_allvisible = 0;
 		entry->relstats_subid = InvalidSubTransactionId;
 		entry->has_delta_state = false;
+		/* cached_pages drifted -- drop the lazy memo. */
+		entry->lazy_check_subid = InvalidSubTransactionId;
+		entry->lazy_check_pages = 0;
 
 		rel->rd_rel->relpages = pages_now;
 		rel->rd_rel->reltuples = 0;
@@ -486,26 +565,77 @@ fasttrun_cache_reset(void)
 	}
 }
 
-static void
+/*
+ * COMMIT-time bookkeeping for the analyze cache.
+ *
+ * The 2.2.0 version of this routine was a CPU hog.  It walked the entire
+ * cache on every COMMIT.  For each entry it called
+ * fasttrun_cache_make_empty_storage_authoritative() -- which does
+ * try_relation_open plus RelationGetNumberOfBlocks per entry.  Then a
+ * nested fasttrun_stats_cache_evict_relid scanned the stats hash, and a
+ * burst of fasttrun_invalidate_local_plan_cache calls fired.  On a
+ * backend with many ON COMMIT DELETE ROWS temp tables that get
+ * re-analyzed every xact, the cost was N x (smgr call + plan-cache walk)
+ * per COMMIT.  It dominated CPU.
+ *
+ * The empty-storage adoption survived, just in a different place.  It
+ * now happens in fasttrun_reinject_relstats() on the planner_hook path.
+ * Runs at most once per relation per query, and only when the planner
+ * actually touches the table.  Stale shared-invalidation traffic from
+ * the COMMIT callback is gone.
+ *
+ * What this function does now:
+ *   - walks the per-xact touched-relid list, not the whole cache;
+ *   - drops entries whose relation has vanished (the long-lived
+ *     backend case -- ON COMMIT DROP temp tables die in
+ *     PreCommit_on_commit_actions() before this callback fires; without
+ *     explicit cleanup the entry would stay forever and the backend
+ *     would slowly grow);
+ *   - frees per-subxact undo chains attached to surviving entries;
+ *   - clears the xact-scoped delta-math snapshot and baseline state;
+ *   - drops entries that lost their planner-visible relstats
+ *     (has_relstats == false -- happens after DDL/DROP eviction).
+ */
+/*
+ * Marked noinline so the duration regression test
+ * (check_fasttrun_commit_duration.sh) can keep a uprobe target.
+ * The function is hot enough that O2 inlines it into the xact callback
+ * otherwise.  The call cost is tiny relative to the work inside.
+ */
+static pg_noinline void
 fasttrun_cache_commit_xact(void)
 {
-	HASH_SEQ_STATUS status;
-	FasttrunAnalyzeCacheEntry *entry;
+	ListCell   *lc;
 
-	if (fasttrun_analyze_cache == NULL)
+	if (fasttrun_analyze_cache == NULL || fasttrun_xact_touched_oids == NIL)
 		return;
 
-	hash_seq_init(&status, fasttrun_analyze_cache);
-	while ((entry = (FasttrunAnalyzeCacheEntry *) hash_seq_search(&status)) != NULL)
+	foreach(lc, fasttrun_xact_touched_oids)
 	{
-		Oid		relid = entry->relid;
-		Oid		plan_relid;
-		bool	empty_storage_changed;
-		bool	empty_storage_authoritative;
+		Oid			relid = lfirst_oid(lc);
+		FasttrunAnalyzeCacheEntry *entry;
 
-		empty_storage_authoritative =
-			fasttrun_cache_make_empty_storage_authoritative(entry, &plan_relid,
-														   &empty_storage_changed);
+		entry = (FasttrunAnalyzeCacheEntry *) hash_search(fasttrun_analyze_cache,
+														  &relid,
+														  HASH_FIND, NULL);
+		if (entry == NULL)
+			continue;
+
+		/*
+		 * Relation gone?  Drop the entry whole, move on.  Catches
+		 * ON COMMIT DROP, plain DROP done elsewhere in the xact, and
+		 * any other path that retires a relid without going through
+		 * our utility_hook eviction.  Syscache hit is cheap, runs once
+		 * per relid touched in this xact (not per cache entry).
+		 */
+		if (!SearchSysCacheExists1(RELOID, ObjectIdGetDatum(relid)))
+		{
+			fasttrun_baseline_free_undo(entry);
+			fasttrun_relstats_free_undo(entry);
+			(void) hash_search(fasttrun_analyze_cache, &relid,
+							   HASH_REMOVE, NULL);
+			continue;
+		}
 
 		fasttrun_baseline_free_undo(entry);
 		fasttrun_relstats_free_undo(entry);
@@ -524,25 +654,21 @@ fasttrun_cache_commit_xact(void)
 		entry->stats_baseline_truncdropped = false;
 		entry->stats_baseline_subid = InvalidSubTransactionId;
 
+		/*
+		 * Drop the lazy-probe memo.  ON COMMIT DELETE ROWS truncate runs
+		 * after our xact callback -- but only on the NEXT xact.  So the
+		 * cached observation no longer holds outside this xact's lifetime.
+		 */
+		entry->lazy_check_subid = InvalidSubTransactionId;
+		entry->lazy_check_pages = 0;
+
 		if (!entry->has_relstats)
-		{
 			(void) hash_search(fasttrun_analyze_cache, &relid,
 							   HASH_REMOVE, NULL);
-			continue;
-		}
-
-		if (empty_storage_authoritative && empty_storage_changed)
-		{
-			if (OidIsValid(plan_relid))
-				fasttrun_stats_cache_evict_relid(plan_relid);
-			fasttrun_invalidate_local_plan_cache(entry->relid);
-			if (OidIsValid(plan_relid) && plan_relid != entry->relid)
-				fasttrun_invalidate_local_plan_cache(plan_relid);
-		}
 	}
 }
 
-/* Finish analyze + stats caches on xact end.  PRE_COMMIT skipped — txn may still abort. */
+/* Finish analyze + stats caches on xact end.  PRE_COMMIT skipped -- txn may still abort. */
 static void
 fasttrun_xact_callback(XactEvent event, void *arg)
 {
@@ -560,8 +686,15 @@ fasttrun_xact_callback(XactEvent event, void *arg)
 			fasttrun_stats_cache_reset();
 			break;
 		default:
-			break;
+			return;
 	}
+
+	/*
+	 * Touched-relid list lives in TopTransactionContext.  The xact machinery
+	 * resets and destroys that context right after this callback returns.
+	 * Drop our pointer so a fresh xact starts with an empty list.
+	 */
+	fasttrun_xact_touched_clear();
 }
 
 /* Lazily allocate the analyze HTAB and its dedicated mcxt. */
@@ -640,6 +773,8 @@ fasttrun_cache_enter(Oid relid)
 		entry->stats_baseline_truncdropped = false;
 		entry->stats_baseline_subid = InvalidSubTransactionId;
 		entry->stats_baseline_undo = NULL;
+		entry->lazy_check_pages = 0;
+		entry->lazy_check_subid = InvalidSubTransactionId;
 	}
 	return entry;
 }
@@ -688,6 +823,17 @@ fasttrun_cache_store_relstats(Relation rel, BlockNumber pages, int64 tuples,
 	entry->cached_tuples = tuples;
 	entry->cached_allvisible = allvisible;
 	entry->relstats_subid = GetCurrentSubTransactionId();
+	/* cached_pages changed -- the lazy-probe memo is now stale. */
+	entry->lazy_check_subid = InvalidSubTransactionId;
+	entry->lazy_check_pages = 0;
+
+	/*
+	 * Register this relid so the xact-end callback walks it.  Index entries
+	 * land here too (via fasttrun_update_index_relstats and
+	 * fasttrun_rebuild_one_index) without going through the top-level touch
+	 * in fasttrun_analyze or fasttruncate.
+	 */
+	fasttrun_xact_touch_relid(RelationGetRelid(rel));
 
 	return entry;
 }
@@ -733,7 +879,7 @@ fasttrun_cache_save_baseline_undo(FasttrunAnalyzeCacheEntry *entry)
  * after a successful collect_and_store (cold scan or refresh with a
  * non-empty sample) and after an empty refresh on a now-empty table.
  *
- * Lazily creates the entry if it doesn't exist yet — fasttrun_analyze
+ * Lazily creates the entry if it doesn't exist yet -- fasttrun_analyze
  * normally populates it earlier on the same call, but
  * fasttrun_cache_update_stats_baseline_if_present() is the right entry
  * point for callers (e.g. fasttrun_collect_stats) that must NOT seed a
@@ -768,7 +914,7 @@ fasttrun_cache_set_stats_baseline(Oid relid, int64 ins, int64 upd, int64 del,
  *
  * No-op if the analyze cache hasn't been touched for this relid yet.
  * In that case the user got fresh column stats but auto-refresh remains
- * disengaged for this relid until the next fasttrun_analyze() — that's
+ * disengaged for this relid until the next fasttrun_analyze() -- that's
  * the documented contract.
  */
 static void
@@ -806,6 +952,10 @@ fasttrun_cache_mark_evicted(Oid relid)
 
 	entry->has_stats_baseline = false;
 	entry->stats_baseline_subid = cur_subid;
+
+	/* The next store resets cached_pages -- drop the lazy memo now. */
+	entry->lazy_check_subid = InvalidSubTransactionId;
+	entry->lazy_check_pages = 0;
 }
 
 /* Drop entry by relid.  Called from fasttruncate. */
@@ -869,10 +1019,10 @@ fasttrun_cache_mark_rel_and_indexes_evicted(Relation rel)
  * Logically the table now has zero rows and zero pages, and the post-
  * truncate pgstat snapshot becomes the new delta-math baseline.  After
  * a subsequent INSERT N, the next fasttrun_analyze() sees:
- *   pages_now > 0 ≥ cached_pages (=0)               → delta hit OK
- *   truncdropped_now == cached_truncdropped         → delta hit OK
- *   delta_ins = ins_now - cached_ins = N            → exactly the new rows
- *   new_tuples = 0 + N - 0 = N                      → correct
+ *   pages_now > 0 >= cached_pages (=0)               -> delta hit OK
+ *   truncdropped_now == cached_truncdropped         -> delta hit OK
+ *   delta_ins = ins_now - cached_ins = N            -> exactly the new rows
+ *   new_tuples = 0 + N - 0 = N                      -> correct
  *
  * The stats baseline is also seeded with the same snapshot, so that the
  * first post-refill analyze passes the refresh-check threshold (any
@@ -903,7 +1053,7 @@ fasttrun_cache_seed_after_truncate(Relation rel)
 
 	if (!fasttrun_read_pgstat_counters(rel, &ins_now, &upd_now, &del_now,
 									   &truncdropped_now))
-		return;	/* no pgstat → no delta seed; next analyze will cold-scan */
+		return;	/* no pgstat -> no delta seed; next analyze will cold-scan */
 
 	cur_subid = GetCurrentSubTransactionId();
 
@@ -923,7 +1073,7 @@ fasttrun_cache_seed_after_truncate(Relation rel)
 	entry->stats_baseline_deleted = del_now;
 	entry->stats_baseline_truncdropped = truncdropped_now;
 	entry->stats_baseline_subid = cur_subid;
-	/* stats_baseline_undo stays NULL — no prior version to restore. */
+	/* stats_baseline_undo stays NULL -- no prior version to restore. */
 }
 
 /*
@@ -939,10 +1089,115 @@ fasttrun_cache_seed_after_truncate(Relation rel)
 static void
 fasttrun_reinject_relstats(Relation rel, FasttrunAnalyzeCacheEntry *entry)
 {
-	float4	cached_tuples = (float4) entry->cached_tuples;
+	float4	cached_tuples;
 
 	if (!fasttrun_relation_has_same_locator(rel, entry))
 		return;
+
+	/*
+	 * Lazy empty-storage adoption.
+	 *
+	 * Core ON COMMIT DELETE ROWS truncates temp relations inside
+	 * PreCommit_on_commit_actions().  That fires outside our xact callback.
+	 * fasttruncate() also resets storage non-transactionally.  Either way,
+	 * the cache may carry stale page counts.
+	 *
+	 * Version 2.2.0 reconciled this eagerly.  It walked the entire cache
+	 * in fasttrun_cache_commit_xact() and read nblocks for each entry.  On
+	 * a backend holding many ON COMMIT DELETE ROWS temp tables, that scaled
+	 * as O(cache_size) per COMMIT and dominated CPU.
+	 *
+	 * The new approach observes the truth at planning time.  If storage
+	 * went to zero since we cached, adopt that fact in place.  One
+	 * smgrnblocks call per cached relid per query -- and only for relations
+	 * the planner actually touches.  Strictly less work than the old scan.
+	 *
+	 * Empty heap means zero blocks.  An index keeps its metapage even after
+	 * truncate (a "fresh" btree is one page).  So index emptiness is judged
+	 * by the underlying heap's block count instead.
+	 */
+	{
+		SubTransactionId cur_subid = GetCurrentSubTransactionId();
+		bool		probe_needed = (entry->cached_pages > 0 &&
+									rel->rd_rel->relpersistence == RELPERSISTENCE_TEMP &&
+									RELKIND_HAS_STORAGE(rel->rd_rel->relkind));
+
+		/*
+		 * Memoize the probe.  Earlier queries in this subxact already
+		 * verified that storage size matches cached_pages -- no need to
+		 * repeat smgrnblocks on every plan touch.  Reset happens on
+		 * cache_store_relstats (cached_pages drift) and on xact end.
+		 */
+		if (probe_needed &&
+			entry->lazy_check_subid == cur_subid &&
+			entry->lazy_check_pages == entry->cached_pages)
+			probe_needed = false;
+
+		if (probe_needed)
+		{
+			bool		looks_empty = false;
+
+			if (rel->rd_rel->relkind == RELKIND_INDEX)
+			{
+				Oid			heapid = IndexGetRelation(RelationGetRelid(rel), true);
+
+				if (OidIsValid(heapid))
+				{
+					Relation	heaprel = try_relation_open(heapid, NoLock);
+
+					if (heaprel != NULL)
+					{
+						if (heaprel->rd_rel->relpersistence == RELPERSISTENCE_TEMP &&
+							isTempNamespace(RelationGetNamespace(heaprel)) &&
+							RelationGetNumberOfBlocks(heaprel) == 0)
+							looks_empty = true;
+						relation_close(heaprel, NoLock);
+					}
+				}
+			}
+			else if (rel->rd_rel->relkind == RELKIND_RELATION ||
+					 rel->rd_rel->relkind == RELKIND_TOASTVALUE)
+			{
+				if (RelationGetNumberOfBlocks(rel) == 0)
+					looks_empty = true;
+			}
+
+			if (looks_empty)
+			{
+				/*
+				 * Heap gives 0.  Index gives 1 -- the freshly rebuilt
+				 * btree/hash metapage stays put.  One nblocks call returns
+				 * the right number for either case.
+				 */
+				entry->cached_pages = RelationGetNumberOfBlocks(rel);
+				entry->cached_tuples = 0;
+				entry->cached_allvisible = 0;
+				entry->has_delta_state = false;
+				entry->cached_inserted = 0;
+				entry->cached_updated = 0;
+				entry->cached_deleted = 0;
+				entry->cached_truncdropped = false;
+				/*
+				 * Cached per-column stats for the now-empty relation get
+				 * hidden by the freshness check in
+				 * fasttrun_get_relation_stats_hook on the next access --
+				 * pgstat ins/upd/del will no longer match the collect-time
+				 * snapshot.  No need to evict them here.
+				 */
+			}
+
+			/*
+			 * Record the observation so later plans in this subxact skip
+			 * the smgr probe.  After adoption the new cached_pages matches
+			 * actual.  On a non-empty probe, both already matched the
+			 * snapshot we just verified.
+			 */
+			entry->lazy_check_subid = cur_subid;
+			entry->lazy_check_pages = entry->cached_pages;
+		}
+	}
+
+	cached_tuples = (float4) entry->cached_tuples;
 
 	if (rel->rd_rel->relpages == entry->cached_pages &&
 		rel->rd_rel->reltuples == cached_tuples &&
@@ -1020,15 +1275,15 @@ fasttrun_reinject_rte_relstats(RangeTblEntry *rte)
  * Per-(relid, attnum) HeapTuples in pg_statistic format, returned to the
  * planner via two complementary hooks:
  *
- *   * get_relation_stats_hook — feeds n_distinct / null_frac and the
+ *   * get_relation_stats_hook -- feeds n_distinct / null_frac and the
  *     full statsTuple into selectivity estimation paths that read
  *     stats through VariableStatData (e.g. eq_sel, scalararraysel).
  *
- *   * get_attavgwidth_hook    — feeds stawidth into the SEPARATE path
+ *   * get_attavgwidth_hook    -- feeds stawidth into the SEPARATE path
  *     that the planner uses to size hash tables, sort tuplestores and
  *     join tuple widths (lsyscache.c:get_attavgwidth).  Without this
  *     second hook the planner falls back to get_typavgwidth() and
- *     happily uses the type's "default" width — for `text` it's 32
+ *     happily uses the type's "default" width -- for `text` it's 32
  *     bytes regardless of the actual sample, which throws off
  *     hash/sort/spool costing on temp tables with short text columns.
  *     The two hooks have to be wired up independently because they
@@ -1061,7 +1316,7 @@ fasttrun_stats_key_init(FasttrunStatsKey *key, Oid relid, AttrNumber attnum,
 /*
  * Saved previous version of a stats entry, pushed on every overwrite
  * that crosses a subxact boundary.  fasttrun_subxact_callback pops this
- * on ROLLBACK TO SAVEPOINT to fully restore the pre-subxact state — not
+ * on ROLLBACK TO SAVEPOINT to fully restore the pre-subxact state -- not
  * just delete the subxact-local refresh.  Lives in fasttrun_stats_mcxt.
  */
 typedef struct FasttrunStatsSavedState
@@ -1089,10 +1344,27 @@ typedef struct FasttrunStatsEntry
 										 * at each subxact-boundary store */
 } FasttrunStatsEntry;
 
+/*
+ * Per-relid backref into the (relid, attnum, inh) stats cache.
+ *
+ * `attkeys` is a List of palloc'd FasttrunStatsKey.  It lives in
+ * fasttrun_stats_mcxt and records every key ever inserted into
+ * fasttrun_stats_cache for this relid.  An entry may carry statsTuple =
+ * NULL after a mark-evicted -- the key still stays live until the row
+ * itself is HASH_REMOVE'd from fasttrun_stats_cache.
+ *
+ * Used by fasttrun_stats_cache_evict_relid and
+ * fasttrun_stats_cache_mark_evicted_relid.  They walk only the columns
+ * belonging to a given relid -- O(#cached-cols), small.  No more full
+ * hash_seq_search over the entire stats cache.  That sequential scan was
+ * O(N) and grew large on long-lived backends that analyzed many temp
+ * tables.
+ */
 typedef struct FasttrunStatsRelidEntry
 {
-	Oid		relid;			/* hash key — must be first */
-	int		refcount;		/* visible statsTuple entries for this relid */
+	Oid			relid;		/* hash key -- must be first */
+	int			refcount;	/* visible statsTuple entries for this relid */
+	List	   *attkeys;	/* List of FasttrunStatsKey *, owns palloc'd keys */
 } FasttrunStatsRelidEntry;
 
 static HTAB			   *fasttrun_stats_cache = NULL;
@@ -1192,6 +1464,25 @@ fasttrun_stats_relid_exists(Oid relid)
 					   HASH_FIND, NULL) != NULL;
 }
 
+/*
+ * fasttrun_stats_relid_cache invariants.
+ *
+ *   refcount -- count of stats entries with statsTuple != NULL.  Drives
+ *               the quick-miss check fasttrun_stats_relid_exists, called
+ *               from the planner hooks.
+ *   attkeys  -- list of every FasttrunStatsKey present in the (relid,
+ *               attnum, inh) stats hash for this relid.  Membership does
+ *               not depend on whether the statsTuple is currently visible.
+ *               Lets evict and mark-evicted iterate just this relid's
+ *               columns in O(K) -- no full hash_seq_search over the
+ *               stats hash.
+ *
+ * The relid_cache row survives while attkeys != NIL.  That holds even
+ * when refcount drops to zero (everything is mark-evicted but not yet
+ * HASH_REMOVE'd) -- evict_relid still needs the key list to drive the
+ * targeted removal.  Once the last attkey is gone, the relid row goes
+ * away too.
+ */
 static void
 fasttrun_stats_relid_ref(Oid relid)
 {
@@ -1205,7 +1496,10 @@ fasttrun_stats_relid_ref(Oid relid)
 													&relid,
 													HASH_ENTER, &found);
 	if (!found)
+	{
 		entry->refcount = 0;
+		entry->attkeys = NIL;
+	}
 	entry->refcount++;
 }
 
@@ -1223,13 +1517,91 @@ fasttrun_stats_relid_unref(Oid relid)
 	if (entry == NULL)
 		return;
 
-	entry->refcount--;
-	if (entry->refcount <= 0)
-		(void) hash_search(fasttrun_stats_relid_cache, &relid,
+	if (entry->refcount > 0)
+		entry->refcount--;
+
+	/*
+	 * Do NOT HASH_REMOVE the row when refcount hits zero.  The attkeys list
+	 * may still carry entries with statsTuple == NULL that
+	 * fasttrun_stats_cache_evict_* needs to walk.  Removal happens later --
+	 * in fasttrun_stats_relid_drop_key, once the last attkey is gone.
+	 */
+}
+
+/*
+ * Add or drop a (relid, attnum, inh) key in the backref list.
+ *
+ * `add_key` allocates the key in fasttrun_stats_mcxt and appends it.
+ * Called the first time we insert into fasttrun_stats_cache for this
+ * triple.
+ *
+ * `drop_key` finds the matching FasttrunStatsKey, removes it, and pfrees
+ * it.  When the list goes empty AND refcount is zero, the relid row
+ * itself is also removed.  Called whenever we HASH_REMOVE from
+ * fasttrun_stats_cache.
+ */
+static void
+fasttrun_stats_relid_add_key(const FasttrunStatsKey *key)
+{
+	FasttrunStatsRelidEntry *entry;
+	bool	found;
+	MemoryContext oldcxt;
+	FasttrunStatsKey *kcopy;
+
+	if (fasttrun_stats_relid_cache == NULL)
+		return;
+
+	entry = (FasttrunStatsRelidEntry *) hash_search(fasttrun_stats_relid_cache,
+													&key->relid,
+													HASH_ENTER, &found);
+	if (!found)
+	{
+		entry->refcount = 0;
+		entry->attkeys = NIL;
+	}
+
+	oldcxt = MemoryContextSwitchTo(fasttrun_stats_mcxt);
+	kcopy = (FasttrunStatsKey *) palloc(sizeof(*kcopy));
+	*kcopy = *key;
+	entry->attkeys = lappend(entry->attkeys, kcopy);
+	MemoryContextSwitchTo(oldcxt);
+}
+
+static void
+fasttrun_stats_relid_drop_key(const FasttrunStatsKey *key)
+{
+	FasttrunStatsRelidEntry *entry;
+	ListCell   *lc;
+
+	if (fasttrun_stats_relid_cache == NULL)
+		return;
+
+	entry = (FasttrunStatsRelidEntry *) hash_search(fasttrun_stats_relid_cache,
+													&key->relid,
+													HASH_FIND, NULL);
+	if (entry == NULL)
+		return;
+
+	foreach(lc, entry->attkeys)
+	{
+		FasttrunStatsKey *k = (FasttrunStatsKey *) lfirst(lc);
+
+		if (k->relid == key->relid &&
+			k->attnum == key->attnum &&
+			k->inh == key->inh)
+		{
+			entry->attkeys = foreach_delete_current(entry->attkeys, lc);
+			pfree(k);
+			break;
+		}
+	}
+
+	if (entry->attkeys == NIL && entry->refcount <= 0)
+		(void) hash_search(fasttrun_stats_relid_cache, &key->relid,
 						   HASH_REMOVE, NULL);
 }
 
-/* freefunc for VariableStatData — we own the tuple, no-op. */
+/* freefunc for VariableStatData -- we own the tuple, no-op. */
 static void
 fasttrun_stats_noop_free(HeapTuple tuple)
 {
@@ -1272,7 +1644,7 @@ fasttrun_get_relation_stats_hook(PlannerInfo *root, RangeTblEntry *rte,
 		upd_now != entry->collected_upd ||
 		del_now != entry->collected_del ||
 		truncdropped_now != entry->collected_truncdropped)
-		goto chain;		/* stale — fall back to defaults */
+		goto chain;		/* stale -- fall back to defaults */
 
 	vardata->statsTuple = entry->statsTuple;
 	vardata->freefunc = fasttrun_stats_noop_free;
@@ -1290,7 +1662,7 @@ chain:
  * separate average-width path (lsyscache.c:get_attavgwidth).
  *
  * Without this hook the planner reads stawidth straight from the
- * pg_statistic syscache, which we never write to — so for temp tables
+ * pg_statistic syscache, which we never write to -- so for temp tables
  * it falls back to get_typavgwidth() and uses the type-default width.
  * For varlena types like text that default is 32 bytes regardless of
  * the real sample, which inflates hash-table / sort / spool costing
@@ -1346,13 +1718,13 @@ chain:
 }
 
 /*
- * planner hook — re-inject cached relpages/reltuples into rd_rel for any
+ * planner hook -- re-inject cached relpages/reltuples into rd_rel for any
  * temp relation whose rd_rel was reset to the on-disk pg_class values
  * by a relcache rebuild (typically triggered by a sinval message from a
  * concurrent backend).
  *
- * fasttrun_analyze() writes (relpages, reltuples) only into rd_rel —
- * never into pg_class — to keep the operation sinval-free.  But rd_rel
+ * fasttrun_analyze() writes (relpages, reltuples) only into rd_rel --
+ * never into pg_class -- to keep the operation sinval-free.  But rd_rel
  * is owned by the relcache, and any RelationCacheInvalidateEntry resets
  * it from pg_class on the next RelationIdGetRelation.  Without this
  * hook, that wipes our analyze results: planner sees relpages=0 and
@@ -1406,6 +1778,7 @@ fasttrun_planner_hook(Query *parse, const char *query_string,
 	PlannedStmt *result = NULL;
 	bool		saved_in_planner = fasttrun_in_planner;
 	int			saved_freshness_cache_used = fasttrun_freshness_cache_used;
+	int			saved_freshness_cache_next_evict = fasttrun_freshness_cache_next_evict;
 	bool		stats_frame_needed = false;
 
 	if (fasttrun_analyze_cache != NULL)
@@ -1437,6 +1810,7 @@ fasttrun_planner_hook(Query *parse, const char *query_string,
 
 	fasttrun_in_planner = true;
 	fasttrun_freshness_cache_used = 0;
+	fasttrun_freshness_cache_next_evict = 0;
 
 	PG_TRY();
 	{
@@ -1451,12 +1825,14 @@ fasttrun_planner_hook(Query *parse, const char *query_string,
 	{
 		fasttrun_in_planner = saved_in_planner;
 		fasttrun_freshness_cache_used = saved_freshness_cache_used;
+		fasttrun_freshness_cache_next_evict = saved_freshness_cache_next_evict;
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
 
 	fasttrun_in_planner = saved_in_planner;
 	fasttrun_freshness_cache_used = saved_freshness_cache_used;
+	fasttrun_freshness_cache_next_evict = saved_freshness_cache_next_evict;
 
 	return result;
 }
@@ -1467,7 +1843,7 @@ fasttrun_planner_hook(Query *parse, const char *query_string,
  * care about UPDATE (rolling-delta math); the column-stats freshness
  * check passes a real pointer because UPDATE changes distribution
  * even though it doesn't change live row count.  Returns false if
- * pgstat is off → caller falls back to always-scan.
+ * pgstat is off -> caller falls back to always-scan.
  */
 static bool
 fasttrun_read_pgstat_counters(Relation rel,
@@ -1553,11 +1929,26 @@ fasttrun_read_pgstat_counters_for_hook(Oid relid,
 		RelationClose(rel);
 	}
 
-	if (fasttrun_in_planner &&
-		fasttrun_freshness_cache_used < FASTTRUN_FRESHNESS_CACHE_SLOTS)
+	if (fasttrun_in_planner)
 	{
-		FasttrunFreshnessCacheEntry *slot =
-			&fasttrun_freshness_cache[fasttrun_freshness_cache_used++];
+		FasttrunFreshnessCacheEntry *slot;
+
+		if (fasttrun_freshness_cache_used < FASTTRUN_FRESHNESS_CACHE_SLOTS)
+		{
+			slot = &fasttrun_freshness_cache[fasttrun_freshness_cache_used++];
+		}
+		else
+		{
+			/*
+			 * Cache full -- replace round-robin.  FIFO is good enough for
+			 * the planner-scoped lifetime; the only way to keep filling here
+			 * is plans that genuinely touch more than 64 different temp
+			 * relids, where the working set itself does not fit anyway.
+			 */
+			slot = &fasttrun_freshness_cache[fasttrun_freshness_cache_next_evict];
+			fasttrun_freshness_cache_next_evict =
+				(fasttrun_freshness_cache_next_evict + 1) % FASTTRUN_FRESHNESS_CACHE_SLOTS;
+		}
 
 		slot->relid = relid;
 		slot->have = have;
@@ -1602,7 +1993,7 @@ fasttrun_estimate_ndistinct(int n_nonnull, int ndistinct, int nmultiple,
 	if (ndistinct == 1)
 		return 1.0f;
 	if (nmultiple == 0)
-		return -1.0f;					/* no repeats — assume unique */
+		return -1.0f;					/* no repeats -- assume unique */
 	if (ndistinct == nmultiple)
 		return (float4) ndistinct;		/* bounded set */
 
@@ -1678,6 +2069,8 @@ fasttrun_stats_cache_store(Oid relid, AttrNumber attnum, HeapTuple statsTuple,
 	SubTransactionId	cur_subid = GetCurrentSubTransactionId();
 
 	fasttrun_stats_cache_init();
+	/* Publish path for per-column stats -- xact-end callbacks must see this relid. */
+	fasttrun_xact_touch_relid(relid);
 
 	fasttrun_stats_key_init(&key, relid, attnum, false);
 
@@ -1688,6 +2081,8 @@ fasttrun_stats_cache_store(Oid relid, AttrNumber attnum, HeapTuple statsTuple,
 	if (!found)
 	{
 		entry->undo = NULL;
+		/* Add a backref so targeted eviction stays O(K). */
+		fasttrun_stats_relid_add_key(&key);
 	}
 	else if (entry->collected_subid != cur_subid)
 	{
@@ -1709,7 +2104,7 @@ fasttrun_stats_cache_store(Oid relid, AttrNumber attnum, HeapTuple statsTuple,
 	}
 	else
 	{
-		/* Same subxact — just free the old tuple. */
+		/* Same subxact -- just free the old tuple. */
 		if (entry->statsTuple != NULL)
 			heap_freetuple(entry->statsTuple);
 	}
@@ -1743,127 +2138,263 @@ fasttrun_stats_entry_free_undo(FasttrunStatsEntry *entry)
 	}
 }
 
-static void
+/*
+ * COMMIT-time bookkeeping for the per-(relid, attnum) column-stats cache.
+ *
+ * Same pathology as fasttrun_cache_commit_xact() suffered before the
+ * 2.2.0 regression.  The old code walked the full stats cache on every
+ * COMMIT.  It did RelationIdGetRelation plus fasttrun_read_pgstat_counters
+ * per entry.  Then it fired fasttrun_invalidate_local_plan_cache()
+ * whenever the pgstat snapshot drifted -- the common case for ON COMMIT
+ * DELETE ROWS temp tables re-analyzed every xact.  Result: all cached
+ * plans walked once per stale entry, N x M work on every COMMIT.
+ *
+ * The new code:
+ *   - walks the per-xact touched-relid list, then the attkeys backref
+ *     for each one -- O(touched * cached-cols-per-rel), not
+ *     O(total-stats-entries);
+ *   - reads pgstat counters once per relid, not once per attkey
+ *     (a 20-column temp table used to cost 20 reads here);
+ *   - on staleness, drops the entry locally and emits no shared
+ *     invalidation.  The freshness check in
+ *     fasttrun_get_relation_stats_hook already hides the tuple from the
+ *     planner.  And the next fasttrun_analyze() that observes drift will
+ *     issue a focused fasttrun_invalidate_local_plan_cache() of its own.
+ *
+ * Net effect: column stats stay "fresh-or-hidden" through the planner
+ * hook.  No per-COMMIT plan-cache walking.
+ */
+/* Same reasoning as for fasttrun_cache_commit_xact -- keep the uprobe target. */
+static pg_noinline void
 fasttrun_stats_cache_commit_xact(void)
 {
-	HASH_SEQ_STATUS status;
-	FasttrunStatsEntry *entry;
+	ListCell   *lc;
 
-	if (fasttrun_stats_cache == NULL)
+	if (fasttrun_stats_cache == NULL ||
+		fasttrun_stats_relid_cache == NULL ||
+		fasttrun_xact_touched_oids == NIL)
 		return;
 
-	hash_seq_init(&status, fasttrun_stats_cache);
-	while ((entry = (FasttrunStatsEntry *) hash_seq_search(&status)) != NULL)
+	foreach(lc, fasttrun_xact_touched_oids)
 	{
-		FasttrunStatsKey key;
-		Relation	rel;
+		Oid			relid = lfirst_oid(lc);
+		FasttrunStatsRelidEntry *relentry;
+		List	   *keys;
+		ListCell   *klc;
 		int64		ins_now = 0;
 		int64		upd_now = 0;
 		int64		del_now = 0;
 		bool		truncdropped_now = false;
 		bool		have_counters = false;
+		bool		counters_attempted = false;
 
-		key = entry->key;
-		if (entry->statsTuple == NULL)
-		{
-			fasttrun_stats_entry_free_undo(entry);
-			(void) hash_search(fasttrun_stats_cache, &key, HASH_REMOVE, NULL);
+		relentry = (FasttrunStatsRelidEntry *)
+			hash_search(fasttrun_stats_relid_cache, &relid, HASH_FIND, NULL);
+		if (relentry == NULL || relentry->attkeys == NIL)
 			continue;
-		}
-
-		rel = RelationIdGetRelation(key.relid);
-		if (rel != NULL)
-		{
-			have_counters = fasttrun_read_pgstat_counters(rel, &ins_now,
-														  &upd_now, &del_now,
-														  &truncdropped_now);
-			RelationClose(rel);
-		}
 
 		/*
-		 * Preserve stats across COMMIT only if they were still fresh at the
-		 * boundary.  Below-threshold DML deliberately leaves collected_* at the
-		 * old snapshot so the planner hook hides the stale tuple; resetting that
-		 * old snapshot to zero would make it look fresh again in the next xact.
+		 * Snapshot the attkey list.  Drop paths below call
+		 * fasttrun_stats_relid_drop_key which mutates relentry->attkeys
+		 * mid-iteration -- iterating the live list would invalidate our
+		 * ListCells.
 		 */
-		if (!have_counters ||
-			ins_now != entry->collected_ins ||
-			upd_now != entry->collected_upd ||
-			del_now != entry->collected_del ||
-			truncdropped_now != entry->collected_truncdropped)
+		keys = list_copy(relentry->attkeys);
+
+		foreach(klc, keys)
 		{
-			fasttrun_stats_entry_free_undo(entry);
-			if (entry->statsTuple != NULL)
+			FasttrunStatsKey *kptr = (FasttrunStatsKey *) lfirst(klc);
+			FasttrunStatsKey key = *kptr;	/* value copy -- drop_key may pfree source */
+			FasttrunStatsEntry *entry;
+
+			entry = (FasttrunStatsEntry *)
+				hash_search(fasttrun_stats_cache, &key, HASH_FIND, NULL);
+			if (entry == NULL)
 			{
-				fasttrun_stats_relid_unref(key.relid);
-				heap_freetuple(entry->statsTuple);
+				/* Stale backref -- drop it and move on. */
+				fasttrun_stats_relid_drop_key(&key);
+				continue;
 			}
-			(void) hash_search(fasttrun_stats_cache, &key, HASH_REMOVE, NULL);
-			fasttrun_invalidate_local_plan_cache(key.relid);
-			continue;
+
+			if (entry->statsTuple == NULL)
+			{
+				fasttrun_stats_entry_free_undo(entry);
+				(void) hash_search(fasttrun_stats_cache, &key, HASH_REMOVE, NULL);
+				fasttrun_stats_relid_drop_key(&key);
+				continue;
+			}
+
+			/*
+			 * Read pgstat once per relid, not once per attkey.  All
+			 * statsTuples for this relid share the same counters; the
+			 * scalar-per-entry loop just compared them against the same
+			 * (ins, upd, del, truncdropped) tuple anyway.
+			 */
+			if (!counters_attempted)
+			{
+				Relation	rel;
+
+				counters_attempted = true;
+				rel = RelationIdGetRelation(relid);
+				if (rel != NULL)
+				{
+					have_counters = fasttrun_read_pgstat_counters(rel, &ins_now,
+																  &upd_now, &del_now,
+																  &truncdropped_now);
+					RelationClose(rel);
+				}
+			}
+
+			/*
+			 * Preserve stats across COMMIT only if they were still fresh at the
+			 * boundary.  Below-threshold DML deliberately leaves collected_* at the
+			 * old snapshot so the planner hook hides the stale tuple; resetting that
+			 * old snapshot to zero would make it look fresh again in the next xact.
+			 *
+			 * No fasttrun_invalidate_local_plan_cache() call here.  The freshness
+			 * check in fasttrun_get_relation_stats_hook will refuse to return the
+			 * stale tuple, and the planner falls back to defaults on the next
+			 * plan.  The next fasttrun_analyze() that publishes refreshed stats
+			 * issues its own targeted invalidation -- see need_plan_inval inside
+			 * fasttrun_analyze.
+			 */
+			if (!have_counters ||
+				ins_now != entry->collected_ins ||
+				upd_now != entry->collected_upd ||
+				del_now != entry->collected_del ||
+				truncdropped_now != entry->collected_truncdropped)
+			{
+				fasttrun_stats_entry_free_undo(entry);
+				if (entry->statsTuple != NULL)
+				{
+					fasttrun_stats_relid_unref(key.relid);
+					heap_freetuple(entry->statsTuple);
+				}
+				(void) hash_search(fasttrun_stats_cache, &key, HASH_REMOVE, NULL);
+				fasttrun_stats_relid_drop_key(&key);
+				continue;
+			}
+
+			fasttrun_stats_entry_free_undo(entry);
+			entry->collected_ins = 0;
+			entry->collected_upd = 0;
+			entry->collected_del = 0;
+			entry->collected_truncdropped = false;
+			entry->collected_subid = InvalidSubTransactionId;
 		}
 
-		fasttrun_stats_entry_free_undo(entry);
-		entry->collected_ins = 0;
-		entry->collected_upd = 0;
-		entry->collected_del = 0;
-		entry->collected_truncdropped = false;
-		entry->collected_subid = InvalidSubTransactionId;
+		list_free(keys);
 	}
 }
 
 /*
- * Drop all stats entries for a given relid.  Called from fasttruncate
- * as a backstop against the freshness check (e.g. if pgstat is off
- * and the hook can't compare counters).
+ * Drop all stats entries for a given relid.
+ *
+ * Called from fasttruncate as a backstop against the freshness check --
+ * for example when pgstat is off and the hook cannot compare counters.
+ * Also called from fasttrun_collect_stats and fasttrun_analyze when a
+ * refresh observes a now-empty sample.
+ *
+ * Iterates only the keys registered in fasttrun_stats_relid_cache for
+ * this relid -- O(#cached-cols).  No more hash_seq_search over the whole
+ * stats hash (O(total-stats-entries)).
  */
 static bool
 fasttrun_stats_cache_evict_relid(Oid relid)
 {
-	HASH_SEQ_STATUS status;
-	FasttrunStatsEntry *entry;
-	bool			removed = false;
+	FasttrunStatsRelidEntry *relentry;
+	List	   *keys;
+	ListCell   *lc;
+	bool		removed = false;
 
-	if (fasttrun_stats_cache == NULL)
+	if (fasttrun_stats_cache == NULL || fasttrun_stats_relid_cache == NULL)
 		return false;
 
-	hash_seq_init(&status, fasttrun_stats_cache);
-	while ((entry = (FasttrunStatsEntry *) hash_seq_search(&status)) != NULL)
+	relentry = (FasttrunStatsRelidEntry *) hash_search(fasttrun_stats_relid_cache,
+													   &relid, HASH_FIND, NULL);
+	if (relentry == NULL || relentry->attkeys == NIL)
+		return false;
+
+	/*
+	 * Snapshot the attkey list.  fasttrun_stats_relid_drop_key mutates
+	 * relentry->attkeys during iteration, and that would invalidate the
+	 * ListCells we are walking.
+	 */
+	keys = list_copy(relentry->attkeys);
+
+	foreach(lc, keys)
 	{
-		FasttrunStatsKey key;
+		FasttrunStatsKey *kptr = (FasttrunStatsKey *) lfirst(lc);
+		FasttrunStatsKey key = *kptr;	/* value copy -- drop_key may pfree source */
+		FasttrunStatsEntry *entry;
 
-		if (entry->key.relid != relid)
+		entry = (FasttrunStatsEntry *) hash_search(fasttrun_stats_cache,
+												   &key, HASH_FIND, NULL);
+		if (entry == NULL)
+		{
+			/* Out of sync -- drop the dangling backref. */
+			fasttrun_stats_relid_drop_key(&key);
 			continue;
+		}
 
-		key = entry->key;
 		fasttrun_stats_entry_free_undo(entry);
 		if (entry->statsTuple != NULL)
 		{
-			fasttrun_stats_relid_unref(key.relid);
+			fasttrun_stats_relid_unref(relid);
 			heap_freetuple(entry->statsTuple);
 		}
 		(void) hash_search(fasttrun_stats_cache, &key, HASH_REMOVE, NULL);
+		fasttrun_stats_relid_drop_key(&key);
 		removed = true;
 	}
 
+	list_free(keys);
 	return removed;
 }
 
+/*
+ * Soft-evict every visible statsTuple for `relid`.
+ *
+ * statsTuple goes to NULL; the old version is pushed onto the per-entry
+ * undo stack so ROLLBACK TO SAVEPOINT can restore it.  Called from DDL
+ * eviction via fasttrun_evict_temp_relid.
+ *
+ * Uses the same O(K) attkeys backref as evict_relid above.
+ */
 static bool
 fasttrun_stats_cache_mark_evicted_relid(Oid relid)
 {
-	HASH_SEQ_STATUS status;
-	FasttrunStatsEntry *entry;
-	bool			changed = false;
+	FasttrunStatsRelidEntry *relentry;
+	List	   *keys;
+	ListCell   *lc;
+	bool		changed = false;
 	SubTransactionId cur_subid = GetCurrentSubTransactionId();
 
-	if (fasttrun_stats_cache == NULL)
+	if (fasttrun_stats_cache == NULL || fasttrun_stats_relid_cache == NULL)
 		return false;
 
-	hash_seq_init(&status, fasttrun_stats_cache);
-	while ((entry = (FasttrunStatsEntry *) hash_seq_search(&status)) != NULL)
+	relentry = (FasttrunStatsRelidEntry *) hash_search(fasttrun_stats_relid_cache,
+													   &relid, HASH_FIND, NULL);
+	if (relentry == NULL || relentry->attkeys == NIL)
+		return false;
+
+	keys = list_copy(relentry->attkeys);
+
+	foreach(lc, keys)
 	{
-		if (entry->key.relid != relid || entry->statsTuple == NULL)
+		FasttrunStatsKey *kptr = (FasttrunStatsKey *) lfirst(lc);
+		FasttrunStatsKey key = *kptr;
+		FasttrunStatsEntry *entry;
+
+		entry = (FasttrunStatsEntry *) hash_search(fasttrun_stats_cache,
+												   &key, HASH_FIND, NULL);
+		if (entry == NULL)
+		{
+			fasttrun_stats_relid_drop_key(&key);
+			continue;
+		}
+
+		if (entry->statsTuple == NULL)
 			continue;
 
 		fasttrun_stats_relid_unref(relid);
@@ -1898,6 +2429,7 @@ fasttrun_stats_cache_mark_evicted_relid(Oid relid)
 		changed = true;
 	}
 
+	list_free(keys);
 	return changed;
 }
 
@@ -1907,16 +2439,16 @@ fasttrun_stats_cache_mark_evicted_relid(Oid relid)
  *
  * Per-column stats cache (statsTuple + freshness counters):
  *   ABORT_SUB:
- *     - entry has undo → pop top saved state back into entry (full
+ *     - entry has undo -> pop top saved state back into entry (full
  *       restore of pre-subxact version);
- *     - no undo → entry was created inside aborting subxact → remove.
+ *     - no undo -> entry was created inside aborting subxact -> remove.
  *   COMMIT_SUB: re-label sub-local entries with the parent subid; if
  *     the undo top is already at parent level, collapse it.
  *
  * Analyze-cache stats baseline (used by the refresh-path churn check):
  *   ABORT_SUB:
- *     - baseline was set in this subxact and has undo → pop;
- *     - was set in this subxact and no undo → mark has_stats_baseline
+ *     - baseline was set in this subxact and has undo -> pop;
+ *     - was set in this subxact and no undo -> mark has_stats_baseline
  *       false (it was created from scratch inside the rolled-back
  *       subxact, there is nothing to restore to).
  *   COMMIT_SUB: re-label + collapse undo, same as the stats cache.
@@ -1931,89 +2463,140 @@ static void
 fasttrun_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 						  SubTransactionId parentSubid, void *arg)
 {
-	HASH_SEQ_STATUS		status;
-	FasttrunStatsEntry *sentry;
-	FasttrunAnalyzeCacheEntry *aentry;
+	ListCell   *lc;
 
 	if (event != SUBXACT_EVENT_ABORT_SUB && event != SUBXACT_EVENT_COMMIT_SUB)
 		return;
 
-	if (fasttrun_stats_cache != NULL)
+	/*
+	 * Hot-path shortcut.  When no fasttrun cache mutation happened anywhere
+	 * in the current top xact, the cache holds nothing that needs
+	 * subxact-aware rollback or promotion.  PL/pgSQL EXCEPTION blocks (each
+	 * iteration is its own subxact) and similar savepoint-heavy patterns
+	 * skip the whole walk entirely.
+	 */
+	if (fasttrun_xact_touched_oids == NIL)
+		return;
+
+	/*
+	 * Walk per touched relid, not per cache entry.  For each relid we hit
+	 * the stats cache through fasttrun_stats_relid_cache.attkeys (O(K) per
+	 * relid) and the analyze cache via a single hash_search by relid.
+	 * Savepoint-heavy PL/pgSQL with a small touched set used to scan the
+	 * whole cache here; now the work is O(touched * cached-cols).
+	 */
+	foreach(lc, fasttrun_xact_touched_oids)
 	{
-		hash_seq_init(&status, fasttrun_stats_cache);
-		while ((sentry = (FasttrunStatsEntry *) hash_seq_search(&status)) != NULL)
+		Oid			relid = lfirst_oid(lc);
+		FasttrunAnalyzeCacheEntry *aentry;
+
+		if (fasttrun_stats_cache != NULL && fasttrun_stats_relid_cache != NULL)
 		{
-			if (sentry->collected_subid != mySubid)
-				continue;
+			FasttrunStatsRelidEntry *relentry;
+			List	   *keys;
+			ListCell   *klc;
 
-			if (event == SUBXACT_EVENT_ABORT_SUB)
+			relentry = (FasttrunStatsRelidEntry *)
+				hash_search(fasttrun_stats_relid_cache, &relid, HASH_FIND, NULL);
+			if (relentry != NULL && relentry->attkeys != NIL)
 			{
-				if (sentry->undo != NULL)
-				{
-					/* Restore pre-subxact version from the undo stack. */
-					FasttrunStatsSavedState *popped = sentry->undo;
-
-					if (sentry->statsTuple != NULL)
-					{
-						fasttrun_stats_relid_unref(sentry->key.relid);
-						heap_freetuple(sentry->statsTuple);
-					}
-					sentry->statsTuple = popped->statsTuple;
-					if (sentry->statsTuple != NULL)
-						fasttrun_stats_relid_ref(sentry->key.relid);
-					sentry->collected_ins = popped->collected_ins;
-					sentry->collected_upd = popped->collected_upd;
-					sentry->collected_del = popped->collected_del;
-					sentry->collected_truncdropped = popped->collected_truncdropped;
-					sentry->collected_subid = popped->collected_subid;
-					sentry->undo = popped->older;
-					pfree(popped);	/* popped->statsTuple now owned by entry */
-					fasttrun_invalidate_local_plan_cache(sentry->key.relid);
-				}
-				else
-				{
-					/* Created in this subxact -> drop entirely. */
-					Oid		relid = sentry->key.relid;
-
-					if (sentry->statsTuple != NULL)
-					{
-						fasttrun_stats_relid_unref(relid);
-						heap_freetuple(sentry->statsTuple);
-					}
-					(void) hash_search(fasttrun_stats_cache, &sentry->key,
-									   HASH_REMOVE, NULL);
-					fasttrun_invalidate_local_plan_cache(relid);
-				}
-			}
-			else	/* SUBXACT_EVENT_COMMIT_SUB */
-			{
-				sentry->collected_subid = parentSubid;
-
 				/*
-				 * If the undo top was also at parent level, the pre-
-				 * and post-store versions now sit at the same subxact
-				 * → the undo entry is obsolete (outer rollback would
-				 * restore to the same level anyway), collapse it.
+				 * Snapshot attkeys.  Drop paths below pfree list nodes via
+				 * fasttrun_stats_relid_drop_key, mutating the live list.
 				 */
-				if (sentry->undo != NULL &&
-					sentry->undo->collected_subid == parentSubid)
-				{
-					FasttrunStatsSavedState *obsolete = sentry->undo;
+				keys = list_copy(relentry->attkeys);
 
-					if (obsolete->statsTuple != NULL)
-						heap_freetuple(obsolete->statsTuple);
-					sentry->undo = obsolete->older;
-					pfree(obsolete);
+				foreach(klc, keys)
+				{
+					FasttrunStatsKey *kptr = (FasttrunStatsKey *) lfirst(klc);
+					FasttrunStatsKey key = *kptr;
+					FasttrunStatsEntry *sentry;
+
+					sentry = (FasttrunStatsEntry *)
+						hash_search(fasttrun_stats_cache, &key, HASH_FIND, NULL);
+					if (sentry == NULL)
+					{
+						fasttrun_stats_relid_drop_key(&key);
+						continue;
+					}
+					if (sentry->collected_subid != mySubid)
+						continue;
+
+					if (event == SUBXACT_EVENT_ABORT_SUB)
+					{
+						if (sentry->undo != NULL)
+						{
+							/* Restore pre-subxact version from the undo stack. */
+							FasttrunStatsSavedState *popped = sentry->undo;
+
+							if (sentry->statsTuple != NULL)
+							{
+								fasttrun_stats_relid_unref(relid);
+								heap_freetuple(sentry->statsTuple);
+							}
+							sentry->statsTuple = popped->statsTuple;
+							if (sentry->statsTuple != NULL)
+								fasttrun_stats_relid_ref(relid);
+							sentry->collected_ins = popped->collected_ins;
+							sentry->collected_upd = popped->collected_upd;
+							sentry->collected_del = popped->collected_del;
+							sentry->collected_truncdropped = popped->collected_truncdropped;
+							sentry->collected_subid = popped->collected_subid;
+							sentry->undo = popped->older;
+							pfree(popped);	/* popped->statsTuple now owned by entry */
+							fasttrun_invalidate_local_plan_cache(relid);
+						}
+						else
+						{
+							/* Created in this subxact -> drop entirely. */
+							if (sentry->statsTuple != NULL)
+							{
+								fasttrun_stats_relid_unref(relid);
+								heap_freetuple(sentry->statsTuple);
+							}
+							(void) hash_search(fasttrun_stats_cache, &key,
+											   HASH_REMOVE, NULL);
+							fasttrun_stats_relid_drop_key(&key);
+							fasttrun_invalidate_local_plan_cache(relid);
+						}
+					}
+					else	/* SUBXACT_EVENT_COMMIT_SUB */
+					{
+						sentry->collected_subid = parentSubid;
+
+						/*
+						 * If the undo top was also at parent level, the pre-
+						 * and post-store versions now sit at the same subxact
+						 * -> the undo entry is obsolete (outer rollback would
+						 * restore to the same level anyway), collapse it.
+						 */
+						if (sentry->undo != NULL &&
+							sentry->undo->collected_subid == parentSubid)
+						{
+							FasttrunStatsSavedState *obsolete = sentry->undo;
+
+							if (obsolete->statsTuple != NULL)
+								heap_freetuple(obsolete->statsTuple);
+							sentry->undo = obsolete->older;
+							pfree(obsolete);
+						}
+					}
 				}
+
+				list_free(keys);
 			}
 		}
-	}
 
-	if (fasttrun_analyze_cache != NULL)
-	{
-		hash_seq_init(&status, fasttrun_analyze_cache);
-		while ((aentry = (FasttrunAnalyzeCacheEntry *) hash_seq_search(&status)) != NULL)
+		if (fasttrun_analyze_cache == NULL)
+			continue;
+
+		aentry = (FasttrunAnalyzeCacheEntry *)
+			hash_search(fasttrun_analyze_cache, &relid, HASH_FIND, NULL);
+		if (aentry == NULL)
+			continue;
+
 		{
+
 			if (aentry->relstats_subid == mySubid)
 			{
 				if (event == SUBXACT_EVENT_ABORT_SUB)
@@ -2138,6 +2721,26 @@ fasttrun_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 					}
 				}
 			}
+
+			/*
+			 * Lazy-probe memo.  The observation in
+			 * fasttrun_reinject_relstats is valid only inside the subxact
+			 * that recorded it.  On ABORT_SUB we drop it -- the storage
+			 * state we saw is the pre-abort view, and we cannot tell now
+			 * whether later DML in this rolled-back subxact moved
+			 * cached_pages.  On COMMIT_SUB we promote it to the parent
+			 * subxact so plans there keep skipping the probe.
+			 */
+			if (aentry->lazy_check_subid == mySubid)
+			{
+				if (event == SUBXACT_EVENT_ABORT_SUB)
+				{
+					aentry->lazy_check_subid = InvalidSubTransactionId;
+					aentry->lazy_check_pages = 0;
+				}
+				else		/* SUBXACT_EVENT_COMMIT_SUB */
+					aentry->lazy_check_subid = parentSubid;
+			}
 		}
 	}
 }
@@ -2147,7 +2750,7 @@ fasttrun_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
  *
  * When fasttrun.use_typanalyze=on (default), fasttrun reuses PostgreSQL's
  * own per-type typanalyze callbacks to compute n_distinct, MCV,
- * histogram, correlation and any type-specific statistics — exactly the
+ * histogram, correlation and any type-specific statistics -- exactly the
  * same code path that a regular ANALYZE would take, only without ever
  * touching pg_statistic on disk.  Output goes into the same per-(relid,
  * attnum) HeapTuple cache that the lightweight Haas-Stokes path uses,
@@ -2201,7 +2804,7 @@ fasttrun_get_attstattarget(Relation rel, AttrNumber attnum)
 }
 
 /*
- * Standard fetch function for compute_stats — pulls a column value out
+ * Standard fetch function for compute_stats -- pulls a column value out
  * of one of our sample tuples.  Mirrors std_fetch_func() in core
  * commands/analyze.c, which is static and not exported.
  */
@@ -2296,7 +2899,7 @@ fasttrun_examine_attribute(Relation rel, int attnum, MemoryContext anl_context)
 /*
  * Build a pg_statistic-shaped HeapTuple from a fully populated
  * VacAttrStats, mirroring the formatting half of update_attstats() in
- * commands/analyze.c — but without ever opening pg_statistic for write.
+ * commands/analyze.c -- but without ever opening pg_statistic for write.
  *
  * Returned tuple is allocated in CurrentMemoryContext.  Caller is
  * expected to feed it to fasttrun_stats_cache_store(), which deep-copies
@@ -2392,7 +2995,7 @@ fasttrun_build_pg_statistic_tuple(TupleDesc pg_stats_desc, Oid relid,
  * MCV / histogram / correlation slots.
  *
  * The temporary VacAttrStats objects live in a private mcxt that we
- * delete on the way out — this is just a sizing query, the real
+ * delete on the way out -- this is just a sizing query, the real
  * collect_and_store path will examine_attribute again.  Each call is
  * O(natts) syscache lookups + a typanalyze function call per column,
  * usually a few hundred microseconds total even on wide tables.  Cheap
@@ -2400,7 +3003,7 @@ fasttrun_build_pg_statistic_tuple(TupleDesc pg_stats_desc, Oid relid,
  *
  * Returns the maximum minrows seen, or 0 if no column has a usable
  * typanalyze (in which case the caller will skip stats collection).
- * A floor of 100 is enforced for sanity — even degenerate cases get
+ * A floor of 100 is enforced for sanity -- even degenerate cases get
  * a non-trivial sample.
  */
 static int
@@ -2440,10 +3043,10 @@ fasttrun_compute_max_minrows(Relation rel)
 
 /*
  * Resolve fasttrun.sample_rows GUC into the actual reservoir size.
- *   < 0 → autosize via fasttrun_compute_max_minrows() (full ANALYZE
+ *   < 0 -> autosize via fasttrun_compute_max_minrows() (full ANALYZE
  *         parity, follows default_statistics_target);
- *   = 0 → caller treats as "stats collection disabled";
- *   > 0 → explicit override.
+ *   = 0 -> caller treats as "stats collection disabled";
+ *   > 0 -> explicit override.
  */
 static int
 fasttrun_effective_sample_target(Relation rel)
@@ -2591,14 +3194,14 @@ fasttrun_cmp_heap_tuples_by_tid(const void *a, const void *b)
  * For every column of rel, compute stats from the sample and store in
  * the session-local cache.  Columns without a btree-orderable type are
  * skipped (planner falls back to defaults).  Also captures the current
- * pgstat counters as a freshness baseline — the planner hook compares
+ * pgstat counters as a freshness baseline -- the planner hook compares
  * against them and refuses to return stale stats after DML.
  *
  * Two implementations of "compute the stats" coexist, switched by
  * fasttrun.use_typanalyze (default on):
- *   * on  → fasttrun_collect_via_typanalyze: full core std_typanalyze
+ *   * on  -> fasttrun_collect_via_typanalyze: full core std_typanalyze
  *           with MCV / histogram / correlation;
- *   * off → fasttrun_collect_via_haas_stokes: lightweight n_distinct /
+ *   * off -> fasttrun_collect_via_haas_stokes: lightweight n_distinct /
  *           null_frac / width only.
  * Both branches end at the same fasttrun_stats_cache_store() and
  * publish through the same hooks.
@@ -2623,9 +3226,9 @@ fasttrun_collect_and_store(Relation rel, HeapTuple *sample, int sample_count,
 		return;
 
 	/*
-	 * track_counts=off (or pgstat otherwise unavailable) → no baseline
-	 * for the freshness check → do not cache at all, the planner will
-	 * fall back to defaults.  This is a "silent killer" — plans
+	 * track_counts=off (or pgstat otherwise unavailable) -> no baseline
+	 * for the freshness check -> do not cache at all, the planner will
+	 * fall back to defaults.  This is a "silent killer" -- plans
 	 * silently degrade without any explicit signal, so we raise a
 	 * WARNING once per backend to make DBAs see it in the server log
 	 * (and the psql client sees it too).
@@ -2746,7 +3349,7 @@ fasttrun_collect_and_store(Relation rel, HeapTuple *sample, int sample_count,
 		 *
 		 * Computes only n_distinct / null_frac / width via a per-
 		 * column qsort_arg.  No MCV / histogram / correlation, no
-		 * type-specific stats — but ~5x cheaper on wide tables and
+		 * type-specific stats -- but ~5x cheaper on wide tables and
 		 * available as a fallback if a particular type-specific
 		 * typanalyze misbehaves.
 		 * ---------------------------------------------------------- */
@@ -2779,7 +3382,7 @@ fasttrun_collect_and_store(Relation rel, HeapTuple *sample, int sample_count,
 
 			typentry = lookup_type_cache(attr->atttypid, TYPECACHE_LT_OPR);
 			if (!OidIsValid(typentry->lt_opr))
-				continue;	/* no btree comparator → skip */
+				continue;	/* no btree comparator -> skip */
 
 			MemoryContextReset(per_col_mcxt);
 			oldcxt = MemoryContextSwitchTo(per_col_mcxt);
@@ -2895,8 +3498,8 @@ fasttrun_collect_and_store(Relation rel, HeapTuple *sample, int sample_count,
 	 * Note: the stats-collection baseline (used by the delta-hit refresh
 	 * path to decide whether DML churn warrants another sample) lives in
 	 * the analyze cache entry, not in the per-(relid,attnum) stats cache.
-	 * It is set by the callers of this function — fasttrun_analyze()
-	 * cold path and refresh path — both of which already own (or just
+	 * It is set by the callers of this function -- fasttrun_analyze()
+	 * cold path and refresh path -- both of which already own (or just
 	 * created) an analyze cache entry to attach it to.  fasttrun_collect_
 	 * stats() does NOT touch the baseline, by design: it is a "give me
 	 * column stats now" entry point that doesn't participate in delta-
@@ -2964,7 +3567,7 @@ fasttrun_scan_with_sample(Relation rel, int64 *tuples_out,
  * next segment doesn't exist (ENOENT) and stop.
  *
  * On unlink failure for any other reason we ereport(WARNING) and bail
- * out — the caller (fasttrun_smgr_bypass_truncate) treats partial
+ * out -- the caller (fasttrun_smgr_bypass_truncate) treats partial
  * unlink as a hard error because the relation will be in a half-state
  * otherwise.
  */
@@ -2984,7 +3587,7 @@ fasttrun_unlink_fork_segments(const char *base_path)
 		if (unlink(path) < 0)
 		{
 			if (errno == ENOENT)
-				return;	/* no more segments — normal end */
+				return;	/* no more segments -- normal end */
 			ereport(ERROR,
 					(errcode_for_file_access(),
 					 errmsg("fasttrun: could not unlink relation segment \"%s\": %m",
@@ -2997,8 +3600,8 @@ fasttrun_unlink_fork_segments(const char *base_path)
 /*
  * Zero-sinval physical truncation of a temp relation.
  *
- * Functionally equivalent to heap_truncate_one_rel(rel) — empties the
- * heap to zero blocks and discards local buffers — but does NOT call
+ * Functionally equivalent to heap_truncate_one_rel(rel) -- empties the
+ * heap to zero blocks and discards local buffers -- but does NOT call
  * smgrtruncate() and therefore never reaches CacheInvalidateSmgr().
  * That removes the last shared-invalidation message that fasttruncate
  * was sending; the path is now literally zero sinval.
@@ -3015,7 +3618,7 @@ fasttrun_unlink_fork_segments(const char *base_path)
  *      built-in invalidation.
  *
  * The whole operation goes through public smgr.h / buf_internals.h /
- * relpath.h API — no internal smgrsw[] poking.  GetRelationPath returns
+ * relpath.h API -- no internal smgrsw[] poking.  GetRelationPath returns
  * a palloc'd char* in PG <18 and a stack-allocated RelPathStr in PG 18+,
  * so the wrapping is version-conditional.
  *
@@ -3059,7 +3662,7 @@ fasttrun_smgr_bypass_truncate(Relation rel)
 	if (smgrexists(reln, VISIBILITYMAP_FORKNUM))
 		forks[nforks++] = VISIBILITYMAP_FORKNUM;
 
-	/* 2. Drop local buffers for every fork (temp tables → local pool). */
+	/* 2. Drop local buffers for every fork (temp tables -> local pool). */
 	for (i = 0; i < nforks; i++)
 		DropRelationLocalBuffers(rlocator.locator, forks[i], 0);
 
@@ -3068,7 +3671,7 @@ fasttrun_smgr_bypass_truncate(Relation rel)
 	 * SMgrRelation BEFORE we touch the files on disk.  Without this, the
 	 * MdfdVec arrays inside md.c keep pointing at the inodes we are about
 	 * to unlink, and the next mdcreate() would resize those arrays via
-	 * repalloc() rather than rebuild them from scratch — leaving stale fd
+	 * repalloc() rather than rebuild them from scratch -- leaving stale fd
 	 * entries for any segment beyond segno 0.  Calling smgrrelease() runs
 	 * mdclose() for every fork, which properly closes every cached fd and
 	 * trims md_seg_fds[] back to zero, so the post-unlink smgrcreate()
@@ -3130,9 +3733,9 @@ fasttrun_smgr_bypass_truncate(Relation rel)
  * Mirrors heap_truncate_one_rel():
  *   1. Truncate the heap via fasttrun_smgr_bypass_truncate.
  *   2. For each index: truncate storage, then rebuild the empty index
- *      structure (metapage) via the AM's ambuild callback directly —
+ *      structure (metapage) via the AM's ambuild callback directly --
  *      NOT through index_build(), because index_build calls
- *      index_update_stats → systable_inplace_update_finish on pg_class,
+ *      index_update_stats -> systable_inplace_update_finish on pg_class,
  *      which generates shared cache invalidation messages.
  *   3. If a toast table exists, truncate it and its indexes the same way.
  */
@@ -3285,14 +3888,14 @@ fasttrun_invalidate_local_plan_cache(Oid relid)
  * Behaviour:
  *   * Resolves the supplied (possibly schema-qualified) name to an OID,
  *     taking AccessExclusiveLock on the relation.  If the relation does
- *     not exist, the function silently does nothing — this lets callers
+ *     not exist, the function silently does nothing -- this lets callers
  *     drop the usual `IF EXISTS` / pre-check pattern and simplifies the
  *     recovery logic of bulk PL/pgSQL routines.
  *   * Verifies the relation lives in a temp namespace; otherwise raises
  *     an error (this prevents accidentally truncating a regular table).
  *   * Cheap empty-check via RelationGetNumberOfBlocks (single smgr
  *     call, no catalog touch); skips the truncate on empty heap.
- *   * If non-empty, calls heap_truncate_one_rel() directly — bypasses
+ *   * If non-empty, calls heap_truncate_one_rel() directly -- bypasses
  *     the heap_truncate(List*) wrapper (avoids a redundant table_open)
  *     AND heap_truncate_check_FKs() (see FK-unsafe warning below).
  *   * Drops any cached fasttrun_analyze entry for this OID.
@@ -3300,7 +3903,7 @@ fasttrun_invalidate_local_plan_cache(Oid relid)
  * IMPORTANT: this function is FOREIGN-KEY-UNSAFE.  fasttruncate does
  * NOT scan pg_constraint.  If you have FKs involving temp tables, use
  * SQL TRUNCATE instead.  Workloads this extension is built for never
- * declare FKs on temp tables — we skip the check by design.
+ * declare FKs on temp tables -- we skip the check by design.
  *
  * Importantly, fasttruncate() does NOT call vacuum() or analyze_rel()
  * after the truncate.  Earlier versions of this extension used to do so,
@@ -3334,7 +3937,7 @@ fasttruncate(PG_FUNCTION_ARGS)
 	relOid = RangeVarGetRelid(relvar, AccessExclusiveLock, true);
 
 	/*
-	 * Missing table — silently bail out (see function header).
+	 * Missing table -- silently bail out (see function header).
 	 */
 	if (!OidIsValid(relOid))
 		PG_RETURN_VOID();
@@ -3359,6 +3962,9 @@ fasttruncate(PG_FUNCTION_ARGS)
 
 	/* Same activity check as core TRUNCATE -- rejects open cursors etc. */
 	CheckTableNotInUse(rel, "fasttruncate");
+
+	/* Register for per-xact bookkeeping -- callbacks walk this list only. */
+	fasttrun_xact_touch_relid(relOid);
 
 	/*
 	 * Evict/invalidate before touching storage.  If index rebuild later
@@ -3435,15 +4041,40 @@ fasttruncate(PG_FUNCTION_ARGS)
  * Column-level coverage: if auto_collect_stats is on (default), the
  * cold scan collects full per-column stats via the planner hook.
  * With use_typanalyze=on (default) this includes MCV, histogram,
- * correlation — same quality as regular ANALYZE.
+ * correlation -- same quality as regular ANALYZE.
  */
-Datum
-fasttrun_analyze(PG_FUNCTION_ARGS)
+/*
+ * Workhorse for fasttrun_analyze() and fasttrun_analyze_bulk().
+ *
+ * Runs the full analyze pipeline on an already-opened Relation:
+ * delta-hit cache, refresh-check, cold scan, index relstats update,
+ * rd_rel reinjection.  Emits fasttrun_invalidate_local_plan_cache()
+ * internally when relstats drift crosses fasttrun.invalidate_threshold.
+ *
+ * Firing the invalidation BEFORE the final rd_rel mutation is
+ * load-bearing.  The invalidation goes through
+ * RelationCacheInvalidateEntry().  That rebuilds the relcache entry from
+ * pg_class while we still hold AccessShareLock.  We then re-mutate
+ * rd_rel afterwards, and the planner observes our cached values -- not
+ * the stale 0/0 from pg_class.  Move the invalidate past the mutation
+ * (or past table_close) and our values get silently wiped.
+ *
+ * Caller is responsible for:
+ *   - resolving the RangeVar to relOid + table_open(NoLock);
+ *   - verifying relpersistence == RELPERSISTENCE_TEMP, isTempNamespace,
+ *     heap-AM;
+ *   - calling fasttrun_xact_touch_relid(relOid);
+ *   - table_close(rel, AccessShareLock) afterwards.
+ *
+ * fasttrun_analyze_bulk() invokes this once per relation in its array.
+ * PG's PlanCacheRelCallback short-circuits already-is_valid=false plans
+ * on subsequent messages, so a tight loop of per-relid invalidations
+ * still amortizes the per-message plan_cache walk.
+ */
+static void
+fasttrun_analyze_relation(Relation rel)
 {
-	text		   *name = PG_GETARG_TEXT_P(0);
-	RangeVar	   *relvar;
-	Oid				relOid;
-	Relation		rel;
+	Oid				relOid = RelationGetRelid(rel);
 	BlockNumber		pages_now = 0;
 	int64			tuples_count = 0;
 	int64			ins_now = 0;
@@ -3466,30 +4097,6 @@ fasttrun_analyze(PG_FUNCTION_ARGS)
 	int64			delta_upd = 0;
 	int64			delta_del = 0;
 	FasttrunAnalyzeCacheEntry *entry = NULL;
-
-	relvar = fasttrun_make_rangevar(name);
-	relOid = RangeVarGetRelid(relvar, AccessShareLock, true);
-
-	if (!OidIsValid(relOid))
-		PG_RETURN_VOID();
-
-	rel = table_open(relOid, NoLock);
-
-	if (rel->rd_rel->relpersistence != RELPERSISTENCE_TEMP ||
-		!isTempNamespace(RelationGetNamespace(rel)))
-	{
-		table_close(rel, NoLock);
-		elog(ERROR, "fasttrun_analyze: relation \"%s\" is not a local temporary table",
-			 RelationGetRelationName(rel));
-	}
-
-	/* heap_getnext + delta math assume heap-AM. */
-	if (rel->rd_tableam != GetHeapamTableAmRoutine())
-	{
-		table_close(rel, NoLock);
-		elog(ERROR, "fasttrun_analyze: relation \"%s\" is not heap-AM",
-			 RelationGetRelationName(rel));
-	}
 
 	old_pages = rel->rd_rel->relpages;
 	old_allvisible = rel->rd_rel->relallvisible;
@@ -3751,14 +4358,177 @@ fasttrun_analyze(PG_FUNCTION_ARGS)
 					   stats_recollected ||
 					   stats_visibility_changed ||
 					   index_relstats_changed);
+
+	/*
+	 * Below-threshold relstats drift does NOT invalidate cached plans.
+	 * A few extra rows rarely flip the optimizer's choice.  And walking
+	 * the entire plan_cache once per analyze dominates xact CPU on
+	 * backends with large SPI/PREPARE caches.
+	 *
+	 * Column-stats refresh, stats-visibility flip, and index relstats
+	 * change always invalidate.  They signal distribution changes that
+	 * the per-row ratio here cannot measure.
+	 */
+	if (need_plan_inval && fasttrun_invalidate_threshold > 0.0 &&
+		!stats_recollected && !stats_visibility_changed &&
+		!index_relstats_changed)
+	{
+		double		baseline_tuples = (old_tuples > 0.0f)
+			? (double) old_tuples : 1.0;
+		double		ratio_tuples =
+			fabs((double) tuples_count - (double) old_tuples) / baseline_tuples;
+		double		ratio_pages = (old_pages > 0)
+			? fabs((double) pages_now - (double) old_pages) / (double) old_pages
+			: (pages_now > 0 ? 1.0 : 0.0);
+		double		worst = Max(ratio_tuples, ratio_pages);
+
+		if (worst < fasttrun_invalidate_threshold)
+			need_plan_inval = false;
+	}
+
 	if (need_plan_inval)
 		fasttrun_invalidate_local_plan_cache(relOid);
 
 	rel->rd_rel->relpages = pages_now;
 	rel->rd_rel->reltuples = (float4) tuples_count;
 	rel->rd_rel->relallvisible = (int32) allvisible_now;
+}
 
+/*
+ * fasttrun_analyze(text) -- a thin wrapper around
+ * fasttrun_analyze_relation().  It resolves the relation name, takes
+ * AccessShareLock, runs the helper, and emits any resulting plan-cache
+ * invalidation.
+ *
+ * For the function-level contract -- silent return on missing relation,
+ * ERROR on non-temp or non-heap, what gets cached, when sinval fires --
+ * see the comment block above fasttrun_analyze_relation() and the
+ * section "Lazy-mode cache for fasttrun_analyze" near the top of this
+ * file.
+ */
+Datum
+fasttrun_analyze(PG_FUNCTION_ARGS)
+{
+	text	   *name = PG_GETARG_TEXT_P(0);
+	RangeVar   *relvar;
+	Oid			relOid;
+	Relation	rel;
+
+	relvar = fasttrun_make_rangevar(name);
+	relOid = RangeVarGetRelid(relvar, AccessShareLock, true);
+	if (!OidIsValid(relOid))
+		PG_RETURN_VOID();
+
+	rel = table_open(relOid, NoLock);
+
+	if (rel->rd_rel->relpersistence != RELPERSISTENCE_TEMP ||
+		!isTempNamespace(RelationGetNamespace(rel)))
+	{
+		table_close(rel, NoLock);
+		elog(ERROR, "fasttrun_analyze: relation \"%s\" is not a local temporary table",
+			 RelationGetRelationName(rel));
+	}
+	if (rel->rd_tableam != GetHeapamTableAmRoutine())
+	{
+		table_close(rel, NoLock);
+		elog(ERROR, "fasttrun_analyze: relation \"%s\" is not heap-AM",
+			 RelationGetRelationName(rel));
+	}
+
+	fasttrun_xact_touch_relid(relOid);
+	fasttrun_analyze_relation(rel);
 	table_close(rel, AccessShareLock);
+
+	PG_RETURN_VOID();
+}
+
+/*
+ * fasttrun_analyze_bulk(VARIADIC text[])
+ *
+ * Run fasttrun_analyze logic over a batch of temp relations in one call.
+ * Per-relation behaviour matches fasttrun_analyze() exactly.  One
+ * performance twist: plan-cache invalidations fire per-relation as the
+ * batch progresses.  PG's PlanCacheRelCallback walks every cached plan
+ * once per message.  Plans that an earlier message already marked
+ * is_valid=false get skipped in O(1) by later walks.  So a batch of N
+ * invalidations costs about (walk_size + N) instead of N x walk_size.
+ * Real win on backends with large SPI/PREPARE caches that re-analyze
+ * many temp tables per xact.
+ *
+ * NULL array elements are silently skipped.  Missing relations are
+ * silently skipped -- same contract as fasttrun_analyze.  Non-temp or
+ * non-heap relations raise an error -- same contract.  The batch aborts
+ * at the first failure.  Relations analyzed before the failure keep
+ * their refreshed cache state -- per-xact rollback semantics kick in
+ * via the surrounding xact or savepoint.
+ */
+Datum
+fasttrun_analyze_bulk(PG_FUNCTION_ARGS)
+{
+	ArrayType  *arr;
+	Datum	   *elems;
+	bool	   *nulls;
+	int			nelems;
+	int			i;
+
+	if (PG_ARGISNULL(0))
+		PG_RETURN_VOID();
+
+	arr = PG_GETARG_ARRAYTYPE_P(0);
+	deconstruct_array(arr, TEXTOID, -1, false, TYPALIGN_INT,
+					  &elems, &nulls, &nelems);
+	if (nelems == 0)
+		PG_RETURN_VOID();
+
+	for (i = 0; i < nelems; i++)
+	{
+		text	   *name;
+		RangeVar   *relvar;
+		Oid			relOid;
+		Relation	rel;
+
+		if (nulls[i])
+			continue;
+
+		name = DatumGetTextPP(elems[i]);
+		relvar = fasttrun_make_rangevar(name);
+		relOid = RangeVarGetRelid(relvar, AccessShareLock, true);
+		if (!OidIsValid(relOid))
+			continue;
+
+		rel = table_open(relOid, NoLock);
+
+		if (rel->rd_rel->relpersistence != RELPERSISTENCE_TEMP ||
+			!isTempNamespace(RelationGetNamespace(rel)))
+		{
+			table_close(rel, NoLock);
+			elog(ERROR, "fasttrun_analyze_bulk: relation \"%s\" "
+						"is not a local temporary table",
+				 RelationGetRelationName(rel));
+		}
+		if (rel->rd_tableam != GetHeapamTableAmRoutine())
+		{
+			table_close(rel, NoLock);
+			elog(ERROR, "fasttrun_analyze_bulk: relation \"%s\" is not heap-AM",
+				 RelationGetRelationName(rel));
+		}
+
+		fasttrun_xact_touch_relid(relOid);
+		fasttrun_analyze_relation(rel);
+		table_close(rel, AccessShareLock);
+	}
+
+	/*
+	 * The helper emits per-relid fasttrun_invalidate_local_plan_cache()
+	 * inline.  It has to fire before the rd_rel mutation -- see the
+	 * comment above fasttrun_analyze_relation().  PG's
+	 * PlanCacheRelCallback marks affected plans is_valid=false on the
+	 * first message and short-circuits already-invalidated entries on
+	 * the rest.  So a tight loop of per-relid invalidations still
+	 * amortizes the per-message walk over the plan cache.  That's the
+	 * bulk variant's one real optimization.  The rest is just a
+	 * convenience wrapper.
+	 */
 	PG_RETURN_VOID();
 }
 
@@ -3843,7 +4613,7 @@ fasttrun_relstats(PG_FUNCTION_ARGS)
 /*
  * fasttrun_collect_stats(text)
  *
- * Explicit-call sample → per-column n_distinct/null_frac/width →
+ * Explicit-call sample -> per-column n_distinct/null_frac/width ->
  * session-local stats cache.  No catalog write.  Same path is taken
  * automatically by fasttrun_analyze on cold scan when
  * fasttrun.auto_collect_stats is on (default).
@@ -3880,6 +4650,9 @@ fasttrun_collect_stats(PG_FUNCTION_ARGS)
 	if (rel->rd_tableam != GetHeapamTableAmRoutine())
 		elog(ERROR, "fasttrun_collect_stats: relation \"%s\" is not heap-AM",
 			 RelationGetRelationName(rel));
+
+	/* Register for per-xact bookkeeping -- callbacks walk this list only. */
+	fasttrun_xact_touch_relid(relOid);
 
 	{
 		sample_target = fasttrun_effective_sample_target(rel);
@@ -3919,7 +4692,7 @@ fasttrun_collect_stats(PG_FUNCTION_ARGS)
 	 * fresh entry here: fasttrun_collect_stats() must not invent
 	 * delta-math state behind the user's back.  If the user never
 	 * called fasttrun_analyze() for this relid, the auto-refresh
-	 * machinery stays disengaged for it — that's the documented
+	 * machinery stays disengaged for it -- that's the documented
 	 * contract.
 	 */
 	{
@@ -3948,7 +4721,7 @@ fasttrun_collect_stats(PG_FUNCTION_ARGS)
  *
  * Production-debugging entry point.  Returns the per-(relid, attnum)
  * statsTuples that the column-stats cache currently holds for the
- * named table — in the **same row shape** as core pg_statistic, so
+ * named table -- in the **same row shape** as core pg_statistic, so
  * the caller can do
  *
  *   SELECT staattnum, stadistinct, stakind1, stanumbers1, stavalues1
@@ -3959,13 +4732,13 @@ fasttrun_collect_stats(PG_FUNCTION_ARGS)
  *
  * Implementation notes:
  *   * Materialize-mode SRF (we expect a small handful of rows per
- *     call — one per analysed column — so building a tuplestore is
+ *     call -- one per analysed column -- so building a tuplestore is
  *     simpler than per-call state and almost free).
  *   * The cached statsTuples are already in pg_statistic shape (built
  *     by fasttrun_build_pg_statistic_tuple from VacAttrStats), so we
  *     just stuff each one straight into the tuplestore.
  *   * If the table doesn't exist, isn't temp, or has no cached stats
- *     yet, the function returns an empty set — same defensive
+ *     yet, the function returns an empty set -- same defensive
  *     behaviour as fasttrun_relstats() / fasttrun_analyze() on
  *     missing tables.
  */
@@ -4009,7 +4782,7 @@ fasttrun_inspect_stats(PG_FUNCTION_ARGS)
 
 	MemoryContextSwitchTo(oldcxt);
 
-	/* Resolve relation; missing → empty result. */
+	/* Resolve relation; missing -> empty result. */
 	relvar = fasttrun_make_rangevar(name);
 	relOid = RangeVarGetRelid(relvar, NoLock, true);
 	if (!OidIsValid(relOid))
@@ -4018,7 +4791,7 @@ fasttrun_inspect_stats(PG_FUNCTION_ARGS)
 	if (!isTempNamespace(get_rel_namespace(relOid)))
 		elog(ERROR, "fasttrun_inspect_stats: relation is not a temporary table");
 
-	/* Empty cache → empty result. */
+	/* Empty cache -> empty result. */
 	if (fasttrun_stats_cache == NULL)
 		return (Datum) 0;
 	if (!fasttrun_stats_relid_exists(relOid))
@@ -4038,7 +4811,7 @@ fasttrun_inspect_stats(PG_FUNCTION_ARGS)
 }
 
 /* ================================================================
- * Temp table creation tracking — shared memory + ProcessUtility hook.
+ * Temp table creation tracking -- shared memory + ProcessUtility hook.
  *
  * Counts how often each temp table name is created across all
  * backends.  Used by fasttrun_prewarm() to pre-create only the
@@ -4273,7 +5046,7 @@ fasttrun_schedule_is_active_now(void)
 	{
 		fasttrun_sched_cache_minute = cache_minute;
 		fasttrun_sched_cache_active = true;
-		return true;				/* tz error — fall back to active */
+		return true;				/* tz error -- fall back to active */
 	}
 
 	weekday = tm->tm_wday;			/* 0=Sunday */
@@ -4323,7 +5096,7 @@ fasttrun_track_schedule_assign_hook(const char *newval, void *extra)
 	fasttrun_sched_cache_active = true;
 }
 
-/* Shmem request hook — called during postmaster startup. */
+/* Shmem request hook -- called during postmaster startup. */
 static void
 fasttrun_shmem_request(void)
 {
@@ -4358,7 +5131,7 @@ fasttrun_track_save(int code, Datum arg)
 	}
 
 	fwrite(&magic, sizeof(magic), 1, f);
-	/* placeholder for count — will rewrite */
+	/* placeholder for count -- will rewrite */
 	fwrite(&count, sizeof(count), 1, f);
 
 	hash_seq_init(&status, fasttrun_track_htab);
@@ -4392,7 +5165,7 @@ fasttrun_track_load(void)
 
 	f = AllocateFile(FASTTRUN_TRACK_FILE, PG_BINARY_R);
 	if (f == NULL)
-		return;		/* no saved stats — fresh start */
+		return;		/* no saved stats -- fresh start */
 
 	if (fread(&magic, sizeof(magic), 1, f) != 1 || magic != FASTTRUN_TRACK_MAGIC)
 	{
@@ -4473,22 +5246,48 @@ fasttrun_evict_temp_relid(Oid relid)
 
 	if (!OidIsValid(relid))
 		return;
-	if (get_rel_persistence(relid) != RELPERSISTENCE_TEMP ||
-		!isTempNamespace(get_rel_namespace(relid)))
-		return;
 
+	/*
+	 * One relcache lookup is enough.  try_relation_open returns the
+	 * Relation with rd_rel already populated -- persistence and namespace
+	 * checks become cheap pointer derefs.  Before this, two SearchSysCache1
+	 * calls fired on every utility_hook eviction
+	 * (get_rel_persistence + get_rel_namespace).  That dominated the path
+	 * on workloads with many CREATE TEMP TABLE IF NOT EXISTS statements.
+	 */
 	rel = try_relation_open(relid, NoLock);
-	if (rel != NULL)
+	if (rel == NULL)
 	{
-		if (rel->rd_rel->relkind == RELKIND_RELATION ||
-			rel->rd_rel->relkind == RELKIND_TOASTVALUE)
-			fasttrun_cache_mark_rel_and_indexes_evicted(rel);
-		else
-			fasttrun_cache_mark_evicted(relid);
+		fasttrun_cache_mark_evicted(relid);
+		fasttrun_stats_cache_mark_evicted_relid(relid);
+		fasttrun_invalidate_local_plan_cache(relid);
+		return;
+	}
+
+	if (rel->rd_rel->relpersistence != RELPERSISTENCE_TEMP ||
+		!isTempNamespace(RelationGetNamespace(rel)))
+	{
 		relation_close(rel, NoLock);
+		return;
+	}
+
+	fasttrun_xact_touch_relid(relid);
+
+	if (rel->rd_rel->relkind == RELKIND_RELATION ||
+		rel->rd_rel->relkind == RELKIND_TOASTVALUE)
+	{
+		List	   *index_oids = RelationGetIndexList(rel);
+		ListCell   *lc;
+
+		foreach(lc, index_oids)
+			fasttrun_xact_touch_relid(lfirst_oid(lc));
+		list_free(index_oids);
+
+		fasttrun_cache_mark_rel_and_indexes_evicted(rel);
 	}
 	else
 		fasttrun_cache_mark_evicted(relid);
+	relation_close(rel, NoLock);
 
 	fasttrun_stats_cache_mark_evicted_relid(relid);
 	fasttrun_invalidate_local_plan_cache(relid);
@@ -4670,7 +5469,7 @@ fasttrun_utility_hook(PlannedStmt *pstmt,
 								params, queryEnv, dest, qc);
 }
 
-/* SQL: fasttrun_hot_temp_tables(n) — returns top-N most created temp tables. */
+/* SQL: fasttrun_hot_temp_tables(n) -- returns top-N most created temp tables. */
 Datum
 fasttrun_hot_temp_tables(PG_FUNCTION_ARGS)
 {
@@ -4804,7 +5603,7 @@ fasttrun_track_cmp_desc(const void *a, const void *b)
 	return 0;
 }
 
-/* SQL: fasttrun_prewarm() — creates top-N temp tables via create_temp_table. */
+/* SQL: fasttrun_prewarm() -- creates top-N temp tables via create_temp_table. */
 Datum
 fasttrun_prewarm(PG_FUNCTION_ARGS)
 {
@@ -4912,7 +5711,7 @@ fasttrun_prewarm(PG_FUNCTION_ARGS)
 	PG_RETURN_INT32(created);
 }
 
-/* SQL: fasttrun_reset_temp_stats() — clears all tracking counters. */
+/* SQL: fasttrun_reset_temp_stats() -- clears all tracking counters. */
 Datum
 fasttrun_reset_temp_stats(PG_FUNCTION_ARGS)
 {
@@ -4988,6 +5787,27 @@ _PG_init(void)
 							 0,
 							 NULL, NULL, NULL);
 
+	DefineCustomRealVariable("fasttrun.invalidate_threshold",
+							 "Relstats drift ratio (vs reltuples or relpages) below "
+							 "which fasttrun_analyze skips invalidating backend-"
+							 "local cached SPI/PREPARE plans",
+							 "Default 0.2 -- matches fasttrun.stats_refresh_threshold. "
+							 "Plan-cache invalidation and column-stats refresh fire "
+							 "together: below the threshold neither happens, above both do. "
+							 "Set to 0 to invalidate plans on any relstats change. "
+							 "Other signals always fire an invalidation: a fresh "
+							 "column-stats refresh, an index relstats change "
+							 "(e.g. partial index), or a stats visibility flip. "
+							 "Those signal distribution changes that the per-row "
+							 "ratio here cannot measure.",
+							 &fasttrun_invalidate_threshold,
+							 0.2,
+							 0.0,
+							 1.0,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
 	DefineCustomBoolVariable("fasttrun.use_typanalyze",
 							 "Use core std_typanalyze for column statistics "
 							 "(MCV, histogram, correlation) instead of the "
@@ -5036,7 +5856,7 @@ _PG_init(void)
 	/*
 	 * Register the xact + subxact callbacks once per backend, here in
 	 * _PG_init, so they fire regardless of which cache is lazily
-	 * allocated first — or whether only standalone
+	 * allocated first -- or whether only standalone
 	 * fasttrun_collect_stats() is ever called.
 	 */
 	RegisterXactCallback(fasttrun_xact_callback, NULL);
@@ -5097,7 +5917,7 @@ _PG_init(void)
 							   fasttrun_track_schedule_assign_hook,
 							   NULL);
 
-		/* Shared memory tracking — only when loaded via shared_preload_libraries. */
+		/* Shared memory tracking -- only when loaded via shared_preload_libraries. */
 		if (process_shared_preload_libraries_in_progress)
 		{
 			prev_shmem_request_hook = shmem_request_hook;

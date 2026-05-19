@@ -149,8 +149,8 @@ ALTER EXTENSION fasttrun UPDATE;
 
 DO $$
 BEGIN
-    IF (SELECT extversion FROM pg_extension WHERE extname = 'fasttrun') <> '2.2.0' THEN
-        RAISE EXCEPTION 'fasttrun extension was not updated to 2.2.0';
+    IF (SELECT extversion FROM pg_extension WHERE extname = 'fasttrun') <> '2.3.0' THEN
+        RAISE EXCEPTION 'fasttrun extension was not updated to 2.3.0';
     END IF;
 END
 $$;

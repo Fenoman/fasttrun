@@ -1,11 +1,11 @@
 --
--- fasttrun_basic — базовая проверка работоспособности расширения.
+-- fasttrun_basic -- базовая проверка работоспособности расширения.
 --
 -- Проверяет:
 --   * CREATE EXTENSION fasttrun
 --   * fasttruncate() очищает временную таблицу
 --   * повторный вызов на уже пустой таблице ничего не делает
---   * цикл «вставить -> очистить» работает многократно
+--   * цикл "вставить -> очистить" работает многократно
 --
 CREATE EXTENSION fasttrun;
 -- ----------------------------------------------------------------------
@@ -32,7 +32,7 @@ SELECT count(*) AS rows_after FROM t_basic;
 (1 row)
 
 -- ----------------------------------------------------------------------
--- 2. fasttruncate на уже пустой таблице — должен ничего не делать
+-- 2. fasttruncate на уже пустой таблице -- должен ничего не делать
 --    и не выдавать ошибок
 -- ----------------------------------------------------------------------
 SELECT fasttruncate('t_basic');
@@ -130,7 +130,7 @@ DROP TABLE t_basic2;
 --    функциональный результат, что и старый путь.  Проверяем что:
 --      (а) с дефолтом (zero_sinval_truncate = on) fasttruncate
 --          корректно очищает таблицу через unlink+smgrcreate;
---      (б) с явным off (старый heap_truncate_one_rel) — тоже работает;
+--      (б) с явным off (старый heap_truncate_one_rel) -- тоже работает;
 --      (в) переключение GUC внутри сессии не ломает state.
 --    Сами sinval не считаем (это требует параллельной нагрузки и
 --    выходит за рамки installcheck), но проверяем что данные после
@@ -237,11 +237,11 @@ DROP TABLE t_zsi;
 --    падать до пустого, а не расти от цикла к циклу.  Это
 --    регрессия-защита на случай если кто-то сломает unlink loop
 --    или забудет smgrrelease перед unlink (что приведёт к stale
---    fd в md_seg_fds[] но НЕ к утечке диска — POSIX гарантирует
+--    fd в md_seg_fds[] но НЕ к утечке диска -- POSIX гарантирует
 --    "delete on close").
 -- ----------------------------------------------------------------------
 CREATE TEMP TABLE t_disk (id int, payload text);
--- Заполняем ~5 MB данных (50k строк × 100 байт)
+-- Заполняем ~5 MB данных (50k строк x 100 байт)
 INSERT INTO t_disk
 SELECT g, repeat('x', 100) FROM generate_series(1, 50000) g;
 -- После fasttruncate физический размер должен упасть до ~1 страницы
@@ -623,4 +623,118 @@ ERROR:  fasttrun_relstats: relation "t_part" is not heap-AM
 SELECT fasttrun_collect_stats('t_part');
 ERROR:  fasttrun_collect_stats: relation "t_part" is not heap-AM
 DROP TABLE t_part;
+-- ----------------------------------------------------------------------
+-- 12. fasttrun_analyze_bulk(VARIADIC text[]): batch wrapper над
+--     fasttrun_analyze для нескольких temp таблиц за один вызов.
+--     Каждая обрабатывается ровно как одиночный fasttrun_analyze;
+--     plan-cache invalidations идут inline на каждой таблице, но
+--     первая помечает планы is_valid=false и rest short-circuit'ятся
+--     в core's PlanCacheRelCallback.
+-- ----------------------------------------------------------------------
+CREATE TEMP TABLE t_bulk_a (id int);
+CREATE TEMP TABLE t_bulk_b (id int);
+CREATE TEMP TABLE t_bulk_c (id int);
+INSERT INTO t_bulk_a SELECT generate_series(1, 100);
+INSERT INTO t_bulk_b SELECT generate_series(1, 200);
+INSERT INTO t_bulk_c SELECT generate_series(1, 300);
+-- Positional (variadic): same args, no ARRAY wrapper.
+SELECT fasttrun_analyze_bulk('t_bulk_a', 't_bulk_b', 't_bulk_c');
+ fasttrun_analyze_bulk 
+-----------------------
+ 
+(1 row)
+
+-- fasttrun publishes stats into rd_rel (process-local), NOT on-disk
+-- pg_class -- read via fasttrun_relstats().
+SELECT 't_bulk_a' AS t, (reltuples = 100::real) AS ok FROM fasttrun_relstats('t_bulk_a')
+UNION ALL
+SELECT 't_bulk_b', (reltuples = 200::real) FROM fasttrun_relstats('t_bulk_b')
+UNION ALL
+SELECT 't_bulk_c', (reltuples = 300::real) FROM fasttrun_relstats('t_bulk_c')
+ORDER BY t;
+    t     | ok 
+----------+----
+ t_bulk_a | t
+ t_bulk_b | t
+ t_bulk_c | t
+(3 rows)
+
+-- VARIADIC ARRAY[] form: programmatic call sites.
+INSERT INTO t_bulk_a SELECT generate_series(1, 50);    -- now 150 rows
+INSERT INTO t_bulk_b SELECT generate_series(1, 50);    -- now 250 rows
+SELECT fasttrun_analyze_bulk(VARIADIC ARRAY['t_bulk_a','t_bulk_b']);
+ fasttrun_analyze_bulk 
+-----------------------
+ 
+(1 row)
+
+SELECT 't_bulk_a' AS t, (reltuples = 150::real) AS ok FROM fasttrun_relstats('t_bulk_a')
+UNION ALL
+SELECT 't_bulk_b', (reltuples = 250::real) FROM fasttrun_relstats('t_bulk_b')
+ORDER BY t;
+    t     | ok 
+----------+----
+ t_bulk_a | t
+ t_bulk_b | t
+(2 rows)
+
+-- NULL and missing names are silently skipped -- t_bulk_c stats unchanged.
+SELECT fasttrun_analyze_bulk(VARIADIC ARRAY['t_bulk_c', NULL, 'no_such_relation']);
+ fasttrun_analyze_bulk 
+-----------------------
+ 
+(1 row)
+
+SELECT reltuples = 300::real AS c_unchanged FROM fasttrun_relstats('t_bulk_c');
+ c_unchanged 
+-------------
+ t
+(1 row)
+
+-- Non-temp / non-heap raises ERROR.
+CREATE TEMP TABLE t_bulk_part (a int) PARTITION BY RANGE (a);
+SELECT fasttrun_analyze_bulk('t_bulk_a', 't_bulk_part');
+ERROR:  fasttrun_analyze_bulk: relation "t_bulk_part" is not heap-AM
+DROP TABLE t_bulk_part;
+DROP TABLE t_bulk_a, t_bulk_b, t_bulk_c;
+-- ----------------------------------------------------------------------
+-- 13. fasttrun.invalidate_threshold: проверяем что GUC принимается и
+--     fasttrun_analyze не падает ни на дефолте (0.2), ни на 0 (legacy
+--     behaviour).  Корректность распределения invalidations через
+--     PlanCacheRelCallback проверяется в scripts/check_fasttrun_bulk_
+--     analyze_overhead.sh (bpftrace, требует sudo + Linux).
+-- ----------------------------------------------------------------------
+CREATE TEMP TABLE t_thresh (id int, payload text);
+INSERT INTO t_thresh SELECT g, md5(g::text) FROM generate_series(1, 1000) g;
+SELECT fasttrun_analyze('t_thresh');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+SET fasttrun.invalidate_threshold = 0.2;
+INSERT INTO t_thresh SELECT g, md5(g::text) FROM generate_series(1, 10) g;
+SELECT fasttrun_analyze('t_thresh');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+SET fasttrun.invalidate_threshold = 0;
+INSERT INTO t_thresh SELECT g, md5(g::text) FROM generate_series(1, 10) g;
+SELECT fasttrun_analyze('t_thresh');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+SELECT reltuples BETWEEN 1000::real AND 1100::real AS within_band
+  FROM fasttrun_relstats('t_thresh');
+ within_band 
+-------------
+ t
+(1 row)
+
+RESET fasttrun.invalidate_threshold;
+DROP TABLE t_thresh;
 DROP EXTENSION fasttrun;

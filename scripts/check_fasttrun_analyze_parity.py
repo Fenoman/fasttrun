@@ -7,6 +7,7 @@ fasttrun should not fall back to catastrophic/default estimates for supported
 temp-table statistics.
 """
 
+
 import argparse
 import json
 import os

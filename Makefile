@@ -1,4 +1,4 @@
-# fasttrun — расширение для быстрых операций над временными таблицами
+# fasttrun - расширение для быстрых операций над временными таблицами
 #                без генерации сообщений инвалидации общего кэша (sinval).
 #
 # Сборка против установленного PostgreSQL (использует pg_config из PATH):
@@ -20,10 +20,12 @@ DATA = fasttrun--2.0.sql \
        fasttrun--2.1.1.sql \
        fasttrun--2.1.2.sql \
        fasttrun--2.2.0.sql \
+       fasttrun--2.3.0.sql \
        fasttrun--2.0--2.1.sql \
        fasttrun--2.1--2.1.1.sql \
        fasttrun--2.1.1--2.1.2.sql \
        fasttrun--2.1.2--2.2.0.sql \
+       fasttrun--2.2.0--2.3.0.sql \
        fasttrun--unpackaged--2.0.sql
 DOCS = README.md
 PGFILEDESC = "fasttrun - sinval-free truncate and analyze for temporary tables"
@@ -43,7 +45,10 @@ PG_CONFIG ?= pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
 
-.PHONY: check-parity check-soak check-perf-smoke check-hook-chain check-zero-sinval check-deep-local
+.PHONY: check-parity check-soak check-perf-smoke check-hook-chain \
+        check-zero-sinval check-commit-inval-overhead \
+        check-bulk-overhead check-on-commit-drop-leak \
+        check-commit-duration check-deep-local
 
 check-parity:
 	PG_CONFIG="$(PG_CONFIG)" scripts/check_fasttrun_analyze_parity.py --profile full
@@ -61,4 +66,19 @@ check-hook-chain:
 check-zero-sinval:
 	PG_CONFIG="$(PG_CONFIG)" scripts/check_zero_shared_sinval.sh
 
-check-deep-local: installcheck check-parity check-soak check-perf-smoke check-hook-chain check-zero-sinval
+check-commit-inval-overhead:
+	PG_CONFIG="$(PG_CONFIG)" scripts/check_fasttrun_commit_inval_overhead.sh
+
+check-bulk-overhead:
+	PG_CONFIG="$(PG_CONFIG)" scripts/check_fasttrun_bulk_analyze_overhead.sh
+
+check-on-commit-drop-leak:
+	PG_CONFIG="$(PG_CONFIG)" scripts/check_fasttrun_on_commit_drop_leak.sh
+
+check-commit-duration:
+	PG_CONFIG="$(PG_CONFIG)" scripts/check_fasttrun_commit_duration.sh
+
+check-deep-local: installcheck check-parity check-soak check-perf-smoke \
+                  check-hook-chain check-zero-sinval \
+                  check-commit-inval-overhead check-bulk-overhead \
+                  check-on-commit-drop-leak check-commit-duration
