@@ -666,6 +666,14 @@ fasttrun_cache_commit_xact(void)
 			(void) hash_search(fasttrun_analyze_cache, &relid,
 							   HASH_REMOVE, NULL);
 	}
+
+	/*
+	 * When the cache is empty, drop the HTAB and its mcxt so the planner-hook
+	 * reinject walk returns to the zero-cost `cache == NULL` path.  Re-armed
+	 * lazily on the next analyze.
+	 */
+	if (hash_get_num_entries(fasttrun_analyze_cache) == 0)
+		fasttrun_cache_reset();
 }
 
 /* Finish analyze + stats caches on xact end.  PRE_COMMIT skipped -- txn may still abort. */
@@ -2285,6 +2293,15 @@ fasttrun_stats_cache_commit_xact(void)
 
 		list_free(keys);
 	}
+
+	/*
+	 * When the cache is empty, drop the stats HTABs and mcxt so the
+	 * column-stats hooks and the planner-hook guard return to the zero-cost
+	 * `cache == NULL` path.  Re-armed lazily on the next collect.
+	 */
+	if (hash_get_num_entries(fasttrun_stats_relid_cache) == 0 &&
+		hash_get_num_entries(fasttrun_stats_cache) == 0)
+		fasttrun_stats_cache_reset();
 }
 
 /*
@@ -3163,9 +3180,18 @@ fasttrun_update_index_relstats(Relation rel, HeapTuple *sample, int sample_count
 			tuple_fract = 1.0;
 		index_tuples = (int64) ceil(tuple_fract * (double) totalrows);
 
+		/*
+		 * Report a change only for stats that move independently of the heap
+		 * row count: index relpages and relallvisible (which vary with
+		 * expression and varlena-keyed indexes and btree dedup), and a partial
+		 * index's tuple count (which tracks the predicate, not the heap).  A
+		 * plain index's reltuples is a linear copy of the heap row count that
+		 * the caller already weighs, so it is not a separate signal here.
+		 */
 		if (indexrel->rd_rel->relpages != index_pages ||
-			indexrel->rd_rel->reltuples != (float4) index_tuples ||
-			indexrel->rd_rel->relallvisible != 0)
+			indexrel->rd_rel->relallvisible != 0 ||
+			(is_partial &&
+			 indexrel->rd_rel->reltuples != (float4) index_tuples))
 			changed = true;
 
 		indexrel->rd_rel->relpages = index_pages;
@@ -3398,29 +3424,31 @@ fasttrun_collect_and_store(Relation rel, HeapTuple *sample, int sample_count,
 					continue;
 				}
 
+				/*
+				 * Accumulate the average-width sample exactly once per type:
+				 * pass-by-value, varlena, and fixed-length by-reference are
+				 * mutually exclusive branches, so no width is double-counted.
+				 */
 				if (attr->attbyval)
 				{
 					values[n_nonnull] = d;
+					total_width += attr->attlen;
+				}
+				else if (attr->attlen == -1)
+				{
+					/* Detoast varlena values for sort stability. */
+					struct varlena *detoasted = pg_detoast_datum_packed(
+						(struct varlena *) DatumGetPointer(d));
+					values[n_nonnull] = PointerGetDatum(detoasted);
+					total_width += VARSIZE_ANY_EXHDR(detoasted);
 				}
 				else
 				{
-					/* Detoast varlena values for sort stability. */
-					if (attr->attlen == -1)
-					{
-						struct varlena *detoasted = pg_detoast_datum_packed(
-							(struct varlena *) DatumGetPointer(d));
-						values[n_nonnull] = PointerGetDatum(detoasted);
-						total_width += VARSIZE_ANY_EXHDR(detoasted);
-					}
-					else
-					{
-						values[n_nonnull] = d;
+					/* Fixed-length by-reference (uuid, name, interval, ...). */
+					values[n_nonnull] = d;
+					if (attr->attlen > 0)
 						total_width += attr->attlen;
-					}
 				}
-
-				if (attr->attbyval || attr->attlen >= 0)
-					total_width += (attr->attlen > 0 ? attr->attlen : 0);
 
 				n_nonnull++;
 			}
@@ -4243,6 +4271,13 @@ fasttrun_analyze_relation(Relation rel)
 		if (churn < 0)
 			churn = -churn;
 
+		/*
+		 * Rescan on any churn when a partial index exists.  A small DML on the
+		 * predicate column can change the partial index's covered tuple count
+		 * out of proportion to the heap churn ratio (e.g. flipping a boolean
+		 * flag on 1% of rows can double the index), so the heap ratio cannot
+		 * gate this rescan.
+		 */
 		if (churn > 0 && fasttrun_relation_has_partial_index(rel))
 		{
 			int			sample_target = fasttrun_effective_sample_target(rel);
@@ -4836,6 +4871,13 @@ static HTAB			   *fasttrun_track_htab = NULL;
 static LWLockId			fasttrun_track_lock;
 static bool				fasttrun_track_enabled = true;
 static int				fasttrun_prewarm_count = 1000;
+/*
+ * Re-entrancy guard: true while fasttrun_prewarm() runs its SPI create loop.
+ * The CREATE TEMP TABLE (LIKE dummy.*) issued by create_temp_table re-enters
+ * fasttrun_utility_hook; without this guard prewarm would count its own
+ * creates as user creates and inflate its own top-N ranking.
+ */
+static bool				fasttrun_in_prewarm = false;
 static char			   *fasttrun_prewarm_schema = "dummy_tmp";
 static char			   *fasttrun_track_schedule = "mon-fri 08:00-18:00";
 static ProcessUtility_hook_type prev_utility_hook = NULL;
@@ -5434,7 +5476,8 @@ fasttrun_utility_hook(PlannedStmt *pstmt,
 				}
 			}
 
-			if (from_dummy && fasttrun_schedule_is_active_now())
+			if (from_dummy && !fasttrun_in_prewarm &&
+				fasttrun_schedule_is_active_now())
 			{
 				FasttrunTrackEntry *entry;
 				bool	found;
@@ -5681,30 +5724,45 @@ fasttrun_prewarm(PG_FUNCTION_ARGS)
 	{
 		/* Verify dummy schema exists; if not, skip all prewarm. */
 		Oid		nspOid = get_namespace_oid(fasttrun_prewarm_schema, true);
+		bool	save_in_prewarm = fasttrun_in_prewarm;
 
-		for (i = 0; i < limit; i++)
+		/*
+		 * Suppress tracking of our own re-entrant CREATE TEMP TABLE.  Save and
+		 * restore the flag so nesting stays correct; PG_FINALLY restores it
+		 * even if SPI_connect or the SPI query throws.
+		 */
+		fasttrun_in_prewarm = true;
+		PG_TRY();
 		{
-			int		ret;
+			for (i = 0; i < limit; i++)
+			{
+				int		ret;
 
-			/* Skip if no matching dummy table in the schema. */
-			if (nspOid == InvalidOid ||
-				get_relname_relid(sorted[i].relname, nspOid) == InvalidOid)
-				continue;
+				/* Skip if no matching dummy table in the schema. */
+				if (nspOid == InvalidOid ||
+					get_relname_relid(sorted[i].relname, nspOid) == InvalidOid)
+					continue;
 
-			ret = SPI_connect();
-			if (ret != SPI_OK_CONNECT)
-				elog(ERROR, "fasttrun_prewarm: SPI_connect failed");
+				ret = SPI_connect();
+				if (ret != SPI_OK_CONNECT)
+					elog(ERROR, "fasttrun_prewarm: SPI_connect failed");
 
-			SPI_execute_with_args(
-				"SELECT create_temp_table($1)",
-				1,
-				(Oid[]) { TEXTOID },
-				(Datum[]) { CStringGetTextDatum(sorted[i].relname) },
-				NULL, false, 0);
+				SPI_execute_with_args(
+					"SELECT create_temp_table($1)",
+					1,
+					(Oid[]) { TEXTOID },
+					(Datum[]) { CStringGetTextDatum(sorted[i].relname) },
+					NULL, false, 0);
 
-			SPI_finish();
-			created++;
+				SPI_finish();
+				created++;
+			}
 		}
+		PG_FINALLY();
+		{
+			fasttrun_in_prewarm = save_in_prewarm;
+		}
+		PG_END_TRY();
 	}
 
 	pfree(sorted);

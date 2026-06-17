@@ -21,11 +21,13 @@ DATA = fasttrun--2.0.sql \
        fasttrun--2.1.2.sql \
        fasttrun--2.2.0.sql \
        fasttrun--2.3.0.sql \
+       fasttrun--2.3.1.sql \
        fasttrun--2.0--2.1.sql \
        fasttrun--2.1--2.1.1.sql \
        fasttrun--2.1.1--2.1.2.sql \
        fasttrun--2.1.2--2.2.0.sql \
        fasttrun--2.2.0--2.3.0.sql \
+       fasttrun--2.3.0--2.3.1.sql \
        fasttrun--unpackaged--2.0.sql
 DOCS = README.md
 PGFILEDESC = "fasttrun - sinval-free truncate and analyze for temporary tables"
@@ -39,7 +41,8 @@ REGRESS = fasttrun_basic \
           fasttrun_stats \
           fasttrun_tracking \
           fasttrun_relstats_survive \
-          fasttrun_plan_cache_survive
+          fasttrun_plan_cache_survive \
+          fasttrun_stats_width
 
 PG_CONFIG ?= pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)

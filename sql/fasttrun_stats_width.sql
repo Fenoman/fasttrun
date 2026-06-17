@@ -1,0 +1,35 @@
+--
+-- fasttrun_stats_width — регрессионные тесты вычисления stawidth (ширины колонок).
+--
+-- Требует shared_preload_libraries = 'fasttrun' (как и остальной suite stats).
+--
+
+CREATE EXTENSION fasttrun;
+
+-- ======================================================================
+-- Haas-Stokes путь (use_typanalyze=off): stawidth для fixed-length
+-- by-reference типов (uuid attlen=16, !attbyval) равен attlen, а не 2*attlen.
+-- Регресс-guard для attbyval (int4=4) и varlena (text >= 20).
+-- ======================================================================
+
+SET fasttrun.use_typanalyze = off;       -- облегчённый Haas-Stokes путь
+SET fasttrun.sample_rows = 3000;
+
+CREATE TEMP TABLE t_w (c int4, u uuid, t text);
+INSERT INTO t_w
+SELECT g, ('00000000-0000-0000-0000-' || lpad(to_hex(g), 12, '0'))::uuid, repeat('a', 20)
+FROM generate_series(1, 2000) g;
+
+SELECT fasttrun_collect_stats('t_w');
+
+-- attbyval int4 -> 4; fixed-len by-ref uuid -> 16 (= attlen); varlena text >= 20.
+SELECT
+  (SELECT stawidth FROM fasttrun_inspect_stats('t_w') WHERE staattnum = 1) = 4   AS int4_width_ok,
+  (SELECT stawidth FROM fasttrun_inspect_stats('t_w') WHERE staattnum = 2) = 16  AS uuid_width_ok,
+  (SELECT stawidth FROM fasttrun_inspect_stats('t_w') WHERE staattnum = 3) >= 20 AS text_width_ok;
+
+RESET fasttrun.use_typanalyze;
+RESET fasttrun.sample_rows;
+DROP TABLE t_w;
+
+DROP EXTENSION fasttrun;
