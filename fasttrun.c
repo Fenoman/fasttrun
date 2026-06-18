@@ -4094,9 +4094,10 @@ fasttruncate(PG_FUNCTION_ARGS)
  *   - table_close(rel, AccessShareLock) afterwards.
  *
  * fasttrun_analyze_bulk() invokes this once per relation in its array.
- * PG's PlanCacheRelCallback short-circuits already-is_valid=false plans
- * on subsequent messages, so a tight loop of per-relid invalidations
- * still amortizes the per-message plan_cache walk.
+ * Each invalidation still makes PG's PlanCacheRelCallback walk the whole
+ * cached-plan list; the saving is per-plan, not per-walk -- a plan an
+ * earlier message already marked is_valid=false is skipped cheaply rather
+ * than re-marked.
  */
 static void
 fasttrun_analyze_relation(Relation rel)
@@ -4486,13 +4487,13 @@ fasttrun_analyze(PG_FUNCTION_ARGS)
  *
  * Run fasttrun_analyze logic over a batch of temp relations in one call.
  * Per-relation behaviour matches fasttrun_analyze() exactly.  One
- * performance twist: plan-cache invalidations fire per-relation as the
- * batch progresses.  PG's PlanCacheRelCallback walks every cached plan
- * once per message.  Plans that an earlier message already marked
- * is_valid=false get skipped in O(1) by later walks.  So a batch of N
- * invalidations costs about (walk_size + N) instead of N x walk_size.
- * Real win on backends with large SPI/PREPARE caches that re-analyze
- * many temp tables per xact.
+ * performance note: plan-cache invalidations fire per-relation as the
+ * batch progresses.  PG's PlanCacheRelCallback walks the whole cached-plan
+ * list once per message, so N invalidations are still N walks.  The only
+ * saving is per-plan: a plan an earlier message already marked
+ * is_valid=false is skipped cheaply instead of re-marked.  That trims the
+ * per-walk body on backends with large SPI/PREPARE caches, not the number
+ * of walks.
  *
  * NULL array elements are silently skipped.  Missing relations are
  * silently skipped -- same contract as fasttrun_analyze.  Non-temp or
@@ -4560,12 +4561,10 @@ fasttrun_analyze_bulk(PG_FUNCTION_ARGS)
 	/*
 	 * The helper emits per-relid fasttrun_invalidate_local_plan_cache()
 	 * inline.  It has to fire before the rd_rel mutation -- see the
-	 * comment above fasttrun_analyze_relation().  PG's
-	 * PlanCacheRelCallback marks affected plans is_valid=false on the
-	 * first message and short-circuits already-invalidated entries on
-	 * the rest.  So a tight loop of per-relid invalidations still
-	 * amortizes the per-message walk over the plan cache.  That's the
-	 * bulk variant's one real optimization.  The rest is just a
+	 * comment above fasttrun_analyze_relation().  Each call still walks the
+	 * whole cached-plan list via PG's PlanCacheRelCallback; a plan already
+	 * marked is_valid=false by an earlier call is skipped cheaply, so the
+	 * batch trims per-plan work, not the walk count.  The rest is just a
 	 * convenience wrapper.
 	 */
 	PG_RETURN_VOID();
