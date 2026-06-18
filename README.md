@@ -82,7 +82,7 @@ new_tuples = cached_tuples + (ins_now - cached_ins) - (del_now - cached_del)
 
 Есть осознанные границы: extended statistics, expression-index statistics и inherited-table statistics не собираются; ACL/RLS/security-barrier поведение обычного `ANALYZE` не воспроизводится. Расширение рассчитано на session-local temp tables, которыми владеет текущий backend.
 
-`relpages/reltuples/relallvisible` и статистика колонок живут в памяти backend'а и переживают `COMMIT`; xact-local delta-состояние очищается на границе транзакции. После DML cached column stats скрываются от планировщика до реального пересбора, чтобы старое распределение не выдавалось как свежее.
+`relpages/reltuples/relallvisible` и статистика колонок живут в памяти backend'а и переживают `COMMIT`; xact-local delta-состояние очищается на границе транзакции. После DML ниже порога `stats_refresh_threshold` cached column stats остаются видимыми планировщику (soft freshness, как ядро PG между ANALYZE); выше порога — скрываются до пересбора.
 
 ## Настройки (GUC)
 
@@ -91,8 +91,8 @@ new_tuples = cached_tuples + (ins_now - cached_ins) - (del_now - cached_del)
 | `fasttrun.auto_collect_stats` | `on` | Собирать статистику колонок при холодном проходе `fasttrun_analyze` |
 | `fasttrun.sample_rows` | `3000` | Размер выборки. `0` — отключить сбор column stats; relation-level relstats для heap и обычных индексов всё равно обновляются. `-1` — авто (как у обычного `ANALYZE`) |
 | `fasttrun.use_typanalyze` | `on` | Использовать `std_typanalyze` из ядра (MCV/histogram/correlation). `off` — только n_distinct/null_frac/width |
-| `fasttrun.stats_refresh_threshold` | `0.2` | Порог доли изменений для пересбора статистики. `0` — при любом DML. `1` — автопересбор не запускается; после DML cached stats скрываются до явного пересбора |
-| `fasttrun.invalidate_threshold` | `0.2` | Порог доли изменений `relpages`/`reltuples` ниже которого `fasttrun_analyze` НЕ инвалидирует cached SPI/PREPARE планы. Симметрично `stats_refresh_threshold` — при <20% DML ни refresh, ни plan invalidation. `0` — инвалидировать на любой drift (как было в 2.2.0). Инвалидации от refresh column stats, изменения index relstats и stats visibility flip срабатывают всегда, независимо от этого порога |
+| `fasttrun.stats_refresh_threshold` | `0.2` | Порог доли изменений: и пересбор статистики, и freshness-толерантность (ниже порога cached column stats видимы планировщику, выше — скрываются). `0` — пересбор при любом DML, видимость только при точном совпадении счётчиков. `1` — автопересбор отключён, freshness терпит churn до 100% |
+| `fasttrun.invalidate_threshold` | `0.2` | Порог доли изменений `relpages`/`reltuples` ниже которого `fasttrun_analyze` НЕ инвалидирует cached SPI/PREPARE планы. Симметрично `stats_refresh_threshold` — при <20% DML ни refresh, ни plan invalidation. `0` — инвалидировать на любой drift (как было в 2.2.0). Инвалидации от пересбора column stats и изменения index relstats срабатывают всегда, независимо от этого порога |
 | `fasttrun.zero_sinval_truncate` | `on` | Прямой `unlink`+`smgrcreate` вместо `smgrtruncate`. `off` — старый путь с 1 SMGR sinval |
 
 ## Производительность
@@ -188,7 +188,7 @@ make check-zero-sinval PG_CONFIG=/path/to/pg_config
 | Режим | Настройки | Что доказывает |
 |---|---|---|
 | `full` | `fasttrun.sample_rows = -1`, `fasttrun.stats_refresh_threshold = 0` | Максимально близкое ANALYZE-like качество планов |
-| `default` | обычные дефолты fasttrun | Нет catastrophic/default estimates и stale stats на поддержанных сценариях |
+| `default` | обычные дефолты fasttrun | Нет catastrophic/default estimates на поддержанных сценариях; column stats терпят churn ниже порога (soft freshness) |
 
 Parity harness сравнивает `EXPLAIN (FORMAT JSON)` после обычного `ANALYZE` и после `fasttrun_analyze`. Это не byte-for-byte сравнение планов: выборка может отличаться, поэтому проверяются bounded estimates по `Plan Rows`.
 

@@ -140,11 +140,11 @@ DEALLOCATE q_analyze_only;
 COMMIT;
 
 -- ----------------------------------------------------------------------
--- 3. Below-threshold DML без пересбора stats: если generic plan создан
---    после UPDATE ниже порога, когда cached column stats выглядят stale,
---    следующий fasttrun_analyze должен инвалидировать этот plan даже когда
---    relpages/reltuples не изменились.  Перепланированный запрос должен
---    увидеть fallback к defaults, а не старые stats как "свежие".
+-- 3. Below-threshold DML без пересбора: generic plan, построенный после
+--    мелкого (ниже порога) UPDATE, видит кешированную стату через soft
+--    freshness и строится на ней (Index Scan по редкому grp), а не на
+--    defaults.  Повторный fasttrun_analyze не инвалидирует план (дрейф ниже
+--    порога), и он остаётся на стате.
 -- ----------------------------------------------------------------------
 CREATE TEMP TABLE t_analyze_freshness_plan (id int, grp int);
 INSERT INTO t_analyze_freshness_plan
@@ -159,14 +159,13 @@ UPDATE t_analyze_freshness_plan SET id = id WHERE id < 10;
 PREPARE q_freshness_only AS
 SELECT * FROM t_analyze_freshness_plan WHERE grp = 50000;
 
--- План создан в окне, когда freshness check отвергает cached stats.
+-- План построен в окне soft freshness: churn ниже порога → стата видна.
 EXPLAIN (COSTS OFF) EXECUTE q_freshness_only;
 
 SELECT fasttrun_analyze('t_analyze_freshness_plan');
 
--- Plan создан в окне, где freshness прячет stats (fallback к defaults).
--- Мелкий DML ниже порога не воскрешает stats: повторный EXPLAIN остаётся
--- на том же fallback-плане.
+-- Below-threshold DML в пределах толерантности: стата остаётся видимой,
+-- повторный EXPLAIN — тот же план на стате (Index Scan).
 EXPLAIN (COSTS OFF) EXECUTE q_freshness_only;
 DEALLOCATE q_freshness_only;
 COMMIT;

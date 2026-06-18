@@ -1615,10 +1615,49 @@ fasttrun_stats_noop_free(HeapTuple tuple)
 }
 
 /*
- * Substitute our cached tuple only when its pgstat snapshot still
- * matches the relation's current counters; any DML since collect time
- * makes the stats stale and we fall through so the planner uses
- * defaults instead of bad estimates.
+ * Soft freshness: is this column-stats entry close enough to keep serving?
+ * True while the DML churn since collect time stays below
+ * stats_refresh_threshold -- a bounded shift, so the cached distribution still
+ * beats planner defaults (core PG keeps using pg_statistic between ANALYZE
+ * runs the same way).  A truncdropped flip means the storage was emptied or
+ * rewritten; a missing analyze-cache row-count baseline means we cannot bound
+ * the drift.  Either makes the entry unusable.
+ */
+static bool
+fasttrun_stats_entry_usable(Oid relid, const FasttrunStatsEntry *entry,
+							int64 ins_now, int64 upd_now, int64 del_now,
+							bool truncdropped_now)
+{
+	FasttrunAnalyzeCacheEntry *aentry;
+	int64		churn;
+	double		baseline;
+
+	if (truncdropped_now != entry->collected_truncdropped)
+		return false;
+
+	if (ins_now == entry->collected_ins &&
+		upd_now == entry->collected_upd &&
+		del_now == entry->collected_del)
+		return true;			/* no DML since collect -- exactly fresh */
+
+	aentry = fasttrun_cache_lookup(relid);
+	if (aentry == NULL || !aentry->has_relstats)
+		return false;
+
+	churn = (ins_now - entry->collected_ins)
+		+ (upd_now - entry->collected_upd)
+		+ (del_now - entry->collected_del);
+	if (churn < 0)
+		churn = -churn;
+	baseline = (double) Max(aentry->cached_tuples, 1);
+
+	return ((double) churn / baseline) < fasttrun_stats_refresh_threshold;
+}
+
+/*
+ * Substitute our cached tuple while it stays within churn tolerance (see
+ * fasttrun_stats_entry_usable); past the threshold we fall through so the
+ * planner uses defaults instead of a distribution that has shifted too far.
  */
 static bool
 fasttrun_get_relation_stats_hook(PlannerInfo *root, RangeTblEntry *rte,
@@ -1642,16 +1681,14 @@ fasttrun_get_relation_stats_hook(PlannerInfo *root, RangeTblEntry *rte,
 	if (entry == NULL || entry->statsTuple == NULL)
 		goto chain;
 
-	/* Freshness check: pgstat counters must match the collect-time snapshot. */
+	/* Freshness check: tolerate DML churn up to stats_refresh_threshold. */
 	if (!fasttrun_read_pgstat_counters_for_hook(rte->relid, &ins_now, &upd_now,
 												&del_now, &truncdropped_now))
 		goto chain;
 
-	if (ins_now != entry->collected_ins ||
-		upd_now != entry->collected_upd ||
-		del_now != entry->collected_del ||
-		truncdropped_now != entry->collected_truncdropped)
-		goto chain;		/* stale -- fall back to defaults */
+	if (!fasttrun_stats_entry_usable(rte->relid, entry, ins_now, upd_now,
+									 del_now, truncdropped_now))
+		goto chain;		/* churn past threshold -- fall back to defaults */
 
 	vardata->statsTuple = entry->statsTuple;
 	vardata->freefunc = fasttrun_stats_noop_free;
@@ -1707,11 +1744,9 @@ fasttrun_get_attavgwidth_hook(Oid relid, AttrNumber attnum)
 												&del_now, &truncdropped_now))
 		goto chain;
 
-	if (ins_now != entry->collected_ins ||
-		upd_now != entry->collected_upd ||
-		del_now != entry->collected_del ||
-		truncdropped_now != entry->collected_truncdropped)
-		goto chain;		/* stale */
+	if (!fasttrun_stats_entry_usable(relid, entry, ins_now, upd_now,
+									 del_now, truncdropped_now))
+		goto chain;		/* churn past threshold */
 
 	stawidth = ((Form_pg_statistic) GETSTRUCT(entry->statsTuple))->stawidth;
 	if (stawidth > 0)
@@ -2322,23 +2357,19 @@ fasttrun_stats_cache_commit_xact(void)
 			}
 
 			/*
-			 * Preserve stats across COMMIT only if they were still fresh at the
-			 * boundary.  Below-threshold DML deliberately leaves collected_* at the
-			 * old snapshot so the planner hook hides the stale tuple; resetting that
-			 * old snapshot to zero would make it look fresh again in the next xact.
+			 * Preserve stats across COMMIT while the entry stays within churn
+			 * tolerance (fasttrun_stats_entry_usable); the collected_* reset
+			 * below then keeps it serving in the next xact.  Past the threshold,
+			 * or with pgstat unavailable, the distribution has drifted too far,
+			 * so drop the entry.
 			 *
-			 * No fasttrun_invalidate_local_plan_cache() call here.  The freshness
-			 * check in fasttrun_get_relation_stats_hook will refuse to return the
-			 * stale tuple, and the planner falls back to defaults on the next
-			 * plan.  The next fasttrun_analyze() that publishes refreshed stats
-			 * issues its own targeted invalidation -- see need_plan_inval inside
-			 * fasttrun_analyze.
+			 * No fasttrun_invalidate_local_plan_cache() here: the next
+			 * fasttrun_analyze() that publishes refreshed stats issues its own
+			 * targeted invalidation -- see need_plan_inval inside fasttrun_analyze.
 			 */
 			if (!have_counters ||
-				ins_now != entry->collected_ins ||
-				upd_now != entry->collected_upd ||
-				del_now != entry->collected_del ||
-				truncdropped_now != entry->collected_truncdropped)
+				!fasttrun_stats_entry_usable(relid, entry, ins_now, upd_now,
+											 del_now, truncdropped_now))
 			{
 				fasttrun_stats_entry_free_undo(entry);
 				if (entry->statsTuple != NULL)

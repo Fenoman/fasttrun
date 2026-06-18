@@ -177,10 +177,10 @@ SELECT fasttrun_analyze('t_refresh');
 EXPLAIN (COSTS OFF) SELECT * FROM t_refresh WHERE grp = 1;
 COMMIT;
 
--- 11b. Маленький DELETE при пороге по умолчанию 0.2 — 0.009% меньше
---      порога → пересбор НЕ срабатывает, и старая статистика НЕ
---      объявляется свежей.  Planner откатывается к defaults до
---      следующего реального пересбора.
+-- 11b. Маленький DELETE при пороге 0.2 — 0.009% ниже порога → пересбора
+--      нет, но churn в пределах толерантности, поэтому soft freshness
+--      отдаёт кешированную стату планировщику (как ядро PG между ANALYZE).
+--      После 11a grp=1 — это все строки, так что план остаётся Seq Scan.
 BEGIN;
 SELECT fasttrun_analyze('t_refresh');
 EXPLAIN (COSTS OFF) SELECT * FROM t_refresh WHERE grp = 1;
@@ -201,9 +201,9 @@ SELECT fasttrun_analyze('t_refresh');
 EXPLAIN (COSTS OFF) SELECT * FROM t_refresh WHERE grp = 1;
 COMMIT;
 
--- 11d. Порог = 1.0 полностью отключает пересбор.  После DML старая
---      статистика скрывается от планировщика, потому что принудительно
---      делать её свежей было бы хуже, чем fallback к defaults.
+-- 11d. Порог = 1.0 отключает пересбор и задаёт максимальную толерантность:
+--      стата прячется только когда churn достигает 100%.  Полный UPDATE
+--      (100% строк) превышает порог → fallback к defaults.
 BEGIN;
 SET LOCAL fasttrun.stats_refresh_threshold = 1;
 SELECT fasttrun_analyze('t_refresh');
@@ -214,12 +214,10 @@ SELECT fasttrun_analyze('t_refresh');
 EXPLAIN (COSTS OFF) SELECT * FROM t_refresh WHERE grp = 999;
 COMMIT;
 
--- 11e. Below-threshold DML внутри savepoint: если пересбор не был
---      выполнен, cached stats не должны насильно становиться "свежими".
---      После ROLLBACK TO SAVEPOINT counters откатываются к pre-savepoint,
---      поэтому старая статистика снова видима.  Без rollback тот же
---      below-threshold DML должен оставить stats скрытыми до реального
---      пересбора, чтобы planner не принимал старое распределение за новое.
+-- 11e. Below-threshold DML внутри savepoint.  После ROLLBACK TO SAVEPOINT
+--      counters откатываются к pre-savepoint → стата точно свежая.  Без
+--      rollback тот же below-threshold DML остаётся в пределах толерантности
+--      → soft freshness продолжает отдавать кешированную стату планировщику.
 BEGIN;
 SELECT fasttrun_analyze('t_refresh');
 
@@ -233,20 +231,19 @@ ROLLBACK TO sp1;
 -- менялся внутри savepoint → match)
 EXPLAIN (COSTS OFF) SELECT * FROM t_refresh WHERE grp = 1;
 
--- Теперь тот же DML без savepoint — stats остаются скрытыми до пересбора
+-- Теперь тот же DML без savepoint — churn в пределах порога → стата видна
 DELETE FROM t_refresh WHERE id < 5;
 SELECT fasttrun_analyze('t_refresh');
 EXPLAIN (COSTS OFF) SELECT * FROM t_refresh WHERE grp = 1;
 COMMIT;
 
--- 11f. DML ниже порога внутри savepoint с последующим RELEASE должен
---      оставлять cached stats скрытыми.  RELEASE продвигает pgstat counters
---      в родительский subxact, а пересбора не было — значит старое
---      распределение нельзя выдавать планировщику как свежее.
+-- 11f. DML ниже порога внутри savepoint с последующим RELEASE.  RELEASE
+--      продвигает pgstat counters в родительский subxact; churn остаётся в
+--      пределах толерантности, поэтому soft freshness отдаёт кешированную
+--      стату.
 --
---      Используем свежую high-cardinality таблицу: с cached stats редкий
---      equality-предикат даёт Index Scan; со stale collected_* hook
---      отвергает stats, и planner откатывается к default selectivity / Bitmap.
+--      High-cardinality таблица: редкий equality-предикат на кешированной
+--      стате даёт Index Scan (на defaults был бы Bitmap).
 CREATE TEMP TABLE t_release_stats (id int, grp int);
 INSERT INTO t_release_stats SELECT g, g FROM generate_series(1, 100000) g;
 CREATE INDEX ON t_release_stats (grp);
@@ -260,15 +257,17 @@ DELETE FROM t_release_stats WHERE id < 10;  -- ниже порога
 SELECT fasttrun_analyze('t_release_stats');
 RELEASE SAVEPOINT sp_release;
 
--- Корректное поведение здесь — fallback к defaults, а не stale stats.
+-- Below-threshold churn → soft freshness держит стату → Index Scan.
 EXPLAIN (COSTS OFF) SELECT * FROM t_release_stats WHERE grp = 50000;
 COMMIT;
 DROP TABLE t_release_stats;
 
--- 11g. Below-threshold DML перед COMMIT: если пересбора не было, старые
---      column stats должны остаться скрытыми и в следующей транзакции.
---      Иначе commit обнулит collected_* и старая high-cardinality
---      статистика снова станет "свежей" на нулевых xact counters.
+-- 11g. Below-threshold DML перед COMMIT: churn в пределах порога, поэтому
+--      commit сохраняет column stats, и они продолжают отдаваться в
+--      следующей транзакции (collected_* обнуляется под нулевые post-commit
+--      counters).  ВНИМАНИЕ: targeted UPDATE концентрирует строки на grp=1,
+--      и soft freshness отдаёт старый n_distinct → Index Scan по «редкому»
+--      grp=1, который на деле стал частым.  Осознанный trade-off soft-режима.
 CREATE TEMP TABLE t_commit_stale_stats (id int, grp int);
 INSERT INTO t_commit_stale_stats SELECT g, g FROM generate_series(1, 100000) g;
 CREATE INDEX ON t_commit_stale_stats (grp);
@@ -280,18 +279,41 @@ EXPLAIN (COSTS OFF) SELECT * FROM t_commit_stale_stats WHERE grp = 1;
 UPDATE t_commit_stale_stats SET grp = 1 WHERE id <= 10000;  -- ниже порога 20%
 SELECT fasttrun_analyze('t_commit_stale_stats');
 
--- Внутри транзакции stats уже скрыты: planner должен уйти на fallback.
+-- Внутри транзакции churn ниже порога → стата видна → Index Scan.
 EXPLAIN (COSTS OFF) SELECT * FROM t_commit_stale_stats WHERE grp = 1;
 COMMIT;
 
--- После COMMIT fallback должен сохраниться, а не воскреснуть как Index Scan
--- на старом n_distinct=100000.
+-- После COMMIT soft freshness сохраняет стату → план остаётся Index Scan
+-- на старом n_distinct=100000 (см. trade-off выше).
 EXPLAIN (COSTS OFF) SELECT * FROM t_commit_stale_stats WHERE grp = 1;
 SELECT count(*) = 10000 AS commit_stale_actual_grp1
   FROM t_commit_stale_stats WHERE grp = 1;
 DROP TABLE t_commit_stale_stats;
 
 DROP TABLE t_refresh;
+
+-- 11h. Граница soft freshness на high-cardinality таблице: churn чуть ниже
+--      порога держит стату видимой (Index Scan по редкому grp), а churn выше
+--      порога без пересбора прячет её (defaults).
+CREATE TEMP TABLE t_soft_below (id int, grp int);
+INSERT INTO t_soft_below SELECT g, g FROM generate_series(1, 100000) g;
+CREATE INDEX ON t_soft_below (grp);
+BEGIN;
+SELECT fasttrun_analyze('t_soft_below');
+DELETE FROM t_soft_below WHERE id <= 15000;   -- 15% ниже порога 0.2 → стата видна
+EXPLAIN (COSTS OFF) SELECT * FROM t_soft_below WHERE grp = 50000;
+COMMIT;
+DROP TABLE t_soft_below;
+
+CREATE TEMP TABLE t_soft_above (id int, grp int);
+INSERT INTO t_soft_above SELECT g, g FROM generate_series(1, 100000) g;
+CREATE INDEX ON t_soft_above (grp);
+BEGIN;
+SELECT fasttrun_analyze('t_soft_above');
+DELETE FROM t_soft_above WHERE id <= 25000;   -- 25% выше порога 0.2 → стата прячется
+EXPLAIN (COSTS OFF) SELECT * FROM t_soft_above WHERE grp = 50000;
+COMMIT;
+DROP TABLE t_soft_above;
 
 -- ----------------------------------------------------------------------
 -- 12. Порог = 0 не должен запускать пересбор, если доля изменений

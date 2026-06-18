@@ -80,7 +80,7 @@ The main difference is sample size. Default `sample_rows = 3000` is ~10x smaller
 
 There are deliberate boundaries: extended statistics, expression-index statistics and inherited-table statistics are not collected; ACL/RLS/security-barrier behavior of regular `ANALYZE` is not reproduced. The extension is designed for session-local temp tables owned by the current backend.
 
-`relpages/reltuples/relallvisible` and column statistics live in backend memory and survive `COMMIT`; xact-local delta state is cleared at transaction boundaries. After DML, cached column stats are hidden from the planner until a real refresh, so old distributions are not reported as fresh.
+`relpages/reltuples/relallvisible` and column statistics live in backend memory and survive `COMMIT`; xact-local delta state is cleared at transaction boundaries. After DML below `stats_refresh_threshold` cached column stats stay visible to the planner (soft freshness, like core PG between ANALYZE runs); past the threshold they are hidden until a refresh.
 
 ## Settings (GUC)
 
@@ -89,8 +89,8 @@ There are deliberate boundaries: extended statistics, expression-index statistic
 | `fasttrun.auto_collect_stats` | `on` | Collect column statistics during cold `fasttrun_analyze` pass |
 | `fasttrun.sample_rows` | `3000` | Sample size. `0` — disable column stats collection; relation-level relstats for the heap and regular indexes are still updated. `-1` — auto (same as regular `ANALYZE`) |
 | `fasttrun.use_typanalyze` | `on` | Use `std_typanalyze` from core (MCV/histogram/correlation). `off` — only n_distinct/null_frac/width |
-| `fasttrun.stats_refresh_threshold` | `0.2` | DML change ratio threshold for stats refresh. `0` — on any DML. `1` — automatic refresh disabled; after DML cached stats are hidden until an explicit refresh |
-| `fasttrun.invalidate_threshold` | `0.2` | `relpages`/`reltuples` drift ratio below which `fasttrun_analyze` does NOT invalidate cached SPI/PREPARE plans. Symmetric with `stats_refresh_threshold` — below 20% DML neither refresh nor plan invalidation fires. `0` — invalidate on any drift (the 2.2.0 behaviour). Invalidations triggered by a column-stats refresh, an index relstats change, or a stats-visibility flip always fire, regardless of this threshold |
+| `fasttrun.stats_refresh_threshold` | `0.2` | DML change ratio threshold governing both stats refresh and freshness tolerance: below it cached column stats stay visible to the planner, past it they are hidden. `0` — refresh on any DML, visible only on an exact counter match. `1` — auto refresh disabled, freshness tolerates churn up to 100% |
+| `fasttrun.invalidate_threshold` | `0.2` | `relpages`/`reltuples` drift ratio below which `fasttrun_analyze` does NOT invalidate cached SPI/PREPARE plans. Symmetric with `stats_refresh_threshold` — below 20% DML neither refresh nor plan invalidation fires. `0` — invalidate on any drift (the 2.2.0 behaviour). Invalidations triggered by a column-stats refresh or an index relstats change always fire, regardless of this threshold |
 | `fasttrun.zero_sinval_truncate` | `on` | Direct `unlink`+`smgrcreate` instead of `smgrtruncate`. `off` — old path with 1 SMGR sinval |
 
 ## Performance
@@ -186,7 +186,7 @@ make check-zero-sinval PG_CONFIG=/path/to/pg_config
 | Mode | Settings | What it proves |
 |---|---|---|
 | `full` | `fasttrun.sample_rows = -1`, `fasttrun.stats_refresh_threshold = 0` | Closest ANALYZE-like plan quality |
-| `default` | regular fasttrun defaults | No catastrophic/default estimates or stale stats on supported scenarios |
+| `default` | regular fasttrun defaults | No catastrophic/default estimates on supported scenarios; column stats tolerate churn below the threshold (soft freshness) |
 
 The parity harness compares `EXPLAIN (FORMAT JSON)` after regular `ANALYZE` and after `fasttrun_analyze`. It is not a byte-for-byte plan comparison: samples can differ, so it checks bounded `Plan Rows` estimates.
 
