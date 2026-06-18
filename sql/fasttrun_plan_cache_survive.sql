@@ -164,8 +164,9 @@ EXPLAIN (COSTS OFF) EXECUTE q_freshness_only;
 
 SELECT fasttrun_analyze('t_analyze_freshness_plan');
 
--- Тот же prepared statement должен перепланироваться после смены
--- planner-visible состояния stats.
+-- Plan создан в окне, где freshness прячет stats (fallback к defaults).
+-- Мелкий DML ниже порога не воскрешает stats: повторный EXPLAIN остаётся
+-- на том же fallback-плане.
 EXPLAIN (COSTS OFF) EXECUTE q_freshness_only;
 DEALLOCATE q_freshness_only;
 COMMIT;
@@ -226,6 +227,39 @@ SELECT fasttrun_collect_stats('t_collect_cached_plan');
 EXPLAIN (COSTS OFF) EXECUTE q_collect_only;
 DEALLOCATE q_collect_only;
 COMMIT;
+
+-- ----------------------------------------------------------------------
+-- 6. Sub-threshold DML НЕ инвалидирует generic plan, построенный на свежих
+--    column stats.  Plan, собранный когда stats видимы (Index Scan на
+--    high-cardinality grp), переживает мелкий (ниже stats_refresh_threshold)
+--    DML + повторный fasttrun_analyze и остаётся Index Scan: мелкое смещение
+--    распределения не стоит инвалидации и потери хорошего плана ради
+--    fallback к default selectivity.  DML идёт по неиндексированному id (HOT),
+--    чтобы index relstats не дрейфнули и порог invalidate сработал.
+-- ----------------------------------------------------------------------
+CREATE TEMP TABLE t_subthreshold_keep_plan (id int, grp int);
+INSERT INTO t_subthreshold_keep_plan SELECT g, g FROM generate_series(1, 100000) g;
+CREATE INDEX ON t_subthreshold_keep_plan (grp);
+
+BEGIN;
+SET LOCAL plan_cache_mode = force_generic_plan;
+SELECT fasttrun_analyze('t_subthreshold_keep_plan');
+
+PREPARE q_keep AS
+SELECT * FROM t_subthreshold_keep_plan WHERE grp = 50000;
+
+-- Generic plan на свежих stats: Index Scan.
+EXPLAIN (COSTS OFF) EXECUTE q_keep;
+
+UPDATE t_subthreshold_keep_plan SET id = id WHERE id <= 50;  -- мелкий churn ниже порога
+SELECT fasttrun_analyze('t_subthreshold_keep_plan');
+
+-- Plan не инвалидирован: остаётся Index Scan, а не fallback Bitmap/Seq.
+EXPLAIN (COSTS OFF) EXECUTE q_keep;
+DEALLOCATE q_keep;
+COMMIT;
+
+DROP TABLE t_subthreshold_keep_plan;
 
 DROP FUNCTION f_outer(int, int);
 DROP FUNCTION f_inner();

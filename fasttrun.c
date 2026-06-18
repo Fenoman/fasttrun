@@ -4251,11 +4251,16 @@ fasttrun_analyze_relation(Relation rel)
 				}
 			}
 
+			/*
+			 * Sub-threshold churn leaves the baseline in place so freshness
+			 * keeps hiding the now-stale distribution from new plans.  A
+			 * cached plan built on the fresh distribution is NOT invalidated
+			 * here: a below-threshold shift rarely flips a plan, and forcing
+			 * a replan would only drop it to default selectivity.
+			 */
 			if (stats_recollected || tuples_count == 0)
 				fasttrun_cache_set_stats_baseline(relOid, ins_now, upd_now,
 												  del_now, truncdropped_now);
-			else
-				stats_visibility_changed = true;
 		}
 	}
 
