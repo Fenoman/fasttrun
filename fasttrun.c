@@ -2242,6 +2242,41 @@ fasttrun_stats_cache_commit_xact(void)
 		 */
 		keys = list_copy(relentry->attkeys);
 
+		/*
+		 * Relation gone (ON COMMIT DROP fires before this callback, plus any
+		 * plain DROP earlier in the xact)?  Drop the column-stats entries via
+		 * a cheap syscache existence probe instead of building a full relcache
+		 * descriptor with RelationIdGetRelation.  Symmetric to the analyze-
+		 * cache commit path.
+		 */
+		if (!SearchSysCacheExists1(RELOID, ObjectIdGetDatum(relid)))
+		{
+			foreach(klc, keys)
+			{
+				FasttrunStatsKey *kptr = (FasttrunStatsKey *) lfirst(klc);
+				FasttrunStatsKey key = *kptr;
+				FasttrunStatsEntry *entry;
+
+				entry = (FasttrunStatsEntry *)
+					hash_search(fasttrun_stats_cache, &key, HASH_FIND, NULL);
+				if (entry == NULL)
+				{
+					fasttrun_stats_relid_drop_key(&key);
+					continue;
+				}
+				fasttrun_stats_entry_free_undo(entry);
+				if (entry->statsTuple != NULL)
+				{
+					fasttrun_stats_relid_unref(key.relid);
+					heap_freetuple(entry->statsTuple);
+				}
+				(void) hash_search(fasttrun_stats_cache, &key, HASH_REMOVE, NULL);
+				fasttrun_stats_relid_drop_key(&key);
+			}
+			list_free(keys);
+			continue;
+		}
+
 		foreach(klc, keys)
 		{
 			FasttrunStatsKey *kptr = (FasttrunStatsKey *) lfirst(klc);
