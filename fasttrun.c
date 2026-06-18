@@ -1778,6 +1778,44 @@ fasttrun_query_contains_stats_relid(Query *query)
 	return false;
 }
 
+/*
+ * Re-inject cached relstats for every temp relation a query references,
+ * descending into subqueries and CTEs.  Mirrors the recursion of
+ * fasttrun_query_contains_stats_relid, so a temp table nested below the top
+ * level gets its rd_rel repaired just like a top-level one -- otherwise the
+ * planner would read relpages/reltuples 0 from pg_class for the nested temp.
+ */
+static void
+fasttrun_reinject_query_relstats(Query *query)
+{
+	ListCell   *lc;
+
+	if (query == NULL)
+		return;
+
+	foreach(lc, query->rtable)
+	{
+		RangeTblEntry *rte = (RangeTblEntry *) lfirst(lc);
+
+		if (rte->rtekind == RTE_RELATION)
+		{
+			fasttrun_reinject_rte_relstats(rte);
+		}
+		else if (rte->rtekind == RTE_SUBQUERY)
+		{
+			fasttrun_reinject_query_relstats(rte->subquery);
+		}
+	}
+
+	foreach(lc, query->cteList)
+	{
+		CommonTableExpr *cte = (CommonTableExpr *) lfirst(lc);
+
+		if (IsA(cte->ctequery, Query))
+			fasttrun_reinject_query_relstats((Query *) cte->ctequery);
+	}
+}
+
 static PlannedStmt *
 fasttrun_planner_hook(Query *parse, const char *query_string,
 					  int cursorOptions, ParamListInfo boundParams)
@@ -1789,12 +1827,7 @@ fasttrun_planner_hook(Query *parse, const char *query_string,
 	bool		stats_frame_needed = false;
 
 	if (fasttrun_analyze_cache != NULL)
-	{
-		ListCell   *lc;
-
-		foreach(lc, parse->rtable)
-			fasttrun_reinject_rte_relstats((RangeTblEntry *) lfirst(lc));
-	}
+		fasttrun_reinject_query_relstats(parse);
 
 	stats_frame_needed =
 		(fasttrun_stats_cache != NULL &&
