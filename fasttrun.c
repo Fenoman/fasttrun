@@ -1615,26 +1615,25 @@ fasttrun_stats_noop_free(HeapTuple tuple)
 }
 
 /*
- * Tighter freshness tolerance for high-cardinality columns.  A column whose
- * cached n_distinct covers at least FASTTRUN_SKEW_DISTINCT_RATIO of its rows is
- * skew-sensitive: a DML that concentrates rows onto one value can blow that
+ * Lower bound for the cardinality-scaled freshness tolerance (see
+ * fasttrun_stats_entry_usable).  A near-unique column gets a tolerance this
+ * tight, since a DML that concentrates rows onto one value can blow that
  * value's "rare" estimate past a plan boundary (Index Scan instead of Seq
- * Scan), so it gets FASTTRUN_SKEW_REFRESH_THRESHOLD instead of the configured
- * stats_refresh_threshold.  Low-cardinality columns are safe -- a stale
- * estimate there still reads as "many rows" and the plan does not flip.
+ * Scan).  Low-cardinality columns scale back up toward stats_refresh_threshold
+ * -- a stale estimate there still reads as "many rows" and the plan holds.
  */
-#define FASTTRUN_SKEW_DISTINCT_RATIO	0.5
-#define FASTTRUN_SKEW_REFRESH_THRESHOLD	0.05
+#define FASTTRUN_SKEW_REFRESH_FLOOR	0.05
 
 /*
  * Soft freshness: is this column-stats entry close enough to keep serving?
  * True while the DML churn since collect time stays below the effective
- * tolerance -- stats_refresh_threshold, tightened for high-cardinality columns
- * (see above).  Within tolerance the cached distribution still beats planner
- * defaults (core PG keeps using pg_statistic between ANALYZE runs the same
- * way).  A truncdropped flip means the storage was emptied or rewritten; a
- * missing analyze-cache row-count baseline means we cannot bound the drift.
- * Either makes the entry unusable.  Caller guarantees entry->statsTuple != NULL.
+ * tolerance -- stats_refresh_threshold scaled down by the column's cardinality
+ * (see FASTTRUN_SKEW_REFRESH_FLOOR).  Within tolerance the cached distribution
+ * still beats planner defaults (core PG keeps using pg_statistic between
+ * ANALYZE runs the same way).  A truncdropped flip means the storage was
+ * emptied or rewritten; a missing analyze-cache row-count baseline means we
+ * cannot bound the drift.  Either makes the entry unusable.  Caller guarantees
+ * entry->statsTuple != NULL.
  */
 static bool
 fasttrun_stats_entry_usable(Oid relid, const FasttrunStatsEntry *entry,
@@ -1645,6 +1644,7 @@ fasttrun_stats_entry_usable(Oid relid, const FasttrunStatsEntry *entry,
 	int64		churn;
 	double		baseline;
 	double		threshold;
+	double		floor_threshold;
 	double		stadistinct;
 	double		dratio;
 
@@ -1671,9 +1671,17 @@ fasttrun_stats_entry_usable(Oid relid, const FasttrunStatsEntry *entry,
 	stadistinct = ((Form_pg_statistic) GETSTRUCT(entry->statsTuple))->stadistinct;
 	dratio = (stadistinct < 0.0) ? -stadistinct : stadistinct / baseline;
 
-	threshold = fasttrun_stats_refresh_threshold;
-	if (dratio >= FASTTRUN_SKEW_DISTINCT_RATIO)
-		threshold = Min(threshold, FASTTRUN_SKEW_REFRESH_THRESHOLD);
+	/*
+	 * Scale tolerance down with cardinality: a near-unique column (dratio -> 1)
+	 * gets FASTTRUN_SKEW_REFRESH_FLOOR, a low-cardinality column keeps the
+	 * configured threshold, and everything between scales linearly -- no cliff,
+	 * moderate-cardinality columns are protected too.  The floor never loosens
+	 * a stricter user setting.
+	 */
+	floor_threshold = Min(fasttrun_stats_refresh_threshold,
+						  FASTTRUN_SKEW_REFRESH_FLOOR);
+	threshold = Max(fasttrun_stats_refresh_threshold * (1.0 - dratio),
+					floor_threshold);
 
 	return ((double) churn / baseline) < threshold;
 }
