@@ -1982,8 +1982,9 @@ fasttrun_read_pgstat_counters_for_hook(Oid relid,
 			/*
 			 * Cache full -- replace round-robin.  FIFO is good enough for
 			 * the planner-scoped lifetime; the only way to keep filling here
-			 * is plans that genuinely touch more than 64 different temp
-			 * relids, where the working set itself does not fit anyway.
+			 * is plans that genuinely touch more than
+			 * FASTTRUN_FRESHNESS_CACHE_SLOTS different temp relids, where the
+			 * working set itself does not fit anyway.
 			 */
 			slot = &fasttrun_freshness_cache[fasttrun_freshness_cache_next_evict];
 			fasttrun_freshness_cache_next_evict =
