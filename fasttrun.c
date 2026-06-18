@@ -118,17 +118,16 @@ static bool		fasttrun_zero_sinval_truncate = true;
  * counters on every call.  While standard_planner runs, cache that pgstat
  * snapshot per relid; outside planner_hook, fall back to direct reads.
  *
- * Slot count was 16 originally.  Real plans touching 17+ temp tables (joins,
- * CTEs, partition-by-temp-table) overflowed: subsequent relids fell through
- * to RelationIdGetRelation + pgstat read every time.  64 covers all temp
- * patterns I have seen on prod -- 3 KB of bss per backend is irrelevant.
- * Linear scan is still cache-friendly at this size and beats hashing.
- *
- * On overflow we replace round-robin (next_evict).  Cache lives only inside
- * one planner invocation; the reset after each plan keeps the working set
- * fresh, so a simple FIFO is good enough.
+ * One slot per distinct temp relid that supplied column stats in the current
+ * plan.  256 slots cover join/CTE/partition-by-temp patterns; once a plan
+ * touches more distinct temp relids than that, round-robin eviction
+ * (next_evict) makes the evicted relid pay one RelationIdGetRelation + pgstat
+ * read on its next probe.  Correctness is unaffected -- every read matches
+ * slot->relid, so an evicted slot is a miss, not a wrong answer.  ~10 KB of
+ * bss per backend; linear scan stays cache-friendly at this size and beats
+ * hashing.  The cache resets after each plan, so a simple FIFO is enough.
  */
-#define FASTTRUN_FRESHNESS_CACHE_SLOTS 64
+#define FASTTRUN_FRESHNESS_CACHE_SLOTS 256
 
 typedef struct FasttrunFreshnessCacheEntry
 {
