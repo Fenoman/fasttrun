@@ -5861,18 +5861,16 @@ fasttrun_prewarm(PG_FUNCTION_ARGS)
 		fasttrun_in_prewarm = true;
 		PG_TRY();
 		{
+			/* One SPI session for the whole batch, not one per table. */
+			if (SPI_connect() != SPI_OK_CONNECT)
+				elog(ERROR, "fasttrun_prewarm: SPI_connect failed");
+
 			for (i = 0; i < limit; i++)
 			{
-				int		ret;
-
 				/* Skip if no matching dummy table in the schema. */
 				if (nspOid == InvalidOid ||
 					get_relname_relid(sorted[i].relname, nspOid) == InvalidOid)
 					continue;
-
-				ret = SPI_connect();
-				if (ret != SPI_OK_CONNECT)
-					elog(ERROR, "fasttrun_prewarm: SPI_connect failed");
 
 				SPI_execute_with_args(
 					"SELECT create_temp_table($1)",
@@ -5881,9 +5879,17 @@ fasttrun_prewarm(PG_FUNCTION_ARGS)
 					(Datum[]) { CStringGetTextDatum(sorted[i].relname) },
 					NULL, false, 0);
 
-				SPI_finish();
+				/* Free this iteration's result so tuptables don't accumulate. */
+				if (SPI_tuptable != NULL)
+				{
+					SPI_freetuptable(SPI_tuptable);
+					SPI_tuptable = NULL;
+				}
+
 				created++;
 			}
+
+			SPI_finish();
 		}
 		PG_FINALLY();
 		{
