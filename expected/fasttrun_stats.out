@@ -503,12 +503,11 @@ EXPLAIN (COSTS OFF) SELECT * FROM t_release_stats WHERE grp = 50000;
 
 COMMIT;
 DROP TABLE t_release_stats;
--- 11g. Below-threshold DML перед COMMIT: churn в пределах порога, поэтому
---      commit сохраняет column stats, и они продолжают отдаваться в
---      следующей транзакции (collected_* обнуляется под нулевые post-commit
---      counters).  ВНИМАНИЕ: targeted UPDATE концентрирует строки на grp=1,
---      и soft freshness отдаёт старый n_distinct → Index Scan по «редкому»
---      grp=1, который на деле стал частым.  Осознанный trade-off soft-режима.
+-- 11g. Targeted UPDATE концентрирует 10% строк на grp=1 — выше строгого порога
+--      для high-cardinality колонки.  Cardinality-aware freshness прячет стату,
+--      и planner уходит на defaults (Bitmap), а не строит Index Scan по
+--      «редкому» grp=1, который на деле стал частым.  Защита сохраняется и
+--      после COMMIT.
 CREATE TEMP TABLE t_commit_stale_stats (id int, grp int);
 INSERT INTO t_commit_stale_stats SELECT g, g FROM generate_series(1, 100000) g;
 CREATE INDEX ON t_commit_stale_stats (grp);
@@ -533,23 +532,26 @@ SELECT fasttrun_analyze('t_commit_stale_stats');
  
 (1 row)
 
--- Внутри транзакции churn ниже порога → стата видна → Index Scan.
+-- Targeted churn выше строгого порога high-card → стата скрыта → defaults.
 EXPLAIN (COSTS OFF) SELECT * FROM t_commit_stale_stats WHERE grp = 1;
-                              QUERY PLAN                               
------------------------------------------------------------------------
- Index Scan using t_commit_stale_stats_grp_idx on t_commit_stale_stats
-   Index Cond: (grp = 1)
-(2 rows)
+                       QUERY PLAN                        
+---------------------------------------------------------
+ Bitmap Heap Scan on t_commit_stale_stats
+   Recheck Cond: (grp = 1)
+   ->  Bitmap Index Scan on t_commit_stale_stats_grp_idx
+         Index Cond: (grp = 1)
+(4 rows)
 
 COMMIT;
--- После COMMIT soft freshness сохраняет стату → план остаётся Index Scan
--- на старом n_distinct=100000 (см. trade-off выше).
+-- После COMMIT защита сохраняется → план остаётся на defaults.
 EXPLAIN (COSTS OFF) SELECT * FROM t_commit_stale_stats WHERE grp = 1;
-                              QUERY PLAN                               
------------------------------------------------------------------------
- Index Scan using t_commit_stale_stats_grp_idx on t_commit_stale_stats
-   Index Cond: (grp = 1)
-(2 rows)
+                       QUERY PLAN                        
+---------------------------------------------------------
+ Bitmap Heap Scan on t_commit_stale_stats
+   Recheck Cond: (grp = 1)
+   ->  Bitmap Index Scan on t_commit_stale_stats_grp_idx
+         Index Cond: (grp = 1)
+(4 rows)
 
 SELECT count(*) = 10000 AS commit_stale_actual_grp1
   FROM t_commit_stale_stats WHERE grp = 1;
@@ -560,51 +562,52 @@ SELECT count(*) = 10000 AS commit_stale_actual_grp1
 
 DROP TABLE t_commit_stale_stats;
 DROP TABLE t_refresh;
--- 11h. Граница soft freshness на high-cardinality таблице: churn чуть ниже
---      порога держит стату видимой (Index Scan по редкому grp), а churn выше
---      порога без пересбора прячет её (defaults).
-CREATE TEMP TABLE t_soft_below (id int, grp int);
-INSERT INTO t_soft_below SELECT g, g FROM generate_series(1, 100000) g;
-CREATE INDEX ON t_soft_below (grp);
+-- 11h. Cardinality-aware граница: для high-cardinality (unique) колонки порог
+--      толерантности ужесточён (concentrated DML может раздуть «редкое»
+--      значение в катастрофический Index Scan).  Мелкий churn ниже строгого
+--      порога держит стату видимой (Index Scan), churn выше — прячет её.
+CREATE TEMP TABLE t_skew_below (id int, grp int);
+INSERT INTO t_skew_below SELECT g, g FROM generate_series(1, 100000) g;
+CREATE INDEX ON t_skew_below (grp);
 BEGIN;
-SELECT fasttrun_analyze('t_soft_below');
+SELECT fasttrun_analyze('t_skew_below');
  fasttrun_analyze 
 ------------------
  
 (1 row)
 
-DELETE FROM t_soft_below WHERE id <= 15000;   -- 15% ниже порога 0.2 → стата видна
-EXPLAIN (COSTS OFF) SELECT * FROM t_soft_below WHERE grp = 50000;
+DELETE FROM t_skew_below WHERE id <= 3000;    -- 3% ниже строгого high-card порога → видна
+EXPLAIN (COSTS OFF) SELECT * FROM t_skew_below WHERE grp = 50000;
                       QUERY PLAN                       
 -------------------------------------------------------
- Index Scan using t_soft_below_grp_idx on t_soft_below
+ Index Scan using t_skew_below_grp_idx on t_skew_below
    Index Cond: (grp = 50000)
 (2 rows)
 
 COMMIT;
-DROP TABLE t_soft_below;
-CREATE TEMP TABLE t_soft_above (id int, grp int);
-INSERT INTO t_soft_above SELECT g, g FROM generate_series(1, 100000) g;
-CREATE INDEX ON t_soft_above (grp);
+DROP TABLE t_skew_below;
+CREATE TEMP TABLE t_skew_above (id int, grp int);
+INSERT INTO t_skew_above SELECT g, g FROM generate_series(1, 100000) g;
+CREATE INDEX ON t_skew_above (grp);
 BEGIN;
-SELECT fasttrun_analyze('t_soft_above');
+SELECT fasttrun_analyze('t_skew_above');
  fasttrun_analyze 
 ------------------
  
 (1 row)
 
-DELETE FROM t_soft_above WHERE id <= 25000;   -- 25% выше порога 0.2 → стата прячется
-EXPLAIN (COSTS OFF) SELECT * FROM t_soft_above WHERE grp = 50000;
+DELETE FROM t_skew_above WHERE id <= 10000;   -- 10% выше строгого high-card порога → прячется
+EXPLAIN (COSTS OFF) SELECT * FROM t_skew_above WHERE grp = 50000;
                    QUERY PLAN                    
 -------------------------------------------------
- Bitmap Heap Scan on t_soft_above
+ Bitmap Heap Scan on t_skew_above
    Recheck Cond: (grp = 50000)
-   ->  Bitmap Index Scan on t_soft_above_grp_idx
+   ->  Bitmap Index Scan on t_skew_above_grp_idx
          Index Cond: (grp = 50000)
 (4 rows)
 
 COMMIT;
-DROP TABLE t_soft_above;
+DROP TABLE t_skew_above;
 -- ----------------------------------------------------------------------
 -- 12. Порог = 0 не должен запускать пересбор, если доля изменений
 --     равна нулю.  Семантика порога: "0 = пересбор при любом DML",
