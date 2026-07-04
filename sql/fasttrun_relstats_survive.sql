@@ -216,6 +216,79 @@ SELECT reltuples = 100000 AS fasttrun_create_index_tuples
   FROM fasttrun_relstats('t_survive_create_index');
 
 -- ----------------------------------------------------------------------
+-- 10. Реинжект достаёт temp-таблицы, на которые запрос ссылается ТОЛЬКО
+--     через SubLink-подзапрос (IN/EXISTS/скалярный) — их Query живёт в
+--     дереве выражений, а не в rtable/cteList верхнего уровня.
+--
+--     Наблюдаемый флип плана: CREATE INDEX по недозаполненной таблице
+--     фиксирует в pg_class плотность той эпохи (100 строк на 1 страницу).
+--     После дозаливки до 50k и fasttrun_analyze чужой sinval перестраивает
+--     relcache, rd_rel берёт stale-плотность из pg_class, планировщик
+--     занижает размер таблицы в разы и semi join уезжает в Nested Loop +
+--     Index Only Scan.  Реинжект обязан дотянуться до сублинка и вернуть
+--     оценку 50k — hash-семиджойн, как в контроле.
+-- ----------------------------------------------------------------------
+CREATE TEMP TABLE t_sublink_reinject (id int, grp int);
+INSERT INTO t_sublink_reinject SELECT g, g % 10 FROM generate_series(1, 100) g;
+CREATE INDEX t_sublink_reinject_idx ON t_sublink_reinject (grp);
+INSERT INTO t_sublink_reinject SELECT g, g % 10 FROM generate_series(101, 50000) g;
+-- stale (relpages=1, reltuples=100) уже записаны CREATE INDEX'ом;
+-- сам индекс дальше не нужен и лишь добавил бы вариативность формы плана.
+DROP INDEX t_sublink_reinject_idx;
+SELECT fasttrun_analyze('t_sublink_reinject');
+
+CREATE TEMP TABLE t_sublink_outer (id int);
+INSERT INTO t_sublink_outer SELECT generate_series(1, 100);
+SELECT fasttrun_analyze('t_sublink_outer');
+
+-- Контроль до rebuild: оценка скана таблицы в сублинке ~50k.
+DO $$
+DECLARE
+  ln text;
+  est int := NULL;
+BEGIN
+  FOR ln IN EXPLAIN SELECT count(*) FROM t_sublink_outer o
+                     WHERE o.id IN (SELECT grp FROM t_sublink_reinject) LOOP
+    IF ln ~ 'on t_sublink_reinject' THEN
+      est := substring(ln FROM 'rows=(\d+)')::int;
+      EXIT;
+    END IF;
+  END LOOP;
+  IF est IS NULL OR est < 40000 OR est > 60000 THEN
+    RAISE EXCEPTION 'baseline sublink estimate out of band: %', est;
+  END IF;
+END$$;
+SELECT 'sublink_baseline_ok' AS marker;
+
+-- Чужой sinval -> rebuild rd_rel из stale pg_class (relpages=1, reltuples=100).
+UPDATE pg_class SET relhasindex = relhasindex
+ WHERE oid = 't_sublink_reinject'::regclass;
+SELECT 1 AS absorb_sinval;
+
+-- Сублинк-only ссылка: реинжект обязан вернуть оценку ~50k, а не
+-- ~22k от stale-плотности (100 строк/страницу x фактические страницы).
+DO $$
+DECLARE
+  ln text;
+  est int := NULL;
+BEGIN
+  FOR ln IN EXPLAIN SELECT count(*) FROM t_sublink_outer o
+                     WHERE o.id IN (SELECT grp FROM t_sublink_reinject) LOOP
+    IF ln ~ 'on t_sublink_reinject' THEN
+      est := substring(ln FROM 'rows=(\d+)')::int;
+      EXIT;
+    END IF;
+  END LOOP;
+  IF est IS NULL OR est < 40000 OR est > 60000 THEN
+    RAISE EXCEPTION 'sublink-only estimate out of band after rebuild: %', est;
+  END IF;
+END$$;
+SELECT 'sublink_after_rebuild_ok' AS marker;
+
+DROP TABLE t_sublink_reinject;
+DROP TABLE t_sublink_outer;
+
+-- ----------------------------------------------------------------------
 -- Очистка
 -- ----------------------------------------------------------------------
 DROP TABLE t_survive;

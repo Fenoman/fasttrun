@@ -158,7 +158,7 @@ make installcheck PG_CONFIG=/path/to/pg_config PGPORT=5433
 | `fasttrun_bench` | Synthetic benchmark on 1M rows × 50 columns |
 | `fasttrun_stats` | Statistics hook: EXPLAIN before/after, auto-collection, sample_rows=0/-1, refresh threshold, DDL/TRUNCATE eviction, partial-index relstats |
 | `fasttrun_tracking` | Tracking frequently created temp tables and prewarm; has expected output for both `shared_preload_libraries` and non-preload modes |
-| `fasttrun_relstats_survive` | relstats survive relcache rebuilds and `COMMIT` inside one backend |
+| `fasttrun_relstats_survive` | relstats survive relcache rebuilds and `COMMIT` inside one backend, including tables referenced only from SubLink subqueries |
 | `fasttrun_plan_cache_survive` | Backend-local SPI/PL/pgSQL plan cache invalidation after fasttruncate, analyze, collect_stats and savepoint rollback |
 | `fasttrun_stats_width` | Correct `stawidth` for by-value / varlena / fixed-length by-reference columns |
 | `fasttrun_discard` | Cache eviction on `DISCARD TEMP/ALL` and dependency drops (`DROP ... CASCADE`), drop rollback inside a savepoint |

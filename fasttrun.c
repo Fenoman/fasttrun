@@ -40,6 +40,7 @@
 #include "executor/executor.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
+#include "nodes/nodeFuncs.h"
 #include "optimizer/planner.h"
 #include "pgstat.h"
 #include "storage/buf_internals.h"
@@ -231,6 +232,9 @@ static bool fasttrun_stats_relid_exists(Oid relid);
 static void fasttrun_stats_relid_ref(Oid relid);
 static void fasttrun_stats_relid_unref(Oid relid);
 static bool fasttrun_query_contains_stats_relid(Query *query);
+static bool fasttrun_contains_stats_sublink_walker(Node *node, void *context);
+static void fasttrun_reinject_query_relstats(Query *query);
+static bool fasttrun_reinject_sublink_walker(Node *node, void *context);
 
 /*
  * Build a RangeVar from a text relation name.  Fast path for bare
@@ -1806,9 +1810,11 @@ chain:
  * picks catastrophic plans (Seq Scan over what looks like a tiny table,
  * nested loop joins on big working sets).
  *
- * We walk only the current query's rangetable and re-inject cached stats for
- * those temp heaps plus their indexes.  This keeps unrelated cached temp
- * tables at zero cost for plans that don't reference them.
+ * We walk the current query's rangetable (recursing into subquery RTEs,
+ * CTEs and, when hasSubLinks is set, SubLink subselects) and re-inject
+ * cached stats for those temp heaps plus their indexes.  This keeps
+ * unrelated cached temp tables at zero cost for plans that don't
+ * reference them.
  */
 static bool
 fasttrun_query_contains_stats_relid(Query *query)
@@ -1843,7 +1849,29 @@ fasttrun_query_contains_stats_relid(Query *query)
 			return true;
 	}
 
+	/*
+	 * Subqueries inside expressions (IN/EXISTS/scalar SubLinks) carry their
+	 * Query outside rtable and cteList.  hasSubLinks gates the extra
+	 * expression walk, so sublink-free queries pay nothing here.
+	 */
+	if (query->hasSubLinks &&
+		query_tree_walker(query, fasttrun_contains_stats_sublink_walker, NULL,
+						  QTW_IGNORE_RT_SUBQUERIES | QTW_IGNORE_CTE_SUBQUERIES))
+		return true;
+
 	return false;
+}
+
+/* Descend into SubLink subselects looking for cached-stats relids. */
+static bool
+fasttrun_contains_stats_sublink_walker(Node *node, void *context)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, Query))
+		return fasttrun_query_contains_stats_relid((Query *) node);
+	return expression_tree_walker(node, fasttrun_contains_stats_sublink_walker,
+								  context);
 }
 
 /*
@@ -1882,6 +1910,27 @@ fasttrun_reinject_query_relstats(Query *query)
 		if (IsA(cte->ctequery, Query))
 			fasttrun_reinject_query_relstats((Query *) cte->ctequery);
 	}
+
+	/* Same SubLink descent as fasttrun_query_contains_stats_relid. */
+	if (query->hasSubLinks)
+		(void) query_tree_walker(query, fasttrun_reinject_sublink_walker, NULL,
+								 QTW_IGNORE_RT_SUBQUERIES |
+								 QTW_IGNORE_CTE_SUBQUERIES);
+}
+
+/* Descend into SubLink subselects repairing rd_rel for cached temp rels. */
+static bool
+fasttrun_reinject_sublink_walker(Node *node, void *context)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, Query))
+	{
+		fasttrun_reinject_query_relstats((Query *) node);
+		return false;
+	}
+	return expression_tree_walker(node, fasttrun_reinject_sublink_walker,
+								  context);
 }
 
 static PlannedStmt *

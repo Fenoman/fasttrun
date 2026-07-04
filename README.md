@@ -160,7 +160,7 @@ make installcheck PG_CONFIG=/path/to/pg_config PGPORT=5433
 | `fasttrun_bench` | Синтетический бенчмарк на 1M строк × 50 колонок |
 | `fasttrun_stats` | Хук статистики: EXPLAIN до/после, автосбор, sample_rows=0/-1, refresh threshold, DDL/TRUNCATE eviction, partial-index relstats |
 | `fasttrun_tracking` | Трекинг часто создаваемых temp tables и prewarm; есть expected для режима с `shared_preload_libraries` и без него |
-| `fasttrun_relstats_survive` | Сохранение relstats через relcache rebuild и `COMMIT` в рамках backend'а |
+| `fasttrun_relstats_survive` | Сохранение relstats через relcache rebuild и `COMMIT` в рамках backend'а, включая таблицы, видимые только из SubLink-подзапросов |
 | `fasttrun_plan_cache_survive` | Локальный сброс кэша планов SPI/PL/pgSQL после fasttruncate, analyze, collect_stats и savepoint rollback |
 | `fasttrun_stats_width` | Корректный `stawidth` для by-value / varlena / fixed-length by-reference колонок |
 | `fasttrun_discard` | Эвикция кэшей при `DISCARD TEMP/ALL` и dependency-удалениях (`DROP ... CASCADE`), откат drop'а в savepoint |
