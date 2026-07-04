@@ -343,6 +343,17 @@ typedef struct FasttrunAnalyzeCacheEntry
 	BlockNumber	cached_allvisible;
 
 	/*
+	 * Storage identity for abort-time probes.  probe_rlb is THIS relation's
+	 * storage; heap_relid/heap_rlb identify the owning heap for index
+	 * entries (equal to the entry itself for heaps).  The subxact-abort path
+	 * checks storage emptiness at smgr level through these -- relcache and
+	 * syscache lookups are unsafe while the transaction state is aborted.
+	 */
+	RelFileLocatorBackend probe_rlb;
+	Oid			heap_relid;
+	RelFileLocatorBackend heap_rlb;
+
+	/*
 	 * Delta-math state is valid only inside the transaction where pgstat
 	 * xact counters were captured.  XACT COMMIT keeps has_relstats but clears
 	 * this part so the next transaction cold-scans before doing delta math.
@@ -427,91 +438,57 @@ fasttrun_relation_has_same_locator(Relation rel, FasttrunAnalyzeCacheEntry *entr
  * next plan can see rows in an empty table.  Whenever we can observe that the
  * underlying temp storage is empty, make that fact authoritative for heap and
  * index relstats.
+ *
+ * Runs from the subxact-abort callback, where relcache and syscache access
+ * is off-limits (TRANS_ABORT; PG18 asserts inside RelationIdGetRelation).
+ * The probe therefore stays at smgr level, addressing storage through the
+ * RelFileLocatorBackend captured at store time.  A vanished or replaced
+ * storage file (smgrexists false) means the cached identity no longer holds
+ * -- bail out to the ordinary undo path.  An index keeps its metapage even
+ * after truncate, so index emptiness is judged by the owning heap's blocks.
+ * rd_rel is left alone: the planner-hook reinject repairs it on the next
+ * plan that touches the relation.
  */
 static bool
 fasttrun_cache_make_empty_storage_authoritative(FasttrunAnalyzeCacheEntry *entry,
-												Oid *plan_relid,
-												bool *changed)
+												Oid *plan_relid)
 {
-	Relation	rel;
-	Relation	heaprel = NULL;
-	BlockNumber	pages_now;
-	bool		is_empty = false;
+	SMgrRelation own;
 
-	*plan_relid = entry->relid;
-	*changed = false;
+	*plan_relid = entry->heap_relid;
 
-	if (!entry->has_relstats)
+	if (!entry->has_relstats || !OidIsValid(entry->heap_relid))
 		return false;
 
-	rel = try_relation_open(entry->relid, NoLock);
-	if (rel == NULL)
+	own = smgropen(entry->probe_rlb.locator, entry->probe_rlb.backend);
+	if (!smgrexists(own, MAIN_FORKNUM))
 		return false;
 
-	if (!fasttrun_relation_has_same_locator(rel, entry) ||
-		rel->rd_rel->relpersistence != RELPERSISTENCE_TEMP ||
-		!isTempNamespace(RelationGetNamespace(rel)) ||
-		!RELKIND_HAS_STORAGE(rel->rd_rel->relkind))
+	if (entry->heap_relid != entry->relid)
 	{
-		relation_close(rel, NoLock);
+		/* Index entry: emptiness is the owning heap's emptiness. */
+		SMgrRelation heap = smgropen(entry->heap_rlb.locator,
+									 entry->heap_rlb.backend);
+
+		if (!smgrexists(heap, MAIN_FORKNUM) ||
+			smgrnblocks(heap, MAIN_FORKNUM) != 0)
+			return false;
+	}
+	else if (smgrnblocks(own, MAIN_FORKNUM) != 0)
 		return false;
-	}
 
-	if (rel->rd_rel->relkind == RELKIND_INDEX)
-	{
-		Oid		heapid = IndexGetRelation(entry->relid, true);
+	/* Heap gives 0 pages here; a rebuilt index keeps its metapage. */
+	entry->has_relstats = true;
+	entry->cached_pages = smgrnblocks(own, MAIN_FORKNUM);
+	entry->cached_tuples = 0;
+	entry->cached_allvisible = 0;
+	entry->relstats_subid = InvalidSubTransactionId;
+	entry->has_delta_state = false;
+	/* cached_pages drifted -- drop the lazy memo. */
+	entry->lazy_check_subid = InvalidSubTransactionId;
+	entry->lazy_check_pages = 0;
 
-		if (OidIsValid(heapid))
-		{
-			heaprel = try_relation_open(heapid, NoLock);
-			if (heaprel != NULL)
-			{
-				if (heaprel->rd_rel->relpersistence == RELPERSISTENCE_TEMP &&
-					isTempNamespace(RelationGetNamespace(heaprel)) &&
-					RelationGetNumberOfBlocks(heaprel) == 0)
-				{
-					is_empty = true;
-					*plan_relid = heapid;
-				}
-			}
-		}
-	}
-	else if (rel->rd_rel->relkind == RELKIND_RELATION ||
-			 rel->rd_rel->relkind == RELKIND_TOASTVALUE)
-	{
-		is_empty = (RelationGetNumberOfBlocks(rel) == 0);
-	}
-
-	if (is_empty)
-	{
-		pages_now = RelationGetNumberOfBlocks(rel);
-		if (entry->cached_pages != pages_now ||
-			entry->cached_tuples != 0 ||
-			entry->cached_allvisible != 0 ||
-			rel->rd_rel->relpages != pages_now ||
-			rel->rd_rel->reltuples != 0 ||
-			rel->rd_rel->relallvisible != 0)
-			*changed = true;
-
-		entry->has_relstats = true;
-		entry->cached_pages = pages_now;
-		entry->cached_tuples = 0;
-		entry->cached_allvisible = 0;
-		entry->relstats_subid = InvalidSubTransactionId;
-		entry->has_delta_state = false;
-		/* cached_pages drifted -- drop the lazy memo. */
-		entry->lazy_check_subid = InvalidSubTransactionId;
-		entry->lazy_check_pages = 0;
-
-		rel->rd_rel->relpages = pages_now;
-		rel->rd_rel->reltuples = 0;
-		rel->rd_rel->relallvisible = 0;
-	}
-
-	if (heaprel != NULL)
-		relation_close(heaprel, NoLock);
-	relation_close(rel, NoLock);
-	return is_empty;
+	return true;
 }
 
 static BlockNumber
@@ -771,6 +748,9 @@ fasttrun_cache_enter(Oid relid)
 		entry->cached_pages = 0;
 		entry->cached_tuples = 0;
 		entry->cached_allvisible = 0;
+		memset(&entry->probe_rlb, 0, sizeof(entry->probe_rlb));
+		entry->heap_relid = InvalidOid;
+		memset(&entry->heap_rlb, 0, sizeof(entry->heap_rlb));
 		entry->has_delta_state = false;
 		entry->cached_inserted = 0;
 		entry->cached_updated = 0;
@@ -834,6 +814,11 @@ fasttrun_cache_store_relstats(Relation rel, BlockNumber pages, int64 tuples,
 	entry->cached_pages = pages;
 	entry->cached_tuples = tuples;
 	entry->cached_allvisible = allvisible;
+	entry->probe_rlb.locator = rel->rd_locator;
+	entry->probe_rlb.backend = rel->rd_backend;
+	/* Default: the entry is its own heap; index call sites override. */
+	entry->heap_relid = RelationGetRelid(rel);
+	entry->heap_rlb = entry->probe_rlb;
 	entry->relstats_subid = GetCurrentSubTransactionId();
 	/* cached_pages changed -- the lazy-probe memo is now stale. */
 	entry->lazy_check_subid = InvalidSubTransactionId;
@@ -848,6 +833,16 @@ fasttrun_cache_store_relstats(Relation rel, BlockNumber pages, int64 tuples,
 	fasttrun_xact_touch_relid(RelationGetRelid(rel));
 
 	return entry;
+}
+
+/* Point an index entry's emptiness probe at its owning heap's storage. */
+static void
+fasttrun_cache_set_owning_heap(FasttrunAnalyzeCacheEntry *entry,
+							   Relation heaprel)
+{
+	entry->heap_relid = RelationGetRelid(heaprel);
+	entry->heap_rlb.locator = heaprel->rd_locator;
+	entry->heap_rlb.backend = heaprel->rd_backend;
 }
 
 static void
@@ -2799,11 +2794,9 @@ fasttrun_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 				if (event == SUBXACT_EVENT_ABORT_SUB)
 				{
 					Oid		plan_relid;
-					bool	empty_storage_changed;
 
 					if (fasttrun_cache_make_empty_storage_authoritative(aentry,
-																		&plan_relid,
-																		&empty_storage_changed))
+																		&plan_relid))
 					{
 						/*
 						 * fasttruncate() is non-transactional for local
@@ -3387,7 +3380,11 @@ fasttrun_update_index_relstats(Relation rel, HeapTuple *sample, int sample_count
 		indexrel->rd_rel->relpages = index_pages;
 		indexrel->rd_rel->reltuples = (float4) index_tuples;
 		indexrel->rd_rel->relallvisible = 0;
-		fasttrun_cache_store_relstats(indexrel, index_pages, index_tuples, 0);
+		fasttrun_cache_set_owning_heap(fasttrun_cache_store_relstats(indexrel,
+																	 index_pages,
+																	 index_tuples,
+																	 0),
+									   rel);
 
 		index_close(indexrel, AccessShareLock);
 	}
@@ -3983,7 +3980,10 @@ fasttrun_rebuild_one_index(Relation heaprel, Relation indexrel)
 		RelationGetNumberOfBlocks(indexrel);
 	indexrel->rd_rel->reltuples = 0;
 	indexrel->rd_rel->relallvisible = 0;
-	fasttrun_cache_store_relstats(indexrel, indexrel->rd_rel->relpages, 0, 0);
+	fasttrun_cache_set_owning_heap(fasttrun_cache_store_relstats(indexrel,
+																 indexrel->rd_rel->relpages,
+																 0, 0),
+								   heaprel);
 }
 
 static void

@@ -304,6 +304,34 @@ COMMIT;
 DROP TABLE t_an_ft_rollback;
 
 -- ----------------------------------------------------------------------
+-- 17b. Та же non-transactional семантика для таблицы С индексом: после
+--      ROLLBACK TO хранилище пусто, relstats heap'а обнулены, а у индекса
+--      остаётся metapage (1 страница) и ноль строк.
+-- ----------------------------------------------------------------------
+CREATE TEMP TABLE t_an_ft_rb_idx (id int, grp int);
+CREATE INDEX t_an_ft_rb_idx_grp ON t_an_ft_rb_idx (grp);
+INSERT INTO t_an_ft_rb_idx SELECT g, g % 10 FROM generate_series(1, 1000) g;
+
+BEGIN;
+SELECT fasttrun_analyze('t_an_ft_rb_idx');
+SELECT reltuples = 1000 AS idx17b_pre FROM fasttrun_relstats('t_an_ft_rb_idx');
+
+SAVEPOINT sp_ft_rb_idx;
+SELECT fasttruncate('t_an_ft_rb_idx');
+ROLLBACK TO SAVEPOINT sp_ft_rb_idx;
+
+SELECT count(*) = 0 AS idx17b_actual_empty FROM t_an_ft_rb_idx;
+SELECT relpages = 0 AS idx17b_heap_pages_zero,
+       reltuples = 0 AS idx17b_heap_tuples_zero
+  FROM fasttrun_relstats('t_an_ft_rb_idx');
+SELECT relpages = 1 AS idx17b_index_metapage,
+       reltuples = 0 AS idx17b_index_tuples_zero
+  FROM fasttrun_relstats('t_an_ft_rb_idx_grp');
+COMMIT;
+
+DROP TABLE t_an_ft_rb_idx;
+
+-- ----------------------------------------------------------------------
 -- 18. Регрессионный тест: ошибка ленивого режима после SQL TRUNCATE
 --     (исправление приоритета P1).
 --
