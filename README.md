@@ -148,7 +148,7 @@ ALTER EXTENSION fasttrun UPDATE;
 make installcheck PG_CONFIG=/path/to/pg_config PGPORT=5433
 ```
 
-10 тест-кейсов через `pg_regress`:
+12 тест-кейсов через `pg_regress`:
 
 | Тест | Что проверяет |
 |---|---|
@@ -162,6 +162,8 @@ make installcheck PG_CONFIG=/path/to/pg_config PGPORT=5433
 | `fasttrun_tracking` | Трекинг часто создаваемых temp tables и prewarm; есть expected для режима с `shared_preload_libraries` и без него |
 | `fasttrun_relstats_survive` | Сохранение relstats через relcache rebuild и `COMMIT` в рамках backend'а |
 | `fasttrun_plan_cache_survive` | Локальный сброс кэша планов SPI/PL/pgSQL после fasttruncate, analyze, collect_stats и savepoint rollback |
+| `fasttrun_stats_width` | Корректный `stawidth` для by-value / varlena / fixed-length by-reference колонок |
+| `fasttrun_discard` | Эвикция кэшей при `DISCARD TEMP/ALL` и dependency-удалениях (`DROP ... CASCADE`), откат drop'а в savepoint |
 
 Все тесты проходят на PG 16.13, 17.9 и 18.3.
 
@@ -347,7 +349,7 @@ fasttrun.track_schedule = ''
 * **Top-level `ROLLBACK` не делает catalog-like undo для `rd_rel`** — savepoint paths обрабатываются локально, но при откате всей транзакции значения могут жить в relcache до следующего `fasttrun_analyze`, `fasttruncate` или reconnect.
 * **Статистика expression indexes** — не собирается. Обычные btree-индексы по колонкам работают через статистику самих колонок, но для индексов вида `CREATE INDEX ON t ((lower(name)))` отдельной статистики выражения пока нет.
 * **ACL/RLS/security-barrier семантика ANALYZE не повторяется** — расширение предназначено для временных таблиц текущей сессии, а не для использования как общий security boundary.
-* **Cached plans инвалидируются только локально** — `fasttruncate`, `fasttrun_analyze`, `fasttrun_collect_stats`, DDL/TRUNCATE eviction и savepoint rollback сбрасывают plan cache текущего backend'а, но не рассылают shared sinval другим backend'ам.
+* **Cached plans инвалидируются только локально** — `fasttruncate`, `fasttrun_analyze`, `fasttrun_collect_stats`, DDL/TRUNCATE eviction и savepoint rollback сбрасывают plan cache текущего backend'а, но не рассылают shared sinval другим backend'ам. Смерть temp-таблиц мимо per-table DDL тоже отслеживается: `DISCARD TEMP/ALL` сбрасывает кэши целиком, а dependency-удаления (`DROP ... CASCADE`, `DROP OWNED BY`) добираются через `object_access_hook` — записи умерших relid'ов не копятся в долгоживущих pooled-сессиях.
 * **Стоимость холодного прохода со сбором статистики** — ~50-150 мс на таблицу 1M строк × 50 колонок. Можно отключить через GUC.
 
 ## Совместимость

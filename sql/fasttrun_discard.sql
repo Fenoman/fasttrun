@@ -1,0 +1,97 @@
+--
+-- fasttrun_discard — эвикция локальных кэшей, когда temp-таблицы умирают
+-- мимо per-table DropStmt: DISCARD TEMP / DISCARD ALL (внутреннее удаление
+-- всего temp-неймспейса) и dependency-удаления (DROP ... CASCADE).
+--
+-- Без эвикции записи умерших relid'ов (включая statsTuple'ы колонок)
+-- живут в кэшах до конца жизни бэкенда — утечка в pooled-сессиях,
+-- где пулер выдаёт DISCARD ALL между клиентами.
+--
+-- Наблюдаемый признак: контексты "fasttrun analyze cache" и
+-- "fasttrun stats cache" сносятся целиком, когда кэши пустеют
+-- (pg_backend_memory_contexts), и лениво взводятся заново.
+--
+
+CREATE EXTENSION fasttrun;
+
+-- ----------------------------------------------------------------------
+-- 1. DISCARD TEMP сбрасывает оба кэша целиком: все temp-таблицы сессии
+--    умирают внутренним удалением, per-table DropStmt через
+--    ProcessUtility не проходит.
+-- ----------------------------------------------------------------------
+CREATE TEMP TABLE t_disc (id int, grp int);
+INSERT INTO t_disc SELECT g, g % 10 FROM generate_series(1, 1000) g;
+SELECT fasttrun_analyze('t_disc');
+
+SELECT count(DISTINCT name) AS ctx_after_analyze
+  FROM pg_backend_memory_contexts
+ WHERE name IN ('fasttrun analyze cache', 'fasttrun stats cache');
+
+DISCARD TEMP;
+
+SELECT count(DISTINCT name) AS ctx_after_discard_temp
+  FROM pg_backend_memory_contexts
+ WHERE name IN ('fasttrun analyze cache', 'fasttrun stats cache');
+
+-- ----------------------------------------------------------------------
+-- 2. После сброса кэши взводятся лениво и расширение полностью
+--    работоспособно.
+-- ----------------------------------------------------------------------
+CREATE TEMP TABLE t_disc2 (id int);
+INSERT INTO t_disc2 SELECT generate_series(1, 500);
+SELECT fasttrun_analyze('t_disc2');
+SELECT reltuples = 500 AS rearm_ok FROM fasttrun_relstats('t_disc2');
+
+SELECT count(DISTINCT name) AS ctx_rearmed
+  FROM pg_backend_memory_contexts
+ WHERE name IN ('fasttrun analyze cache', 'fasttrun stats cache');
+
+-- ----------------------------------------------------------------------
+-- 3. DISCARD ALL — тот же контракт (пулеры шлют его между клиентами).
+-- ----------------------------------------------------------------------
+DISCARD ALL;
+
+SELECT count(DISTINCT name) AS ctx_after_discard_all
+  FROM pg_backend_memory_contexts
+ WHERE name IN ('fasttrun analyze cache', 'fasttrun stats cache');
+
+-- ----------------------------------------------------------------------
+-- 4. Dependency-удаление: DROP TABLE parent CASCADE убивает ребёнка
+--    через механизм зависимостей — ребёнка нет в stmt->objects.
+--    Его записи должен добрать commit-колбэк, после чего пустые кэши
+--    сносятся.
+-- ----------------------------------------------------------------------
+CREATE TEMP TABLE t_disc_parent (a int);
+CREATE TEMP TABLE t_disc_child (b int) INHERITS (t_disc_parent);
+INSERT INTO t_disc_child SELECT g, g FROM generate_series(1, 300) g;
+SELECT fasttrun_analyze('t_disc_child');
+
+SELECT count(DISTINCT name) AS ctx_before_cascade
+  FROM pg_backend_memory_contexts
+ WHERE name IN ('fasttrun analyze cache', 'fasttrun stats cache');
+
+DROP TABLE t_disc_parent CASCADE;
+
+SELECT count(DISTINCT name) AS ctx_after_cascade
+  FROM pg_backend_memory_contexts
+ WHERE name IN ('fasttrun analyze cache', 'fasttrun stats cache');
+
+-- ----------------------------------------------------------------------
+-- 5. Откат dependency-удаления не должен трогать кэш: DROP в subxact +
+--    ROLLBACK TO SAVEPOINT оставляет таблицу и её relstats на месте.
+-- ----------------------------------------------------------------------
+CREATE TEMP TABLE t_disc_rb (id int);
+INSERT INTO t_disc_rb SELECT generate_series(1, 200);
+SELECT fasttrun_analyze('t_disc_rb');
+
+BEGIN;
+SAVEPOINT sp;
+DROP TABLE t_disc_rb;
+ROLLBACK TO SAVEPOINT sp;
+SELECT reltuples = 200 AS survived_rollback FROM fasttrun_relstats('t_disc_rb');
+COMMIT;
+
+SELECT reltuples = 200 AS survived_commit FROM fasttrun_relstats('t_disc_rb');
+
+DROP TABLE t_disc_rb;
+DROP EXTENSION fasttrun;

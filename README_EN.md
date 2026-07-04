@@ -146,7 +146,7 @@ ALTER EXTENSION fasttrun UPDATE;
 make installcheck PG_CONFIG=/path/to/pg_config PGPORT=5433
 ```
 
-10 test cases via `pg_regress`:
+12 test cases via `pg_regress`:
 
 | Test | What it checks |
 |---|---|
@@ -160,6 +160,8 @@ make installcheck PG_CONFIG=/path/to/pg_config PGPORT=5433
 | `fasttrun_tracking` | Tracking frequently created temp tables and prewarm; has expected output for both `shared_preload_libraries` and non-preload modes |
 | `fasttrun_relstats_survive` | relstats survive relcache rebuilds and `COMMIT` inside one backend |
 | `fasttrun_plan_cache_survive` | Backend-local SPI/PL/pgSQL plan cache invalidation after fasttruncate, analyze, collect_stats and savepoint rollback |
+| `fasttrun_stats_width` | Correct `stawidth` for by-value / varlena / fixed-length by-reference columns |
+| `fasttrun_discard` | Cache eviction on `DISCARD TEMP/ALL` and dependency drops (`DROP ... CASCADE`), drop rollback inside a savepoint |
 
 All tests pass on PG 16.13, 17.9 and 18.3.
 
@@ -345,7 +347,7 @@ Statistics are saved to disk (`pg_stat/fasttrun_temp_stats`) on server shutdown 
 * **Top-level `ROLLBACK` does not do catalog-like undo for `rd_rel`** — savepoint paths are handled locally, but after aborting the whole transaction values may live in relcache until the next `fasttrun_analyze`, `fasttruncate` or reconnect.
 * **Expression index statistics** — not collected. Regular btree indexes on table columns use the column statistics, but indexes like `CREATE INDEX ON t ((lower(name)))` do not yet get separate expression statistics.
 * **ACL/RLS/security-barrier semantics of ANALYZE are not reproduced** — the extension is meant for temporary tables in the current session, not as a general security boundary.
-* **Cached plans are invalidated only locally** — `fasttruncate`, `fasttrun_analyze`, `fasttrun_collect_stats`, DDL/TRUNCATE eviction and savepoint rollback reset the current backend plan cache, but do not send shared sinval to other backends.
+* **Cached plans are invalidated only locally** — `fasttruncate`, `fasttrun_analyze`, `fasttrun_collect_stats`, DDL/TRUNCATE eviction and savepoint rollback reset the current backend plan cache, but do not send shared sinval to other backends. Temp tables dying without a per-table DDL statement are tracked too: `DISCARD TEMP/ALL` drops both caches whole, and dependency drops (`DROP ... CASCADE`, `DROP OWNED BY`) are caught via `object_access_hook` — entries for dead relids do not accumulate in long-lived pooled sessions.
 * **Cost of cold-path stats collection** — ~50-150 ms for a 1M rows × 50 columns table. Can be disabled via GUC.
 
 ## Compatibility

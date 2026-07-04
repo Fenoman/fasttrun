@@ -29,6 +29,7 @@
 #include "catalog/heap.h"
 #include "catalog/index.h"
 #include "catalog/namespace.h"
+#include "catalog/objectaccess.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_statistic.h"
 #include "catalog/pg_type.h"
@@ -5016,6 +5017,7 @@ static bool				fasttrun_in_prewarm = false;
 static char			   *fasttrun_prewarm_schema = "dummy_tmp";
 static char			   *fasttrun_track_schedule = "mon-fri 08:00-18:00";
 static ProcessUtility_hook_type prev_utility_hook = NULL;
+static object_access_hook_type prev_object_access_hook = NULL;
 static shmem_startup_hook_type prev_shmem_startup_hook = NULL;
 static shmem_request_hook_type prev_shmem_request_hook = NULL;
 
@@ -5561,9 +5563,54 @@ fasttrun_evict_utility_caches(Node *parsetree)
 				}
 				break;
 			}
+		case T_DiscardStmt:
+			{
+				DiscardStmt *stmt = (DiscardStmt *) parsetree;
+
+				/*
+				 * DISCARD TEMP/ALL drops every temp table of the session via
+				 * internal dependency deletion -- no per-table DropStmt ever
+				 * reaches this hook.  Every cached relid dies at once, so
+				 * drop both caches whole; they re-arm lazily on the next
+				 * analyze/collect.
+				 */
+				if (stmt->target == DISCARD_ALL || stmt->target == DISCARD_TEMP)
+					fasttrun_evict_all_session_caches();
+				break;
+			}
 		default:
 			break;
 	}
+}
+
+/*
+ * Dependency-machinery drops (DROP ... CASCADE, DROP OWNED BY, DISCARD)
+ * delete relations without a per-table DropStmt, so the utility hook never
+ * sees them.  Register the dropped relid in the per-xact touched list; the
+ * commit callbacks already remove entries whose relation is gone.  A plain
+ * touch keeps rollback semantics intact: if the drop aborts, the untouched
+ * cache entry stays valid.
+ */
+static void
+fasttrun_object_access_hook(ObjectAccessType access, Oid classId,
+							Oid objectId, int subId, void *arg)
+{
+	if (prev_object_access_hook)
+		(*prev_object_access_hook) (access, classId, objectId, subId, arg);
+
+	if (access != OAT_DROP || classId != RelationRelationId || subId != 0)
+		return;
+
+	if (fasttrun_analyze_cache == NULL && fasttrun_stats_cache == NULL)
+		return;
+
+	/* Touch only relids we actually track -- keeps the list small on
+	 * mass drops of unrelated relations. */
+	if (fasttrun_cache_lookup(objectId) == NULL &&
+		!fasttrun_stats_relid_exists(objectId))
+		return;
+
+	fasttrun_xact_touch_relid(objectId);
 }
 
 /* ProcessUtility hook: track CREATE TEMP TABLE and evict stats on temp-table DDL. */
@@ -6069,6 +6116,9 @@ _PG_init(void)
 	 */
 	prev_utility_hook = ProcessUtility_hook;
 	ProcessUtility_hook = fasttrun_utility_hook;
+
+	prev_object_access_hook = object_access_hook;
+	object_access_hook = fasttrun_object_access_hook;
 
 	/* Tracking GUCs */
 	DefineCustomBoolVariable("fasttrun.track_temp_creates",
