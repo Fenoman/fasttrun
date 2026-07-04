@@ -200,6 +200,7 @@ Other checks:
 | `check-perf-smoke` | Uses `bpftrace` to verify lazy hooks, cheap miss-path for regular tables, temp stats hit, and no-DML hot path |
 | `check-hook-chain` | Starts a best-effort prod-like preload cluster, loads available extensions, and verifies that fasttrun stats reach the planner |
 | `check-zero-sinval` | Uses `gdb` to verify that fasttrun operations do not send shared sinval |
+| `check-replace-catalog` | Fixture check for `scripts/replace_analyze_in_catalog.sql`: replacement only at statement position, `EXECUTE '...'` literals and comments untouched, functions stay executable (cross-platform, no sudo) |
 
 The full local set can be run with one target:
 

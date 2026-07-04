@@ -202,6 +202,7 @@ Parity harness сравнивает `EXPLAIN (FORMAT JSON)` после обыч�
 | `check-perf-smoke` | Через `bpftrace` проверяет lazy hooks, дешёвый miss-path для обычных таблиц, temp stats hit и no-DML hot path |
 | `check-hook-chain` | Поднимает best-effort prod-like preload cluster, грузит доступные расширения и проверяет, что fasttrun stats доходят до планировщика |
 | `check-zero-sinval` | Проверяет через `gdb`, что fasttrun операции не отправляют shared sinval |
+| `check-replace-catalog` | Фикстурная проверка `scripts/replace_analyze_in_catalog.sql`: замена только в statement-позиции, литералы `EXECUTE '...'` и комментарии не трогаются, функции остаются исполнимыми (кроссплатформенный, без sudo) |
 
 Полный локальный набор можно запустить одной целью:
 
