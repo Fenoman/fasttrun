@@ -2638,6 +2638,7 @@ fasttrun_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 	{
 		Oid			relid = lfirst_oid(lc);
 		FasttrunAnalyzeCacheEntry *aentry;
+		bool		plan_inval_needed = false;
 
 		if (fasttrun_stats_cache != NULL && fasttrun_stats_relid_cache != NULL)
 		{
@@ -2693,7 +2694,7 @@ fasttrun_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 							sentry->collected_subid = popped->collected_subid;
 							sentry->undo = popped->older;
 							pfree(popped);	/* popped->statsTuple now owned by entry */
-							fasttrun_invalidate_local_plan_cache(relid);
+							plan_inval_needed = true;
 						}
 						else
 						{
@@ -2706,7 +2707,7 @@ fasttrun_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 							(void) hash_search(fasttrun_stats_cache, &key,
 											   HASH_REMOVE, NULL);
 							fasttrun_stats_relid_drop_key(&key);
-							fasttrun_invalidate_local_plan_cache(relid);
+							plan_inval_needed = true;
 						}
 					}
 					else	/* SUBXACT_EVENT_COMMIT_SUB */
@@ -2736,14 +2737,12 @@ fasttrun_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 			}
 		}
 
-		if (fasttrun_analyze_cache == NULL)
-			continue;
+		aentry = NULL;
+		if (fasttrun_analyze_cache != NULL)
+			aentry = (FasttrunAnalyzeCacheEntry *)
+				hash_search(fasttrun_analyze_cache, &relid, HASH_FIND, NULL);
 
-		aentry = (FasttrunAnalyzeCacheEntry *)
-			hash_search(fasttrun_analyze_cache, &relid, HASH_FIND, NULL);
-		if (aentry == NULL)
-			continue;
-
+		if (aentry != NULL)
 		{
 
 			if (aentry->relstats_subid == mySubid)
@@ -2807,7 +2806,7 @@ fasttrun_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 						aentry->has_delta_state = false;
 						aentry->relstats_subid = InvalidSubTransactionId;
 					}
-					fasttrun_invalidate_local_plan_cache(aentry->relid);
+					plan_inval_needed = true;
 				}
 				else
 				{
@@ -2891,6 +2890,16 @@ fasttrun_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 					aentry->lazy_check_subid = parentSubid;
 			}
 		}
+
+		/*
+		 * One local invalidation per relid.  The call is idempotent, and the
+		 * per-column undo/drop paths above only need the plan cache walked
+		 * once -- repeating it per attkey just re-scans every cached plan.
+		 * The empty-storage branch skips this via continue: it has already
+		 * invalidated its relids directly.
+		 */
+		if (plan_inval_needed)
+			fasttrun_invalidate_local_plan_cache(relid);
 	}
 }
 
@@ -4033,6 +4042,9 @@ fasttrun_invalidate_local_plan_cache(Oid relid)
 
 	/* InvalidOid would target the whole relcache; defend against that. */
 	Assert(OidIsValid(relid));
+
+	/* Fixed text (no OID) so regression tests can count calls. */
+	elog(DEBUG1, "fasttrun: invalidating backend-local cached plans");
 
 	msg.rc.id = SHAREDINVALRELCACHE_ID;
 	msg.rc.dbId = MyDatabaseId;

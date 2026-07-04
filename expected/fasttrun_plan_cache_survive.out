@@ -347,6 +347,48 @@ EXPLAIN (COSTS OFF) EXECUTE q_keep;
 DEALLOCATE q_keep;
 COMMIT;
 DROP TABLE t_subthreshold_keep_plan;
+-- ----------------------------------------------------------------------
+-- 7. ROLLBACK TO SAVEPOINT инвалидирует локальный plan cache ровно один
+--    раз на relid, а не по разу на каждую откатываемую колонку стата.
+--    Вызовы считаем по DEBUG-строке из
+--    fasttrun_invalidate_local_plan_cache; SET внутри subxact ещё
+--    действует в момент колбэка (GUC-откат в AbortSubTransaction идёт
+--    после subxact-колбэков) и сам снимается откатом.
+-- ----------------------------------------------------------------------
+RESET fasttrun.stats_refresh_threshold;
+RESET fasttrun.invalidate_threshold;
+CREATE TEMP TABLE t_abort_inval_once (c1 int, c2 int, c3 int, c4 int,
+                                      c5 int, c6 int, c7 int, c8 int);
+INSERT INTO t_abort_inval_once
+SELECT g, g, g, g, g, g, g, g FROM generate_series(1, 500) g;
+BEGIN;
+SELECT fasttrun_analyze('t_abort_inval_once');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+SAVEPOINT sp_inval;
+INSERT INTO t_abort_inval_once
+SELECT g, g, g, g, g, g, g, g FROM generate_series(501, 1000) g;
+SELECT fasttrun_analyze('t_abort_inval_once');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+SET client_min_messages = debug1;
+ROLLBACK TO SAVEPOINT sp_inval;
+DEBUG:  fasttrun: invalidating backend-local cached plans
+SELECT reltuples = 500 AS abort_restored
+  FROM fasttrun_relstats('t_abort_inval_once');
+ abort_restored 
+----------------
+ t
+(1 row)
+
+COMMIT;
+DROP TABLE t_abort_inval_once;
 DROP FUNCTION f_outer(int, int);
 DROP FUNCTION f_inner();
 DROP TABLE t_rsd_details;
