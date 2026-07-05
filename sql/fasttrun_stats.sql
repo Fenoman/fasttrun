@@ -1236,6 +1236,73 @@ SELECT stadistinct = 10 AS attopts_ndistinct_applied
 COMMIT;
 DROP TABLE t_attopts;
 
+-- ----------------------------------------------------------------------
+-- 29. Cross-commit staleness: обычный SQL-refill temp-таблицы в ОТДЕЛЬНОЙ
+--     транзакции (без вызова fasttrun_*) не должен оставлять stale
+--     MCV/n_distinct видимыми планировщику.
+--
+--     pgstat-счётчики temp-таблицы обнуляются на границе транзакции
+--     (и trans-цепочка, и локальный snapshot), в shared pgstat temp не
+--     флашится вовсе — то есть счётчик, переживающий commit, недоступен.
+--     Единственный переживающий commit сигнал — физический размер, но он
+--     bloat-контаминирован (bulk UPDATE / откат подтранзакции удваивает
+--     страницы без смены данных). Поэтому это грубый backstop: стата
+--     прячется только при изменении размера на порядок (>=3x или <=1/3),
+--     что однозначно означает refill мимо fasttrun_analyze. Остаточный
+--     случай (refill той же величины, но иным распределением, закоммиченный
+--     без вызова fasttrun) не ловится — для temp нет построчного сигнала.
+-- ----------------------------------------------------------------------
+CREATE TEMP TABLE t_xcommit (c int) ON COMMIT PRESERVE ROWS;
+
+-- 1-строчный зонд с честной статистикой — детерминирует форму join-оценки.
+CREATE TEMP TABLE t_xc_probe (c int);
+INSERT INTO t_xc_probe VALUES (42);
+SELECT fasttrun_analyze('t_xc_probe');
+
+-- Xact A: 1000 строк, все c=5 -> MCV{5:1.0}, n_distinct=1.
+INSERT INTO t_xcommit SELECT 5 FROM generate_series(1, 1000);
+BEGIN;
+SELECT fasttrun_analyze('t_xcommit');
+COMMIT;
+
+-- Позитивный контроль: размер не менялся через commit -> стата ОСТАЁТСЯ
+-- видимой (soft freshness переживает commit). Оценка c=5 ~ вся таблица.
+DO $$
+DECLARE ln text; est int := NULL;
+BEGIN
+  FOR ln IN EXPLAIN SELECT * FROM t_xcommit WHERE c = 5 LOOP
+    IF ln ~ 'rows=' THEN est := substring(ln FROM 'rows=(\d+)')::int; EXIT; END IF;
+  END LOOP;
+  IF est IS NULL OR est < 500 THEN
+    RAISE EXCEPTION 'unchanged-across-commit stats wrongly hidden: est=%', est;
+  END IF;
+END$$;
+SELECT 'xcommit_unchanged_visible_ok' AS marker;
+
+-- Xact B: обычный INSERT 100000 РАЗНЫХ значений, БЕЗ fasttrun_analyze.
+-- Размер вырастает в разы; relid не попадает в touched-список.
+INSERT INTO t_xcommit SELECT g FROM generate_series(1, 100000) g;
+
+-- Xact C: join probe -> t_xcommit по c. При stale n_distinct=1 планировщик
+-- считает join почти декартовым (~100k+). После фикса стата спрятана,
+-- оценка коллапсирует к defaults. Дискриминатор с огромным зазором.
+DO $$
+DECLARE ln text; est bigint := NULL;
+BEGIN
+  FOR ln IN EXPLAIN SELECT * FROM t_xc_probe p JOIN t_xcommit t ON t.c = p.c LOOP
+    IF ln ~ 'Join' OR ln ~ 'Nested Loop' THEN
+      est := substring(ln FROM 'rows=(\d+)')::bigint; EXIT;
+    END IF;
+  END LOOP;
+  IF est IS NULL OR est > 10000 THEN
+    RAISE EXCEPTION 'stale n_distinct served across commit: join est=%', est;
+  END IF;
+END$$;
+SELECT 'xcommit_stale_hidden_ok' AS marker;
+
+DROP TABLE t_xcommit;
+DROP TABLE t_xc_probe;
+
 -- Очистка
 DROP TABLE t_stats;
 DROP TABLE t_multi;

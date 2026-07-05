@@ -139,6 +139,7 @@ typedef struct FasttrunFreshnessCacheEntry
 	int64		upd;
 	int64		del;
 	bool		truncdropped;
+	BlockNumber	pages;
 } FasttrunFreshnessCacheEntry;
 
 static bool		fasttrun_in_planner = false;
@@ -215,7 +216,8 @@ static bool fasttrun_read_pgstat_counters(Relation rel,
 static bool fasttrun_read_pgstat_counters_for_hook(Oid relid,
 												   int64 *ins, int64 *upd,
 												   int64 *del,
-												   bool *truncdropped);
+												   bool *truncdropped,
+												   BlockNumber *pages);
 static void fasttrun_invalidate_local_plan_cache(Oid relid);
 static bool fasttrun_get_relation_stats_hook(PlannerInfo *root,
 											 RangeTblEntry *rte,
@@ -1333,6 +1335,7 @@ typedef struct FasttrunStatsSavedState
 	int64				collected_upd;
 	int64				collected_del;
 	bool				collected_truncdropped;
+	BlockNumber			collected_pages;
 	SubTransactionId	collected_subid;
 	struct FasttrunStatsSavedState *older;
 } FasttrunStatsSavedState;
@@ -1345,6 +1348,9 @@ typedef struct FasttrunStatsEntry
 	int64				collected_upd;
 	int64				collected_del;
 	bool				collected_truncdropped;
+	BlockNumber			collected_pages;	/* physical block count at collect;
+											 * the only change signal that
+											 * survives a temp table's commit */
 	SubTransactionId	collected_subid;	/* subxact in which this entry
 											 * was (re)published */
 	FasttrunStatsSavedState *undo;		/* stack of older versions saved
@@ -1625,6 +1631,16 @@ fasttrun_stats_noop_free(HeapTuple tuple)
 #define FASTTRUN_SKEW_REFRESH_FLOOR	0.05
 
 /*
+ * Cross-commit physical-size backstop factor (see fasttrun_stats_entry_usable).
+ * A temp table's pgstat counters reset at every transaction boundary and never
+ * reach shared stats, so a committed plain-SQL refill done without a fasttrun_*
+ * call is invisible to the counter-based freshness check.  Physical page count
+ * survives the commit but is bloat-contaminated, so only an order-of-size
+ * change is trusted as a real refill.
+ */
+#define FASTTRUN_STALE_SIZE_FACTOR	3.0
+
+/*
  * Soft freshness: is this column-stats entry close enough to keep serving?
  * True while the DML churn since collect time stays below the effective
  * tolerance -- stats_refresh_threshold scaled down by the column's cardinality
@@ -1638,7 +1654,7 @@ fasttrun_stats_noop_free(HeapTuple tuple)
 static bool
 fasttrun_stats_entry_usable(Oid relid, const FasttrunStatsEntry *entry,
 							int64 ins_now, int64 upd_now, int64 del_now,
-							bool truncdropped_now)
+							bool truncdropped_now, BlockNumber pages_now)
 {
 	FasttrunAnalyzeCacheEntry *aentry;
 	int64		churn;
@@ -1654,7 +1670,45 @@ fasttrun_stats_entry_usable(Oid relid, const FasttrunStatsEntry *entry,
 	if (ins_now == entry->collected_ins &&
 		upd_now == entry->collected_upd &&
 		del_now == entry->collected_del)
-		return true;			/* no DML since collect -- exactly fresh */
+	{
+		/*
+		 * Counters say nothing changed since collect.  For a temp table that
+		 * is not enough: pgstat counters reset at every transaction boundary
+		 * and temp stats never reach shared pgstat, so a plain-SQL
+		 * refill/TRUNCATE done by a prior committed transaction (without a
+		 * fasttrun_* call to re-evaluate the entry) leaves both sides at zero
+		 * and this branch would serve a distribution the table no longer has.
+		 * The physical page count DOES survive commit, so anchor freshness to
+		 * it: if storage drifted past the refresh threshold since collect, the
+		 * cached MCV/histogram/n_distinct are untrustworthy -- hide them and
+		 * let the planner fall back to defaults (as core does with no
+		 * pg_statistic row).  Within a transaction the counter path below
+		 * governs soft freshness; this check only guards the "counters see
+		 * nothing" blind spot.
+		 */
+		if (pages_now != entry->collected_pages)
+		{
+			BlockNumber	base_pages = Max(entry->collected_pages, 1);
+			double		ratio = (double) pages_now / (double) base_pages;
+
+			/*
+			 * Coarse cross-commit backstop.  Physical size is the only change
+			 * signal that survives a temp table's commit, but it is
+			 * bloat-contaminated (a bulk UPDATE or a rolled-back subxact
+			 * roughly doubles pages without changing the data), so it cannot
+			 * carry the fine stats_refresh_threshold semantics without
+			 * defeating soft freshness and savepoint restore.  Only an
+			 * order-of-size change -- the footprint tripled or dropped below a
+			 * third since collect -- is taken as "the table was refilled while
+			 * the per-xact counters were blind", hiding the now-meaningless
+			 * sample so the planner falls back to defaults.
+			 */
+			if (ratio >= FASTTRUN_STALE_SIZE_FACTOR ||
+				ratio <= 1.0 / FASTTRUN_STALE_SIZE_FACTOR)
+				return false;
+		}
+		return true;			/* no DML and size stable -- exactly fresh */
+	}
 
 	aentry = fasttrun_cache_lookup(relid);
 	if (aentry == NULL || !aentry->has_relstats)
@@ -1701,6 +1755,7 @@ fasttrun_get_relation_stats_hook(PlannerInfo *root, RangeTblEntry *rte,
 	int64			upd_now = 0;
 	int64			del_now = 0;
 	bool			truncdropped_now = false;
+	BlockNumber		pages_now = 0;
 
 	if (fasttrun_stats_cache == NULL ||
 		!fasttrun_stats_relid_exists(rte->relid))
@@ -1715,11 +1770,12 @@ fasttrun_get_relation_stats_hook(PlannerInfo *root, RangeTblEntry *rte,
 
 	/* Freshness check: tolerate DML churn up to stats_refresh_threshold. */
 	if (!fasttrun_read_pgstat_counters_for_hook(rte->relid, &ins_now, &upd_now,
-												&del_now, &truncdropped_now))
+												&del_now, &truncdropped_now,
+												&pages_now))
 		goto chain;
 
 	if (!fasttrun_stats_entry_usable(rte->relid, entry, ins_now, upd_now,
-									 del_now, truncdropped_now))
+									 del_now, truncdropped_now, pages_now))
 		goto chain;		/* churn past threshold -- fall back to defaults */
 
 	vardata->statsTuple = entry->statsTuple;
@@ -1758,6 +1814,7 @@ fasttrun_get_attavgwidth_hook(Oid relid, AttrNumber attnum)
 	int64				upd_now = 0;
 	int64				del_now = 0;
 	bool				truncdropped_now = false;
+	BlockNumber			pages_now = 0;
 	int32				stawidth;
 
 	if (fasttrun_stats_cache == NULL ||
@@ -1773,11 +1830,12 @@ fasttrun_get_attavgwidth_hook(Oid relid, AttrNumber attnum)
 		goto chain;
 
 	if (!fasttrun_read_pgstat_counters_for_hook(relid, &ins_now, &upd_now,
-												&del_now, &truncdropped_now))
+												&del_now, &truncdropped_now,
+												&pages_now))
 		goto chain;
 
 	if (!fasttrun_stats_entry_usable(relid, entry, ins_now, upd_now,
-									 del_now, truncdropped_now))
+									 del_now, truncdropped_now, pages_now))
 		goto chain;		/* churn past threshold */
 
 	stawidth = ((Form_pg_statistic) GETSTRUCT(entry->statsTuple))->stawidth;
@@ -2041,11 +2099,13 @@ fasttrun_read_pgstat_counters(Relation rel,
 static bool
 fasttrun_read_pgstat_counters_for_hook(Oid relid,
 									   int64 *ins, int64 *upd, int64 *del,
-									   bool *truncdropped)
+									   bool *truncdropped, BlockNumber *pages)
 {
 	int		i;
 	Relation rel;
 	bool	have;
+
+	*pages = 0;
 
 	if (fasttrun_in_planner)
 	{
@@ -2061,6 +2121,7 @@ fasttrun_read_pgstat_counters_for_hook(Oid relid,
 				*upd = slot->upd;
 			*del = slot->del;
 			*truncdropped = slot->truncdropped;
+			*pages = slot->pages;
 			return slot->have;
 		}
 	}
@@ -2078,6 +2139,14 @@ fasttrun_read_pgstat_counters_for_hook(Oid relid,
 	else
 	{
 		have = fasttrun_read_pgstat_counters(rel, ins, upd, del, truncdropped);
+		/*
+		 * Physical size is the only change signal that survives a temp
+		 * table's commit (pgstat counters reset per xact; temp stats never
+		 * reach shared pgstat).  Read it in the same relation open the
+		 * freshness path already pays for.
+		 */
+		if (RELKIND_HAS_STORAGE(rel->rd_rel->relkind))
+			*pages = RelationGetNumberOfBlocks(rel);
 		RelationClose(rel);
 	}
 
@@ -2109,6 +2178,7 @@ fasttrun_read_pgstat_counters_for_hook(Oid relid,
 		slot->upd = (upd != NULL) ? *upd : 0;
 		slot->del = *del;
 		slot->truncdropped = *truncdropped;
+		slot->pages = *pages;
 	}
 
 	return have;
@@ -2212,7 +2282,8 @@ fasttrun_build_stats_tuple(TupleDesc pg_stats_desc, Oid relid, AttrNumber attnum
  */
 static void
 fasttrun_stats_cache_store(Oid relid, AttrNumber attnum, HeapTuple statsTuple,
-						   int64 ins, int64 upd, int64 del, bool truncdropped)
+						   int64 ins, int64 upd, int64 del, bool truncdropped,
+						   BlockNumber pages)
 {
 	FasttrunStatsKey	key;
 	FasttrunStatsEntry *entry;
@@ -2251,6 +2322,7 @@ fasttrun_stats_cache_store(Oid relid, AttrNumber attnum, HeapTuple statsTuple,
 		saved->collected_upd = entry->collected_upd;
 		saved->collected_del = entry->collected_del;
 		saved->collected_truncdropped = entry->collected_truncdropped;
+		saved->collected_pages = entry->collected_pages;
 		saved->collected_subid = entry->collected_subid;
 		saved->older = entry->undo;
 		entry->undo = saved;
@@ -2270,6 +2342,7 @@ fasttrun_stats_cache_store(Oid relid, AttrNumber attnum, HeapTuple statsTuple,
 	entry->collected_upd = upd;
 	entry->collected_del = del;
 	entry->collected_truncdropped = truncdropped;
+	entry->collected_pages = pages;
 	entry->collected_subid = cur_subid;
 
 	if (!had_visible)
@@ -2338,6 +2411,7 @@ fasttrun_stats_cache_commit_xact(void)
 		int64		upd_now = 0;
 		int64		del_now = 0;
 		bool		truncdropped_now = false;
+		BlockNumber	pages_now = 0;
 		bool		have_counters = false;
 		bool		counters_attempted = false;
 
@@ -2429,6 +2503,8 @@ fasttrun_stats_cache_commit_xact(void)
 					have_counters = fasttrun_read_pgstat_counters(rel, &ins_now,
 																  &upd_now, &del_now,
 																  &truncdropped_now);
+					if (RELKIND_HAS_STORAGE(rel->rd_rel->relkind))
+						pages_now = RelationGetNumberOfBlocks(rel);
 					RelationClose(rel);
 				}
 			}
@@ -2446,7 +2522,7 @@ fasttrun_stats_cache_commit_xact(void)
 			 */
 			if (!have_counters ||
 				!fasttrun_stats_entry_usable(relid, entry, ins_now, upd_now,
-											 del_now, truncdropped_now))
+											 del_now, truncdropped_now, pages_now))
 			{
 				fasttrun_stats_entry_free_undo(entry);
 				if (entry->statsTuple != NULL)
@@ -2606,6 +2682,7 @@ fasttrun_stats_cache_mark_evicted_relid(Oid relid)
 			saved->collected_upd = entry->collected_upd;
 			saved->collected_del = entry->collected_del;
 			saved->collected_truncdropped = entry->collected_truncdropped;
+			saved->collected_pages = entry->collected_pages;
 			saved->collected_subid = entry->collected_subid;
 			saved->older = entry->undo;
 			entry->undo = saved;
@@ -2735,6 +2812,7 @@ fasttrun_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 							sentry->collected_upd = popped->collected_upd;
 							sentry->collected_del = popped->collected_del;
 							sentry->collected_truncdropped = popped->collected_truncdropped;
+							sentry->collected_pages = popped->collected_pages;
 							sentry->collected_subid = popped->collected_subid;
 							sentry->undo = popped->older;
 							pfree(popped);	/* popped->statsTuple now owned by entry */
@@ -3434,9 +3512,18 @@ fasttrun_collect_and_store(Relation rel, HeapTuple *sample, int sample_count,
 	int64		snap_upd = 0;
 	int64		snap_del = 0;
 	bool		snap_truncdropped = false;
+	BlockNumber	snap_pages;
 
 	if (sample_count <= 0)
 		return;
+
+	/*
+	 * Physical block count at collect time: the freshness check anchors to it
+	 * to detect a cross-commit refill that pgstat counters cannot see (they
+	 * reset per xact and temp stats never reach shared pgstat).
+	 */
+	snap_pages = RELKIND_HAS_STORAGE(rel->rd_rel->relkind)
+		? RelationGetNumberOfBlocks(rel) : 0;
 
 	/*
 	 * track_counts=off (or pgstat otherwise unavailable) -> no baseline
@@ -3549,7 +3636,7 @@ fasttrun_collect_and_store(Relation rel, HeapTuple *sample, int sample_count,
 			/* cache_store copies tuple into fasttrun_stats_mcxt */
 			fasttrun_stats_cache_store(RelationGetRelid(rel), attnum, stats_tuple,
 									   snap_ins, snap_upd, snap_del,
-									   snap_truncdropped);
+									   snap_truncdropped, snap_pages);
 			heap_freetuple(stats_tuple);
 		}
 	}
@@ -3698,7 +3785,7 @@ fasttrun_collect_and_store(Relation rel, HeapTuple *sample, int sample_count,
 
 			fasttrun_stats_cache_store(RelationGetRelid(rel), attnum, stats_tuple,
 									   snap_ins, snap_upd, snap_del,
-									   snap_truncdropped);
+									   snap_truncdropped, snap_pages);
 			heap_freetuple(stats_tuple);
 		}
 

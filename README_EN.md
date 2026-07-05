@@ -82,6 +82,8 @@ There are deliberate boundaries: extended statistics, expression-index statistic
 
 `relpages/reltuples/relallvisible` and column statistics live in backend memory and survive `COMMIT`; xact-local delta state is cleared at transaction boundaries. After DML below `stats_refresh_threshold` cached column stats stay visible to the planner (soft freshness, like core PG between ANALYZE runs); past the threshold they are hidden until a refresh.
 
+A separate commit-boundary backstop: a temp table's pgstat counters reset at every transaction (temp is never flushed to shared pgstat), so a plain SQL refill of a temp table in a separate transaction without a `fasttrun_analyze` call is invisible to the freshness counters. To keep such a refill from serving stale MCV/n_distinct to the planner, freshness is additionally anchored to physical size: if the block count changed by an order of magnitude (>=3x or <=1/3) since collection, cached column stats are hidden. The signal is coarse (bloat-contaminated), so it only catches an outright refill; a same-size refill with a different distribution committed without `fasttrun_analyze` is not caught — call `fasttrun_analyze` after refilling, as intended.
+
 ## Settings (GUC)
 
 | Parameter | Default | Description |

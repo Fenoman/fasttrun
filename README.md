@@ -84,6 +84,8 @@ new_tuples = cached_tuples + (ins_now - cached_ins) - (del_now - cached_del)
 
 `relpages/reltuples/relallvisible` и статистика колонок живут в памяти backend'а и переживают `COMMIT`; xact-local delta-состояние очищается на границе транзакции. После DML ниже порога `stats_refresh_threshold` cached column stats остаются видимыми планировщику (soft freshness, как ядро PG между ANALYZE); выше порога — скрываются до пересбора.
 
+Отдельный backstop для commit-границы: pgstat-счётчики temp-таблицы обнуляются на каждой транзакции (в shared pgstat temp не флашится), поэтому обычный SQL-refill temp-таблицы в отдельной транзакции без вызова `fasttrun_analyze` не виден счётчикам свежести. Чтобы такой refill не отдавал планировщику устаревшие MCV/n_distinct, freshness дополнительно якорится на физический размер: если число блоков изменилось на порядок (>=3x или <=1/3) с момента сбора статистики, cached column stats скрываются. Сигнал грубый (bloat-контаминирован), поэтому ловит только явный refill; refill той же величины с иным распределением, закоммиченный без `fasttrun_analyze`, остаётся неучтённым — вызывайте `fasttrun_analyze` после перезаполнения, как и задумано.
+
 ## Настройки (GUC)
 
 | Параметр | По умолчанию | Описание |
