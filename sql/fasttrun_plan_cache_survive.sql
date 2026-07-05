@@ -289,6 +289,56 @@ COMMIT;
 
 DROP TABLE t_abort_inval_once;
 
+-- ----------------------------------------------------------------------
+-- 8. DISCARD TEMP роняет все temp-таблицы внутренним сбросом неймспейса
+--    (не per-table DropStmt); fasttrun эвиктит оба кэша. Cached-план на
+--    temp-таблице с тем же именем, пересозданной после DISCARD, обязан
+--    отражать СТАТИСТИКУ НОВОЙ таблицы, а не устаревший план до DISCARD.
+--    (DISCARD ALL спасён ядерным ResetPlanCache; DISCARD TEMP полагается
+--    на ядерную инвалидацию плана при дропе старой таблицы.)
+-- ----------------------------------------------------------------------
+CREATE TEMP TABLE t_disc_plan (id int, grp int);
+CREATE INDEX ON t_disc_plan (grp);
+-- v1: низкая кардинальность grp (5 значений) -> grp=1 ~1000 строк.
+INSERT INTO t_disc_plan SELECT g, g % 5 FROM generate_series(1, 5000) g;
+SELECT fasttrun_analyze('t_disc_plan');
+PREPARE dp AS SELECT * FROM t_disc_plan WHERE grp = 1;
+DO $$
+DECLARE ln text; est int := NULL;
+BEGIN
+  FOR ln IN EXPLAIN EXECUTE dp LOOP
+    IF ln ~ 'rows=' THEN est := substring(ln FROM 'rows=(\d+)')::int; EXIT; END IF;
+  END LOOP;
+  IF est IS NULL OR est < 500 THEN
+    RAISE EXCEPTION 'baseline low-card estimate unexpectedly small: %', est;
+  END IF;
+END$$;
+SELECT 'disc_plan_baseline_ok' AS marker;
+
+DISCARD TEMP;
+
+-- v2 то же имя: высокая кардинальность grp (уникальна) -> grp=1 ~1 строка.
+CREATE TEMP TABLE t_disc_plan (id int, grp int);
+CREATE INDEX ON t_disc_plan (grp);
+INSERT INTO t_disc_plan SELECT g, g FROM generate_series(1, 5000) g;
+SELECT fasttrun_analyze('t_disc_plan');
+-- Старый prepared dp обязан переплаироваться под НОВУЮ таблицу: оценка
+-- grp=1 должна коллапсировать к ~1, а не остаться stale ~1000.
+DO $$
+DECLARE ln text; est int := NULL;
+BEGIN
+  FOR ln IN EXPLAIN EXECUTE dp LOOP
+    IF ln ~ 'rows=' THEN est := substring(ln FROM 'rows=(\d+)')::int; EXIT; END IF;
+  END LOOP;
+  IF est IS NULL OR est > 50 THEN
+    RAISE EXCEPTION 'stale plan after DISCARD TEMP recreate: grp=1 est=%', est;
+  END IF;
+END$$;
+SELECT 'disc_plan_fresh_ok' AS marker;
+
+DEALLOCATE dp;
+DROP TABLE t_disc_plan;
+
 DROP FUNCTION f_outer(int, int);
 DROP FUNCTION f_inner();
 DROP TABLE t_rsd_details;

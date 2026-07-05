@@ -332,6 +332,45 @@ COMMIT;
 DROP TABLE t_an_ft_rb_idx;
 
 -- ----------------------------------------------------------------------
+-- 17c. Abort-проба под churn имени: DROP + CREATE той же temp-таблицы
+--      внутри подтранзакции, затем ROLLBACK TO. Новая таблица получает
+--      свой relfilenode; её analyze-запись помечена подтранзакцией, так
+--      что smgr-проба пустого хранилища в abort-колбэке отрабатывает
+--      именно по ней. Откат обязан восстановить ОРИГИНАЛ (старый OID,
+--      старые relstats) без краша и без ложной «пустоты» от чужого
+--      storage. (Истинный relfilenode-reuse недостижим в тесте —
+--      счётчик монотонен; это ближайшая воспроизводимая проверка пути.)
+-- ----------------------------------------------------------------------
+CREATE TEMP TABLE t_an_oidchurn (id int);
+INSERT INTO t_an_oidchurn SELECT generate_series(1, 1000);
+SELECT fasttrun_analyze('t_an_oidchurn');
+
+BEGIN;
+SELECT reltuples = 1000 AS churn_pre FROM fasttrun_relstats('t_an_oidchurn');
+SAVEPOINT sp_churn;
+DROP TABLE t_an_oidchurn;
+CREATE TEMP TABLE t_an_oidchurn (id int);
+INSERT INTO t_an_oidchurn SELECT generate_series(1, 7);
+SELECT fasttrun_analyze('t_an_oidchurn');
+SELECT reltuples = 7 AS churn_sub FROM fasttrun_relstats('t_an_oidchurn');
+ROLLBACK TO SAVEPOINT sp_churn;
+
+-- Откат восстановил оригинал: 1000 строк, никакой ложной пустоты.
+SELECT count(*) = 1000 AS churn_restored FROM t_an_oidchurn;
+SELECT reltuples = 1000 AS churn_relstats_restored
+  FROM fasttrun_relstats('t_an_oidchurn');
+-- Форсируем relcache rebuild — реинжект обязан отдать 1000, не 0.
+UPDATE pg_class SET relhasindex = relhasindex
+ WHERE oid = 't_an_oidchurn'::regclass;
+SELECT 1 AS churn_force_inval;
+SELECT reltuples = 1000 AS churn_after_inval
+  FROM fasttrun_relstats('t_an_oidchurn');
+COMMIT;
+
+SELECT count(*) = 1000 AS churn_after_commit FROM t_an_oidchurn;
+DROP TABLE t_an_oidchurn;
+
+-- ----------------------------------------------------------------------
 -- 18. Регрессионный тест: ошибка ленивого режима после SQL TRUNCATE
 --     (исправление приоритета P1).
 --
