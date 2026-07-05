@@ -136,7 +136,7 @@ make install PG_CONFIG=/path/to/pg_config
 CREATE EXTENSION fasttrun;
 ```
 
-By default, this installs version `2.3.2`.
+By default, this installs version `2.3.3`.
 
 Upgrade from older versions `2.0` / `2.1` / `2.1.1` / `2.1.2` / `2.2.0` is supported:
 ```sql
@@ -371,7 +371,8 @@ fasttrun.c                    # main C code (~5100 lines)
 fasttrun.control              # extension metadata
 fasttrun--2.3.0.sql           # older version
 fasttrun--2.3.1.sql           # previous version
-fasttrun--2.3.2.sql           # current version (8 functions)
+fasttrun--2.3.2.sql           # previous version
+fasttrun--2.3.3.sql           # current version (8 functions)
 fasttrun--2.2.0.sql           # older version
 fasttrun--2.0.sql             # old base version
 fasttrun--2.0--2.1.sql        # migration 2.0 -> 2.1
@@ -381,6 +382,7 @@ fasttrun--2.1.2--2.2.0.sql    # migration 2.1.2 -> 2.2.0
 fasttrun--2.2.0--2.3.0.sql    # migration 2.2.0 -> 2.3.0 (new SQL function + C-side fixes)
 fasttrun--2.3.0--2.3.1.sql    # migration 2.3.0 -> 2.3.1 (C-side fixes only, no SQL changes)
 fasttrun--2.3.1--2.3.2.sql    # migration 2.3.1 -> 2.3.2 (C-side fixes only, no SQL changes)
+fasttrun--2.3.2--2.3.3.sql    # migration 2.3.2 -> 2.3.3 (C-side fixes only, no SQL changes)
 Makefile                      # PGXS
 examples/                     # examples (create_temp_table)
 sql/                          # tests (12 files)
