@@ -1323,6 +1323,43 @@ SELECT stadistinct < 0 AS wide_not_collapsed
 COMMIT;
 DROP TABLE t_wide;
 
+-- ----------------------------------------------------------------------
+-- 31. Giant-temp guardrail: выше fasttrun.max_analyze_pages холодный
+--     fasttrun_analyze переходит на block-sampling (оценка count по
+--     плотности, как core ANALYZE) вместо полного скана всей таблицы.
+--     reltuples становится оценкой (±%), column-stats собираются с
+--     выборочных блоков. Ниже порога / при 0 — точный полный скан.
+-- ----------------------------------------------------------------------
+CREATE TEMP TABLE t_giant (id int, grp int);
+INSERT INTO t_giant SELECT g, g % 100 FROM generate_series(1, 50000) g;
+
+BEGIN;
+-- Порог низкий -> ~220-страничная таблица уходит в block-sampling.
+SET LOCAL fasttrun.max_analyze_pages = 5;
+SET LOCAL client_min_messages = debug1;
+SELECT fasttrun_analyze('t_giant');
+RESET client_min_messages;
+
+-- reltuples — оценка в разумной полосе вокруг 50000 (±25%).
+SELECT reltuples BETWEEN 37500 AND 62500 AS giant_reltuples_estimate
+  FROM fasttrun_relstats('t_giant');
+
+-- column-stats собраны из выборки: grp (100 значений) -> ~500 строк на
+-- значение, вменяемая оценка, не default-селективность.
+DO $$
+DECLARE ln text; est int := NULL;
+BEGIN
+  FOR ln IN EXPLAIN SELECT * FROM t_giant WHERE grp = 1 LOOP
+    IF ln ~ 'rows=' THEN est := substring(ln FROM 'rows=(\d+)')::int; EXIT; END IF;
+  END LOOP;
+  IF est IS NULL OR est > 5000 THEN
+    RAISE EXCEPTION 'giant block-sample column stats off: grp=1 est=%', est;
+  END IF;
+END$$;
+SELECT 'giant_block_sample_ok' AS marker;
+COMMIT;
+DROP TABLE t_giant;
+
 -- Очистка
 DROP TABLE t_stats;
 DROP TABLE t_multi;

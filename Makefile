@@ -54,7 +54,8 @@ include $(PGXS)
 .PHONY: check-parity check-soak check-perf-smoke check-hook-chain \
         check-zero-sinval check-commit-inval-overhead \
         check-bulk-overhead check-on-commit-drop-leak \
-        check-commit-duration check-replace-catalog check-deep-local
+        check-commit-duration check-replace-catalog check-giant-temp \
+        check-deep-local
 
 check-parity:
 	PG_CONFIG="$(PG_CONFIG)" scripts/check_fasttrun_analyze_parity.py --profile full
@@ -87,8 +88,11 @@ check-commit-duration:
 check-replace-catalog:
 	PG_CONFIG="$(PG_CONFIG)" scripts/check_replace_analyze_catalog.sh
 
+check-giant-temp:
+	PG_CONFIG="$(PG_CONFIG)" scripts/check_fasttrun_giant_temp.sh
+
 check-deep-local: installcheck check-parity check-soak check-perf-smoke \
                   check-hook-chain check-zero-sinval \
                   check-commit-inval-overhead check-bulk-overhead \
                   check-on-commit-drop-leak check-commit-duration \
-                  check-replace-catalog
+                  check-replace-catalog check-giant-temp

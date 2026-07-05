@@ -70,6 +70,7 @@
 #include "utils/timestamp.h"
 #include "utils/varlena.h"
 #include "storage/ipc.h"
+#include "storage/procarray.h"
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
 #include "executor/spi.h"
@@ -111,6 +112,7 @@ static double	fasttrun_stats_refresh_threshold = 0.2;
 static double	fasttrun_invalidate_threshold = 0.2;
 static bool		fasttrun_use_typanalyze = true;
 static bool		fasttrun_zero_sinval_truncate = true;
+static int		fasttrun_max_analyze_pages = 100000;
 
 /*
  * Per-planning freshness cache for column-stats hooks.
@@ -3910,6 +3912,107 @@ fasttrun_scan_with_sample(Relation rel, int64 *tuples_out,
 }
 
 /*
+ * Block-sampled variant of fasttrun_scan_with_sample for giant temp tables
+ * (heap pages > fasttrun.max_analyze_pages).  Reads only a bounded random
+ * sample of blocks instead of the whole relation and estimates the row count
+ * from tuple density, exactly like core acquire_sample_rows() -- so cold
+ * analyze cost stays O(sample) rather than O(table).  *tuples_out is an
+ * ESTIMATE (like a regular ANALYZE), not an exact count.
+ *
+ * Ported from commands/analyze.c on the public block-sampling API
+ * (BlockSampler_* + table_scan_analyze_next_block/tuple).  Prefetch and
+ * progress reporting are dropped; the reservoir + density math match core.
+ */
+static void
+fasttrun_block_sample_rows(Relation rel, int64 *tuples_out,
+						   HeapTuple *sample, int sample_target,
+						   int *sample_count_out)
+{
+	int				numrows = 0;
+	double			samplerows = 0;
+	double			liverows = 0;
+	double			deadrows = 0;
+	double			rowstoskip = -1;
+	uint32			randseed;
+	BlockNumber		totalblocks;
+	TransactionId	OldestXmin;
+	BlockSamplerData bs;
+	ReservoirStateData rstate;
+	TupleTableSlot *slot;
+	TableScanDesc	scan;
+	BufferAccessStrategy strategy;
+
+	elog(DEBUG1, "fasttrun: block-sampling cold analyze");
+
+	totalblocks = RelationGetNumberOfBlocks(rel);
+	OldestXmin = GetOldestNonRemovableTransactionId(rel);
+	randseed = pg_prng_uint32(&fasttrun_prng_state);
+	(void) BlockSampler_Init(&bs, totalblocks, sample_target, randseed);
+	reservoir_init_selection_state(&rstate, sample_target);
+	strategy = GetAccessStrategy(BAS_VACUUM);
+
+	scan = table_beginscan_analyze(rel);
+	slot = table_slot_create(rel, NULL);
+
+	while (BlockSampler_HasMore(&bs))
+	{
+		BlockNumber		targblock = BlockSampler_Next(&bs);
+
+		CHECK_FOR_INTERRUPTS();
+
+		if (!table_scan_analyze_next_block(scan, targblock, strategy))
+			continue;
+
+		while (table_scan_analyze_next_tuple(scan, OldestXmin,
+											 &liverows, &deadrows, slot))
+		{
+			/*
+			 * liverows is counted by the analyze primitive regardless -- that
+			 * feeds the density estimate.  The reservoir only runs when the
+			 * caller wants a column-stats sample (sample != NULL); count-only
+			 * callers (column stats disabled) still sample blocks for the
+			 * estimate but keep no rows.  Vitter algorithm as in core.
+			 */
+			if (sample != NULL)
+			{
+				if (numrows < sample_target)
+					sample[numrows++] = ExecCopySlotHeapTuple(slot);
+				else
+				{
+					if (rowstoskip < 0)
+						rowstoskip = reservoir_get_next_S(&rstate, samplerows,
+														  sample_target);
+
+					if (rowstoskip <= 0)
+					{
+						int		k = (int) (sample_target *
+										   sampler_random_fract(&rstate.randstate));
+
+						Assert(k >= 0 && k < sample_target);
+						heap_freetuple(sample[k]);
+						sample[k] = ExecCopySlotHeapTuple(slot);
+					}
+					rowstoskip -= 1;
+				}
+			}
+			samplerows += 1;
+		}
+	}
+
+	ExecDropSingleTupleTableSlot(slot);
+	table_endscan(scan);
+	FreeAccessStrategy(strategy);
+
+	/* Density extrapolation over the sampled blocks (core's estimator). */
+	if (bs.m > 0)
+		*tuples_out = (int64) floor((liverows / bs.m) * totalblocks + 0.5);
+	else
+		*tuples_out = 0;
+
+	*sample_count_out = numrows;
+}
+
+/*
  * Unlink every segment of a relation fork file.
  *
  * heap files are split into 1 GB segments with suffixes .1, .2, ...
@@ -4666,8 +4769,25 @@ fasttrun_analyze_relation(Relation rel)
 
 		if (pages_now > 0)
 		{
-			fasttrun_scan_with_sample(rel, &tuples_count,
-									  sample, sample_target, &sample_count);
+			/*
+			 * Giant temp table: switch the cold scan to bounded block
+			 * sampling (estimated row count, like core ANALYZE) so cost stays
+			 * O(sample) instead of O(table).  Below the threshold, or when it
+			 * is 0, keep the exact full scan.  Column stats are sampled with
+			 * the configured target; when they are disabled a floor target
+			 * still bounds the count estimate.
+			 */
+			if (fasttrun_max_analyze_pages > 0 &&
+				pages_now > (BlockNumber) fasttrun_max_analyze_pages)
+			{
+				int		block_target = (sample_target > 0) ? sample_target : 3000;
+
+				fasttrun_block_sample_rows(rel, &tuples_count, sample,
+										   block_target, &sample_count);
+			}
+			else
+				fasttrun_scan_with_sample(rel, &tuples_count,
+										  sample, sample_target, &sample_count);
 		}
 
 		if (sample != NULL && sample_count > 0)
@@ -6299,6 +6419,26 @@ _PG_init(void)
 							 PGC_USERSET,
 							 0,
 							 NULL, NULL, NULL);
+
+	DefineCustomIntVariable("fasttrun.max_analyze_pages",
+							"Heap page count above which cold fasttrun_analyze "
+							"switches to bounded block sampling",
+							"Default 100000 (~800 MB).  A cold fasttrun_analyze "
+							"normally scans the whole temp table for an exact "
+							"row count; above this many heap pages it instead "
+							"reads a bounded random block sample and ESTIMATES "
+							"the row count from tuple density (like a regular "
+							"ANALYZE), keeping cost O(sample) instead of "
+							"O(table) on anomalously giant temp tables.  Column "
+							"statistics are collected from the same sample.  "
+							"Set to 0 to always do the exact full scan.",
+							&fasttrun_max_analyze_pages,
+							100000,
+							0,
+							INT_MAX,
+							PGC_USERSET,
+							0,
+							NULL, NULL, NULL);
 
 	pg_prng_seed(&fasttrun_prng_state, (uint64) MyProcPid);
 
