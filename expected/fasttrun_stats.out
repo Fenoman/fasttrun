@@ -2072,6 +2072,35 @@ SELECT 'xcommit_stale_hidden_ok' AS marker;
 
 DROP TABLE t_xcommit;
 DROP TABLE t_xc_probe;
+-- ----------------------------------------------------------------------
+-- 30. use_typanalyze=off (Haas-Stokes): чрезмерно широкие varlena НЕ
+--     детостятся — иначе полный TOAST-payload материализуется в памяти
+--     и на multi-MB значениях × sample_rows раздувает backend до OOM.
+--     Зеркалим ядерный WIDTH_THRESHOLD (1024 байта): широкие значения
+--     считаются toowide (assumed distinct), а не детостятся и сравниваются.
+--     Наблюдаемо: набор ОДИНАКОВЫХ широких значений не схлопывается в
+--     n_distinct=1 (что потребовало бы детоста всех) — stadistinct < 0
+--     (все distinct), как у обычного ANALYZE.
+-- ----------------------------------------------------------------------
+CREATE TEMP TABLE t_wide (doc text);
+INSERT INTO t_wide SELECT repeat('x', 4000) FROM generate_series(1, 300);
+BEGIN;
+SET LOCAL fasttrun.use_typanalyze = off;
+SELECT fasttrun_collect_stats('t_wide');
+ fasttrun_collect_stats 
+------------------------
+ 
+(1 row)
+
+SELECT stadistinct < 0 AS wide_not_collapsed
+  FROM fasttrun_inspect_stats('t_wide');
+ wide_not_collapsed 
+--------------------
+ t
+(1 row)
+
+COMMIT;
+DROP TABLE t_wide;
 -- Очистка
 DROP TABLE t_stats;
 DROP TABLE t_multi;

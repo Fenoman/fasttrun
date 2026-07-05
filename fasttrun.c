@@ -18,6 +18,7 @@
 #include <unistd.h>
 
 #include "access/amapi.h"
+#include "access/detoast.h"
 #include "access/genam.h"
 #include "access/heapam.h"
 #include "access/htup_details.h"
@@ -3482,6 +3483,14 @@ fasttrun_cmp_heap_tuples_by_tid(const void *a, const void *b)
 }
 
 /*
+ * Above this raw width a varlena sample value is not detoasted for the
+ * lightweight Haas-Stokes path: materializing multi-MB TOAST payloads for
+ * every sampled row would blow up backend memory.  Matches core
+ * analyze.c:WIDTH_THRESHOLD -- such values are counted as distinct instead.
+ */
+#define FASTTRUN_WIDTH_THRESHOLD	1024
+
+/*
  * For every column of rel, compute stats from the sample and store in
  * the session-local cache.  Columns without a btree-orderable type are
  * skipped (planner falls back to defaults).  Also captures the current
@@ -3663,6 +3672,8 @@ fasttrun_collect_and_store(Relation rel, HeapTuple *sample, int sample_count,
 			TypeCacheEntry	  *typentry;
 			SortSupportData	ssup;
 			int				   n_nonnull = 0;
+			int				   n_array = 0;
+			int				   toowide_cnt = 0;
 			int				   n_null = 0;
 			int64			   total_width = 0;
 			int				   ndistinct = 0;
@@ -3702,24 +3713,45 @@ fasttrun_collect_and_store(Relation rel, HeapTuple *sample, int sample_count,
 				 * Accumulate the average-width sample exactly once per type:
 				 * pass-by-value, varlena, and fixed-length by-reference are
 				 * mutually exclusive branches, so no width is double-counted.
+				 * Only non-toowide values land in values[] for the distinct
+				 * sort; n_nonnull counts every non-null, n_array the sortable
+				 * subset.
 				 */
 				if (attr->attbyval)
 				{
-					values[n_nonnull] = d;
+					values[n_array++] = d;
 					total_width += attr->attlen;
 				}
 				else if (attr->attlen == -1)
 				{
-					/* Detoast varlena values for sort stability. */
-					struct varlena *detoasted = pg_detoast_datum_packed(
-						(struct varlena *) DatumGetPointer(d));
-					values[n_nonnull] = PointerGetDatum(detoasted);
-					total_width += VARSIZE_ANY_EXHDR(detoasted);
+					/*
+					 * Excessively wide varlena: don't detoast (would
+					 * materialize the full TOAST payload and can OOM the
+					 * backend on multi-MB values).  Count it as too-wide --
+					 * assumed distinct -- mirroring core analyze.c.  The size
+					 * probe reads the raw length from the header without
+					 * detoasting.
+					 */
+					if (toast_raw_datum_size(d) > FASTTRUN_WIDTH_THRESHOLD)
+					{
+						toowide_cnt++;
+						total_width += VARSIZE_ANY(DatumGetPointer(d));
+						n_nonnull++;
+						continue;
+					}
+
+					/* In-range varlena: detoast for sort stability. */
+					{
+						struct varlena *detoasted = pg_detoast_datum_packed(
+							(struct varlena *) DatumGetPointer(d));
+						values[n_array++] = PointerGetDatum(detoasted);
+						total_width += VARSIZE_ANY_EXHDR(detoasted);
+					}
 				}
 				else
 				{
 					/* Fixed-length by-reference (uuid, name, interval, ...). */
-					values[n_nonnull] = d;
+					values[n_array++] = d;
 					if (attr->attlen > 0)
 						total_width += attr->attlen;
 				}
@@ -3735,41 +3767,49 @@ fasttrun_collect_and_store(Relation rel, HeapTuple *sample, int sample_count,
 			}
 			else
 			{
-				memset(&ssup, 0, sizeof(ssup));
-				ssup.ssup_cxt = per_col_mcxt;
-				ssup.ssup_collation = attr->attcollation;
-				ssup.ssup_nulls_first = false;
-				PrepareSortSupportFromOrderingOp(typentry->lt_opr, &ssup);
-
-				qsort_arg(values, n_nonnull, sizeof(Datum),
-						  fasttrun_datum_cmp, &ssup);
-
-				/* Count distinct values and multiples in the sorted run. */
-				dups_cnt = 1;
-				for (i = 1; i <= n_nonnull; i++)
+				if (n_array > 0)
 				{
-					bool	end_of_run;
+					memset(&ssup, 0, sizeof(ssup));
+					ssup.ssup_cxt = per_col_mcxt;
+					ssup.ssup_collation = attr->attcollation;
+					ssup.ssup_nulls_first = false;
+					PrepareSortSupportFromOrderingOp(typentry->lt_opr, &ssup);
 
-					if (i == n_nonnull)
-						end_of_run = true;
-					else
-						end_of_run = ApplySortComparator(values[i - 1], false,
-														 values[i], false,
-														 &ssup) != 0;
-					if (end_of_run)
+					qsort_arg(values, n_array, sizeof(Datum),
+							  fasttrun_datum_cmp, &ssup);
+
+					/* Count distinct values and multiples in the sorted run. */
+					dups_cnt = 1;
+					for (i = 1; i <= n_array; i++)
 					{
-						ndistinct++;
-						if (dups_cnt > 1)
-							nmultiple++;
-						dups_cnt = 1;
+						bool	end_of_run;
+
+						if (i == n_array)
+							end_of_run = true;
+						else
+							end_of_run = ApplySortComparator(values[i - 1], false,
+															 values[i], false,
+															 &ssup) != 0;
+						if (end_of_run)
+						{
+							ndistinct++;
+							if (dups_cnt > 1)
+								nmultiple++;
+							dups_cnt = 1;
+						}
+						else
+							dups_cnt++;
 					}
-					else
-						dups_cnt++;
 				}
 
+				/*
+				 * Too-wide values were never compared, so treat each as its
+				 * own distinct singleton (same assumption core makes).
+				 */
 				stanullfrac = (float4) n_null / (float4) sample_count;
 				stawidth = (int32) (total_width / n_nonnull);
-				stadistinct = fasttrun_estimate_ndistinct(n_nonnull, ndistinct,
+				stadistinct = fasttrun_estimate_ndistinct(n_nonnull,
+														  ndistinct + toowide_cnt,
 														  nmultiple, totalrows);
 			}
 
