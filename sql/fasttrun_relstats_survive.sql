@@ -289,6 +289,34 @@ DROP TABLE t_sublink_reinject;
 DROP TABLE t_sublink_outer;
 
 -- ----------------------------------------------------------------------
+-- 11. Index relstats обновляются на холодном проходе даже при
+--     track_counts=off. Column stats при выключенном pgstat не кешируются
+--     (нет baseline свежести) — collect_and_store выходит вхолостую. Но
+--     relation-level relstats индекса (relpages/reltuples) от pgstat не
+--     зависят: они берутся из скана и RelationGetNumberOfBlocks. После
+--     fasttruncate (индекс обнулён) + refill + fasttrun_analyze reltuples
+--     индекса обязаны отражать новые данные, а не post-truncate нули.
+-- ----------------------------------------------------------------------
+CREATE TEMP TABLE t_idx_troff (id int, grp int);
+CREATE INDEX t_idx_troff_grp ON t_idx_troff (grp);
+INSERT INTO t_idx_troff SELECT g, g % 100 FROM generate_series(1, 5000) g;
+
+BEGIN;
+SET LOCAL track_counts = off;
+SELECT fasttrun_analyze('t_idx_troff');
+SELECT fasttruncate('t_idx_troff');
+INSERT INTO t_idx_troff SELECT g, g % 100 FROM generate_series(1, 3000) g;
+SELECT fasttrun_analyze('t_idx_troff');
+-- Индекс должен видеть 3000 строк, а не 0 (post-truncate).
+SELECT reltuples = 3000 AS idx_troff_reltuples_fresh
+  FROM fasttrun_relstats('t_idx_troff_grp');
+-- post-truncate индекс = только метапейдж (1 страница); 3000 строк дают больше.
+SELECT relpages > 1 AS idx_troff_pages_fresh
+  FROM fasttrun_relstats('t_idx_troff_grp');
+COMMIT;
+DROP TABLE t_idx_troff;
+
+-- ----------------------------------------------------------------------
 -- Очистка
 -- ----------------------------------------------------------------------
 DROP TABLE t_survive;

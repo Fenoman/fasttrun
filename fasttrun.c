@@ -208,7 +208,7 @@ static bool fasttrun_stats_cache_evict_relid(Oid relid);
 static void fasttrun_subxact_callback(SubXactEvent event,
 									  SubTransactionId mySubid,
 									  SubTransactionId parentSubid, void *arg);
-static void fasttrun_collect_and_store(Relation rel, HeapTuple *sample,
+static bool fasttrun_collect_and_store(Relation rel, HeapTuple *sample,
 									   int sample_count, int64 totalrows,
 									   bool sample_needs_tid_sort);
 static bool fasttrun_read_pgstat_counters(Relation rel,
@@ -3506,7 +3506,14 @@ fasttrun_cmp_heap_tuples_by_tid(const void *a, const void *b)
  * Both branches end at the same fasttrun_stats_cache_store() and
  * publish through the same hooks.
  */
-static void
+/*
+ * Returns true if it actually collected and stored column stats (which also
+ * refreshes index relstats via the internal fasttrun_update_index_relstats
+ * below); false when it early-returns without storing -- notably when pgstat
+ * is unavailable (track_counts=off).  Callers gate stats_recollected on this
+ * so the index-relstats refresh still runs when column collection was skipped.
+ */
+static bool
 fasttrun_collect_and_store(Relation rel, HeapTuple *sample, int sample_count,
 						   int64 totalrows, bool sample_needs_tid_sort)
 {
@@ -3524,7 +3531,7 @@ fasttrun_collect_and_store(Relation rel, HeapTuple *sample, int sample_count,
 	BlockNumber	snap_pages;
 
 	if (sample_count <= 0)
-		return;
+		return false;
 
 	/*
 	 * Physical block count at collect time: the freshness check anchors to it
@@ -3558,7 +3565,7 @@ fasttrun_collect_and_store(Relation rel, HeapTuple *sample, int sample_count,
 					 errhint("Set track_counts = on in postgresql.conf or per session (SET track_counts = on) to re-enable fasttrun column statistics caching.")));
 			fasttrun_warned_track_counts_off = true;
 		}
-		return;
+		return false;
 	}
 
 	pg_stats_rel = table_open(StatisticRelationId, AccessShareLock);
@@ -3847,6 +3854,7 @@ fasttrun_collect_and_store(Relation rel, HeapTuple *sample, int sample_count,
 	 * column stats now" entry point that doesn't participate in delta-
 	 * math state tracking and shouldn't interfere with it.
 	 */
+	return true;
 }
 
 /*
@@ -4664,10 +4672,17 @@ fasttrun_analyze_relation(Relation rel)
 
 		if (sample != NULL && sample_count > 0)
 		{
-			/* Sort needed only when reservoir sampling displaced entries. */
-			fasttrun_collect_and_store(rel, sample, sample_count, tuples_count,
-									   tuples_count > sample_target);
-			stats_recollected = true;
+			/*
+			 * Sort needed only when reservoir sampling displaced entries.
+			 * collect_and_store returns false when it stored nothing (e.g.
+			 * track_counts=off) -- then it also skipped the internal index
+			 * relstats refresh, so the !stats_recollected path below still
+			 * runs fasttrun_update_index_relstats.
+			 */
+			stats_recollected = fasttrun_collect_and_store(rel, sample,
+														   sample_count,
+														   tuples_count,
+														   tuples_count > sample_target);
 		}
 
 		if (sample != NULL)
