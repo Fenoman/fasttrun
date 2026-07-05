@@ -71,6 +71,9 @@
 #include "utils/varlena.h"
 #include "storage/ipc.h"
 #include "storage/procarray.h"
+#if PG_VERSION_NUM >= 170000
+#include "storage/read_stream.h"		/* PG17+ rewrote analyze scan on ReadStream */
+#endif
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
 #include "executor/spi.h"
@@ -3923,6 +3926,62 @@ fasttrun_scan_with_sample(Relation rel, int64 *tuples_out,
  * (BlockSampler_* + table_scan_analyze_next_block/tuple).  Prefetch and
  * progress reporting are dropped; the reservoir + density math match core.
  */
+/*
+ * Reservoir bookkeeping for one analyzed block: pull every live tuple the
+ * analyze scan yields (which also advances *liverows for the density
+ * estimate) and, when the caller wants a column-stats sample, keep a Vitter
+ * reservoir of sample_target rows.  Shared by the PG16/17 and PG18 outer
+ * loops, which only differ in how blocks are fed to the scan.
+ */
+static void
+fasttrun_reservoir_collect_block(TableScanDesc scan, TransactionId OldestXmin,
+								 TupleTableSlot *slot, HeapTuple *sample,
+								 int sample_target, int *numrows,
+								 double *samplerows, double *rowstoskip,
+								 double *liverows, double *deadrows,
+								 ReservoirState rstate)
+{
+	while (table_scan_analyze_next_tuple(scan, OldestXmin,
+										 liverows, deadrows, slot))
+	{
+		if (sample != NULL)
+		{
+			if (*numrows < sample_target)
+				sample[(*numrows)++] = ExecCopySlotHeapTuple(slot);
+			else
+			{
+				if (*rowstoskip < 0)
+					*rowstoskip = reservoir_get_next_S(rstate, *samplerows,
+													   sample_target);
+
+				if (*rowstoskip <= 0)
+				{
+					int		k = (int) (sample_target *
+									   sampler_random_fract(&rstate->randstate));
+
+					Assert(k >= 0 && k < sample_target);
+					heap_freetuple(sample[k]);
+					sample[k] = ExecCopySlotHeapTuple(slot);
+				}
+				*rowstoskip -= 1;
+			}
+		}
+		*samplerows += 1;
+	}
+}
+
+#if PG_VERSION_NUM >= 170000
+/* ReadStream callback: hand out BlockSampler-chosen blocks (PG17+ analyze). */
+static BlockNumber
+fasttrun_block_sample_stream_next(ReadStream *stream, void *callback_private_data,
+								  void *per_buffer_data)
+{
+	BlockSampler	bs = (BlockSampler) callback_private_data;
+
+	return BlockSampler_HasMore(bs) ? BlockSampler_Next(bs) : InvalidBlockNumber;
+}
+#endif
+
 static void
 fasttrun_block_sample_rows(Relation rel, int64 *tuples_out,
 						   HeapTuple *sample, int sample_target,
@@ -3954,6 +4013,27 @@ fasttrun_block_sample_rows(Relation rel, int64 *tuples_out,
 	scan = table_beginscan_analyze(rel);
 	slot = table_slot_create(rel, NULL);
 
+#if PG_VERSION_NUM >= 170000
+	{
+		/* PG17+ drives the sampled-block scan through a ReadStream. */
+		ReadStream *stream = read_stream_begin_relation(READ_STREAM_MAINTENANCE,
+														strategy, rel,
+														MAIN_FORKNUM,
+														fasttrun_block_sample_stream_next,
+														&bs, 0);
+
+		while (table_scan_analyze_next_block(scan, stream))
+		{
+			CHECK_FOR_INTERRUPTS();
+			fasttrun_reservoir_collect_block(scan, OldestXmin, slot, sample,
+											 sample_target, &numrows,
+											 &samplerows, &rowstoskip,
+											 &liverows, &deadrows, &rstate);
+		}
+
+		read_stream_end(stream);
+	}
+#else
 	while (BlockSampler_HasMore(&bs))
 	{
 		BlockNumber		targblock = BlockSampler_Next(&bs);
@@ -3963,41 +4043,12 @@ fasttrun_block_sample_rows(Relation rel, int64 *tuples_out,
 		if (!table_scan_analyze_next_block(scan, targblock, strategy))
 			continue;
 
-		while (table_scan_analyze_next_tuple(scan, OldestXmin,
-											 &liverows, &deadrows, slot))
-		{
-			/*
-			 * liverows is counted by the analyze primitive regardless -- that
-			 * feeds the density estimate.  The reservoir only runs when the
-			 * caller wants a column-stats sample (sample != NULL); count-only
-			 * callers (column stats disabled) still sample blocks for the
-			 * estimate but keep no rows.  Vitter algorithm as in core.
-			 */
-			if (sample != NULL)
-			{
-				if (numrows < sample_target)
-					sample[numrows++] = ExecCopySlotHeapTuple(slot);
-				else
-				{
-					if (rowstoskip < 0)
-						rowstoskip = reservoir_get_next_S(&rstate, samplerows,
-														  sample_target);
-
-					if (rowstoskip <= 0)
-					{
-						int		k = (int) (sample_target *
-										   sampler_random_fract(&rstate.randstate));
-
-						Assert(k >= 0 && k < sample_target);
-						heap_freetuple(sample[k]);
-						sample[k] = ExecCopySlotHeapTuple(slot);
-					}
-					rowstoskip -= 1;
-				}
-			}
-			samplerows += 1;
-		}
+		fasttrun_reservoir_collect_block(scan, OldestXmin, slot, sample,
+										 sample_target, &numrows,
+										 &samplerows, &rowstoskip,
+										 &liverows, &deadrows, &rstate);
 	}
+#endif
 
 	ExecDropSingleTupleTableSlot(slot);
 	table_endscan(scan);
