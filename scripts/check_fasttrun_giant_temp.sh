@@ -3,18 +3,23 @@
 # Regression-проверка giant-temp guardrail (fasttrun.max_analyze_pages).
 #
 # Выше порога холодный fasttrun_analyze обязан переходить на block-sampling
-# и читать ТОЛЬКО выборку блоков вместо полного скана таблицы. Считаем
-# фактические чтения буферов (ReadBufferExtended) внутри бэкенда через
-# bpftrace для двух прогонов на одной большой temp-таблице:
+# и НЕ итерировать всю таблицу. Считаем вызовы heap_getnext внутри бэкенда
+# через bpftrace для двух прогонов на одной большой temp-таблице:
 #
 #   A. block-sampling: fasttrun.max_analyze_pages = 100  (порог << размера)
 #   B. full-scan:      fasttrun.max_analyze_pages = 0     (точный полный скан)
 #
+# heap_getnext вызывается по строке в полном скане (fasttrun_scan_with_sample)
+# и НЕ вызывается на пути block-sampling (там table_scan_analyze_next_tuple).
+# Метрика version-стабильна: в PG17+ ANALYZE-скан ушёл на ReadStream, поэтому
+# считать ReadBufferExtended бессмысленно, а heap_getnext стабилен во всех
+# поддержанных версиях.
+#
 # Pass criteria:
-#   - A прочитал заметно меньше блоков, чем B (block-sampling bounded);
-#     по умолчанию A <= B / 3.
-#   - B прочитал ~все блоки таблицы (positive control: полный скан реально
-#     трогает всю таблицу, иначе сравнение бессмысленно).
+#   - A (block-sampling) итерирует заметно меньше строк, чем B (full-scan);
+#     по умолчанию A <= B / 3 (на деле A ~ 0).
+#   - B прошёл ~все строки таблицы (positive control: полный скан реально
+#     итерирует всю таблицу, иначе сравнение бессмысленно).
 #
 # Требует Linux + bpftrace + sudo (uprobe на символ postgres).
 #
@@ -122,10 +127,10 @@ done
 total_blocks=$(awk '/^BLOCKS /{print $2}' "$WORKDIR/repro.out" | head -1)
 total_blocks=${total_blocks:-0}
 
-# Считаем ReadBufferExtended в бэкенде с интервальным флашем; снимаем дельты
+# Считаем heap_getnext в бэкенде с интервальным флашем; снимаем дельты
 # на границах A_READY..A_DONE и B_READY..B_DONE через shell-сэмплинг.
 $SUDO timeout 300 "$BPFTRACE" -e "
-uprobe:$PG_BINDIR/postgres:ReadBufferExtended /pid == $backend_pid/ { @reads = count(); }
+uprobe:$PG_BINDIR/postgres:heap_getnext /pid == $backend_pid/ { @reads = count(); }
 interval:ms:200 { print(@reads); }
 " -o "$WORKDIR/reads.bpf.out" 2>&1 &
 TRACE_PID=$!
@@ -161,18 +166,18 @@ b_reads=$(( b_end - b_start ))
 cat <<METRICS
 
 таблица: $ROWS строк, $total_blocks блоков
-A block-sampling (max_analyze_pages=100): ReadBufferExtended = $a_reads
-B full-scan      (max_analyze_pages=0)  : ReadBufferExtended = $b_reads
+A block-sampling (max_analyze_pages=100): heap_getnext = $a_reads
+B full-scan      (max_analyze_pages=0)  : heap_getnext = $b_reads
 порог: A <= B / $RATIO_DIVISOR
 METRICS
 
 failed=0
 if [ "$b_reads" -le 0 ]; then
-	echo "FAIL: full-scan дал ноль чтений -- uprobe не подцепился?" >&2
+	echo "FAIL: full-scan дал ноль heap_getnext -- uprobe не подцепился?" >&2
 	failed=1
 fi
 if [ "$b_reads" -gt 0 ] && [ "$a_reads" -gt $(( b_reads / RATIO_DIVISOR )) ]; then
-	echo "FAIL: block-sampling прочитал $a_reads >= B/$RATIO_DIVISOR ($(( b_reads / RATIO_DIVISOR ))) -- не ограничен" >&2
+	echo "FAIL: block-sampling сделал $a_reads heap_getnext >= B/$RATIO_DIVISOR ($(( b_reads / RATIO_DIVISOR ))) -- не ограничен" >&2
 	failed=1
 fi
 [ "$failed" -ne 0 ] && exit 1
