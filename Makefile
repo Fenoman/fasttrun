@@ -24,6 +24,7 @@ DATA = fasttrun--2.0.sql \
        fasttrun--2.3.1.sql \
        fasttrun--2.3.2.sql \
        fasttrun--2.3.3.sql \
+       fasttrun--2.3.4.sql \
        fasttrun--2.0--2.1.sql \
        fasttrun--2.1--2.1.1.sql \
        fasttrun--2.1.1--2.1.2.sql \
@@ -32,6 +33,7 @@ DATA = fasttrun--2.0.sql \
        fasttrun--2.3.0--2.3.1.sql \
        fasttrun--2.3.1--2.3.2.sql \
        fasttrun--2.3.2--2.3.3.sql \
+       fasttrun--2.3.3--2.3.4.sql \
        fasttrun--unpackaged--2.0.sql
 DOCS = README.md
 PGFILEDESC = "fasttrun - sinval-free truncate and analyze for temporary tables"
