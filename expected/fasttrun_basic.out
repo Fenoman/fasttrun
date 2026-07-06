@@ -737,4 +737,38 @@ SELECT reltuples BETWEEN 1000::real AND 1100::real AS within_band
 
 RESET fasttrun.invalidate_threshold;
 DROP TABLE t_thresh;
+-- ----------------------------------------------------------------------
+-- 14. Предварительно опустошённый heap (DELETE + VACUUM) с раздутым
+--     индексом.  RelationGetNumberOfBlocks считает только heap main
+--     fork; после VACUUM он равен 0, но btree-индекс VACUUM физически
+--     не ужимает -- его storage остаётся раздутым.  fasttruncate должен
+--     всё равно сбросить индекс (как обычный TRUNCATE), а не
+--     превратиться в no-op из-за пустого heap.
+-- ----------------------------------------------------------------------
+CREATE TEMP TABLE t_bloat_idx (id int primary key, payload text);
+INSERT INTO t_bloat_idx SELECT g, md5(g::text) FROM generate_series(1, 100000) g;
+DELETE FROM t_bloat_idx;
+VACUUM t_bloat_idx;
+-- heap опустошён до 0 байт, индекс всё ещё раздут.
+SELECT pg_relation_size('t_bloat_idx') = 0 AS heap_emptied,
+       pg_relation_size('t_bloat_idx_pkey') > 1000000 AS idx_bloated;
+ heap_emptied | idx_bloated 
+--------------+-------------
+ t            | t
+(1 row)
+
+SELECT fasttruncate('t_bloat_idx');
+ fasttruncate 
+--------------
+ 
+(1 row)
+
+-- Индекс сброшен, несмотря на нулевой heap.
+SELECT pg_relation_size('t_bloat_idx_pkey') < 100000 AS idx_reclaimed;
+ idx_reclaimed 
+---------------
+ t
+(1 row)
+
+DROP TABLE t_bloat_idx;
 DROP EXTENSION fasttrun;

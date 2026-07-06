@@ -3409,7 +3409,7 @@ fasttrun_relation_has_partial_index(Relation rel)
 
 static bool
 fasttrun_update_index_relstats(Relation rel, HeapTuple *sample, int sample_count,
-							   int64 totalrows)
+							   int64 totalrows, bool partial_upper_bound)
 {
 	List	   *index_oids;
 	ListCell   *lc;
@@ -3424,18 +3424,13 @@ fasttrun_update_index_relstats(Relation rel, HeapTuple *sample, int sample_count
 		double		tuple_fract;
 		int64		index_tuples;
 		bool		is_partial;
+		bool		set_reltuples = true;
 
 		indexrel = index_open(indexOid, AccessShareLock);
 		is_partial = (RelationGetIndexPredicate(indexrel) != NIL);
 
-		if (is_partial && sample_count <= 0 && totalrows > 0)
-		{
-			index_close(indexrel, AccessShareLock);
-			continue;
-		}
-
 		index_pages = RelationGetNumberOfBlocks(indexrel);
-		if (is_partial)
+		if (is_partial && sample_count > 0)
 		{
 			IndexInfo  *indexInfo = BuildIndexInfo(indexrel);
 
@@ -3443,9 +3438,26 @@ fasttrun_update_index_relstats(Relation rel, HeapTuple *sample, int sample_count
 														   indexInfo, sample,
 														   sample_count);
 		}
+		else if (is_partial && !partial_upper_bound)
+		{
+			/*
+			 * Sample-less refresh after a sample-based one already set this
+			 * partial index's tuple count this analyze: keep that estimate,
+			 * refresh only relpages/relallvisible below.
+			 */
+			tuple_fract = 0.0;
+			set_reltuples = false;
+		}
 		else
+			/*
+			 * A full index, or a partial index whose tuple count has no better
+			 * source: use totalrows as an upper bound -- better than leaving a
+			 * stale under-estimate.
+			 */
 			tuple_fract = 1.0;
-		index_tuples = (int64) ceil(tuple_fract * (double) totalrows);
+		index_tuples = set_reltuples
+			? (int64) ceil(tuple_fract * (double) totalrows)
+			: (int64) indexrel->rd_rel->reltuples;
 
 		/*
 		 * Report a change only for stats that move independently of the heap
@@ -3846,7 +3858,8 @@ fasttrun_collect_and_store(Relation rel, HeapTuple *sample, int sample_count,
 
 	MemoryContextDelete(per_col_mcxt);
 	table_close(pg_stats_rel, AccessShareLock);
-	(void) fasttrun_update_index_relstats(rel, sample, sample_count, totalrows);
+	(void) fasttrun_update_index_relstats(rel, sample, sample_count, totalrows,
+										  true);
 
 	/*
 	 * Note: the stats-collection baseline (used by the delta-hit refresh
@@ -4485,8 +4498,16 @@ fasttruncate(PG_FUNCTION_ARGS)
 	fasttrun_stats_cache_evict_relid(relOid);
 	fasttrun_invalidate_local_plan_cache(RelationGetRelid(rel));
 
-	/* Cheap empty-check via smgr; skip heap_truncate_check_FKs (FK-unsafe). */
-	if (RelationGetNumberOfBlocks(rel) > 0)
+	/*
+	 * Skip only when there is nothing to reclaim: an empty heap with no
+	 * indexes and no toast.  A pre-emptied heap (DELETE+VACUUM) can still
+	 * carry bloated index/toast storage that a real TRUNCATE resets, so run
+	 * the truncate for indexed/toasted tables even when the heap is at 0.
+	 * Skip heap_truncate_check_FKs (FK-unsafe).
+	 */
+	if (RelationGetNumberOfBlocks(rel) > 0 ||
+		rel->rd_rel->relhasindex ||
+		OidIsValid(rel->rd_rel->reltoastrelid))
 	{
 		if (fasttrun_zero_sinval_truncate)
 			fasttrun_full_bypass_truncate(rel);
@@ -4599,6 +4620,7 @@ fasttrun_analyze_relation(Relation rel)
 	bool			index_relstats_changed = false;
 	bool			need_plan_inval = false;
 	bool			pure_delta_noop = false;
+	bool			partial_index_sampled = false;
 	bool			pages_now_known = false;
 	BlockNumber		allvisible_now = 0;
 	BlockNumber		old_pages;
@@ -4725,7 +4747,7 @@ fasttrun_analyze_relation(Relation rel)
 							stats_visibility_changed = true;
 						index_relstats_changed |=
 							fasttrun_update_index_relstats(rel, NULL, 0,
-														   tuples_count);
+														   tuples_count, true);
 					}
 
 					for (i = 0; i < sample_count; i++)
@@ -4784,7 +4806,8 @@ fasttrun_analyze_relation(Relation rel)
 				tuples_count = scanned_tuples;
 				index_relstats_changed |=
 					fasttrun_update_index_relstats(rel, sample, sample_count,
-												   tuples_count);
+												   tuples_count, true);
+				partial_index_sampled = true;
 
 				for (i = 0; i < sample_count; i++)
 					heap_freetuple(sample[i]);
@@ -4793,9 +4816,16 @@ fasttrun_analyze_relation(Relation rel)
 		}
 	}
 
+	/*
+	 * A trailing sample-less refresh keeps non-partial index relpages in step
+	 * with the heap.  Pass partial_upper_bound=false when a sample-based rescan
+	 * above already set the partial index tuple counts, so this call does not
+	 * overwrite those estimates with the totalrows upper bound.
+	 */
 	if (!scan_needed && !stats_recollected && !pure_delta_noop)
 		index_relstats_changed |=
-			fasttrun_update_index_relstats(rel, NULL, 0, tuples_count);
+			fasttrun_update_index_relstats(rel, NULL, 0, tuples_count,
+										   !partial_index_sampled);
 
 	/*
 	 * Below-threshold DML deliberately does NOT advance collected_*.
@@ -4877,7 +4907,7 @@ fasttrun_analyze_relation(Relation rel)
 
 		if (!stats_recollected)
 			index_relstats_changed |=
-				fasttrun_update_index_relstats(rel, NULL, 0, tuples_count);
+				fasttrun_update_index_relstats(rel, NULL, 0, tuples_count, true);
 
 		/* Populate stats baseline only when pgstat is usable. */
 		if (have_counters)
@@ -5222,7 +5252,7 @@ fasttrun_collect_stats(PG_FUNCTION_ARGS)
 	}
 	else if (fasttrun_stats_cache_evict_relid(relOid))
 	{
-		(void) fasttrun_update_index_relstats(rel, NULL, 0, tuples_count);
+		(void) fasttrun_update_index_relstats(rel, NULL, 0, tuples_count, true);
 		fasttrun_invalidate_local_plan_cache(relOid);
 	}
 

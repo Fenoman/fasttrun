@@ -2151,6 +2151,53 @@ SELECT 'giant_block_sample_ok' AS marker;
 
 COMMIT;
 DROP TABLE t_giant;
+-- ----------------------------------------------------------------------
+-- 32. Partial-index relstats при fasttrun.sample_rows = 0.  Без выборки
+--     column-stats отключены, но relpages (физический размер) и
+--     reltuples partial-индекса всё равно должны обновляться: relpages
+--     измеряется напрямую, reltuples берётся как верхняя граница
+--     (totalrows) вместо устаревшего заниженного значения.  Проверяем
+--     через fasttrun_relstats -- planner-visible срез relstats из
+--     session-local кэша.
+-- ----------------------------------------------------------------------
+CREATE TEMP TABLE t_partial_zero (id int, flag bool);
+INSERT INTO t_partial_zero SELECT g, false FROM generate_series(1, 100000) g;
+CREATE INDEX t_partial_zero_idx ON t_partial_zero (id) WHERE flag;
+SELECT fasttrun_analyze('t_partial_zero');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+-- Индекс стартует пустым (предикат не матчит ни одной строки).
+SELECT reltuples::bigint = 0 AS partial_zero_start
+  FROM fasttrun_relstats('t_partial_zero_idx');
+ partial_zero_start 
+--------------------
+ t
+(1 row)
+
+-- Предикат начинает матчить половину строк.
+UPDATE t_partial_zero SET flag = true WHERE id <= 50000;
+-- Без выборки relpages обновляется (физический замер), reltuples берётся
+-- как верхняя граница totalrows, а не остаётся устаревшим нулём.
+SET fasttrun.sample_rows = 0;
+SELECT fasttrun_analyze('t_partial_zero');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+SELECT relpages > 1 AS relpages_refreshed,
+       reltuples::bigint = 100000 AS reltuples_upper_bound
+  FROM fasttrun_relstats('t_partial_zero_idx');
+ relpages_refreshed | reltuples_upper_bound 
+--------------------+-----------------------
+ t                  | t
+(1 row)
+
+RESET fasttrun.sample_rows;
+DROP TABLE t_partial_zero;
 -- Очистка
 DROP TABLE t_stats;
 DROP TABLE t_multi;
