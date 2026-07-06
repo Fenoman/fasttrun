@@ -28,6 +28,11 @@
 #
 set -euo pipefail
 
+# Пиним C-локаль на весь скрипт: без этого на macOS тестовый postmaster
+# падает при старте с "postmaster became multithreaded during startup".
+# На Linux C-локаль тоже валидна, поведение не меняется.
+export LC_ALL=C LANG=C
+
 PG_CONFIG=${PG_CONFIG:-pg_config}
 PG_BINDIR=$("$PG_CONFIG" --bindir)
 PSQL=${PSQL:-"$PG_BINDIR/psql"}
@@ -125,9 +130,18 @@ ORDER BY name;
 SELECT 'AFTER_END';
 SQL
 
+psql_rc=0
 "$PSQL" -h "$WORKDIR" -p "$PORT" -d "$DBNAME" -X \
 	-v ON_ERROR_STOP=1 -f "$WORKDIR/leak.sql" \
-	>"$WORKDIR/leak.out" 2>"$WORKDIR/leak.err"
+	>"$WORKDIR/leak.out" 2>"$WORKDIR/leak.err" || psql_rc=$?
+
+# Реальный сбой измерения: psql упал (ошибка соединения или SQL).
+# Это НЕ то же самое, что "запрос отработал, но контекст отсутствует".
+if [ "$psql_rc" -ne 0 ]; then
+	echo "psql завершился с кодом $psql_rc -- измерение не удалось:" >&2
+	cat "$WORKDIR/leak.err" >&2
+	exit 1
+fi
 
 extract_bytes()
 {
@@ -149,11 +163,12 @@ extract_bytes()
 warmed=$(extract_bytes WARMED_BEGIN WARMED_END)
 after=$(extract_bytes AFTER_BEGIN AFTER_END)
 
-if [ -z "$warmed" ] || [ -z "$after" ]; then
-	echo "не смог снять размер 'fasttrun analyze cache' из вывода:" >&2
-	cat "$WORKDIR/leak.out" >&2
-	exit 1
-fi
+# Пустой захват означает, что контекст 'fasttrun analyze cache' отсутствует:
+# кэш опустел, fasttrun снёс HTAB вместе с его контекстом (fasttrun_cache_reset
+# -> MemoryContextDelete).  Нет контекста == ничего не удержано == 0 байт.
+# Это лучший исход, а не сбой измерения.
+[ -z "$warmed" ] && warmed=0
+[ -z "$after" ] && after=0
 
 growth=$((after - warmed))
 
