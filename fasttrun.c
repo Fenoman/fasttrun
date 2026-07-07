@@ -425,6 +425,16 @@ typedef struct FasttrunAnalyzeCacheEntry
 	BlockNumber	cached_allvisible;
 
 	/*
+	 * rd_rel values published at the moment of the last local plan-cache
+	 * invalidation.  The invalidate_threshold gate measures drift against
+	 * these, so sub-threshold steps accumulate instead of re-anchoring on
+	 * every call.
+	 */
+	BlockNumber	last_inval_pages;
+	float4		last_inval_tuples;
+	bool		last_inval_valid;
+
+	/*
 	 * Storage identity for abort-time probes.  probe_rlb is THIS relation's
 	 * storage; heap_relid/heap_rlb identify the owning heap for index
 	 * entries (equal to the entry itself for heaps).  The subxact-abort path
@@ -830,6 +840,9 @@ fasttrun_cache_enter(Oid relid)
 		entry->cached_pages = 0;
 		entry->cached_tuples = 0;
 		entry->cached_allvisible = 0;
+		entry->last_inval_pages = 0;
+		entry->last_inval_tuples = 0;
+		entry->last_inval_valid = false;
 		memset(&entry->probe_rlb, 0, sizeof(entry->probe_rlb));
 		entry->heap_relid = InvalidOid;
 		memset(&entry->heap_rlb, 0, sizeof(entry->heap_rlb));
@@ -1139,6 +1152,11 @@ fasttrun_cache_seed_after_truncate(Relation rel)
 	fasttrun_cache_remove(relid);
 
 	entry = fasttrun_cache_store_relstats(rel, 0, 0, 0);
+
+	/* fasttruncate just invalidated local plans -- anchor the gate here. */
+	entry->last_inval_pages = 0;
+	entry->last_inval_tuples = 0;
+	entry->last_inval_valid = true;
 
 	if (!fasttrun_read_pgstat_counters(rel, &ins_now, &upd_now, &del_now,
 									   &truncdropped_now))
@@ -5131,6 +5149,12 @@ fasttrun_analyze_relation(Relation rel)
 	 * the entire plan_cache once per analyze dominates xact CPU on
 	 * backends with large SPI/PREPARE caches.
 	 *
+	 * Drift is measured against the values published at the LAST actual
+	 * invalidation -- the values the surviving plans were built on -- not
+	 * against the previous call.  Re-anchoring on every call would let a
+	 * series of sub-threshold steps accumulate unbounded drift without a
+	 * single invalidation.
+	 *
 	 * Column-stats refresh, stats-visibility flip, and index relstats
 	 * change always invalidate.  They signal distribution changes that
 	 * the per-row ratio here cannot measure.
@@ -5139,21 +5163,42 @@ fasttrun_analyze_relation(Relation rel)
 		!stats_recollected && !stats_visibility_changed &&
 		!index_relstats_changed)
 	{
-		double		baseline_tuples = (old_tuples > 0.0f)
-			? (double) old_tuples : 1.0;
-		double		ratio_tuples =
-			fabs((double) tuples_count - (double) old_tuples) / baseline_tuples;
-		double		ratio_pages = (old_pages > 0)
-			? fabs((double) pages_now - (double) old_pages) / (double) old_pages
+		BlockNumber	anchor_pages = old_pages;
+		float4		anchor_tuples = old_tuples;
+		double		baseline_tuples;
+		double		ratio_tuples;
+		double		ratio_pages;
+		double		worst;
+
+		if (entry != NULL && entry->last_inval_valid)
+		{
+			anchor_pages = entry->last_inval_pages;
+			anchor_tuples = entry->last_inval_tuples;
+		}
+
+		baseline_tuples = (anchor_tuples > 0.0f)
+			? (double) anchor_tuples : 1.0;
+		ratio_tuples =
+			fabs((double) tuples_count - (double) anchor_tuples) / baseline_tuples;
+		ratio_pages = (anchor_pages > 0)
+			? fabs((double) pages_now - (double) anchor_pages) / (double) anchor_pages
 			: (pages_now > 0 ? 1.0 : 0.0);
-		double		worst = Max(ratio_tuples, ratio_pages);
+		worst = Max(ratio_tuples, ratio_pages);
 
 		if (worst < fasttrun_invalidate_threshold)
 			need_plan_inval = false;
 	}
 
 	if (need_plan_inval)
+	{
 		fasttrun_invalidate_local_plan_cache(relOid);
+		if (entry != NULL)
+		{
+			entry->last_inval_pages = pages_now;
+			entry->last_inval_tuples = (float4) tuples_count;
+			entry->last_inval_valid = true;
+		}
+	}
 
 	rel->rd_rel->relpages = pages_now;
 	rel->rd_rel->reltuples = (float4) tuples_count;

@@ -455,6 +455,59 @@ SELECT 'disc_plan_fresh_ok' AS marker;
 
 DEALLOCATE dp;
 DROP TABLE t_disc_plan;
+-- ----------------------------------------------------------------------
+-- 9. Кумулятивный дрейф sub-threshold шагов инвалидирует план от якоря
+--    последней инвалидации, а не от предыдущего вызова.  sample_rows=0
+--    отключает пересбор column stats (он форсирует инвалидацию мимо
+--    порога), таблица без индексов — index-сигнал не участвует.  Каждый
+--    шаг +15% строк: ниже порога 0.2 относительно предыдущего вызова,
+--    но два шага дают ~30% от последней инвалидации — второй analyze
+--    обязан инвалидировать план.  Считаем по DEBUG-строке из
+--    fasttrun_invalidate_local_plan_cache.
+-- ----------------------------------------------------------------------
+SET fasttrun.sample_rows = 0;
+CREATE TEMP TABLE t_cum_drift (id int, pad text);
+INSERT INTO t_cum_drift SELECT g, repeat('x', 100) FROM generate_series(1, 20000) g;
+BEGIN;
+SET LOCAL plan_cache_mode = force_generic_plan;
+SELECT fasttrun_analyze('t_cum_drift');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+PREPARE q_cum AS SELECT count(*) FROM t_cum_drift;
+EXECUTE q_cum;
+ count 
+-------
+ 20000
+(1 row)
+
+-- Шаг 1: +15% — ниже порога и от якоря; инвалидации нет.
+INSERT INTO t_cum_drift SELECT g, repeat('x', 100) FROM generate_series(1, 3000) g;
+SET client_min_messages = debug1;
+SELECT fasttrun_analyze('t_cum_drift');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+RESET client_min_messages;
+-- Шаг 2: ещё +3000 — от предыдущего вызова ~13%, от якоря ~30%.
+INSERT INTO t_cum_drift SELECT g, repeat('x', 100) FROM generate_series(1, 3000) g;
+SET client_min_messages = debug1;
+SELECT fasttrun_analyze('t_cum_drift');
+DEBUG:  fasttrun: invalidating backend-local cached plans
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+RESET client_min_messages;
+DEALLOCATE q_cum;
+COMMIT;
+DROP TABLE t_cum_drift;
+RESET fasttrun.sample_rows;
 DROP FUNCTION f_outer(int, int);
 DROP FUNCTION f_inner();
 DROP TABLE t_rsd_details;
