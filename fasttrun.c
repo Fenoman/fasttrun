@@ -4144,6 +4144,12 @@ fasttrun_scan_with_sample(Relation rel, int64 *tuples_out,
 	HeapTuple		tuple;
 	int64			tuples_count = 0;
 	int				sample_count = 0;
+	double			samplerows = 0;
+	double			rowstoskip = -1;
+	ReservoirStateData rstate;
+
+	if (sample != NULL && sample_target > 0)
+		reservoir_init_selection_state(&rstate, sample_target);
 
 	snap = GetActiveSnapshot();
 	if (snap == NULL)
@@ -4162,14 +4168,23 @@ fasttrun_scan_with_sample(Relation rel, int64 *tuples_out,
 			sample[sample_count++] = heap_copytuple(tuple);
 		else
 		{
-			uint64	r = pg_prng_uint64_range(&fasttrun_prng_state,
-											 0, (uint64) tuples_count - 1);
-			if (r < (uint64) sample_target)
+			/* Vitter skip distances: one RNG draw per replacement, not per row. */
+			if (rowstoskip < 0)
+				rowstoskip = reservoir_get_next_S(&rstate, samplerows,
+												  sample_target);
+
+			if (rowstoskip <= 0)
 			{
-				heap_freetuple(sample[r]);
-				sample[r] = heap_copytuple(tuple);
+				int		k = (int) (sample_target *
+								   sampler_random_fract(&rstate.randstate));
+
+				Assert(k >= 0 && k < sample_target);
+				heap_freetuple(sample[k]);
+				sample[k] = heap_copytuple(tuple);
 			}
+			rowstoskip -= 1;
 		}
+		samplerows += 1;
 	}
 	table_endscan(scan);
 
