@@ -2440,30 +2440,42 @@ fasttrun_datum_cmp(const void *a, const void *b, void *arg)
  */
 static float4
 fasttrun_estimate_ndistinct(int n_nonnull, int ndistinct, int nmultiple,
-							int64 totalrows)
+							int64 totalrows, double stanullfrac)
 {
 	int		f1;
-	double	numer;
-	double	denom;
+	double	n;
+	double	N;
 	double	estimate;
 
 	if (n_nonnull <= 0)
 		return 0.0f;
-	if (ndistinct == 1)
-		return 1.0f;
 	if (nmultiple == 0)
-		return -1.0f;					/* no repeats -- assume unique */
+	{
+		/* No repeats -- assume unique, discounted for nulls (as core). */
+		return (float4) (-1.0 * (1.0 - stanullfrac));
+	}
 	if (ndistinct == nmultiple)
 		return (float4) ndistinct;		/* bounded set */
 
+	/*
+	 * Haas-Stokes Duj1, exactly as core compute_scalar_stats():
+	 * n*d / (n - f1 + f1*n/N), nulls excluded from both n and N.
+	 */
 	f1 = ndistinct - nmultiple;
-	numer = (double) n_nonnull * (double) ndistinct;
-	denom = (double) (n_nonnull - f1)
-		+ (double) f1 * (double) n_nonnull / (double) totalrows;
-	estimate = numer / denom;
+	n = (double) n_nonnull;
+	N = (double) totalrows * (1.0 - stanullfrac);
 
-	if (estimate > (double) totalrows)
-		estimate = (double) totalrows;
+	if (N > 0)
+		estimate = (n * (double) ndistinct) /
+			((n - (double) f1) + (double) f1 * n / N);
+	else
+		estimate = 0;
+
+	if (estimate < (double) ndistinct)
+		estimate = (double) ndistinct;
+	if (estimate > N)
+		estimate = N;
+	estimate = floor(estimate + 0.5);
 
 	if (estimate > 0.1 * (double) totalrows)
 		return (float4) -(estimate / (double) totalrows);
@@ -4018,7 +4030,7 @@ fasttrun_collect_and_store(Relation rel, HeapTuple *sample, int sample_count,
 						struct varlena *detoasted = pg_detoast_datum_packed(
 							(struct varlena *) DatumGetPointer(d));
 						values[n_array++] = PointerGetDatum(detoasted);
-						total_width += VARSIZE_ANY_EXHDR(detoasted);
+						total_width += VARSIZE_ANY(detoasted);
 					}
 				}
 				else
@@ -4083,7 +4095,8 @@ fasttrun_collect_and_store(Relation rel, HeapTuple *sample, int sample_count,
 				stawidth = (int32) (total_width / n_nonnull);
 				stadistinct = fasttrun_estimate_ndistinct(n_nonnull,
 														  ndistinct + toowide_cnt,
-														  nmultiple, totalrows);
+														  nmultiple, totalrows,
+														  (double) stanullfrac);
 			}
 
 			fasttrun_apply_attribute_options(rel, attnum, false,

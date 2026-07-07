@@ -34,4 +34,37 @@ SELECT
 RESET fasttrun.use_typanalyze;
 RESET fasttrun.sample_rows;
 DROP TABLE t_w;
+-- ======================================================================
+-- Паритет с ядерным ANALYZE в Haas-Stokes пути: nullable-unique колонка
+-- даёт n_distinct = -(1-nullfrac), varlena stawidth считается с
+-- заголовком (VARSIZE_ANY).  Эталон — обычная таблица с теми же данными.
+-- ======================================================================
+SET fasttrun.use_typanalyze = off;
+SET fasttrun.sample_rows = -1;           -- полный сэмпл: точное совпадение с ядром
+CREATE TEMP TABLE t_hs_parity (id int, val text);
+INSERT INTO t_hs_parity
+SELECT g, CASE WHEN g % 2 = 0 THEN NULL ELSE 'v_' || g END
+FROM generate_series(1, 2000) g;
+SELECT fasttrun_collect_stats('t_hs_parity');
+ fasttrun_collect_stats 
+------------------------
+ 
+(1 row)
+
+CREATE TABLE t_hs_parity_ref AS SELECT * FROM t_hs_parity;
+ANALYZE t_hs_parity_ref;
+SELECT s.stadistinct = p.n_distinct AS hs_ndistinct_core_parity,
+       s.stawidth    = p.avg_width  AS hs_width_core_parity
+FROM fasttrun_inspect_stats('t_hs_parity') s
+JOIN pg_stats p ON p.tablename = 't_hs_parity_ref' AND p.attname = 'val'
+WHERE s.staattnum = 2;
+ hs_ndistinct_core_parity | hs_width_core_parity 
+--------------------------+----------------------
+ t                        | t
+(1 row)
+
+DROP TABLE t_hs_parity_ref;
+DROP TABLE t_hs_parity;
+RESET fasttrun.use_typanalyze;
+RESET fasttrun.sample_rows;
 DROP EXTENSION fasttrun;
