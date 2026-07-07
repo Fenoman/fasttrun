@@ -315,7 +315,7 @@ static void fasttrun_stats_relid_ref(Oid relid);
 static void fasttrun_stats_relid_unref(Oid relid);
 static bool fasttrun_query_contains_stats_relid(Query *query);
 static bool fasttrun_contains_stats_sublink_walker(Node *node, void *context);
-static void fasttrun_reinject_query_relstats(Query *query);
+static bool fasttrun_reinject_query_relstats(Query *query, bool detect_stats);
 static bool fasttrun_reinject_sublink_walker(Node *node, void *context);
 
 /*
@@ -2068,14 +2068,27 @@ fasttrun_contains_stats_sublink_walker(Node *node, void *context)
  * fasttrun_query_contains_stats_relid, so a temp table nested below the top
  * level gets its rd_rel repaired just like a top-level one -- otherwise the
  * planner would read relpages/reltuples 0 from pg_class for the nested temp.
+ *
+ * With detect_stats the same single walk also reports whether any visited
+ * relation has cached column stats (the answer fasttrun_query_contains_
+ * stats_relid gives), so the planner hook pays one tree walk instead of
+ * two.  Probing stops after the first hit; the reinject part still visits
+ * everything.
  */
-static void
-fasttrun_reinject_query_relstats(Query *query)
+typedef struct FasttrunReinjectWalkContext
+{
+	bool		detect_stats;
+	bool		found;
+} FasttrunReinjectWalkContext;
+
+static bool
+fasttrun_reinject_query_relstats(Query *query, bool detect_stats)
 {
 	ListCell   *lc;
+	bool		found = false;
 
 	if (query == NULL)
-		return;
+		return false;
 
 	foreach(lc, query->rtable)
 	{
@@ -2084,10 +2097,14 @@ fasttrun_reinject_query_relstats(Query *query)
 		if (rte->rtekind == RTE_RELATION)
 		{
 			fasttrun_reinject_rte_relstats(rte);
+			if (detect_stats && !found &&
+				fasttrun_stats_relid_exists(rte->relid))
+				found = true;
 		}
 		else if (rte->rtekind == RTE_SUBQUERY)
 		{
-			fasttrun_reinject_query_relstats(rte->subquery);
+			if (fasttrun_reinject_query_relstats(rte->subquery, detect_stats))
+				found = true;
 		}
 	}
 
@@ -2095,26 +2112,42 @@ fasttrun_reinject_query_relstats(Query *query)
 	{
 		CommonTableExpr *cte = (CommonTableExpr *) lfirst(lc);
 
-		if (IsA(cte->ctequery, Query))
-			fasttrun_reinject_query_relstats((Query *) cte->ctequery);
+		if (IsA(cte->ctequery, Query) &&
+			fasttrun_reinject_query_relstats((Query *) cte->ctequery,
+											 detect_stats))
+			found = true;
 	}
 
 	/* Same SubLink descent as fasttrun_query_contains_stats_relid. */
 	if (query->hasSubLinks)
-		(void) query_tree_walker(query, fasttrun_reinject_sublink_walker, NULL,
+	{
+		FasttrunReinjectWalkContext ctx;
+
+		ctx.detect_stats = detect_stats;
+		ctx.found = false;
+		(void) query_tree_walker(query, fasttrun_reinject_sublink_walker, &ctx,
 								 QTW_IGNORE_RT_SUBQUERIES |
 								 QTW_IGNORE_CTE_SUBQUERIES);
+		if (ctx.found)
+			found = true;
+	}
+
+	return found;
 }
 
 /* Descend into SubLink subselects repairing rd_rel for cached temp rels. */
 static bool
 fasttrun_reinject_sublink_walker(Node *node, void *context)
 {
+	FasttrunReinjectWalkContext *ctx = (FasttrunReinjectWalkContext *) context;
+
 	if (node == NULL)
 		return false;
 	if (IsA(node, Query))
 	{
-		fasttrun_reinject_query_relstats((Query *) node);
+		if (fasttrun_reinject_query_relstats((Query *) node,
+											 ctx->detect_stats))
+			ctx->found = true;
 		return false;
 	}
 	return expression_tree_walker(node, fasttrun_reinject_sublink_walker,
@@ -2132,11 +2165,18 @@ fasttrun_planner_hook(Query *parse, const char *query_string,
 	bool		stats_frame_needed = false;
 
 	if (fasttrun_analyze_cache != NULL)
-		fasttrun_reinject_query_relstats(parse);
+	{
+		bool		detect = (fasttrun_stats_cache != NULL &&
+							  fasttrun_stats_relid_cache != NULL);
 
-	stats_frame_needed =
-		(fasttrun_stats_cache != NULL &&
-		 fasttrun_query_contains_stats_relid(parse));
+		/* One walk: reinject relstats and detect cached column stats. */
+		stats_frame_needed = fasttrun_reinject_query_relstats(parse, detect);
+	}
+	else if (fasttrun_stats_cache != NULL)
+	{
+		/* Nothing to reinject -- detect-only walk with early exit. */
+		stats_frame_needed = fasttrun_query_contains_stats_relid(parse);
+	}
 
 	/*
 	 * The freshness frame is only useful for cached column statistics
