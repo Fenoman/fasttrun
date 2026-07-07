@@ -317,6 +317,36 @@ BEGIN
 
     RAISE NOTICE '3g OK: reset cleared everything, prewarm returns 0';
 
+    -- 3g2. prewarm создаёт temp tables через create_temp_table -> CREATE TEMP
+    --      TABLE (LIKE dummy_tmp.x), что повторно входит в utility hook.  Эти
+    --      внутренние creates НЕ должны считаться пользовательскими, иначе
+    --      prewarm накручивает собственный top-N рейтинг.
+    PERFORM fasttrun_reset_temp_stats();
+    DROP TABLE IF EXISTS temp_calc_main;
+    FOR i IN 1..5 LOOP
+        CREATE TEMP TABLE IF NOT EXISTS temp_calc_main (LIKE dummy_tmp.temp_calc_main);
+        DROP TABLE temp_calc_main;
+    END LOOP;
+    SELECT create_count INTO _count
+    FROM fasttrun_hot_temp_tables(100) WHERE relname = 'temp_calc_main';
+    IF _count != 5 THEN
+        RAISE EXCEPTION '3g2 seed: expected 5 user creates, got %', _count;
+    END IF;
+
+    SET LOCAL fasttrun.prewarm_count = 10;
+    SELECT fasttrun_prewarm() INTO _prewarm;
+    IF _prewarm != 1 THEN
+        RAISE EXCEPTION '3g2 prewarm expected to create 1, got %', _prewarm;
+    END IF;
+
+    SELECT create_count INTO _count
+    FROM fasttrun_hot_temp_tables(100) WHERE relname = 'temp_calc_main';
+    IF _count != 5 THEN
+        RAISE EXCEPTION 'prewarm inflated its own create_count: expected 5, got %', _count;
+    END IF;
+    DROP TABLE IF EXISTS temp_calc_main;
+    RAISE NOTICE '3g2 OK: prewarm did not inflate own create_count';
+
     -- 3h. Schedule: empty = always active, стандартный счёт растёт
     SET LOCAL fasttrun.track_schedule = '';
     PERFORM fasttrun_reset_temp_stats();
