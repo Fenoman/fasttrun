@@ -4416,27 +4416,17 @@ fasttrun_smgr_bypass_truncate(Relation rel)
 }
 
 /*
- * Zero-sinval truncate of a relation AND all its indexes and toast.
- *
- * Mirrors heap_truncate_one_rel():
- *   1. Truncate the heap via fasttrun_smgr_bypass_truncate.
- *   2. For each index: truncate storage, then rebuild the empty index
- *      structure (metapage) via the AM's ambuild callback directly --
- *      NOT through index_build(), because index_build calls
- *      index_update_stats -> systable_inplace_update_finish on pg_class,
- *      which generates shared cache invalidation messages.
- *   3. If a toast table exists, truncate it and its indexes the same way.
- */
-/*
- * Truncate and rebuild one index via the zero-sinval path.
- * Factored out to keep the PG_TRY wrapper readable.
+ * Phase 2 of the zero-sinval index rebuild: reconstruct one empty index
+ * structure (metapage) via the AM's ambuild callback directly -- NOT
+ * through index_build(), because index_build calls index_update_stats ->
+ * systable_inplace_update_finish on pg_class, which generates shared
+ * cache invalidation messages.  The index storage must already be
+ * dropped and re-created empty: ambuild requires a zero-block relation.
  */
 static void
 fasttrun_rebuild_one_index(Relation heaprel, Relation indexrel)
 {
 	IndexInfo  *indexInfo = BuildDummyIndexInfo(indexrel);
-
-	fasttrun_smgr_bypass_truncate(indexrel);
 
 	if (indexrel->rd_amcache)
 	{
@@ -4459,10 +4449,27 @@ fasttrun_rebuild_one_index(Relation heaprel, Relation indexrel)
 								   heaprel);
 }
 
+/*
+ * Zero-sinval truncate of a relation AND all its indexes and toast.
+ *
+ * Mirrors heap_truncate_one_rel():
+ *   1. Truncate the heap via fasttrun_smgr_bypass_truncate.
+ *   2. Drop the storage of every index, the toast table and its indexes
+ *      (phase 1), then run every ambuild (phase 2).
+ *
+ * The two phases are load-bearing: with ALL index storage gone before the
+ * first ambuild, a failure anywhere (OOM in ambuild, disk error) leaves at
+ * worst an empty index file without a metapage, and any scan of it fails
+ * loudly.  Rebuilding index-by-index would leave the indexes past the
+ * failure point untouched -- still carrying old TIDs that silently resolve
+ * to wrong rows once the heap is refilled.
+ */
 static void
 fasttrun_full_bypass_truncate(Relation rel)
 {
-	List	   *index_oids;
+	List	   *indexes = NIL;
+	List	   *toast_indexes = NIL;
+	Relation	toastrel = NULL;
 	ListCell   *lc;
 	Oid			toastrelid;
 
@@ -4470,56 +4477,67 @@ fasttrun_full_bypass_truncate(Relation rel)
 	fasttrun_smgr_bypass_truncate(rel);
 
 	/*
-	 * 2-3. Rebuild indexes and toast.  If any step fails (OOM in ambuild,
-	 * disk error in smgrcreate), the table is left in a half-truncated
-	 * state: heap is empty but some indexes may lack a metapage.  Since
-	 * this is a temp table owned exclusively by this backend, the damage
-	 * is contained.  We emit a WARNING so the user knows to DROP and
-	 * recreate the table.
+	 * 2. Indexes and toast.  On failure the table stays half-truncated:
+	 * heap empty, some indexes without a metapage.  The temp table is
+	 * owned exclusively by this backend, so the damage is contained; a
+	 * WARNING tells the user to DROP the table.
 	 */
 	PG_TRY();
 	{
-		index_oids = RelationGetIndexList(rel);
-		foreach(lc, index_oids)
-		{
-			Relation	currentIndex;
+		List	   *index_oids = RelationGetIndexList(rel);
 
-			currentIndex = index_open(lfirst_oid(lc), AccessExclusiveLock);
-			fasttrun_rebuild_one_index(rel, currentIndex);
-			index_close(currentIndex, NoLock);
-		}
+		foreach(lc, index_oids)
+			indexes = lappend(indexes,
+							  index_open(lfirst_oid(lc), AccessExclusiveLock));
 		list_free(index_oids);
 
 		toastrelid = rel->rd_rel->reltoastrelid;
 		if (OidIsValid(toastrelid))
 		{
-			Relation	toastrel = table_open(toastrelid, AccessExclusiveLock);
 			List	   *toast_index_oids;
 
-			fasttrun_smgr_bypass_truncate(toastrel);
-
+			toastrel = table_open(toastrelid, AccessExclusiveLock);
 			toast_index_oids = RelationGetIndexList(toastrel);
 			foreach(lc, toast_index_oids)
-			{
-				Relation	currentIndex;
-
-				currentIndex = index_open(lfirst_oid(lc),
-										  AccessExclusiveLock);
-				fasttrun_rebuild_one_index(toastrel, currentIndex);
-				index_close(currentIndex, NoLock);
-			}
+				toast_indexes = lappend(toast_indexes,
+										index_open(lfirst_oid(lc),
+												   AccessExclusiveLock));
 			list_free(toast_index_oids);
-
-			table_close(toastrel, NoLock);
 		}
+
+		/* Phase 1: drop the storage of everything. */
+		foreach(lc, indexes)
+			fasttrun_smgr_bypass_truncate((Relation) lfirst(lc));
+		if (toastrel != NULL)
+		{
+			fasttrun_smgr_bypass_truncate(toastrel);
+			foreach(lc, toast_indexes)
+				fasttrun_smgr_bypass_truncate((Relation) lfirst(lc));
+		}
+
+		/* Phase 2: rebuild the empty index structures. */
+		foreach(lc, indexes)
+			fasttrun_rebuild_one_index(rel, (Relation) lfirst(lc));
+		foreach(lc, toast_indexes)
+			fasttrun_rebuild_one_index(toastrel, (Relation) lfirst(lc));
+
+		foreach(lc, indexes)
+			index_close((Relation) lfirst(lc), NoLock);
+		list_free(indexes);
+		foreach(lc, toast_indexes)
+			index_close((Relation) lfirst(lc), NoLock);
+		list_free(toast_indexes);
+		if (toastrel != NULL)
+			table_close(toastrel, NoLock);
 	}
 	PG_CATCH();
 	{
 		ereport(WARNING,
 				(errmsg("fasttrun: index rebuild failed for relation \"%s\"",
 						RelationGetRelationName(rel)),
-				 errdetail("The table may have inconsistent indexes. "
-						   "DROP and recreate the temporary table to recover.")));
+				 errdetail("Index rebuild did not complete; scans on this "
+						   "table's indexes will fail.  DROP and recreate "
+						   "the temporary table to recover.")));
 		PG_RE_THROW();
 	}
 	PG_END_TRY();

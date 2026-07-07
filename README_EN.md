@@ -42,8 +42,13 @@ Safe because temporary tables live in the backend's local buffer pool. Other pro
 At the same time, `fasttruncate` locally invalidates the current backend plan cache. This is needed so PL/pgSQL / SPI does not reuse an old plan after truncate and refill. This step does not send anything to the shared sinval queue.
 
 Besides the table itself, `fasttruncate` handles:
-* **all indexes** — rebuilds via `ambuild` (btree metapage, hash, etc.);
-* **toast table** and its index — same path;
+* **all indexes, the toast table and its index** — in two phases: first
+  the storage of all of them is dropped at once (unlink + `smgrcreate`),
+  then the empty structures are rebuilt via `ambuild` (btree metapage,
+  hash, etc.).  A failure at any step leaves at worst an empty index
+  without a metapage: the first touch fails with a clear read error
+  instead of silently wrong results through stale TIDs (the WARNING
+  says to recreate the table);
 * **`rd_amcache`** — clears the index AM metadata cache;
 * **`smgr_cached_nblocks`** — invalidated after ambuild;
 * **analyze cache** — seeds the baseline for delta math.
