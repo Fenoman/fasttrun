@@ -6263,6 +6263,22 @@ fasttrun_evict_utility_caches(Node *parsetree)
 				fasttrun_evict_rangevar(stmt->relation);
 				break;
 			}
+		case T_ClusterStmt:
+			{
+				ClusterStmt *stmt = (ClusterStmt *) parsetree;
+
+				/*
+				 * CLUSTER rewrites the heap: the physical order (and with it
+				 * the cached correlation) changes while pgstat counters stay
+				 * put, so freshness cannot catch it.  Bare CLUSTER revisits
+				 * every previously clustered table -- drop both caches whole.
+				 */
+				if (stmt->relation != NULL)
+					fasttrun_evict_rangevar(stmt->relation);
+				else
+					fasttrun_evict_all_session_caches();
+				break;
+			}
 		case T_VacuumStmt:
 			{
 				VacuumStmt *stmt = (VacuumStmt *) parsetree;

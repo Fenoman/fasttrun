@@ -668,6 +668,39 @@ COMMIT;
 DROP TABLE t_stats_ddl;
 
 -- ----------------------------------------------------------------------
+-- 20a. CLUSTER на temp table физически переупорядочивает строки (rewrite):
+--      correlation в кэше становится ложной при неизменных DML-счётчиках,
+--      freshness это не ловит.  Эвикция срабатывает до выполнения; откат
+--      в savepoint восстанавливает стату (undo), как у остальных DDL.
+-- ----------------------------------------------------------------------
+CREATE TEMP TABLE t_stats_cluster (id int, v int);
+INSERT INTO t_stats_cluster SELECT g, (g * 17) % 10000 FROM generate_series(1, 10000) g;
+CREATE INDEX t_stats_cluster_v_idx ON t_stats_cluster (v);
+
+BEGIN;
+SELECT fasttrun_analyze('t_stats_cluster');
+SELECT count(*) = 2 AS cluster_stats_before
+  FROM fasttrun_inspect_stats('t_stats_cluster');
+CLUSTER t_stats_cluster USING t_stats_cluster_v_idx;
+SELECT count(*) = 0 AS cluster_stats_evicted
+  FROM fasttrun_inspect_stats('t_stats_cluster');
+COMMIT;
+
+BEGIN;
+SELECT fasttrun_analyze('t_stats_cluster');
+SELECT count(*) = 2 AS cluster_rollback_stats_before
+  FROM fasttrun_inspect_stats('t_stats_cluster');
+SAVEPOINT sp_cluster_rollback;
+CLUSTER t_stats_cluster USING t_stats_cluster_v_idx;
+SELECT count(*) = 0 AS cluster_rollback_stats_evicted_inside
+  FROM fasttrun_inspect_stats('t_stats_cluster');
+ROLLBACK TO SAVEPOINT sp_cluster_rollback;
+SELECT count(*) = 2 AS cluster_rollback_stats_restored
+  FROM fasttrun_inspect_stats('t_stats_cluster');
+COMMIT;
+DROP TABLE t_stats_cluster;
+
+-- ----------------------------------------------------------------------
 -- 21. Регрессионный тест: relstats partial index должны обновляться
 --     вместе с fasttrun_analyze.  Обычный ANALYZE обновляет pg_class для
 --     index relation; fasttrun должен публиковать тот же planner-visible
