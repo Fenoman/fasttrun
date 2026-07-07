@@ -3611,50 +3611,70 @@ fasttrun_estimate_index_fraction(Relation heaprel, Relation indexrel,
 	return (double) matched / (double) sample_count;
 }
 
-static bool
-fasttrun_relation_has_partial_index(Relation rel)
+static List *
+fasttrun_open_index_rels(Relation rel)
 {
-	List	   *index_oids;
+	List	   *index_oids = RelationGetIndexList(rel);
+	List	   *index_rels = NIL;
 	ListCell   *lc;
-	bool		found_partial = false;
 
-	index_oids = RelationGetIndexList(rel);
 	foreach(lc, index_oids)
-	{
-		Relation	indexrel;
-
-		indexrel = index_open(lfirst_oid(lc), AccessShareLock);
-		if (RelationGetIndexPredicate(indexrel) != NIL)
-			found_partial = true;
-		index_close(indexrel, AccessShareLock);
-		if (found_partial)
-			break;
-	}
+		index_rels = lappend(index_rels,
+							 index_open(lfirst_oid(lc), AccessShareLock));
 	list_free(index_oids);
+	return index_rels;
+}
 
-	return found_partial;
+static void
+fasttrun_close_index_rels(List *index_rels)
+{
+	ListCell   *lc;
+
+	foreach(lc, index_rels)
+		index_close((Relation) lfirst(lc), AccessShareLock);
+	list_free(index_rels);
 }
 
 static bool
-fasttrun_update_index_relstats(Relation rel, HeapTuple *sample, int sample_count,
+fasttrun_index_rels_have_partial(List *index_rels)
+{
+	ListCell   *lc;
+
+	foreach(lc, index_rels)
+	{
+		if (RelationGetIndexPredicate((Relation) lfirst(lc)) != NIL)
+			return true;
+	}
+	return false;
+}
+
+/*
+ * Refresh relpages/reltuples/relallvisible of every index of `rel`.
+ * index_rels is an already-open list from fasttrun_open_index_rels so hot
+ * callers pay one open per index per analyze; NIL means open (and close)
+ * here.
+ */
+static bool
+fasttrun_update_index_relstats(Relation rel, List *index_rels,
+							   HeapTuple *sample, int sample_count,
 							   int64 totalrows, bool partial_upper_bound)
 {
-	List	   *index_oids;
 	ListCell   *lc;
 	bool		changed = false;
+	List	   *opened = NIL;
 
-	index_oids = RelationGetIndexList(rel);
-	foreach(lc, index_oids)
+	if (index_rels == NIL)
+		index_rels = opened = fasttrun_open_index_rels(rel);
+
+	foreach(lc, index_rels)
 	{
-		Oid			indexOid = lfirst_oid(lc);
-		Relation	indexrel;
+		Relation	indexrel = (Relation) lfirst(lc);
 		BlockNumber	index_pages;
 		double		tuple_fract;
 		int64		index_tuples;
 		bool		is_partial;
 		bool		set_reltuples = true;
 
-		indexrel = index_open(indexOid, AccessShareLock);
 		is_partial = (RelationGetIndexPredicate(indexrel) != NIL);
 
 		index_pages = RelationGetNumberOfBlocks(indexrel);
@@ -3663,8 +3683,8 @@ fasttrun_update_index_relstats(Relation rel, HeapTuple *sample, int sample_count
 			IndexInfo  *indexInfo = BuildIndexInfo(indexrel);
 
 			tuple_fract = fasttrun_estimate_index_fraction(rel, indexrel,
-														   indexInfo, sample,
-														   sample_count);
+															   indexInfo, sample,
+															   sample_count);
 		}
 		else if (is_partial && !partial_upper_bound)
 		{
@@ -3709,13 +3729,14 @@ fasttrun_update_index_relstats(Relation rel, HeapTuple *sample, int sample_count
 																	 index_tuples,
 																	 0),
 									   rel);
-
-		index_close(indexrel, AccessShareLock);
 	}
-	list_free(index_oids);
+
+	if (opened != NIL)
+		fasttrun_close_index_rels(opened);
 
 	return changed;
 }
+
 
 /* qsort comparator: order HeapTuples by physical TID (block, offset). */
 static int
@@ -4086,8 +4107,8 @@ fasttrun_collect_and_store(Relation rel, HeapTuple *sample, int sample_count,
 
 	MemoryContextDelete(per_col_mcxt);
 	table_close(pg_stats_rel, AccessShareLock);
-	(void) fasttrun_update_index_relstats(rel, sample, sample_count, totalrows,
-										  true);
+	(void) fasttrun_update_index_relstats(rel, NIL, sample, sample_count,
+										  totalrows, true);
 	fasttrun_stats_relid_remember_locator(rel);
 
 	/*
@@ -4993,7 +5014,7 @@ fasttrun_analyze_relation(Relation rel)
 						if (fasttrun_stats_cache_evict_relid(relOid))
 							stats_visibility_changed = true;
 						index_relstats_changed |=
-							fasttrun_update_index_relstats(rel, NULL, 0,
+							fasttrun_update_index_relstats(rel, NIL, NULL, 0,
 														   tuples_count, true);
 					}
 
@@ -5016,63 +5037,81 @@ fasttrun_analyze_relation(Relation rel)
 		}
 	}
 
-	if (!scan_needed && have_counters && !stats_recollected &&
-		fasttrun_sample_rows != 0 &&
-		entry != NULL && entry->has_stats_baseline)
+	if (!scan_needed && !stats_recollected)
 	{
-		int64		churn;
+		bool		probe_partial = (have_counters &&
+								 fasttrun_sample_rows != 0 &&
+								 entry != NULL &&
+								 entry->has_stats_baseline);
+		bool		trailing_refresh = !pure_delta_noop;
 
-		churn = (ins_now - entry->stats_baseline_inserted)
-			+ (upd_now - entry->stats_baseline_updated)
-			+ (del_now - entry->stats_baseline_deleted);
-		if (churn < 0)
-			churn = -churn;
-
-		/*
-		 * Rescan on any churn when a partial index exists.  A small DML on the
-		 * predicate column can change the partial index's covered tuple count
-		 * out of proportion to the heap churn ratio (e.g. flipping a boolean
-		 * flag on 1% of rows can double the index), so the heap ratio cannot
-		 * gate this rescan.
-		 */
-		if (churn > 0 && fasttrun_relation_has_partial_index(rel))
+		if (probe_partial || trailing_refresh)
 		{
-			int			sample_target = fasttrun_effective_sample_target(rel);
+			/* One open per index serves the probe and both refreshes. */
+			List	   *index_rels = fasttrun_open_index_rels(rel);
 
-			if (sample_target > 0)
+			if (probe_partial)
 			{
-				HeapTuple  *sample;
-				int64		scanned_tuples = 0;
-				int			sample_count = 0;
-				int			i;
+				int64		churn;
 
-				sample = (HeapTuple *) palloc(sizeof(HeapTuple) * sample_target);
-				fasttrun_scan_with_sample(rel, &scanned_tuples,
-										  sample, sample_target,
-										  &sample_count);
-				tuples_count = scanned_tuples;
-				index_relstats_changed |=
-					fasttrun_update_index_relstats(rel, sample, sample_count,
-												   tuples_count, true);
-				partial_index_sampled = true;
+				churn = (ins_now - entry->stats_baseline_inserted)
+					+ (upd_now - entry->stats_baseline_updated)
+					+ (del_now - entry->stats_baseline_deleted);
+				if (churn < 0)
+					churn = -churn;
 
-				for (i = 0; i < sample_count; i++)
-					heap_freetuple(sample[i]);
-				pfree(sample);
+				/*
+				 * Rescan on any churn when a partial index exists.  A small DML
+				 * on the predicate column can change the partial index's covered
+				 * tuple count out of proportion to the heap churn ratio (e.g.
+				 * flipping a boolean flag on 1% of rows can double the index),
+				 * so the heap ratio cannot gate this rescan.
+				 */
+				if (churn > 0 && fasttrun_index_rels_have_partial(index_rels))
+				{
+					int			sample_target = fasttrun_effective_sample_target(rel);
+
+					if (sample_target > 0)
+					{
+						HeapTuple  *sample;
+						int64		scanned_tuples = 0;
+						int			sample_count = 0;
+						int			i;
+
+						sample = (HeapTuple *) palloc(sizeof(HeapTuple) * sample_target);
+						fasttrun_scan_with_sample(rel, &scanned_tuples,
+												  sample, sample_target,
+												  &sample_count);
+						tuples_count = scanned_tuples;
+						index_relstats_changed |=
+							fasttrun_update_index_relstats(rel, index_rels,
+															   sample, sample_count,
+															   tuples_count, true);
+						partial_index_sampled = true;
+
+						for (i = 0; i < sample_count; i++)
+							heap_freetuple(sample[i]);
+						pfree(sample);
+					}
+				}
 			}
+
+			/*
+			 * A trailing sample-less refresh keeps non-partial index relpages
+			 * in step with the heap.  Pass partial_upper_bound=false when a
+			 * sample-based rescan above already set the partial index tuple
+			 * counts, so this call does not overwrite those estimates with the
+			 * totalrows upper bound.
+			 */
+			if (trailing_refresh)
+				index_relstats_changed |=
+					fasttrun_update_index_relstats(rel, index_rels, NULL, 0,
+												   tuples_count,
+												   !partial_index_sampled);
+
+			fasttrun_close_index_rels(index_rels);
 		}
 	}
-
-	/*
-	 * A trailing sample-less refresh keeps non-partial index relpages in step
-	 * with the heap.  Pass partial_upper_bound=false when a sample-based rescan
-	 * above already set the partial index tuple counts, so this call does not
-	 * overwrite those estimates with the totalrows upper bound.
-	 */
-	if (!scan_needed && !stats_recollected && !pure_delta_noop)
-		index_relstats_changed |=
-			fasttrun_update_index_relstats(rel, NULL, 0, tuples_count,
-										   !partial_index_sampled);
 
 	/*
 	 * Below-threshold DML deliberately does NOT advance collected_*.
@@ -5154,7 +5193,8 @@ fasttrun_analyze_relation(Relation rel)
 
 		if (!stats_recollected)
 			index_relstats_changed |=
-				fasttrun_update_index_relstats(rel, NULL, 0, tuples_count, true);
+				fasttrun_update_index_relstats(rel, NIL, NULL, 0, tuples_count,
+										   true);
 
 		/* Populate stats baseline only when pgstat is usable. */
 		if (have_counters)
@@ -5526,7 +5566,8 @@ fasttrun_collect_stats(PG_FUNCTION_ARGS)
 	}
 	else if (fasttrun_stats_cache_evict_relid(relOid))
 	{
-		(void) fasttrun_update_index_relstats(rel, NULL, 0, tuples_count, true);
+		(void) fasttrun_update_index_relstats(rel, NIL, NULL, 0, tuples_count,
+										  true);
 		fasttrun_invalidate_local_plan_cache(relOid);
 	}
 
