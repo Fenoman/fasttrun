@@ -44,6 +44,7 @@
 #include "nodes/nodeFuncs.h"
 #include "optimizer/planner.h"
 #include "pgstat.h"
+#include "utils/pgstat_internal.h"	/* pgstat_fetch_pending_entry */
 #include "storage/buf_internals.h"
 #include "storage/bufmgr.h"
 #include "storage/lmgr.h"
@@ -198,12 +199,85 @@ fasttrun_xact_touch_relid(Oid relid)
 	MemoryContextSwitchTo(oldcxt);
 }
 
+/*
+ * Relids dropped in the current top xact, recorded by the OAT_DROP hook
+ * together with the subxact id of the drop.  The commit callbacks consult
+ * this list instead of probing the syscache: XACT_EVENT_COMMIT runs at
+ * TRANS_COMMIT, where catalog access is forbidden (RelationIdGetRelation
+ * asserts IsTransactionState()).  ROLLBACK TO SAVEPOINT prunes the notes
+ * of the aborted subxact, so a rolled-back DROP keeps its cache entries.
+ */
+typedef struct FasttrunDroppedRelid
+{
+	Oid			relid;
+	SubTransactionId subid;
+} FasttrunDroppedRelid;
+
+static List *fasttrun_xact_dropped_relids = NIL;
+
+static bool
+fasttrun_xact_relid_dropped(Oid relid)
+{
+	ListCell   *lc;
+
+	foreach(lc, fasttrun_xact_dropped_relids)
+	{
+		FasttrunDroppedRelid *note = (FasttrunDroppedRelid *) lfirst(lc);
+
+		if (note->relid == relid)
+			return true;
+	}
+	return false;
+}
+
+static void
+fasttrun_xact_note_dropped(Oid relid)
+{
+	MemoryContext oldcxt;
+	FasttrunDroppedRelid *note;
+
+	if (fasttrun_xact_relid_dropped(relid))
+		return;
+
+	oldcxt = MemoryContextSwitchTo(TopTransactionContext);
+	note = (FasttrunDroppedRelid *) palloc(sizeof(*note));
+	note->relid = relid;
+	note->subid = GetCurrentSubTransactionId();
+	fasttrun_xact_dropped_relids = lappend(fasttrun_xact_dropped_relids, note);
+	MemoryContextSwitchTo(oldcxt);
+}
+
+/* Promote drop notes on RELEASE SAVEPOINT, prune them on ROLLBACK TO SAVEPOINT. */
+static void
+fasttrun_xact_dropped_subxact(SubXactEvent event, SubTransactionId mySubid,
+							  SubTransactionId parentSubid)
+{
+	ListCell   *lc;
+
+	foreach(lc, fasttrun_xact_dropped_relids)
+	{
+		FasttrunDroppedRelid *note = (FasttrunDroppedRelid *) lfirst(lc);
+
+		if (note->subid != mySubid)
+			continue;
+		if (event == SUBXACT_EVENT_COMMIT_SUB)
+			note->subid = parentSubid;
+		else
+		{
+			fasttrun_xact_dropped_relids =
+				foreach_delete_current(fasttrun_xact_dropped_relids, lc);
+			pfree(note);
+		}
+	}
+}
+
 static inline void
 fasttrun_xact_touched_clear(void)
 {
-	/* List sits in TopTransactionContext -- about to be reset, or already
-	 * was.  Just drop the pointer. */
+	/* Both lists sit in TopTransactionContext -- about to be reset, or
+	 * already was.  Just drop the pointers. */
 	fasttrun_xact_touched_oids = NIL;
+	fasttrun_xact_dropped_relids = NIL;
 }
 
 /* Forward decls for stats infrastructure (defined below) */
@@ -611,13 +685,13 @@ fasttrun_cache_commit_xact(void)
 			continue;
 
 		/*
-		 * Relation gone?  Drop the entry whole, move on.  Catches
-		 * ON COMMIT DROP, plain DROP done elsewhere in the xact, and
-		 * any other path that retires a relid without going through
-		 * our utility_hook eviction.  Syscache hit is cheap, runs once
-		 * per relid touched in this xact (not per cache entry).
+		 * Relation dropped this xact?  Drop the entry whole, move on.
+		 * Catches ON COMMIT DROP, plain DROP done elsewhere in the xact,
+		 * and dependency drops: every drop path fires OAT_DROP, which
+		 * records the relid.  No syscache probe here -- this callback
+		 * runs at TRANS_COMMIT, where catalog access is forbidden.
 		 */
-		if (!SearchSysCacheExists1(RELOID, ObjectIdGetDatum(relid)))
+		if (fasttrun_xact_relid_dropped(relid))
 		{
 			fasttrun_baseline_free_undo(entry);
 			fasttrun_relstats_free_undo(entry);
@@ -645,7 +719,7 @@ fasttrun_cache_commit_xact(void)
 
 		/*
 		 * Drop the lazy-probe memo.  ON COMMIT DELETE ROWS truncate runs
-		 * after our xact callback -- but only on the NEXT xact.  So the
+		 * in PreCommit_on_commit_actions(), before this callback.  The
 		 * cached observation no longer holds outside this xact's lifetime.
 		 */
 		entry->lazy_check_subid = InvalidSubTransactionId;
@@ -1158,7 +1232,15 @@ fasttrun_reinject_relstats(Relation rel, FasttrunAnalyzeCacheEntry *entry)
 
 				if (OidIsValid(heapid))
 				{
-					Relation	heaprel = try_relation_open(heapid, NoLock);
+					/*
+					 * The planner path always holds a lock on the owning
+					 * heap, but fasttrun_relstats(index_name) reaches here
+					 * with only the index locked -- relation_open with
+					 * NoLock asserts then.  A transient AccessShareLock
+					 * covers both callers.
+					 */
+					Relation	heaprel = try_relation_open(heapid,
+															AccessShareLock);
 
 					if (heaprel != NULL)
 					{
@@ -1166,7 +1248,7 @@ fasttrun_reinject_relstats(Relation rel, FasttrunAnalyzeCacheEntry *entry)
 							isTempNamespace(RelationGetNamespace(heaprel)) &&
 							RelationGetNumberOfBlocks(heaprel) == 0)
 							looks_empty = true;
-						relation_close(heaprel, NoLock);
+						relation_close(heaprel, AccessShareLock);
 					}
 				}
 			}
@@ -1384,6 +1466,8 @@ typedef struct FasttrunStatsRelidEntry
 	Oid			relid;		/* hash key -- must be first */
 	int			refcount;	/* visible statsTuple entries for this relid */
 	List	   *attkeys;	/* List of FasttrunStatsKey *, owns palloc'd keys */
+	RelFileLocatorBackend heap_rlb;	/* heap storage identity for the commit-time size probe */
+	bool		heap_rlb_valid;
 } FasttrunStatsRelidEntry;
 
 static HTAB			   *fasttrun_stats_cache = NULL;
@@ -1518,6 +1602,8 @@ fasttrun_stats_relid_ref(Oid relid)
 	{
 		entry->refcount = 0;
 		entry->attkeys = NIL;
+		memset(&entry->heap_rlb, 0, sizeof(entry->heap_rlb));
+		entry->heap_rlb_valid = false;
 	}
 	entry->refcount++;
 }
@@ -1577,6 +1663,8 @@ fasttrun_stats_relid_add_key(const FasttrunStatsKey *key)
 	{
 		entry->refcount = 0;
 		entry->attkeys = NIL;
+		memset(&entry->heap_rlb, 0, sizeof(entry->heap_rlb));
+		entry->heap_rlb_valid = false;
 	}
 
 	oldcxt = MemoryContextSwitchTo(fasttrun_stats_mcxt);
@@ -1584,6 +1672,29 @@ fasttrun_stats_relid_add_key(const FasttrunStatsKey *key)
 	*kcopy = *key;
 	entry->attkeys = lappend(entry->attkeys, kcopy);
 	MemoryContextSwitchTo(oldcxt);
+}
+
+/*
+ * Remember the heap's storage identity so the commit-time freshness walk
+ * can read the physical size via smgr without opening the relation.
+ */
+static void
+fasttrun_stats_relid_remember_locator(Relation heaprel)
+{
+	FasttrunStatsRelidEntry *entry;
+	Oid			relid = RelationGetRelid(heaprel);
+
+	if (fasttrun_stats_relid_cache == NULL)
+		return;
+
+	entry = (FasttrunStatsRelidEntry *) hash_search(fasttrun_stats_relid_cache,
+													&relid, HASH_FIND, NULL);
+	if (entry == NULL)
+		return;
+
+	entry->heap_rlb.locator = heaprel->rd_locator;
+	entry->heap_rlb.backend = heaprel->rd_backend;
+	entry->heap_rlb_valid = true;
 }
 
 static void
@@ -2102,6 +2213,67 @@ fasttrun_read_pgstat_counters(Relation rel,
 	return true;
 }
 
+/*
+ * Commit-time variant of the counter read.  XACT_EVENT_COMMIT runs at
+ * TRANS_COMMIT, where relcache/syscache access is forbidden
+ * (RelationIdGetRelation asserts IsTransactionState()), so read the same
+ * per-xact sums straight from the pending pgstat entry.  It is still
+ * alive here -- AtEOXact_PgStat runs after the xact callbacks.  Temp
+ * relations are database-local, so MyDatabaseId is the only dboid to try.
+ */
+static bool
+fasttrun_read_pgstat_counters_at_commit(Oid relid,
+										int64 *ins, int64 *upd, int64 *del,
+										bool *truncdropped)
+{
+	PgStat_EntryRef *ref;
+	PgStat_TableStatus *tabstat;
+	PgStat_TableXactStatus *trans;
+
+	*ins = 0;
+	*upd = 0;
+	*del = 0;
+	*truncdropped = false;
+
+	if (!pgstat_track_counts)
+		return false;
+
+	ref = pgstat_fetch_pending_entry(PGSTAT_KIND_RELATION, MyDatabaseId, relid);
+	if (ref == NULL || ref->pending == NULL)
+		return false;
+
+	tabstat = (PgStat_TableStatus *) ref->pending;
+	for (trans = tabstat->trans; trans != NULL; trans = trans->upper)
+	{
+		*ins += trans->tuples_inserted;
+		*upd += trans->tuples_updated;
+		*del += trans->tuples_deleted;
+		if (trans->truncdropped)
+			*truncdropped = true;
+	}
+
+	return true;
+}
+
+/*
+ * Commit-time physical size probe.  Same smgr-only discipline as the
+ * subxact-abort probe: no relcache in sight.
+ */
+static BlockNumber
+fasttrun_stats_relid_nblocks_at_commit(const FasttrunStatsRelidEntry *relentry)
+{
+	SMgrRelation reln;
+
+	if (!relentry->heap_rlb_valid)
+		return 0;
+
+	reln = smgropen(relentry->heap_rlb.locator, relentry->heap_rlb.backend);
+	if (!smgrexists(reln, MAIN_FORKNUM))
+		return 0;
+
+	return smgrnblocks(reln, MAIN_FORKNUM);
+}
+
 static bool
 fasttrun_read_pgstat_counters_for_hook(Oid relid,
 									   int64 *ins, int64 *upd, int64 *del,
@@ -2435,13 +2607,13 @@ fasttrun_stats_cache_commit_xact(void)
 		keys = list_copy(relentry->attkeys);
 
 		/*
-		 * Relation gone (ON COMMIT DROP fires before this callback, plus any
-		 * plain DROP earlier in the xact)?  Drop the column-stats entries via
-		 * a cheap syscache existence probe instead of building a full relcache
-		 * descriptor with RelationIdGetRelation.  Symmetric to the analyze-
-		 * cache commit path.
+		 * Relation dropped this xact (ON COMMIT DROP fires before this
+		 * callback, plus any plain DROP earlier in the xact)?  Drop the
+		 * column-stats entries.  The OAT_DROP note replaces the syscache
+		 * probe: TRANS_COMMIT forbids catalog access.  Symmetric to the
+		 * analyze-cache commit path.
 		 */
-		if (!SearchSysCacheExists1(RELOID, ObjectIdGetDatum(relid)))
+		if (fasttrun_xact_relid_dropped(relid))
 		{
 			foreach(klc, keys)
 			{
@@ -2496,23 +2668,18 @@ fasttrun_stats_cache_commit_xact(void)
 			 * Read pgstat once per relid, not once per attkey.  All
 			 * statsTuples for this relid share the same counters; the
 			 * scalar-per-entry loop just compared them against the same
-			 * (ins, upd, del, truncdropped) tuple anyway.
+			 * (ins, upd, del, truncdropped) tuple anyway.  Both reads are
+			 * relcache-free: this callback runs at TRANS_COMMIT, where
+			 * catalog access is forbidden.
 			 */
 			if (!counters_attempted)
 			{
-				Relation	rel;
-
 				counters_attempted = true;
-				rel = RelationIdGetRelation(relid);
-				if (rel != NULL)
-				{
-					have_counters = fasttrun_read_pgstat_counters(rel, &ins_now,
-																  &upd_now, &del_now,
-																  &truncdropped_now);
-					if (RELKIND_HAS_STORAGE(rel->rd_rel->relkind))
-						pages_now = RelationGetNumberOfBlocks(rel);
-					RelationClose(rel);
-				}
+				have_counters =
+					fasttrun_read_pgstat_counters_at_commit(relid, &ins_now,
+															&upd_now, &del_now,
+															&truncdropped_now);
+				pages_now = fasttrun_stats_relid_nblocks_at_commit(relentry);
 			}
 
 			/*
@@ -2753,6 +2920,9 @@ fasttrun_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 	 */
 	if (fasttrun_xact_touched_oids == NIL)
 		return;
+
+	/* Keep the drop notes in step with the savepoint outcome. */
+	fasttrun_xact_dropped_subxact(event, mySubid, parentSubid);
 
 	/*
 	 * Walk per touched relid, not per cache entry.  For each relid we hit
@@ -3860,6 +4030,7 @@ fasttrun_collect_and_store(Relation rel, HeapTuple *sample, int sample_count,
 	table_close(pg_stats_rel, AccessShareLock);
 	(void) fasttrun_update_index_relstats(rel, sample, sample_count, totalrows,
 										  true);
+	fasttrun_stats_relid_remember_locator(rel);
 
 	/*
 	 * Note: the stats-collection baseline (used by the delta-hit refresh
@@ -5837,8 +6008,13 @@ fasttrun_evict_temp_relid(Oid relid)
 	 * calls fired on every utility_hook eviction
 	 * (get_rel_persistence + get_rel_namespace).  That dominated the path
 	 * on workloads with many CREATE TEMP TABLE IF NOT EXISTS statements.
+	 *
+	 * The utility hook runs before the DDL takes its own lock, so opening
+	 * with NoLock would trip the lock-discipline assert in relation_open
+	 * on assert-enabled builds.  Take a transient AccessShareLock and
+	 * release it at close; the DDL acquires its stronger lock right after.
 	 */
-	rel = try_relation_open(relid, NoLock);
+	rel = try_relation_open(relid, AccessShareLock);
 	if (rel == NULL)
 	{
 		fasttrun_cache_mark_evicted(relid);
@@ -5850,7 +6026,7 @@ fasttrun_evict_temp_relid(Oid relid)
 	if (rel->rd_rel->relpersistence != RELPERSISTENCE_TEMP ||
 		!isTempNamespace(RelationGetNamespace(rel)))
 	{
-		relation_close(rel, NoLock);
+		relation_close(rel, AccessShareLock);
 		return;
 	}
 
@@ -5870,7 +6046,7 @@ fasttrun_evict_temp_relid(Oid relid)
 	}
 	else
 		fasttrun_cache_mark_evicted(relid);
-	relation_close(rel, NoLock);
+	relation_close(rel, AccessShareLock);
 
 	fasttrun_stats_cache_mark_evicted_relid(relid);
 	fasttrun_invalidate_local_plan_cache(relid);
@@ -5990,10 +6166,11 @@ fasttrun_evict_utility_caches(Node *parsetree)
 /*
  * Dependency-machinery drops (DROP ... CASCADE, DROP OWNED BY, DISCARD)
  * delete relations without a per-table DropStmt, so the utility hook never
- * sees them.  Register the dropped relid in the per-xact touched list; the
- * commit callbacks already remove entries whose relation is gone.  A plain
- * touch keeps rollback semantics intact: if the drop aborts, the untouched
- * cache entry stays valid.
+ * sees them.  Touch the relid and note the drop with its subxact id; the
+ * commit callbacks remove noted entries without probing the syscache
+ * (TRANS_COMMIT forbids catalog access).  Rollback semantics stay intact:
+ * if the drop aborts, the subxact callback prunes the note and the cache
+ * entry stays valid.
  */
 static void
 fasttrun_object_access_hook(ObjectAccessType access, Oid classId,
@@ -6015,6 +6192,7 @@ fasttrun_object_access_hook(ObjectAccessType access, Oid classId,
 		return;
 
 	fasttrun_xact_touch_relid(objectId);
+	fasttrun_xact_note_dropped(objectId);
 }
 
 /* ProcessUtility hook: track CREATE TEMP TABLE and evict stats on temp-table DDL. */

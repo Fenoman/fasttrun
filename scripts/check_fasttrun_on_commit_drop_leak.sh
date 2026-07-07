@@ -15,9 +15,10 @@
 #   копил мёртвые entries.
 #
 # Что должно быть после фикса:
-#   fasttrun_cache_commit_xact для каждого touched relid делает
-#   SearchSysCacheExists1(RELOID).  Если relation gone -- HASH_REMOVE
-#   entry полностью.  Никакого linear growth.
+#   object_access_hook(OAT_DROP) ставит на relid drop-отметку с subid,
+#   fasttrun_cache_commit_xact для каждого touched relid проверяет её
+#   (syscache в TRANS_COMMIT запрещён).  Если relation dropped --
+#   HASH_REMOVE entry полностью.  Никакого linear growth.
 #
 # Pass criteria (по умолчанию ITERATIONS=500):
 #   - "fasttrun analyze cache" used_bytes после прогона не должен
