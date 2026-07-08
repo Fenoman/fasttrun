@@ -250,6 +250,16 @@ echo "fasttrun_cache_commit_xact:       $analyze_count       $analyze_avg"
 echo "fasttrun_stats_cache_commit_xact: $stats_count       $stats_avg"
 echo "лимит avg ns/call: $MAX_AVG_NS"
 
+# Positive-attach guard: под нагрузкой оба commit-колбэка ОБЯЗАНЫ сработать.
+# Нулевой count означает, что uprobe не подцепился к соответствующей функции
+# (stripped-бинарь, инлайн символа, права) -- avg тогда тривиально 0 и порог
+# проходит ложно. Это отдельная причина от превышения avg-лимита ниже.
+if [ "$analyze_count" -eq 0 ] || [ "$stats_count" -eq 0 ]; then
+	echo "FAIL: uprobe не подцепился (@analyze_count=$analyze_count @stats_count=$stats_count, ожидается >0) -- харнес недостоверен, ничего не измерено" >&2
+	echo "  (это НЕ превышение avg-лимита: проверьте bpftrace/uprobe attach к commit-колбэкам)" >&2
+	exit 1
+fi
+
 failed=0
 if [ "$analyze_avg" -gt "$MAX_AVG_NS" ]; then
 	echo "FAIL: fasttrun_cache_commit_xact avg duration $analyze_avg ns > limit $MAX_AVG_NS ns" >&2

@@ -221,6 +221,16 @@ fasttrun_stats_cache_evict_relid из COMMIT-колбэка:           $stats_ev
 БЮДЖЕТ commit-callback inval <= $MAX_COMMIT_INVAL, empty-auth <= $MAX_EMPTY_AUTH
 METRICS
 
+# Positive-attach guard: под нагрузкой xact_callback ОБЯЗАН сработать.
+# Ноль означает, что uprobe не подцепился (stripped-бинарь, инлайн символа,
+# нет pg_noinline-цели, права) -- харнес ничего не измерил, а не "прошёл".
+# Это отдельная причина от превышения бюджета ниже.
+if [ "$xact_calls" -eq 0 ]; then
+	echo "FAIL: uprobe не подцепился (@xact_cb_calls=0) -- харнес недостоверен, ничего не измерено" >&2
+	echo "  (это НЕ превышение бюджета: проверьте bpftrace/uprobe attach к xact-callback)" >&2
+	exit 1
+fi
+
 failed=0
 if [ "$ft_inval_commit" -gt "$MAX_COMMIT_INVAL" ]; then
 	echo "FAIL: инвалидаций из commit-колбэка $ft_inval_commit > $MAX_COMMIT_INVAL" >&2
