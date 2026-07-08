@@ -559,6 +559,48 @@ COMMIT;
 DROP TABLE t_abort_anchor;
 RESET fasttrun.sample_rows;
 DROP FUNCTION f_outer(int, int);
+-- ----------------------------------------------------------------------
+-- 11. ROLLBACK TO SAVEPOINT после fasttruncate инвалидирует локальный
+--     plan cache РОВНО РАЗ на уникальный relid, а не по разу на индекс.
+--     fasttruncate трогает heap + каждый индекс + toast как отдельные
+--     relid'ы; empty-storage ветка abort-колбэка инвалидировала owning
+--     heap на КАЖДОЙ индексной entry -> ~2N walk'ов на N индексов.
+--     Дедуп через inval_seen: N уникальных relid = N DEBUG-строк.
+--     Здесь heap + btree + hash + gin + toast + toast-idx = 6 уникальных.
+-- ----------------------------------------------------------------------
+CREATE TEMP TABLE t_inval_dedup (a int, b int, c text);
+CREATE INDEX ON t_inval_dedup (a);
+CREATE INDEX ON t_inval_dedup USING hash (b);
+CREATE INDEX ON t_inval_dedup USING gin (to_tsvector('simple', c));
+INSERT INTO t_inval_dedup SELECT g, g % 10, 'x' || g FROM generate_series(1, 1000) g;
+SELECT fasttrun_analyze('t_inval_dedup');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+BEGIN;
+SAVEPOINT sp_dedup;
+SELECT fasttruncate('t_inval_dedup');
+ fasttruncate 
+--------------
+ 
+(1 row)
+
+-- Окно наблюдения: только ROLLBACK эмитит abort-инвалидации (fasttruncate
+-- выше уже отработал на warning-уровне). Ожидаем 6 DEBUG-строк -- по одной
+-- на уникальный relid, а не 2N+1.
+SET client_min_messages = debug1;
+ROLLBACK TO SAVEPOINT sp_dedup;
+DEBUG:  fasttrun: invalidating backend-local cached plans
+DEBUG:  fasttrun: invalidating backend-local cached plans
+DEBUG:  fasttrun: invalidating backend-local cached plans
+DEBUG:  fasttrun: invalidating backend-local cached plans
+DEBUG:  fasttrun: invalidating backend-local cached plans
+DEBUG:  fasttrun: invalidating backend-local cached plans
+RESET client_min_messages;
+COMMIT;
+DROP TABLE t_inval_dedup;
 DROP FUNCTION f_inner();
 DROP TABLE t_rsd_details;
 ERROR:  table "t_rsd_details" does not exist

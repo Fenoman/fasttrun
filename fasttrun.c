@@ -2979,11 +2979,28 @@ fasttrun_stats_cache_mark_evicted_relid(Oid relid)
  *   the aborted subxact's stats.  COMMIT_SUB promotes the snapshot to
  *   the parent subxact.
  */
+/*
+ * Invalidate a relid's backend-local plans at most once per subxact-callback
+ * pass.  fasttruncate touches the heap plus every index as separate relids;
+ * each index's empty-storage abort branch also invalidates the owning heap,
+ * so without this the heap relid is walked once per index.  `seen` spans the
+ * whole callback (all touched relids), not one relid.
+ */
+static void
+fasttrun_subxact_invalidate_once(Oid relid, List **seen)
+{
+	if (!OidIsValid(relid) || list_member_oid(*seen, relid))
+		return;
+	*seen = lappend_oid(*seen, relid);
+	fasttrun_invalidate_local_plan_cache(relid);
+}
+
 static void
 fasttrun_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 						  SubTransactionId parentSubid, void *arg)
 {
 	ListCell   *lc;
+	List	   *inval_seen = NIL;
 
 	if (event != SUBXACT_EVENT_ABORT_SUB && event != SUBXACT_EVENT_COMMIT_SUB)
 		return;
@@ -3149,9 +3166,8 @@ fasttrun_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 						if (OidIsValid(plan_relid))
 							fasttrun_stats_cache_evict_relid(plan_relid);
 						aentry->last_inval_valid = false;
-						fasttrun_invalidate_local_plan_cache(aentry->relid);
-						if (OidIsValid(plan_relid) && plan_relid != aentry->relid)
-							fasttrun_invalidate_local_plan_cache(plan_relid);
+						fasttrun_subxact_invalidate_once(aentry->relid, &inval_seen);
+						fasttrun_subxact_invalidate_once(plan_relid, &inval_seen);
 						continue;
 					}
 
@@ -3272,11 +3288,14 @@ fasttrun_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 		 * per-column undo/drop paths above only need the plan cache walked
 		 * once -- repeating it per attkey just re-scans every cached plan.
 		 * The empty-storage branch skips this via continue: it has already
-		 * invalidated its relids directly.
+		 * invalidated its relids directly.  inval_seen dedups across the whole
+		 * pass so a heap shared by many indexes is walked once, not per index.
 		 */
 		if (plan_inval_needed)
-			fasttrun_invalidate_local_plan_cache(relid);
+			fasttrun_subxact_invalidate_once(relid, &inval_seen);
 	}
+
+	list_free(inval_seen);
 }
 
 /* ----------------------------------------------------------------------
