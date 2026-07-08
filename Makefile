@@ -49,7 +49,8 @@ REGRESS = fasttrun_basic \
           fasttrun_relstats_survive \
           fasttrun_plan_cache_survive \
           fasttrun_stats_width \
-          fasttrun_discard
+          fasttrun_discard \
+          fasttrun_zero_sinval_catalog
 
 PG_CONFIG ?= pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)

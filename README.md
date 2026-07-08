@@ -156,7 +156,7 @@ ALTER EXTENSION fasttrun UPDATE;
 make installcheck PG_CONFIG=/path/to/pg_config PGPORT=5433
 ```
 
-12 тест-кейсов через `pg_regress`:
+13 тест-кейсов через `pg_regress`:
 
 | Тест | Что проверяет |
 |---|---|
@@ -172,6 +172,7 @@ make installcheck PG_CONFIG=/path/to/pg_config PGPORT=5433
 | `fasttrun_plan_cache_survive` | Локальный сброс кэша планов SPI/PL/pgSQL после fasttruncate, analyze, collect_stats и savepoint rollback |
 | `fasttrun_stats_width` | Корректный `stawidth` для by-value / varlena / fixed-length by-reference колонок |
 | `fasttrun_discard` | Эвикция кэшей при `DISCARD TEMP/ALL` и dependency-удалениях (`DROP ... CASCADE`), откат drop'а в savepoint |
+| `fasttrun_zero_sinval_catalog` | Канарейка на «ноль shared sinval»: fasttruncate/analyze/bulk/collect не пишут каталог (relfilenode таблицы и индексов неизменны, `pg_class`/`pg_statistic` не тронуты); позитивный контроль — ядерные TRUNCATE/ANALYZE каталог меняют |
 
 Все тесты проходят на PG 16.13, 17.9 и 18.3.
 
