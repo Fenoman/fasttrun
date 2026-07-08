@@ -4415,7 +4415,7 @@ fasttrun_unlink_fork_segments(const char *base_path)
  *
  * How:
  *   1. Discover all forks that currently exist (main / fsm / vm).
- *   2. Drop their local buffers via DropRelationLocalBuffers (temp
+ *   2. Drop their local buffers via DropRelationAllLocalBuffers (temp
  *      tables live in the local buffer pool, not shared).
  *   3. Physically unlink every segment of every fork via raw unlink()
  *      on the path returned by relpathbackend().
@@ -4443,7 +4443,7 @@ fasttrun_smgr_bypass_truncate(Relation rel)
 
 	/*
 	 * Self-defense: this helper unlinks files via raw POSIX unlink() and
-	 * uses DropRelationLocalBuffers, both of which only make sense on a
+	 * uses DropRelationAllLocalBuffers, both of which only make sense on a
 	 * temp relation owned by this backend.  fasttruncate() already
 	 * checks isTempNamespace + heap-AM in the caller, but a stray direct
 	 * call here on a non-temp rel would silently corrupt that rel's
@@ -4469,9 +4469,8 @@ fasttrun_smgr_bypass_truncate(Relation rel)
 	if (smgrexists(reln, VISIBILITYMAP_FORKNUM))
 		forks[nforks++] = VISIBILITYMAP_FORKNUM;
 
-	/* 2. Drop local buffers for every fork (temp tables -> local pool). */
-	for (i = 0; i < nforks; i++)
-		DropRelationLocalBuffers(rlocator.locator, forks[i], 0);
+	/* 2. Drop local buffers of all forks in one pool scan (temp -> local pool). */
+	DropRelationAllLocalBuffers(rlocator.locator);
 
 	/*
 	 * 3. Release all cached file descriptors and per-fork state inside the
