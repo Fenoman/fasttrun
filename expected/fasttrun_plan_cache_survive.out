@@ -508,6 +508,56 @@ DEALLOCATE q_cum;
 COMMIT;
 DROP TABLE t_cum_drift;
 RESET fasttrun.sample_rows;
+-- ----------------------------------------------------------------------
+-- 10. Якорь порога сбрасывается при откате savepoint: инвалидация из
+--     ABORT_SUB рушит планы, но якорь last_inval_* без сброса остался бы
+--     от отменённого analyze — и подавлял бы следующую инвалидацию, пока
+--     дрейф от stale-якоря не пробьёт порог.  sample_rows=0 и таблица
+--     без индексов, как в секции 9.
+-- ----------------------------------------------------------------------
+SET fasttrun.sample_rows = 0;
+CREATE TEMP TABLE t_abort_anchor (id int, pad text);
+INSERT INTO t_abort_anchor SELECT g, repeat('x', 100) FROM generate_series(1, 20000) g;
+BEGIN;
+SET LOCAL plan_cache_mode = force_generic_plan;
+SELECT fasttrun_analyze('t_abort_anchor');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+PREPARE q_anchor AS SELECT count(*) FROM t_abort_anchor;
+EXECUTE q_anchor;
+ count 
+-------
+ 20000
+(1 row)
+
+SAVEPOINT sp_anchor;
+INSERT INTO t_abort_anchor SELECT g, repeat('x', 100) FROM generate_series(1, 6000) g;
+SELECT fasttrun_analyze('t_abort_anchor');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+ROLLBACK TO SAVEPOINT sp_anchor;
+-- +25% от базы (5000/20000), но лишь ~4% от stale-якоря отменённого analyze:
+-- инвалидация обязана произойти.
+INSERT INTO t_abort_anchor SELECT g, repeat('x', 100) FROM generate_series(1, 5000) g;
+SET client_min_messages = debug1;
+SELECT fasttrun_analyze('t_abort_anchor');
+DEBUG:  fasttrun: invalidating backend-local cached plans
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+RESET client_min_messages;
+DEALLOCATE q_anchor;
+COMMIT;
+DROP TABLE t_abort_anchor;
+RESET fasttrun.sample_rows;
 DROP FUNCTION f_outer(int, int);
 DROP FUNCTION f_inner();
 DROP TABLE t_rsd_details;

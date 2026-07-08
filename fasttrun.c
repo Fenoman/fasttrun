@@ -1051,6 +1051,8 @@ fasttrun_cache_mark_evicted(Oid relid)
 	entry->has_relstats = false;
 	entry->has_delta_state = false;
 	entry->relstats_subid = cur_subid;
+	/* Eviction retires the published state -- the drift anchor with it. */
+	entry->last_inval_valid = false;
 
 	entry->has_stats_baseline = false;
 	entry->stats_baseline_subid = cur_subid;
@@ -3141,6 +3143,7 @@ fasttrun_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 
 						if (OidIsValid(plan_relid))
 							fasttrun_stats_cache_evict_relid(plan_relid);
+						aentry->last_inval_valid = false;
 						fasttrun_invalidate_local_plan_cache(aentry->relid);
 						if (OidIsValid(plan_relid) && plan_relid != aentry->relid)
 							fasttrun_invalidate_local_plan_cache(plan_relid);
@@ -3172,6 +3175,8 @@ fasttrun_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 						aentry->has_delta_state = false;
 						aentry->relstats_subid = InvalidSubTransactionId;
 					}
+					/* Published state rolled back -- the drift anchor with it. */
+					aentry->last_inval_valid = false;
 					plan_inval_needed = true;
 				}
 				else
@@ -5067,11 +5072,20 @@ fasttrun_analyze_relation(Relation rel)
 
 	if (!scan_needed && !stats_recollected)
 	{
-		bool		probe_partial = (have_counters &&
-								 fasttrun_sample_rows != 0 &&
-								 entry != NULL &&
-								 entry->has_stats_baseline);
+		int64		churn = 0;
+		bool		probe_partial;
 		bool		trailing_refresh = !pure_delta_noop;
+
+		if (have_counters && fasttrun_sample_rows != 0 &&
+			entry != NULL && entry->has_stats_baseline)
+		{
+			churn = (ins_now - entry->stats_baseline_inserted)
+				+ (upd_now - entry->stats_baseline_updated)
+				+ (del_now - entry->stats_baseline_deleted);
+			if (churn < 0)
+				churn = -churn;
+		}
+		probe_partial = (churn > 0);
 
 		if (probe_partial || trailing_refresh)
 		{
@@ -5080,14 +5094,6 @@ fasttrun_analyze_relation(Relation rel)
 
 			if (probe_partial)
 			{
-				int64		churn;
-
-				churn = (ins_now - entry->stats_baseline_inserted)
-					+ (upd_now - entry->stats_baseline_updated)
-					+ (del_now - entry->stats_baseline_deleted);
-				if (churn < 0)
-					churn = -churn;
-
 				/*
 				 * Rescan on any churn when a partial index exists.  A small DML
 				 * on the predicate column can change the partial index's covered
@@ -5095,7 +5101,7 @@ fasttrun_analyze_relation(Relation rel)
 				 * flipping a boolean flag on 1% of rows can double the index),
 				 * so the heap ratio cannot gate this rescan.
 				 */
-				if (churn > 0 && fasttrun_index_rels_have_partial(index_rels))
+				if (fasttrun_index_rels_have_partial(index_rels))
 				{
 					int			sample_target = fasttrun_effective_sample_target(rel);
 
