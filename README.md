@@ -175,6 +175,14 @@ make installcheck PG_CONFIG=/path/to/pg_config PGPORT=5433
 
 Все тесты проходят на PG 16.13, 17.9 и 18.3.
 
+Перед релизом набор гоняется на **cassert-сборках** (`--enable-cassert`) PG 16, 17
+и 18 — обычный installcheck не ловит нарушения инвариантов, которые PostgreSQL
+проверяет только под assert (напр. запрет каталожного доступа в
+`RelationIdGetRelation` на границах транзакции, на котором держатся xact-колбэки).
+Скрипт `scripts/check_cassert_allversions.sh` пересобирает расширение под каждую
+cassert-версию и считает assert-падения (`TRAP`); ожидание — 12/12 тестов и ноль
+`TRAP`. Верифицировано на PG 16/17/18.
+
 Для отдельной проверки контракта "ноль shared sinval" на Linux есть smoke-тест с `gdb`:
 
 ```bash
