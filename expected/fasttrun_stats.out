@@ -2180,7 +2180,7 @@ BEGIN;
 SET LOCAL fasttrun.max_analyze_pages = 5;
 SET LOCAL client_min_messages = debug1;
 SELECT fasttrun_analyze('t_giant');
-DEBUG:  fasttrun: block-sampling cold analyze
+DEBUG:  fasttrun: block-sampling analyze scan
 DEBUG:  fasttrun: invalidating backend-local cached plans
  fasttrun_analyze 
 ------------------
@@ -2216,6 +2216,41 @@ SELECT 'giant_block_sample_ok' AS marker;
 
 COMMIT;
 DROP TABLE t_giant;
+-- ----------------------------------------------------------------------
+-- 31b. Тот же guardrail покрывает delta-refresh (не только cold path):
+--      после надпорогового churn пересбор статы на гигантской temp тоже
+--      идёт block-sampling, а не полный O(таблицы) скан.
+-- ----------------------------------------------------------------------
+CREATE TEMP TABLE t_giant_delta (id int, grp int);
+INSERT INTO t_giant_delta SELECT g, g % 100 FROM generate_series(1, 50000) g;
+BEGIN;
+SET LOCAL fasttrun.max_analyze_pages = 5;
+SELECT fasttrun_analyze('t_giant_delta');       -- cold (block-sample, debug тихо)
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+UPDATE t_giant_delta SET grp = grp + 1 WHERE id <= 20000;  -- 40% churn -> refresh
+SET LOCAL client_min_messages = debug1;
+SELECT fasttrun_analyze('t_giant_delta');       -- delta-refresh -> block-sample
+DEBUG:  fasttrun: block-sampling analyze scan
+DEBUG:  fasttrun: invalidating backend-local cached plans
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+RESET client_min_messages;
+SELECT reltuples BETWEEN 37500 AND 62500 AS delta_reltuples_estimate
+  FROM fasttrun_relstats('t_giant_delta');
+ delta_reltuples_estimate 
+--------------------------
+ t
+(1 row)
+
+COMMIT;
+DROP TABLE t_giant_delta;
 -- ----------------------------------------------------------------------
 -- 32. Partial-index relstats при fasttrun.sample_rows = 0.  Без выборки
 --     column-stats отключены, но relpages (физический размер) и

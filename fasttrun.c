@@ -4323,7 +4323,7 @@ fasttrun_block_sample_rows(Relation rel, int64 *tuples_out,
 	TableScanDesc	scan;
 	BufferAccessStrategy strategy;
 
-	elog(DEBUG1, "fasttrun: block-sampling cold analyze");
+	elog(DEBUG1, "fasttrun: block-sampling analyze scan");
 
 	totalblocks = RelationGetNumberOfBlocks(rel);
 	OldestXmin = GetOldestNonRemovableTransactionId(rel);
@@ -4383,6 +4383,31 @@ fasttrun_block_sample_rows(Relation rel, int64 *tuples_out,
 		*tuples_out = 0;
 
 	*sample_count_out = numrows;
+}
+
+/*
+ * Sample rows for analyze, honoring fasttrun.max_analyze_pages: above the
+ * threshold use bounded block sampling (estimated row count, O(sample) cost);
+ * at or below it -- or when the threshold is 0 -- do the exact full scan.
+ * Shared by the cold path, the delta-refresh, and the partial-index rescan so
+ * the giant-temp guardrail covers all three scans, not just the cold one.
+ */
+static void
+fasttrun_sample_for_analyze(Relation rel, BlockNumber pages_now,
+							HeapTuple *sample, int sample_target,
+							int64 *tuples_out, int *sample_count_out)
+{
+	if (fasttrun_max_analyze_pages > 0 &&
+		pages_now > (BlockNumber) fasttrun_max_analyze_pages)
+	{
+		int		block_target = (sample_target > 0) ? sample_target : 3000;
+
+		fasttrun_block_sample_rows(rel, tuples_out, sample,
+								   block_target, sample_count_out);
+	}
+	else
+		fasttrun_scan_with_sample(rel, tuples_out, sample,
+								  sample_target, sample_count_out);
 }
 
 /*
@@ -5055,9 +5080,9 @@ fasttrun_analyze_relation(Relation rel)
 					int			i;
 
 					sample = (HeapTuple *) palloc(sizeof(HeapTuple) * sample_target);
-					fasttrun_scan_with_sample(rel, &scanned_tuples,
-											  sample, sample_target,
-											  &sample_count);
+					fasttrun_sample_for_analyze(rel, pages_now, sample,
+												sample_target, &scanned_tuples,
+												&sample_count);
 					tuples_count = scanned_tuples;
 
 					if (sample_count > 0)
@@ -5138,9 +5163,9 @@ fasttrun_analyze_relation(Relation rel)
 						int			i;
 
 						sample = (HeapTuple *) palloc(sizeof(HeapTuple) * sample_target);
-						fasttrun_scan_with_sample(rel, &scanned_tuples,
-												  sample, sample_target,
-												  &sample_count);
+						fasttrun_sample_for_analyze(rel, pages_now, sample,
+													sample_target, &scanned_tuples,
+													&sample_count);
 						tuples_count = scanned_tuples;
 						index_relstats_changed |=
 							fasttrun_update_index_relstats(rel, index_rels,
@@ -5196,24 +5221,12 @@ fasttrun_analyze_relation(Relation rel)
 		if (pages_now > 0)
 		{
 			/*
-			 * Giant temp table: switch the cold scan to bounded block
-			 * sampling (estimated row count, like core ANALYZE) so cost stays
-			 * O(sample) instead of O(table).  Below the threshold, or when it
-			 * is 0, keep the exact full scan.  Column stats are sampled with
-			 * the configured target; when they are disabled a floor target
-			 * still bounds the count estimate.
+			 * Giant temp table: block-sample above max_analyze_pages (estimated
+			 * row count, O(sample)); exact full scan at or below.  Same helper
+			 * gates the delta-refresh and partial-index rescans.
 			 */
-			if (fasttrun_max_analyze_pages > 0 &&
-				pages_now > (BlockNumber) fasttrun_max_analyze_pages)
-			{
-				int		block_target = (sample_target > 0) ? sample_target : 3000;
-
-				fasttrun_block_sample_rows(rel, &tuples_count, sample,
-										   block_target, &sample_count);
-			}
-			else
-				fasttrun_scan_with_sample(rel, &tuples_count,
-										  sample, sample_target, &sample_count);
+			fasttrun_sample_for_analyze(rel, pages_now, sample, sample_target,
+										&tuples_count, &sample_count);
 		}
 
 		if (sample != NULL && sample_count > 0)

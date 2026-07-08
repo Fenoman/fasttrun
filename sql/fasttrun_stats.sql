@@ -1394,6 +1394,26 @@ COMMIT;
 DROP TABLE t_giant;
 
 -- ----------------------------------------------------------------------
+-- 31b. Тот же guardrail покрывает delta-refresh (не только cold path):
+--      после надпорогового churn пересбор статы на гигантской temp тоже
+--      идёт block-sampling, а не полный O(таблицы) скан.
+-- ----------------------------------------------------------------------
+CREATE TEMP TABLE t_giant_delta (id int, grp int);
+INSERT INTO t_giant_delta SELECT g, g % 100 FROM generate_series(1, 50000) g;
+
+BEGIN;
+SET LOCAL fasttrun.max_analyze_pages = 5;
+SELECT fasttrun_analyze('t_giant_delta');       -- cold (block-sample, debug тихо)
+UPDATE t_giant_delta SET grp = grp + 1 WHERE id <= 20000;  -- 40% churn -> refresh
+SET LOCAL client_min_messages = debug1;
+SELECT fasttrun_analyze('t_giant_delta');       -- delta-refresh -> block-sample
+RESET client_min_messages;
+SELECT reltuples BETWEEN 37500 AND 62500 AS delta_reltuples_estimate
+  FROM fasttrun_relstats('t_giant_delta');
+COMMIT;
+DROP TABLE t_giant_delta;
+
+-- ----------------------------------------------------------------------
 -- 32. Partial-index relstats при fasttrun.sample_rows = 0.  Без выборки
 --     column-stats отключены, но relpages (физический размер) и
 --     reltuples partial-индекса всё равно должны обновляться: relpages
