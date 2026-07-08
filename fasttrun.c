@@ -6175,22 +6175,39 @@ static void
 fasttrun_evict_temp_relid(Oid relid)
 {
 	Relation	rel;
+	HeapTuple	tp;
+	Form_pg_class relform;
+	bool		is_our_temp;
 
 	if (!OidIsValid(relid))
 		return;
 
 	/*
-	 * One relcache lookup is enough.  try_relation_open returns the
-	 * Relation with rd_rel already populated -- persistence and namespace
-	 * checks become cheap pointer derefs.  Before this, two SearchSysCache1
-	 * calls fired on every utility_hook eviction
-	 * (get_rel_persistence + get_rel_namespace).  That dominated the path
-	 * on workloads with many CREATE TEMP TABLE IF NOT EXISTS statements.
-	 *
-	 * The utility hook runs before the DDL takes its own lock, so opening
-	 * with NoLock would trip the lock-discipline assert in relation_open
-	 * on assert-enabled builds.  Take a transient AccessShareLock and
-	 * release it at close; the DDL acquires its stronger lock right after.
+	 * Filter with one syscache probe BEFORE taking any lock.  The hook runs
+	 * for every DDL target, and waiting on somebody else's lock here would
+	 * defeat conditional-locking callers such as VACUUM (SKIP_LOCKED).
+	 * Only this backend's own temp relations proceed to the open below,
+	 * where the AccessShareLock is uncontended.
+	 */
+	tp = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
+	if (!HeapTupleIsValid(tp))
+	{
+		fasttrun_cache_mark_evicted(relid);
+		fasttrun_stats_cache_mark_evicted_relid(relid);
+		fasttrun_invalidate_local_plan_cache(relid);
+		return;
+	}
+	relform = (Form_pg_class) GETSTRUCT(tp);
+	is_our_temp = (relform->relpersistence == RELPERSISTENCE_TEMP &&
+				   isTempNamespace(relform->relnamespace));
+	ReleaseSysCache(tp);
+	if (!is_our_temp)
+		return;
+
+	/*
+	 * relation_open with NoLock would trip the lock-discipline assert on
+	 * assert-enabled builds (the DDL has not taken its own lock yet), so
+	 * take a transient AccessShareLock and release it at close.
 	 */
 	rel = try_relation_open(relid, AccessShareLock);
 	if (rel == NULL)
@@ -6198,13 +6215,6 @@ fasttrun_evict_temp_relid(Oid relid)
 		fasttrun_cache_mark_evicted(relid);
 		fasttrun_stats_cache_mark_evicted_relid(relid);
 		fasttrun_invalidate_local_plan_cache(relid);
-		return;
-	}
-
-	if (rel->rd_rel->relpersistence != RELPERSISTENCE_TEMP ||
-		!isTempNamespace(RelationGetNamespace(rel)))
-	{
-		relation_close(rel, AccessShareLock);
 		return;
 	}
 
