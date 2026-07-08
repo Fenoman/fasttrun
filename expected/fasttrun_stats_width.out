@@ -72,7 +72,9 @@ RESET fasttrun.sample_rows;
 -- по ХРАНИМОМУ (сжатому) размеру, detoast только для сравнений;
 -- (б) bounded-set (каждое значение повторяется, distinct > 10% строк) —
 -- негативная форма n_distinct, как ядерное 10%-масштабирование.
--- toast_tuple_target=128 форсирует inline-сжатие при raw <= 1024.
+-- PLAIN-балласт (~1600 Б) раздувает tuple за TOAST_TUPLE_THRESHOLD:
+-- тостер сжимает только big (raw <= 1024 — мимо toowide), сжатое
+-- значение остаётся inline.
 -- ======================================================================
 SET fasttrun.use_typanalyze = off;
 SET fasttrun.sample_rows = -1;
