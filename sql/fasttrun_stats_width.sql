@@ -62,4 +62,44 @@ DROP TABLE t_hs_parity;
 RESET fasttrun.use_typanalyze;
 RESET fasttrun.sample_rows;
 
+-- ======================================================================
+-- Паритет с ядром, продолжение: (а) inline-compressed varlena — stawidth
+-- по ХРАНИМОМУ (сжатому) размеру, detoast только для сравнений;
+-- (б) bounded-set (каждое значение повторяется, distinct > 10% строк) —
+-- негативная форма n_distinct, как ядерное 10%-масштабирование.
+-- toast_tuple_target=128 форсирует inline-сжатие при raw <= 1024.
+-- ======================================================================
+
+SET fasttrun.use_typanalyze = off;
+SET fasttrun.sample_rows = -1;
+
+CREATE TEMP TABLE t_hs_parity2 (id int, pad text, big text, grp int);
+ALTER TABLE t_hs_parity2 ALTER COLUMN pad SET STORAGE PLAIN;
+INSERT INTO t_hs_parity2
+SELECT g, repeat('x', 1600), repeat('ab', 450) || (g % 4), g % 50
+FROM generate_series(1, 100) g;
+
+SELECT fasttrun_collect_stats('t_hs_parity2');
+
+CREATE TABLE t_hs_parity2_ref (id int, pad text, big text, grp int);
+ALTER TABLE t_hs_parity2_ref ALTER COLUMN pad SET STORAGE PLAIN;
+INSERT INTO t_hs_parity2_ref SELECT * FROM t_hs_parity2;
+ANALYZE t_hs_parity2_ref;
+
+SELECT (SELECT s.stawidth FROM fasttrun_inspect_stats('t_hs_parity2') s
+         WHERE s.staattnum = 3)
+     = (SELECT p.avg_width FROM pg_stats p
+         WHERE p.tablename = 't_hs_parity2_ref' AND p.attname = 'big')
+       AS hs_width_compressed_parity,
+       (SELECT s.stadistinct FROM fasttrun_inspect_stats('t_hs_parity2') s
+         WHERE s.staattnum = 4)
+     = (SELECT p.n_distinct FROM pg_stats p
+         WHERE p.tablename = 't_hs_parity2_ref' AND p.attname = 'grp')
+       AS hs_bounded_ndistinct_parity;
+
+DROP TABLE t_hs_parity2_ref;
+DROP TABLE t_hs_parity2;
+RESET fasttrun.use_typanalyze;
+RESET fasttrun.sample_rows;
+
 DROP EXTENSION fasttrun;

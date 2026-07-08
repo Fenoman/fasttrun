@@ -2457,26 +2457,31 @@ fasttrun_estimate_ndistinct(int n_nonnull, int ndistinct, int nmultiple,
 		return (float4) (-1.0 * (1.0 - stanullfrac));
 	}
 	if (ndistinct == nmultiple)
-		return (float4) ndistinct;		/* bounded set */
-
-	/*
-	 * Haas-Stokes Duj1, exactly as core compute_scalar_stats():
-	 * n*d / (n - f1 + f1*n/N), nulls excluded from both n and N.
-	 */
-	f1 = ndistinct - nmultiple;
-	n = (double) n_nonnull;
-	N = (double) totalrows * (1.0 - stanullfrac);
-
-	if (N > 0)
-		estimate = (n * (double) ndistinct) /
-			((n - (double) f1) + (double) f1 * n / N);
-	else
-		estimate = 0;
-
-	if (estimate < (double) ndistinct)
+	{
+		/* Bounded set: the sample says the column has just these values. */
 		estimate = (double) ndistinct;
-	if (estimate > N)
-		estimate = N;
+	}
+	else
+	{
+		/*
+		 * Haas-Stokes Duj1, exactly as core compute_scalar_stats():
+		 * n*d / (n - f1 + f1*n/N), nulls excluded from both n and N.
+		 */
+		f1 = ndistinct - nmultiple;
+		n = (double) n_nonnull;
+		N = (double) totalrows * (1.0 - stanullfrac);
+
+		if (N > 0)
+			estimate = (n * (double) ndistinct) /
+				((n - (double) f1) + (double) f1 * n / N);
+		else
+			estimate = 0;
+
+		if (estimate < (double) ndistinct)
+			estimate = (double) ndistinct;
+		if (estimate > N)
+			estimate = N;
+	}
 	estimate = floor(estimate + 0.5);
 
 	if (estimate > 0.1 * (double) totalrows)
@@ -4022,20 +4027,22 @@ fasttrun_collect_and_store(Relation rel, HeapTuple *sample, int sample_count,
 					 * probe reads the raw length from the header without
 					 * detoasting.
 					 */
+					/* Stored (possibly compressed) width, as core: before detoast. */
+					total_width += VARSIZE_ANY(DatumGetPointer(d));
+
 					if (toast_raw_datum_size(d) > FASTTRUN_WIDTH_THRESHOLD)
 					{
 						toowide_cnt++;
-						total_width += VARSIZE_ANY(DatumGetPointer(d));
 						n_nonnull++;
 						continue;
 					}
 
-					/* In-range varlena: detoast for sort stability. */
+					/* In-range varlena: detoast once, for the comparisons only. */
 					{
 						struct varlena *detoasted = pg_detoast_datum_packed(
 							(struct varlena *) DatumGetPointer(d));
+
 						values[n_array++] = PointerGetDatum(detoasted);
-						total_width += VARSIZE_ANY(detoasted);
 					}
 				}
 				else
