@@ -15,6 +15,10 @@ WORKDIR=${WORKDIR:-$(mktemp -d /tmp/fasttrun-perf.XXXXXX)}
 DBNAME=${DBNAME:-fasttrun_perf}
 TRACE_SECONDS=${TRACE_SECONDS:-6}
 FASTTRUN_SO=${FASTTRUN_SO:-"$PG_PKGLIBDIR/fasttrun.so"}
+# Строгий SLO fasttruncate на 1M-row temp таблице с индексом, мс.
+# pg_regress-порог в sql/fasttrun_bench.sql намеренно мягкий (500 мс,
+# не флапает на медленных боксах); жёсткая планка живёт здесь.
+MAX_TRUNC_MS=${MAX_TRUNC_MS:-100}
 
 cleanup()
 {
@@ -268,5 +272,38 @@ assert_count "no-DML RelationGetNumberOfBlocksInFork" \
 assert_count "no-DML smgrnblocks" \
 	"$(map_count @smgr "$WORKDIR/no_dml_analyze.trace")" eq 0
 echo "no_dml_analyze passed"
+
+# Строгий тайминговый SLO: fasttruncate 1M-row temp таблицы с индексом
+# укладывается в MAX_TRUNC_MS.  Чистый psql, bpftrace не нужен.
+cat >"$WORKDIR/trunc_slo.sql" <<SQL
+CREATE TEMP TABLE ft_trunc_slo (id bigint, payload text);
+INSERT INTO ft_trunc_slo
+SELECT g, md5(g::text) FROM generate_series(1, 1000000) g;
+CREATE INDEX ON ft_trunc_slo (id);
+DO \$\$
+DECLARE
+    t_start timestamptz;
+    t_ms    numeric;
+BEGIN
+    t_start := clock_timestamp();
+    PERFORM fasttruncate('ft_trunc_slo');
+    t_ms := EXTRACT(EPOCH FROM (clock_timestamp() - t_start)) * 1000;
+    RAISE NOTICE 'fasttruncate 1M-row temp table: % ms (limit $MAX_TRUNC_MS ms)',
+                 round(t_ms, 2);
+    IF t_ms > $MAX_TRUNC_MS THEN
+        RAISE EXCEPTION 'fasttruncate SLO exceeded: % ms > $MAX_TRUNC_MS ms',
+                        round(t_ms, 2);
+    END IF;
+END\$\$;
+SQL
+"$PSQL" -h "$WORKDIR" -p "$PORT" -d "$DBNAME" -X -qAt \
+	-v ON_ERROR_STOP=1 -f "$WORKDIR/trunc_slo.sql" \
+	>"$WORKDIR/trunc_slo.psql.out" 2>&1 || {
+	cat "$WORKDIR/trunc_slo.psql.out" >&2
+	echo "trunc_slo failed" >&2
+	exit 1
+}
+grep 'fasttruncate 1M-row' "$WORKDIR/trunc_slo.psql.out" || true
+echo "trunc_slo passed"
 
 echo "fasttrun perf smoke passed"

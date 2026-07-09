@@ -23,7 +23,9 @@
 --   * полный reservoir refresh после массового DML не
 --     медленнее 500 мс;
 --   * ускорение тёплый/холодный не менее 20x;
---   * fasttruncate миллионной таблицы не медленнее 100 мс.
+--   * fasttruncate миллионной таблицы не медленнее 500 мс (на быстром
+--     железе это единицы-десятки мс; строгий SLO с настраиваемым
+--     порогом живёт в scripts/check_fasttrun_perf_smoke.sh).
 -- Эти пороги намеренно консервативны: на любом современном железе
 -- (включая медленные CI-раннеры) они выполняются с большим запасом
 -- — обычные локальные значения: ускорение 1000x+, доли мс на тёплый
@@ -347,8 +349,8 @@ BEGIN
 
     RAISE NOTICE 'fasttruncate of 1M-row wide table: % ms', round(t_trunc, 2);
 
-    IF t_trunc > 100 THEN
-        RAISE EXCEPTION 'fasttruncate too slow on 1M-row table: % ms (expected <100)',
+    IF t_trunc > 500 THEN
+        RAISE EXCEPTION 'fasttruncate too slow on 1M-row table: % ms (expected <500)',
                         round(t_trunc, 2);
     END IF;
 

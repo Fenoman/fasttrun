@@ -146,7 +146,10 @@ fi
 
 extract_bytes()
 {
-	# вывод: "fasttrun analyze cache|<used_bytes>"; берём первое число.
+	# вывод: "fasttrun analyze cache|<used_bytes>"; суммируем used_bytes
+	# по ВСЕМ строкам совпадения -- контекстов с этим именем может быть
+	# несколько (родитель + дочерние), и утечка в непервом была бы
+	# невидима при захвате только первой строки.
 	local begin="$1"
 	local end="$2"
 	awk -v b="$begin" -v e="$end" '
@@ -155,9 +158,10 @@ extract_bytes()
 		capture && /fasttrun analyze cache\|/ {
 			n = $0
 			sub(/^.*\|/, "", n)
-			print n
-			exit
+			sum += n
+			seen = 1
 		}
+		END { if (seen) print sum }
 	' "$WORKDIR/leak.out"
 }
 
