@@ -4676,17 +4676,26 @@ fasttrun_rebuild_one_index(Relation heaprel, Relation indexrel)
 /*
  * Zero-sinval truncate of a relation AND all its indexes and toast.
  *
- * Mirrors heap_truncate_one_rel():
- *   1. Truncate the heap via fasttrun_smgr_bypass_truncate.
- *   2. Drop the storage of every index, the toast table and its indexes
- *      (phase 1), then run every ambuild (phase 2).
+ * The ordering is load-bearing: no reachable failure state may pair an
+ * emptied heap with an index still holding old TIDs, because after a
+ * refill such an index silently resolves them to unrelated new rows.
  *
- * The two phases are load-bearing: with ALL index storage gone before the
- * first ambuild, a failure anywhere (OOM in ambuild, disk error) leaves at
- * worst an empty index file without a metapage, and any scan of it fails
- * loudly.  Rebuilding index-by-index would leave the indexes past the
- * failure point untouched -- still carrying old TIDs that silently resolve
- * to wrong rows once the heap is refilled.
+ *   1. Open every index, the toast table and its indexes BEFORE any
+ *      destructive call.  A failure here leaves the table untouched.
+ *   2. Phase 1: drop the storage of every index and toast (unlink +
+ *      smgrcreate); the heap keeps its data.  A failure mid-way leaves
+ *      the heap correct: untouched indexes stay valid, already-emptied
+ *      ones fail loudly on their missing metapage.
+ *   3. Truncate the heap -- the last destructive step; every index is
+ *      already empty by now.
+ *   4. Phase 2: run every ambuild to recreate the empty index
+ *      structures (metapages).
+ *
+ * Keeping phase 1 apart from phase 2 is equally load-bearing: with ALL
+ * index storage gone before the first ambuild, a failure in any ambuild
+ * (OOM, disk error) leaves at worst an empty index without a metapage,
+ * and any scan of it fails loudly.  Rebuilding index-by-index would
+ * leave the indexes past the failure point still carrying old TIDs.
  */
 static void
 fasttrun_full_bypass_truncate(Relation rel)
@@ -4696,40 +4705,43 @@ fasttrun_full_bypass_truncate(Relation rel)
 	Relation	toastrel = NULL;
 	ListCell   *lc;
 	Oid			toastrelid;
-
-	/* 1. Truncate the heap itself. */
-	fasttrun_smgr_bypass_truncate(rel);
+	List	   *index_oids;
 
 	/*
-	 * 2. Indexes and toast.  On failure the table stays half-truncated:
-	 * heap empty, some indexes without a metapage.  The temp table is
-	 * owned exclusively by this backend, so the damage is contained; a
-	 * WARNING tells the user to DROP the table.
+	 * 1. Open everything before the first destructive call.  An error in
+	 * here propagates with the table fully intact; (sub)transaction abort
+	 * releases the refcounts and locks.
+	 */
+	index_oids = RelationGetIndexList(rel);
+	foreach(lc, index_oids)
+		indexes = lappend(indexes,
+						  index_open(lfirst_oid(lc), AccessExclusiveLock));
+	list_free(index_oids);
+
+	toastrelid = rel->rd_rel->reltoastrelid;
+	if (OidIsValid(toastrelid))
+	{
+		List	   *toast_index_oids;
+
+		toastrel = table_open(toastrelid, AccessExclusiveLock);
+		toast_index_oids = RelationGetIndexList(toastrel);
+		foreach(lc, toast_index_oids)
+			toast_indexes = lappend(toast_indexes,
+									index_open(lfirst_oid(lc),
+											   AccessExclusiveLock));
+		list_free(toast_index_oids);
+	}
+
+	/*
+	 * 2-4. Destructive part.  On failure the table is left with empty
+	 * indexes and possibly an empty heap; every such state errors out
+	 * loudly on access instead of returning stale rows.  The temp table
+	 * is owned exclusively by this backend, so the damage is contained;
+	 * a WARNING tells the user to DROP the table.
 	 */
 	PG_TRY();
 	{
-		List	   *index_oids = RelationGetIndexList(rel);
-
-		foreach(lc, index_oids)
-			indexes = lappend(indexes,
-							  index_open(lfirst_oid(lc), AccessExclusiveLock));
-		list_free(index_oids);
-
-		toastrelid = rel->rd_rel->reltoastrelid;
-		if (OidIsValid(toastrelid))
-		{
-			List	   *toast_index_oids;
-
-			toastrel = table_open(toastrelid, AccessExclusiveLock);
-			toast_index_oids = RelationGetIndexList(toastrel);
-			foreach(lc, toast_index_oids)
-				toast_indexes = lappend(toast_indexes,
-										index_open(lfirst_oid(lc),
-												   AccessExclusiveLock));
-			list_free(toast_index_oids);
-		}
-
-		/* Phase 1: drop the storage of everything. */
+		/* Phase 1: drop the storage of every index and toast. */
 		foreach(lc, indexes)
 			fasttrun_smgr_bypass_truncate((Relation) lfirst(lc));
 		if (toastrel != NULL)
@@ -4739,20 +4751,14 @@ fasttrun_full_bypass_truncate(Relation rel)
 				fasttrun_smgr_bypass_truncate((Relation) lfirst(lc));
 		}
 
+		/* Heap last: every index is empty by now. */
+		fasttrun_smgr_bypass_truncate(rel);
+
 		/* Phase 2: rebuild the empty index structures. */
 		foreach(lc, indexes)
 			fasttrun_rebuild_one_index(rel, (Relation) lfirst(lc));
 		foreach(lc, toast_indexes)
 			fasttrun_rebuild_one_index(toastrel, (Relation) lfirst(lc));
-
-		foreach(lc, indexes)
-			index_close((Relation) lfirst(lc), NoLock);
-		list_free(indexes);
-		foreach(lc, toast_indexes)
-			index_close((Relation) lfirst(lc), NoLock);
-		list_free(toast_indexes);
-		if (toastrel != NULL)
-			table_close(toastrel, NoLock);
 	}
 	PG_CATCH();
 	{
@@ -4765,6 +4771,15 @@ fasttrun_full_bypass_truncate(Relation rel)
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
+
+	foreach(lc, indexes)
+		index_close((Relation) lfirst(lc), NoLock);
+	list_free(indexes);
+	foreach(lc, toast_indexes)
+		index_close((Relation) lfirst(lc), NoLock);
+	list_free(toast_indexes);
+	if (toastrel != NULL)
+		table_close(toastrel, NoLock);
 }
 
 /*
