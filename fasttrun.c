@@ -1461,6 +1461,9 @@ typedef struct FasttrunStatsEntry
 											 * survives a temp table's commit */
 	SubTransactionId	collected_subid;	/* subxact in which this entry
 											 * was (re)published */
+	bool				was_usable;		/* entry passed the freshness check at
+										 * the last analyze/publish; drives the
+										 * visible->hidden flip detection */
 	FasttrunStatsSavedState *undo;		/* stack of older versions saved
 										 * at each subxact-boundary store */
 } FasttrunStatsEntry;
@@ -2599,6 +2602,8 @@ fasttrun_stats_cache_store(Oid relid, AttrNumber attnum, HeapTuple statsTuple,
 	entry->collected_truncdropped = truncdropped;
 	entry->collected_pages = pages;
 	entry->collected_subid = cur_subid;
+	/* Freshly published stats are within tolerance by construction. */
+	entry->was_usable = true;
 
 	if (!had_visible)
 		fasttrun_stats_relid_ref(relid);
@@ -2951,6 +2956,63 @@ fasttrun_stats_cache_mark_evicted_relid(Oid relid)
 
 	list_free(keys);
 	return changed;
+}
+
+/*
+ * Detect a visible->hidden flip of this relid's cached column stats.
+ *
+ * The freshness gate (fasttrun_stats_entry_usable) hides an entry from the
+ * planner once churn passes the cardinality-scaled tolerance, while the
+ * refresh path recollects only at the flat stats_refresh_threshold.  In the
+ * band between them new plans fall back to defaults, but a cached generic
+ * plan built on the now-hidden distribution would keep running -- the flip
+ * must invalidate it.
+ *
+ * Walks only this relid's attkeys backref (O(#cached-cols)), recomputes
+ * usability with the same check the planner hook applies, and refreshes each
+ * entry's was_usable marker.  The marker moves only here and on publish --
+ * never from the planner hooks -- so detection does not depend on whether
+ * anything was planned between two analyze calls.  Returns true when at
+ * least one column that served stats at the last analyze no longer does.
+ */
+static bool
+fasttrun_stats_note_visibility(Oid relid, bool have_counters,
+							   int64 ins_now, int64 upd_now, int64 del_now,
+							   bool truncdropped_now, BlockNumber pages_now)
+{
+	FasttrunStatsRelidEntry *relentry;
+	ListCell   *lc;
+	bool		flipped = false;
+
+	if (fasttrun_stats_cache == NULL || fasttrun_stats_relid_cache == NULL)
+		return false;
+
+	relentry = (FasttrunStatsRelidEntry *) hash_search(fasttrun_stats_relid_cache,
+													   &relid, HASH_FIND, NULL);
+	if (relentry == NULL || relentry->attkeys == NIL)
+		return false;
+
+	foreach(lc, relentry->attkeys)
+	{
+		FasttrunStatsKey *key = (FasttrunStatsKey *) lfirst(lc);
+		FasttrunStatsEntry *entry;
+		bool		usable_now;
+
+		entry = (FasttrunStatsEntry *) hash_search(fasttrun_stats_cache,
+												   key, HASH_FIND, NULL);
+		if (entry == NULL || entry->statsTuple == NULL)
+			continue;			/* no published stats -- nothing to flip */
+
+		/* The planner hook hides stats when pgstat is unavailable too. */
+		usable_now = have_counters &&
+			fasttrun_stats_entry_usable(relid, entry, ins_now, upd_now,
+										del_now, truncdropped_now, pages_now);
+		if (entry->was_usable && !usable_now)
+			flipped = true;
+		entry->was_usable = usable_now;
+	}
+
+	return flipped;
 }
 
 /*
@@ -5287,6 +5349,19 @@ fasttrun_analyze_relation(Relation rel)
 			fasttrun_cache_store_delta_state(entry, ins_now, upd_now, del_now,
 											 truncdropped_now);
 	}
+
+	/*
+	 * Column stats that served plans at the last analyze but are hidden by
+	 * the freshness gate now (e.g. a near-unique column whose scaled
+	 * tolerance sits below the recollect threshold) force invalidation:
+	 * new plans already see defaults, so a cached plan on the stale
+	 * distribution must not outlive the flip.  Runs against the state just
+	 * published above -- exactly what the planner hook will see next.
+	 */
+	if (fasttrun_stats_note_visibility(relOid, have_counters, ins_now,
+									   upd_now, del_now, truncdropped_now,
+									   pages_now))
+		stats_visibility_changed = true;
 
 	need_plan_inval = (old_pages != pages_now ||
 					   old_tuples != (float4) tuples_count ||

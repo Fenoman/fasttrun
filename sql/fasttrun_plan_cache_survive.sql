@@ -438,6 +438,66 @@ COMMIT;
 
 DROP TABLE t_inval_dedup;
 
+-- ----------------------------------------------------------------------
+-- 12. Смена видимости column stats инвалидирует generic plan.  Near-unique
+--     колонка получает cardinality-scaled freshness-порог (пол 5%), а
+--     пересбор статы гейтится плоским stats_refresh_threshold (20%):
+--     churn в полосе между ними прячет стату от новых планов без
+--     пересбора.  Generic план, построенный на видимой стате (grp=$1 ->
+--     оценка ~1 строка), обязан инвалидироваться тем же fasttrun_analyze,
+--     который наблюдает флип visible->hidden, иначе живёт на stale rows=1
+--     при факте 10000.  Всё в одной транзакции: analyze в новой xact идёт
+--     cold-recollect'ом и инвалидирует безусловно.  Считаем по
+--     DEBUG-строке из fasttrun_invalidate_local_plan_cache.
+-- ----------------------------------------------------------------------
+BEGIN;
+SET LOCAL plan_cache_mode = force_generic_plan;
+CREATE TEMP TABLE t_vis_flip (id int, grp int) WITH (fillfactor = 70);
+INSERT INTO t_vis_flip SELECT g, g FROM generate_series(1, 100000) g;
+SELECT fasttrun_analyze('t_vis_flip');
+
+PREPARE q_flip(int) AS SELECT count(*) FROM t_vis_flip WHERE grp = $1;
+EXECUTE q_flip(1);
+
+-- Generic план на видимой стате: near-unique grp -> оценка ~1 строка.
+DO $$
+DECLARE ln text; est int := NULL;
+BEGIN
+  FOR ln IN EXPLAIN EXECUTE q_flip(1) LOOP
+    IF ln ~ 'on t_vis_flip' THEN est := substring(ln FROM 'rows=(\d+)')::int; EXIT; END IF;
+  END LOOP;
+  IF est IS NULL OR est > 50 THEN
+    RAISE EXCEPTION 'baseline generic plan not built on cached stats: est=%', est;
+  END IF;
+END$$;
+SELECT 'vis_flip_baseline_ok' AS marker;
+
+-- 10% churn: выше 5%-пола near-unique колонки (стата прячется от новых
+-- планов), ниже 20%-порога пересбора.
+UPDATE t_vis_flip SET grp = 1 WHERE id <= 10000;
+
+SET client_min_messages = debug1;
+SELECT fasttrun_analyze('t_vis_flip');
+RESET client_min_messages;
+
+-- План обязан перепланироваться: оценка коллапсирует к defaults (~500),
+-- а не остаётся stale rows=1 от спрятанной статы.
+DO $$
+DECLARE ln text; est int := NULL;
+BEGIN
+  FOR ln IN EXPLAIN EXECUTE q_flip(1) LOOP
+    IF ln ~ 'on t_vis_flip' THEN est := substring(ln FROM 'rows=(\d+)')::int; EXIT; END IF;
+  END LOOP;
+  IF est IS NULL OR est < 100 THEN
+    RAISE EXCEPTION 'stale generic plan after visibility flip: est=%', est;
+  END IF;
+END$$;
+SELECT 'vis_flip_replanned_ok' AS marker;
+
+DEALLOCATE q_flip;
+COMMIT;
+DROP TABLE t_vis_flip;
+
 DROP FUNCTION f_inner();
 DROP TABLE t_rsd_details;
 DROP TABLE t_balance_out;
