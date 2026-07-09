@@ -178,11 +178,41 @@ static pg_prng_state fasttrun_prng_state;
  * holding many ON-COMMIT-DELETE-ROWS temp tables paid O(cache_size)
  * work per COMMIT.  That dominated CPU.
  *
- * Membership uses list_member_oid -- a flat array of Oids.  For typical
- * temp workloads (a few dozen relids per xact at most) the linear scan
- * beats maintaining a hash.
+ * Membership starts as list_member_oid -- a flat array of Oids that the
+ * linear scan beats a hash on for typical temp workloads (a few dozen
+ * relids per xact).  Past FASTTRUN_TOUCHED_LIST_MAX relids a membership
+ * HTAB (also TopTransactionContext) takes over the duplicate check, or
+ * the per-add scan would go quadratic on xacts touching thousands of
+ * relids.  The list stays authoritative for walk order; the hash mirrors
+ * its members and serves lookups only.
  */
+#define FASTTRUN_TOUCHED_LIST_MAX	64
+
 static List *fasttrun_xact_touched_oids = NIL;
+static HTAB *fasttrun_xact_touched_hash = NULL;
+
+static void
+fasttrun_xact_touched_promote(void)
+{
+	HASHCTL		ctl;
+	ListCell   *lc;
+
+	memset(&ctl, 0, sizeof(ctl));
+	ctl.keysize = sizeof(Oid);
+	ctl.entrysize = sizeof(Oid);
+	ctl.hcxt = TopTransactionContext;
+	fasttrun_xact_touched_hash =
+		hash_create("fasttrun touched relids",
+					2 * FASTTRUN_TOUCHED_LIST_MAX,
+					&ctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+
+	foreach(lc, fasttrun_xact_touched_oids)
+	{
+		Oid			oid = lfirst_oid(lc);
+
+		(void) hash_search(fasttrun_xact_touched_hash, &oid, HASH_ENTER, NULL);
+	}
+}
 
 static inline void
 fasttrun_xact_touch_relid(Oid relid)
@@ -191,8 +221,24 @@ fasttrun_xact_touch_relid(Oid relid)
 
 	if (!OidIsValid(relid))
 		return;
-	if (list_member_oid(fasttrun_xact_touched_oids, relid))
-		return;
+
+	if (fasttrun_xact_touched_hash == NULL)
+	{
+		if (list_member_oid(fasttrun_xact_touched_oids, relid))
+			return;
+		if (list_length(fasttrun_xact_touched_oids) >= FASTTRUN_TOUCHED_LIST_MAX)
+			fasttrun_xact_touched_promote();
+	}
+
+	if (fasttrun_xact_touched_hash != NULL)
+	{
+		bool		found;
+
+		(void) hash_search(fasttrun_xact_touched_hash, &relid, HASH_ENTER,
+						   &found);
+		if (found)
+			return;
+	}
 
 	oldcxt = MemoryContextSwitchTo(TopTransactionContext);
 	fasttrun_xact_touched_oids = lappend_oid(fasttrun_xact_touched_oids, relid);
@@ -274,9 +320,10 @@ fasttrun_xact_dropped_subxact(SubXactEvent event, SubTransactionId mySubid,
 static inline void
 fasttrun_xact_touched_clear(void)
 {
-	/* Both lists sit in TopTransactionContext -- about to be reset, or
-	 * already was.  Just drop the pointers. */
+	/* Lists and membership hash sit in TopTransactionContext -- about to
+	 * be reset, or already was.  Just drop the pointers. */
 	fasttrun_xact_touched_oids = NIL;
+	fasttrun_xact_touched_hash = NULL;
 	fasttrun_xact_dropped_relids = NIL;
 }
 
