@@ -22,7 +22,7 @@
 |---|---|---|
 | `fasttruncate(text)` | Очищает временную таблицу (heap + индексы + toast) | **нет** |
 | `fasttrun_analyze(text)` | Публикует `relpages/reltuples` + собирает статистику колонок | **нет** |
-| `fasttrun_analyze_bulk(VARIADIC text[])` | Batch-вариант `fasttrun_analyze` для нескольких таблиц за один вызов. Plan-cache invalidations идут inline на каждой таблице, но первая помечает задетые cached SPI/PREPARE планы `is_valid=false`, и каждая следующая в этом батче short-circuit'ится в core's `PlanCacheRelCallback` по этому флагу - O(1) на сообщение. Используется в циклах с многими temp таблицами в одной транзакции. | **нет** |
+| `fasttrun_analyze_bulk(VARIADIC text[])` | Batch-вариант `fasttrun_analyze` для нескольких таблиц за один вызов. Plan-cache invalidation идёт inline на каждой таблице, и каждая заставляет ядро пройти весь список cached-планов (`PlanCacheRelCallback`): N таблиц — N проходов. Экономия только per-plan: план, уже помеченный `is_valid=false` ранней инвалидацией батча, пропускается дёшево, а не перепомечается. Используется в циклах с многими temp таблицами в одной транзакции. | **нет** |
 | `fasttrun_collect_stats(text)` | Явный сбор статистики колонок. В 99% случаев достаточно `fasttrun_analyze` — он делает то же самое автоматически при первом проходе. Эта функция нужна только если автосбор отключён (`auto_collect_stats=off`) или хочется принудительно пересобрать статистику | **нет** |
 | `fasttrun_relstats(text)` | Возвращает текущие `relpages/reltuples` из памяти процесса | **нет** |
 | `fasttrun_inspect_stats(text)` | Возвращает кешированные statsTuple в формате `pg_statistic` (для отладки) | **нет** |
@@ -61,7 +61,7 @@
 
 Перед очисткой вызывается `CheckTableNotInUse` — та же проверка, что делает обычный SQL `TRUNCATE`. Если на таблице висит открытый курсор или активный запрос, будет понятная SQL-ошибка, а не PANIC.
 
-Запасной путь: `SET fasttrun.zero_sinval_truncate = off` — возвращает на `heap_truncate_one_rel` (одно SMGR sinval-сообщение за вызов).
+Запасной путь: `SET fasttrun.zero_sinval_truncate = off` — возвращает на `heap_truncate_one_rel`. Ядерный путь шлёт несколько shared smgr/relcache sinval-сообщений на каждое затронутое отношение (heap, каждый индекс, toast): на таблице с одним индексом это порядка десятка сообщений.
 
 ## Как работает fasttrun_analyze
 
@@ -107,7 +107,7 @@ Partial-индексы: их `reltuples` пересэмплируется при
 | `fasttrun.max_analyze_pages` | `100000` | Порог heap-страниц (~800 MB), выше которого `fasttrun_analyze` переходит с полного скана на block-sampling: читает ограниченную случайную выборку блоков и ОЦЕНИВАЕТ reltuples по плотности (как обычный `ANALYZE`), стоимость O(sample) вместо O(таблицы) на аномально гигантских temp. Column-stats собираются с той же выборки. Порог покрывает все сканы analyze — холодный, delta-refresh после churn и partial-index rescan, а не только первый. `0` — всегда точный полный скан |
 | `fasttrun.stats_refresh_threshold` | `0.2` | Порог доли изменений: и пересбор статистики, и freshness-толерантность (ниже порога cached column stats видимы планировщику, выше — скрываются). Для freshness эффективный порог масштабируется по кардинальности колонки (`threshold·(1−dratio)`, пол 5%): near-unique колонки строже (защита от stale skewed estimate), low-card — полный порог. Флип видимости visible→hidden, замеченный `fasttrun_analyze` (в т.ч. в полосе между масштабированным полом и порогом пересбора), инвалидирует cached SPI/PREPARE планы — план на спрятанной стате не живёт дольше флипа, когда новые планы уже видят дефолты. `0` — пересбор при любом DML, видимость только при точном совпадении счётчиков. `1` — автопересбор отключён, freshness терпит churn до 100% (с учётом масштабирования) |
 | `fasttrun.invalidate_threshold` | `0.2` | Порог доли изменений `relpages`/`reltuples` ниже которого `fasttrun_analyze` НЕ инвалидирует cached SPI/PREPARE планы. Drift меряется кумулятивно — от значений на момент последней инвалидации, а не от предыдущего вызова: серия мелких шагов, каждый ниже порога, всё равно инвалидирует план, когда суммарный дрейф достигнет порога. Симметрично `stats_refresh_threshold` — при <20% DML ни refresh, ни plan invalidation. `0` — инвалидировать на любой drift (как было в 2.2.0). Инвалидации от пересбора column stats, смены их видимости и изменения index relstats срабатывают всегда, независимо от этого порога |
-| `fasttrun.zero_sinval_truncate` | `on` | Прямой `unlink`+`smgrcreate` вместо `smgrtruncate`. `off` — старый путь с 1 SMGR sinval |
+| `fasttrun.zero_sinval_truncate` | `on` | Прямой `unlink`+`smgrcreate` вместо `smgrtruncate`. `off` — ядерный путь с несколькими smgr/relcache sinval на каждое затронутое отношение (heap, каждый индекс, toast) |
 
 ## Производительность
 
@@ -122,6 +122,7 @@ fasttruncate (toast)                              ~400 us
 fasttrun_analyze, горячий путь (100k строк)         ~1 us
 fasttrun_analyze + INSERT (50k строк)             ~1.8 us
 fasttrun_analyze vs ANALYZE (4 колонки)           ~230x быстрее
+хуки планировщика (кэши активны)               ~+0.26 us к планированию
 ```
 
 Под нагрузкой разрыв ещё больше — обычный `ANALYZE` заставляет все остальные бэкенды обрабатывать очередь sinval, а `fasttrun_analyze` туда ничего не кладёт.
@@ -268,6 +269,8 @@ PERFORM fasttruncate('temp_xxx');
 
 При работе с пулером бэкенд обслуживает сотни клиентов. Каждый клиент может использовать десятки временных таблиц. Если чучел (таблиц-шаблонов) в базе тысячи, создавать их все при старте бэкенда — долго и порождает sinval. Вместо этого fasttrun умеет отслеживать, какие temp tables создаются чаще всего, и прогревать только самые горячие.
 
+Оговорка про sinval: прогрев создаёт таблицы обычным `CREATE TEMP TABLE` — это штатный DDL с обычными сообщениями инвалидации каталога. Zero-sinval контракт fasttrun распространяется на `fasttruncate` / `fasttrun_analyze` / `fasttrun_collect_stats`, но не на создание таблиц (включая prewarm). Выигрыш прогрева в том, что таблиц создаётся меньше (top-N вместо всех), а не в том, что их создание становится бесплатным.
+
 ### Как включить
 
 Добавить fasttrun в `shared_preload_libraries` **последним в списке**:
@@ -374,6 +377,7 @@ fasttrun.track_schedule = ''
 * **Статистика expression indexes** — не собирается. Обычные btree-индексы по колонкам работают через статистику самих колонок, но для индексов вида `CREATE INDEX ON t ((lower(name)))` отдельной статистики выражения пока нет.
 * **ACL/RLS/security-barrier семантика ANALYZE не повторяется** — расширение предназначено для временных таблиц текущей сессии, а не для использования как общий security boundary.
 * **Cached plans инвалидируются только локально** — `fasttruncate`, `fasttrun_analyze`, `fasttrun_collect_stats`, DDL/TRUNCATE eviction и savepoint rollback сбрасывают plan cache текущего backend'а, но не рассылают shared sinval другим backend'ам. Смерть temp-таблиц мимо per-table DDL тоже отслеживается: `DISCARD TEMP/ALL` сбрасывает кэши целиком, а dependency-удаления (`DROP ... CASCADE`, `DROP OWNED BY`) добираются через `object_access_hook` — записи умерших relid'ов не копятся в долгоживущих pooled-сессиях.
+* **TRUNCATE, транзитивно задевающий другие temp-таблицы, не эвиктит их кэш** — utility-хук обходит только таблицы, явно перечисленные в команде. Наследники/секции при `TRUNCATE` родителя и FK-связанные таблицы при `TRUNCATE ... CASCADE` остаются с прежней кэшированной статистикой до следующего `fasttrun_analyze`/`fasttruncate` по ним. Расширение рассчитано на плоские temp-таблицы без FK.
 * **Стоимость холодного прохода со сбором статистики** — ~50-150 мс на таблицу 1M строк × 50 колонок. Можно отключить через GUC.
 
 ## Совместимость

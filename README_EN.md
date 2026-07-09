@@ -20,7 +20,7 @@ This fasttrun fork tries to solve both problems:
 |---|---|---|
 | `fasttruncate(text)` | Clears a temporary table (heap + indexes + toast) | **no** |
 | `fasttrun_analyze(text)` | Publishes `relpages/reltuples` + collects column statistics | **no** |
-| `fasttrun_analyze_bulk(VARIADIC text[])` | Batch variant of `fasttrun_analyze` for several tables in one call. Plan-cache invalidations are emitted inline per table -- the first marks affected cached SPI/PREPARE plans `is_valid=false`, and every subsequent message in the batch short-circuits in core's `PlanCacheRelCallback` on that flag -- O(1) per message. Useful in loops touching many temp tables per transaction. | **no** |
+| `fasttrun_analyze_bulk(VARIADIC text[])` | Batch variant of `fasttrun_analyze` for several tables in one call. Plan-cache invalidation is emitted inline per table, and each one makes the core walk the whole cached-plan list (`PlanCacheRelCallback`): N tables — N walks. The only saving is per-plan: a plan already marked `is_valid=false` by an earlier invalidation in the batch is skipped cheaply instead of re-marked. Useful in loops touching many temp tables per transaction. | **no** |
 | `fasttrun_collect_stats(text)` | Explicit column statistics collection. In 99% of cases `fasttrun_analyze` is enough — it does the same automatically on the first pass. This function is needed only if auto-collection is disabled (`auto_collect_stats=off`) or you want to force a rebuild | **no** |
 | `fasttrun_relstats(text)` | Returns current `relpages/reltuples` from process memory | **no** |
 | `fasttrun_inspect_stats(text)` | Returns cached statsTuple in `pg_statistic` format (for debugging) | **no** |
@@ -59,7 +59,7 @@ Besides the table itself, `fasttruncate` handles:
 
 Before cleanup, `CheckTableNotInUse` is called — the same check that regular SQL `TRUNCATE` does. If there is an open cursor or an active query on the table, you get a clear SQL error, not a PANIC.
 
-Fallback: `SET fasttrun.zero_sinval_truncate = off` reverts to `heap_truncate_one_rel` (one SMGR sinval message per call).
+Fallback: `SET fasttrun.zero_sinval_truncate = off` reverts to `heap_truncate_one_rel`. The core path emits several shared smgr/relcache sinval messages per affected relation (heap, each index, toast): on a table with one index that is around ten messages.
 
 ## How fasttrun_analyze works
 
@@ -105,7 +105,7 @@ A separate commit-boundary backstop: a temp table's pgstat counters reset at eve
 | `fasttrun.max_analyze_pages` | `100000` | Heap-page threshold (~800 MB) above which a cold `fasttrun_analyze` switches from a full scan to block sampling: it reads a bounded random block sample and ESTIMATES reltuples from tuple density (like a regular `ANALYZE`), keeping cost O(sample) instead of O(table) on anomalously giant temp tables. Column stats are collected from the same sample. The threshold covers every analyze scan — cold, delta-refresh after churn and the partial-index rescan, not just the first one. `0` — always do the exact full scan |
 | `fasttrun.stats_refresh_threshold` | `0.2` | DML change ratio threshold governing both stats refresh and freshness tolerance: below it cached column stats stay visible to the planner, past it they are hidden. For freshness the effective threshold scales with column cardinality (`threshold·(1−dratio)`, floored at 5%): near-unique columns are stricter (guarding against a stale skewed estimate), low-cardinality columns keep the full threshold. A visible→hidden flip observed by `fasttrun_analyze` (including in the band between the scaled floor and the refresh threshold) invalidates cached SPI/PREPARE plans — a plan built on the now-hidden distribution does not outlive the flip while new plans already see defaults. `0` — refresh on any DML, visible only on an exact counter match. `1` — auto refresh disabled, freshness tolerates churn up to 100% (subject to the scaling) |
 | `fasttrun.invalidate_threshold` | `0.2` | `relpages`/`reltuples` drift ratio below which `fasttrun_analyze` does NOT invalidate cached SPI/PREPARE plans. Drift is measured cumulatively — against the values published at the last invalidation, not against the previous call: a series of small steps, each below the threshold, still invalidates the plan once the accumulated drift reaches it. Symmetric with `stats_refresh_threshold` — below 20% DML neither refresh nor plan invalidation fires. `0` — invalidate on any drift (the 2.2.0 behaviour). Invalidations triggered by a column-stats refresh, a stats-visibility flip, or an index relstats change always fire, regardless of this threshold |
-| `fasttrun.zero_sinval_truncate` | `on` | Direct `unlink`+`smgrcreate` instead of `smgrtruncate`. `off` — old path with 1 SMGR sinval |
+| `fasttrun.zero_sinval_truncate` | `on` | Direct `unlink`+`smgrcreate` instead of `smgrtruncate`. `off` — core path with several smgr/relcache sinval messages per affected relation (heap, each index, toast) |
 
 ## Performance
 
@@ -120,6 +120,7 @@ fasttruncate (toast)                              ~400 us
 fasttrun_analyze, hot path (100k rows)              ~1 us
 fasttrun_analyze + INSERT (50k rows)              ~1.8 us
 fasttrun_analyze vs ANALYZE (4 columns)           ~230x faster
+planner hooks (caches active)                  ~+0.26 us per planning
 ```
 
 Under load the gap is even wider — regular `ANALYZE` forces all other backends to drain the sinval queue, while `fasttrun_analyze` puts nothing into it.
@@ -257,6 +258,8 @@ In a typical PL/pgSQL calculation, one backend works with 10-30 temporary tables
 
 When working with a pooler, a backend serves hundreds of clients. Each client can use dozens of temporary tables. If you have thousands of templates in the database, creating all of them on backend startup is slow and generates sinval. Instead, fasttrun can track which temp tables are created most often and prewarm only the hottest ones.
 
+A sinval caveat: prewarming creates tables with a plain `CREATE TEMP TABLE` — regular DDL with the usual catalog invalidation messages. The zero-sinval contract of fasttrun covers `fasttruncate` / `fasttrun_analyze` / `fasttrun_collect_stats`, not table creation (prewarm included). The win of prewarming is creating fewer tables (top-N instead of all), not making their creation free.
+
 ### How to enable
 
 Add fasttrun to `shared_preload_libraries` **as the last entry**:
@@ -363,6 +366,7 @@ Statistics are saved to disk (`pg_stat/fasttrun_temp_stats`) on server shutdown 
 * **Expression index statistics** — not collected. Regular btree indexes on table columns use the column statistics, but indexes like `CREATE INDEX ON t ((lower(name)))` do not yet get separate expression statistics.
 * **ACL/RLS/security-barrier semantics of ANALYZE are not reproduced** — the extension is meant for temporary tables in the current session, not as a general security boundary.
 * **Cached plans are invalidated only locally** — `fasttruncate`, `fasttrun_analyze`, `fasttrun_collect_stats`, DDL/TRUNCATE eviction and savepoint rollback reset the current backend plan cache, but do not send shared sinval to other backends. Temp tables dying without a per-table DDL statement are tracked too: `DISCARD TEMP/ALL` drops both caches whole, and dependency drops (`DROP ... CASCADE`, `DROP OWNED BY`) are caught via `object_access_hook` — entries for dead relids do not accumulate in long-lived pooled sessions.
+* **A TRUNCATE that transitively touches other temp tables does not evict their caches** — the utility hook walks only the tables explicitly listed in the command. Children/partitions on a parent `TRUNCATE` and FK-linked tables on `TRUNCATE ... CASCADE` keep their previously cached statistics until the next `fasttrun_analyze`/`fasttruncate` on them. The extension is designed for flat temp tables without FKs.
 * **Cost of cold-path stats collection** — ~50-150 ms for a 1M rows × 50 columns table. Can be disabled via GUC.
 
 ## Compatibility
