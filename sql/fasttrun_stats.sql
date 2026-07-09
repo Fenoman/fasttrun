@@ -1444,6 +1444,69 @@ SELECT relpages > 1 AS relpages_refreshed,
 RESET fasttrun.sample_rows;
 DROP TABLE t_partial_zero;
 
+-- ----------------------------------------------------------------------
+-- 33. Повторный partial-index rescan без нового DML.  Один sub-threshold
+--     UPDATE не должен заставлять каждый последующий fasttrun_analyze в
+--     той же транзакции заново сэмплировать partial-индексы: probe меряет
+--     churn от якоря последнего рескана, а не от baseline пересбора
+--     column stats (baseline ниже порога намеренно стоит на месте).
+--     max_analyze_pages=1 превращает каждый фактический скан в
+--     block-sample DEBUG-маркер; 2000 строк < sample_rows делают выборку
+--     исчерпывающей, а оценки детерминированными.
+-- ----------------------------------------------------------------------
+CREATE TEMP TABLE t_partial_repeat (id int, flag bool);
+INSERT INTO t_partial_repeat SELECT g, g <= 100 FROM generate_series(1, 2000) g;
+CREATE INDEX t_partial_repeat_idx ON t_partial_repeat (id) WHERE flag;
+
+BEGIN;
+SET LOCAL fasttrun.max_analyze_pages = 1;   -- любой скан = DEBUG-маркер
+SELECT fasttrun_analyze('t_partial_repeat');   -- cold, вне DEBUG-окна
+UPDATE t_partial_repeat SET flag = true WHERE id > 100 AND id <= 120;  -- 1% churn
+SET LOCAL client_min_messages = debug1;
+SELECT fasttrun_analyze('t_partial_repeat');   -- новый churn: рескан + инвалидация
+SELECT fasttrun_analyze('t_partial_repeat');   -- без нового DML: тихо
+SELECT fasttrun_analyze('t_partial_repeat');   -- без нового DML: тихо
+RESET client_min_messages;
+-- Любой НОВЫЙ churn триггерит рескан снова.
+UPDATE t_partial_repeat SET flag = true WHERE id > 120 AND id <= 140;
+SET LOCAL client_min_messages = debug1;
+SELECT fasttrun_analyze('t_partial_repeat');   -- новый churn: рескан + инвалидация
+RESET client_min_messages;
+COMMIT;
+DROP TABLE t_partial_repeat;
+
+-- ----------------------------------------------------------------------
+-- 33b. Якорь рескана откатывается вместе с savepoint'ом.  Рескан внутри
+--      откаченной подтранзакции не должен подавить рескан churn'а,
+--      набранного до savepoint (index relstats тоже откатились); после
+--      RELEASE якорь промоутится к родителю, и analyze без нового DML
+--      молчит.
+-- ----------------------------------------------------------------------
+CREATE TEMP TABLE t_partial_sp (id int, flag bool);
+INSERT INTO t_partial_sp SELECT g, g <= 100 FROM generate_series(1, 2000) g;
+CREATE INDEX t_partial_sp_idx ON t_partial_sp (id) WHERE flag;
+
+BEGIN;
+SET LOCAL fasttrun.max_analyze_pages = 1;   -- любой скан = DEBUG-маркер
+SELECT fasttrun_analyze('t_partial_sp');    -- cold, вне DEBUG-окна
+UPDATE t_partial_sp SET flag = true WHERE id > 100 AND id <= 120;  -- churn ДО savepoint
+SET LOCAL client_min_messages = debug1;
+SAVEPOINT s;
+SELECT fasttrun_analyze('t_partial_sp');    -- рескан внутри savepoint
+ROLLBACK TO SAVEPOINT s;                    -- якорь сброшен, churn жив
+SELECT fasttrun_analyze('t_partial_sp');    -- рескан обязан повториться
+SELECT fasttrun_analyze('t_partial_sp');    -- без нового DML: тихо
+RESET client_min_messages;
+UPDATE t_partial_sp SET flag = true WHERE id > 120 AND id <= 140;
+SET LOCAL client_min_messages = debug1;
+SAVEPOINT s2;
+SELECT fasttrun_analyze('t_partial_sp');    -- рескан внутри savepoint
+RELEASE SAVEPOINT s2;                       -- якорь промоутится к родителю
+SELECT fasttrun_analyze('t_partial_sp');    -- без нового DML: тихо
+RESET client_min_messages;
+COMMIT;
+DROP TABLE t_partial_sp;
+
 -- Очистка
 DROP TABLE t_stats;
 DROP TABLE t_multi;

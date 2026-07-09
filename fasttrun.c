@@ -494,6 +494,25 @@ typedef struct FasttrunAnalyzeCacheEntry
 	FasttrunAnalyzeBaselineUndo *stats_baseline_undo;
 
 	/*
+	 * Partial-index rescan anchor: pgstat counters captured when the
+	 * partial-index relstats were last brought in sync with the heap
+	 * (sample-based rescan, or any refresh that publishes a stats
+	 * baseline).  The rescan probe measures churn from here, NOT from the
+	 * stats baseline: the baseline deliberately stays put on sub-threshold
+	 * churn, and measuring against it would re-sample the partial indexes
+	 * on every analyze after a single small DML.  An invalid anchor falls
+	 * back to the baseline -- at worst one extra rescan, never a missed
+	 * one.  Subid-tagged like the lazy-probe memo: reset when the
+	 * recording subxact aborts (its counters rolled back with it),
+	 * promoted to the parent on subcommit.
+	 */
+	bool		partial_scan_valid;
+	int64		partial_scan_inserted;
+	int64		partial_scan_updated;
+	int64		partial_scan_deleted;
+	SubTransactionId	partial_scan_subid;
+
+	/*
 	 * Memo for the lazy empty-storage probe in fasttrun_reinject_relstats().
 	 *
 	 * If lazy_check_subid matches GetCurrentSubTransactionId() and
@@ -621,6 +640,32 @@ fasttrun_relstats_free_undo(FasttrunAnalyzeCacheEntry *entry)
 	}
 }
 
+static void
+fasttrun_cache_reset_partial_scan_anchor(FasttrunAnalyzeCacheEntry *entry)
+{
+	entry->partial_scan_valid = false;
+	entry->partial_scan_inserted = 0;
+	entry->partial_scan_updated = 0;
+	entry->partial_scan_deleted = 0;
+	entry->partial_scan_subid = InvalidSubTransactionId;
+}
+
+/*
+ * Record the counters at the moment the partial-index relstats were
+ * brought in sync with the heap.  See the anchor comment in
+ * FasttrunAnalyzeCacheEntry.
+ */
+static void
+fasttrun_cache_set_partial_scan_anchor(FasttrunAnalyzeCacheEntry *entry,
+									   int64 ins, int64 upd, int64 del)
+{
+	entry->partial_scan_valid = true;
+	entry->partial_scan_inserted = ins;
+	entry->partial_scan_updated = upd;
+	entry->partial_scan_deleted = del;
+	entry->partial_scan_subid = GetCurrentSubTransactionId();
+}
+
 /* Drop the analyze HTAB + its mcxt (frees all baseline undo chains). */
 static void
 fasttrun_cache_reset(void)
@@ -726,6 +771,9 @@ fasttrun_cache_commit_xact(void)
 		entry->stats_baseline_deleted = 0;
 		entry->stats_baseline_truncdropped = false;
 		entry->stats_baseline_subid = InvalidSubTransactionId;
+
+		/* Anchored to this xact's pgstat counters -- meaningless outside. */
+		fasttrun_cache_reset_partial_scan_anchor(entry);
 
 		/*
 		 * Drop the lazy-probe memo.  ON COMMIT DELETE ROWS truncate runs
@@ -860,6 +908,7 @@ fasttrun_cache_enter(Oid relid)
 		entry->stats_baseline_truncdropped = false;
 		entry->stats_baseline_subid = InvalidSubTransactionId;
 		entry->stats_baseline_undo = NULL;
+		fasttrun_cache_reset_partial_scan_anchor(entry);
 		entry->lazy_check_pages = 0;
 		entry->lazy_check_subid = InvalidSubTransactionId;
 	}
@@ -1006,6 +1055,13 @@ fasttrun_cache_set_stats_baseline(Oid relid, int64 ins, int64 upd, int64 del,
 	entry->stats_baseline_deleted = del;
 	entry->stats_baseline_truncdropped = truncdropped;
 	entry->stats_baseline_subid = cur_subid;
+
+	/*
+	 * Every baseline publish follows a refresh that also brought the index
+	 * relstats (partial included) in sync -- advance the rescan anchor with
+	 * the same counters so the next analyze does not re-probe old churn.
+	 */
+	fasttrun_cache_set_partial_scan_anchor(entry, ins, upd, del);
 }
 
 /*
@@ -1056,6 +1112,9 @@ fasttrun_cache_mark_evicted(Oid relid)
 
 	entry->has_stats_baseline = false;
 	entry->stats_baseline_subid = cur_subid;
+
+	/* Eviction retires the rescan bookkeeping too. */
+	fasttrun_cache_reset_partial_scan_anchor(entry);
 
 	/* The next store resets cached_pages -- drop the lazy memo now. */
 	entry->lazy_check_subid = InvalidSubTransactionId;
@@ -3224,6 +3283,7 @@ fasttrun_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 						aentry->stats_baseline_deleted = 0;
 						aentry->stats_baseline_truncdropped = false;
 						aentry->stats_baseline_subid = InvalidSubTransactionId;
+						fasttrun_cache_reset_partial_scan_anchor(aentry);
 
 						if (OidIsValid(plan_relid))
 							fasttrun_stats_cache_evict_relid(plan_relid);
@@ -3322,6 +3382,23 @@ fasttrun_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 						pfree(obsolete);
 					}
 				}
+			}
+
+			/*
+			 * Partial-rescan anchor.  A rescan recorded in an aborted
+			 * subxact must not survive it: the pgstat counters it anchors
+			 * rolled back with the subxact, and a stale anchor could
+			 * report zero churn while live churn exists.  Reset instead of
+			 * undo-restore -- the probe then falls back to the stats
+			 * baseline, which at worst re-samples once.  On subcommit
+			 * promote to the parent like the lazy memo below.
+			 */
+			if (aentry->partial_scan_subid == mySubid)
+			{
+				if (event == SUBXACT_EVENT_ABORT_SUB)
+					fasttrun_cache_reset_partial_scan_anchor(aentry);
+				else		/* SUBXACT_EVENT_COMMIT_SUB */
+					aentry->partial_scan_subid = parentSubid;
 			}
 
 			/*
@@ -5206,9 +5283,21 @@ fasttrun_analyze_relation(Relation rel)
 		if (have_counters && fasttrun_sample_rows != 0 &&
 			entry != NULL && entry->has_stats_baseline)
 		{
-			churn = (ins_now - entry->stats_baseline_inserted)
-				+ (upd_now - entry->stats_baseline_updated)
-				+ (del_now - entry->stats_baseline_deleted);
+			/*
+			 * Churn is measured from the rescan anchor (the counters at the
+			 * last partial-index sync), not from the stats baseline: the
+			 * baseline stays put on sub-threshold churn, and measuring
+			 * against it would re-sample the partial indexes on every
+			 * analyze after a single small DML.
+			 */
+			if (entry->partial_scan_valid)
+				churn = (ins_now - entry->partial_scan_inserted)
+					+ (upd_now - entry->partial_scan_updated)
+					+ (del_now - entry->partial_scan_deleted);
+			else
+				churn = (ins_now - entry->stats_baseline_inserted)
+					+ (upd_now - entry->stats_baseline_updated)
+					+ (del_now - entry->stats_baseline_deleted);
 			if (churn < 0)
 				churn = -churn;
 		}
@@ -5222,11 +5311,12 @@ fasttrun_analyze_relation(Relation rel)
 			if (probe_partial)
 			{
 				/*
-				 * Rescan on any churn when a partial index exists.  A small DML
-				 * on the predicate column can change the partial index's covered
-				 * tuple count out of proportion to the heap churn ratio (e.g.
-				 * flipping a boolean flag on 1% of rows can double the index),
-				 * so the heap ratio cannot gate this rescan.
+				 * Rescan on any new churn when a partial index exists.  A
+				 * small DML on the predicate column can change the partial
+				 * index's covered tuple count out of proportion to the heap
+				 * churn ratio (e.g. flipping a boolean flag on 1% of rows can
+				 * double the index), so the heap ratio cannot gate this
+				 * rescan.
 				 */
 				if (fasttrun_index_rels_have_partial(index_rels))
 				{
@@ -5249,11 +5339,24 @@ fasttrun_analyze_relation(Relation rel)
 															   sample, sample_count,
 															   tuples_count, true);
 						partial_index_sampled = true;
+						fasttrun_cache_set_partial_scan_anchor(entry, ins_now,
+															   upd_now, del_now);
 
 						for (i = 0; i < sample_count; i++)
 							heap_freetuple(sample[i]);
 						pfree(sample);
 					}
+					/*
+					 * sample_target <= 0: a rescan is impossible right now.
+					 * Leave the anchor alone so a later call (e.g. after the
+					 * sampling GUCs change) still sees this churn.
+					 */
+				}
+				else
+				{
+					/* No partial indexes: nothing to sync, anchor the probe. */
+					fasttrun_cache_set_partial_scan_anchor(entry, ins_now,
+														   upd_now, del_now);
 				}
 			}
 

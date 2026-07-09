@@ -83,6 +83,8 @@ new_tuples = cached_tuples + (ins_now - cached_ins) - (del_now - cached_del)
 
 Если после предыдущего сбора доля изменений DML превысила `stats_refresh_threshold` (по умолчанию 20%), запускается такой же полный reservoir sample, как на холодном пути. Это дороже старого блочного refresh, но сохраняет качество планов на уровне обычного `ANALYZE` для кластеризованных и разреженных heap.
 
+Partial-индексы: их `reltuples` пересэмплируется при любом новом DML с момента последнего рескана — порог не применяется, потому что селективность предиката непредсказуема (флип boolean-флага на 1% строк может удвоить индекс). Повторные вызовы `fasttrun_analyze` без нового DML рескан не повторяют.
+
 ### Качество статистики
 
 По умолчанию (`use_typanalyze = on`) расширение вызывает **те же самые** `std_typanalyze` / type-specific `typanalyze` из ядра PostgreSQL для обычных колонок heap-таблицы. Собираются MCV, histogram, correlation, type-specific stats; учитываются `ALTER COLUMN SET STATISTICS 0` и `ALTER COLUMN SET (n_distinct = ...)`.
