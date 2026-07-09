@@ -289,7 +289,8 @@ static void fasttrun_subxact_callback(SubXactEvent event,
 									  SubTransactionId parentSubid, void *arg);
 static bool fasttrun_collect_and_store(Relation rel, HeapTuple *sample,
 									   int sample_count, int64 totalrows,
-									   bool sample_needs_tid_sort);
+									   bool sample_needs_tid_sort,
+									   bool *evicted_stats);
 static bool fasttrun_read_pgstat_counters(Relation rel,
 										  int64 *ins, int64 *upd, int64 *del,
 										  bool *truncdropped);
@@ -3958,10 +3959,16 @@ fasttrun_cmp_heap_tuples_by_tid(const void *a, const void *b)
  * below); false when it early-returns without storing -- notably when pgstat
  * is unavailable (track_counts=off).  Callers gate stats_recollected on this
  * so the index-relstats refresh still runs when column collection was skipped.
+ *
+ * *evicted_stats (optional) is set when the pgstat-unavailable branch evicted
+ * previously cached column stats.  Plan invalidation for that flip is the
+ * caller's responsibility -- every caller already invalidates once per call,
+ * and a second emission from here would double-fire.
  */
 static bool
 fasttrun_collect_and_store(Relation rel, HeapTuple *sample, int sample_count,
-						   int64 totalrows, bool sample_needs_tid_sort)
+						   int64 totalrows, bool sample_needs_tid_sort,
+						   bool *evicted_stats)
 {
 	TupleDesc	tupdesc = RelationGetDescr(rel);
 	Relation	pg_stats_rel;
@@ -3975,6 +3982,9 @@ fasttrun_collect_and_store(Relation rel, HeapTuple *sample, int sample_count,
 	int64		snap_del = 0;
 	bool		snap_truncdropped = false;
 	BlockNumber	snap_pages;
+
+	if (evicted_stats != NULL)
+		*evicted_stats = false;
 
 	if (sample_count <= 0)
 		return false;
@@ -3998,8 +4008,9 @@ fasttrun_collect_and_store(Relation rel, HeapTuple *sample, int sample_count,
 	if (!fasttrun_read_pgstat_counters(rel, &snap_ins, &snap_upd, &snap_del,
 									   &snap_truncdropped))
 	{
-		if (fasttrun_stats_cache_evict_relid(RelationGetRelid(rel)))
-			fasttrun_invalidate_local_plan_cache(RelationGetRelid(rel));
+		if (fasttrun_stats_cache_evict_relid(RelationGetRelid(rel)) &&
+			evicted_stats != NULL)
+			*evicted_stats = true;
 
 		if (!fasttrun_warned_track_counts_off)
 		{
@@ -5241,10 +5252,14 @@ fasttrun_analyze_relation(Relation rel)
 
 					if (sample_count > 0)
 					{
+						bool	evicted = false;
+
 						fasttrun_collect_and_store(rel, sample, sample_count,
 												   tuples_count,
-												   tuples_count > sample_target);
+												   tuples_count > sample_target,
+												   &evicted);
 						stats_recollected = true;
+						stats_visibility_changed |= evicted;
 					}
 					else
 					{
@@ -5411,17 +5426,23 @@ fasttrun_analyze_relation(Relation rel)
 
 		if (sample != NULL && sample_count > 0)
 		{
+			bool	evicted = false;
+
 			/*
 			 * Sort needed only when reservoir sampling displaced entries.
 			 * collect_and_store returns false when it stored nothing (e.g.
 			 * track_counts=off) -- then it also skipped the internal index
 			 * relstats refresh, so the !stats_recollected path below still
-			 * runs fasttrun_update_index_relstats.
+			 * runs fasttrun_update_index_relstats.  An eviction inside it
+			 * counts as a visibility flip and rides the single plan-inval
+			 * site below.
 			 */
 			stats_recollected = fasttrun_collect_and_store(rel, sample,
 														   sample_count,
 														   tuples_count,
-														   tuples_count > sample_target);
+														   tuples_count > sample_target,
+														   &evicted);
+			stats_visibility_changed |= evicted;
 		}
 
 		if (sample != NULL)
@@ -5825,8 +5846,9 @@ fasttrun_collect_stats(PG_FUNCTION_ARGS)
 
 	if (sample_count > 0)
 	{
+		/* Eviction inside is covered by the unconditional inval below. */
 		fasttrun_collect_and_store(rel, sample, sample_count, tuples_count,
-								   tuples_count > sample_target);
+								   tuples_count > sample_target, NULL);
 		fasttrun_invalidate_local_plan_cache(relOid);
 	}
 	else if (fasttrun_stats_cache_evict_relid(relOid))
