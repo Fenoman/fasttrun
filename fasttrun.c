@@ -371,6 +371,12 @@ fasttrun_xact_entry_dropped(const FasttrunXactRelEntry *entry)
 	return (entry->flags & FASTTRUN_TOUCH_DROPPED) != 0;
 }
 
+typedef struct FasttrunCollectResult
+{
+	bool		published_any;
+	bool		became_neutral;
+} FasttrunCollectResult;
+
 /* Forward decls for stats infrastructure (defined below) */
 static void fasttrun_stats_cache_reset(void);
 static void fasttrun_stats_cache_commit_xact(void);
@@ -379,10 +385,11 @@ static void fasttrun_stats_forget_relid(Oid relid);
 static void fasttrun_subxact_callback(SubXactEvent event,
 									  SubTransactionId mySubid,
 									  SubTransactionId parentSubid, void *arg);
-static bool fasttrun_collect_and_store(Relation rel, HeapTuple *sample,
-									   int sample_count, int64 totalrows,
-									   bool sample_needs_tid_sort,
-									   bool *evicted_stats);
+static FasttrunCollectResult fasttrun_collect_and_store(Relation rel,
+												HeapTuple *sample,
+												int sample_count,
+												int64 totalrows,
+												bool sample_needs_tid_sort);
 static bool fasttrun_read_pgstat_counters(Relation rel,
 										  int64 *ins, int64 *upd, int64 *del,
 										  bool *truncdropped);
@@ -1885,6 +1892,34 @@ fasttrun_stats_set_relation_policy(Relation rel,
 							FASTTRUN_TOUCH_STATS |
 							FASTTRUN_TOUCH_PLAN_INVALIDATE);
 	return changed;
+}
+
+/* Catalog probe is allowed only from explicit mutation paths, never hooks. */
+static bool
+fasttrun_relation_has_core_stats(Relation rel)
+{
+	TupleDesc	desc = RelationGetDescr(rel);
+	Oid			relid = RelationGetRelid(rel);
+	int			i;
+
+	for (i = 0; i < desc->natts; i++)
+	{
+		Form_pg_attribute attr = TupleDescAttr(desc, i);
+		HeapTuple	tuple;
+
+		if (attr->attisdropped)
+			continue;
+		tuple = SearchSysCache3(STATRELATTINH,
+								ObjectIdGetDatum(relid),
+								Int16GetDatum(i + 1),
+								BoolGetDatum(false));
+		if (HeapTupleIsValid(tuple))
+		{
+			ReleaseSysCache(tuple);
+			return true;
+		}
+	}
+	return false;
 }
 
 /* freefunc for VariableStatData -- we own the tuple, no-op. */
@@ -4242,22 +4277,14 @@ fasttrun_cmp_heap_tuples_by_tid(const void *a, const void *b)
  * publish through the same hooks.
  */
 /*
- * Returns true if it actually collected and stored column stats (which also
- * refreshes index relstats via the internal fasttrun_update_index_relstats
- * below); false when it early-returns without storing -- notably when pgstat
- * is unavailable (track_counts=off).  Callers gate stats_recollected on this
- * so the index-relstats refresh still runs when column collection was skipped.
- *
- * *evicted_stats (optional) is set when the pgstat-unavailable branch evicted
- * previously cached column stats.  Plan invalidation for that flip is the
- * caller's responsibility -- every caller already invalidates once per call,
- * and a second emission from here would double-fire.
+ * The result separates publishing a candidate from a transition to neutral.
+ * Callers invalidate only when either changes planner-visible ownership.
  */
-static bool
+static FasttrunCollectResult
 fasttrun_collect_and_store(Relation rel, HeapTuple *sample, int sample_count,
-						   int64 totalrows, bool sample_needs_tid_sort,
-						   bool *evicted_stats)
+						   int64 totalrows, bool sample_needs_tid_sort)
 {
+	FasttrunCollectResult result = {false, false};
 	TupleDesc	tupdesc = RelationGetDescr(rel);
 	Relation	pg_stats_rel;
 	TupleDesc	pg_stats_desc;
@@ -4271,11 +4298,8 @@ fasttrun_collect_and_store(Relation rel, HeapTuple *sample, int sample_count,
 	bool		snap_truncdropped = false;
 	BlockNumber	snap_pages;
 
-	if (evicted_stats != NULL)
-		*evicted_stats = false;
-
 	if (sample_count <= 0)
-		return false;
+		return result;
 
 	/*
 	 * Physical block count at collect time: the freshness check anchors to it
@@ -4296,9 +4320,8 @@ fasttrun_collect_and_store(Relation rel, HeapTuple *sample, int sample_count,
 	if (!fasttrun_read_pgstat_counters(rel, &snap_ins, &snap_upd, &snap_del,
 									   &snap_truncdropped))
 	{
-		if (fasttrun_stats_cache_evict_relid(RelationGetRelid(rel)) &&
-			evicted_stats != NULL)
-			*evicted_stats = true;
+		result.became_neutral =
+			fasttrun_stats_cache_evict_relid(RelationGetRelid(rel));
 
 		if (!fasttrun_warned_track_counts_off)
 		{
@@ -4310,7 +4333,7 @@ fasttrun_collect_and_store(Relation rel, HeapTuple *sample, int sample_count,
 					 errhint("Set track_counts = on in postgresql.conf or per session (SET track_counts = on) to re-enable fasttrun column statistics caching.")));
 			fasttrun_warned_track_counts_off = true;
 		}
-		return false;
+		return result;
 	}
 
 	pg_stats_rel = table_open(StatisticRelationId, AccessShareLock);
@@ -4398,6 +4421,7 @@ fasttrun_collect_and_store(Relation rel, HeapTuple *sample, int sample_count,
 			fasttrun_stats_cache_store(rel, attnum, stats_tuple,
 									   snap_ins, snap_upd, snap_del,
 									   snap_truncdropped, snap_pages);
+			result.published_any = true;
 			heap_freetuple(stats_tuple);
 		}
 	}
@@ -4581,6 +4605,7 @@ fasttrun_collect_and_store(Relation rel, HeapTuple *sample, int sample_count,
 			fasttrun_stats_cache_store(rel, attnum, stats_tuple,
 									   snap_ins, snap_upd, snap_del,
 									   snap_truncdropped, snap_pages);
+			result.published_any = true;
 			heap_freetuple(stats_tuple);
 		}
 
@@ -4604,7 +4629,7 @@ fasttrun_collect_and_store(Relation rel, HeapTuple *sample, int sample_count,
 	 * column stats now" entry point that doesn't participate in delta-
 	 * math state tracking and shouldn't interfere with it.
 	 */
-	return true;
+	return result;
 }
 
 /*
@@ -5439,6 +5464,7 @@ fasttrun_analyze_relation(Relation rel)
 	bool			pure_delta_noop = false;
 	bool			partial_index_sampled = false;
 	bool			pages_now_known = false;
+	bool			relation_policy_changed;
 	BlockNumber		allvisible_now = 0;
 	BlockNumber		old_pages;
 	int32			old_allvisible;
@@ -5448,8 +5474,10 @@ fasttrun_analyze_relation(Relation rel)
 	int64			delta_del = 0;
 	FasttrunAnalyzeCacheEntry *entry = NULL;
 
-	(void) fasttrun_stats_set_relation_policy(rel,
-											FASTTRUN_REL_LOCAL_NEUTRAL);
+	relation_policy_changed = fasttrun_stats_set_relation_policy(rel,
+													FASTTRUN_REL_LOCAL_NEUTRAL);
+	if (relation_policy_changed && fasttrun_relation_has_core_stats(rel))
+		stats_visibility_changed = true;
 	old_pages = rel->rd_rel->relpages;
 	old_allvisible = rel->rd_rel->relallvisible;
 	old_tuples = rel->rd_rel->reltuples;
@@ -5555,14 +5583,14 @@ fasttrun_analyze_relation(Relation rel)
 
 					if (sample_count > 0)
 					{
-						bool	evicted = false;
+						FasttrunCollectResult collect_result;
 
-						fasttrun_collect_and_store(rel, sample, sample_count,
-												   tuples_count,
-												   tuples_count > sample_target,
-												   &evicted);
-						stats_recollected = true;
-						stats_visibility_changed |= evicted;
+						collect_result = fasttrun_collect_and_store(rel, sample,
+																 sample_count,
+																 tuples_count,
+																 tuples_count > sample_target);
+						stats_recollected |= collect_result.published_any;
+						stats_visibility_changed |= collect_result.became_neutral;
 					}
 					else
 					{
@@ -5729,23 +5757,20 @@ fasttrun_analyze_relation(Relation rel)
 
 		if (sample != NULL && sample_count > 0)
 		{
-			bool	evicted = false;
+			FasttrunCollectResult collect_result;
 
 			/*
 			 * Sort needed only when reservoir sampling displaced entries.
-			 * collect_and_store returns false when it stored nothing (e.g.
-			 * track_counts=off) -- then it also skipped the internal index
-			 * relstats refresh, so the !stats_recollected path below still
-			 * runs fasttrun_update_index_relstats.  An eviction inside it
-			 * counts as a visibility flip and rides the single plan-inval
-			 * site below.
+			 * published_any stays false when track_counts is off; then the
+			 * !stats_recollected path below still refreshes index relstats.
+			 * became_neutral rides the same single plan-invalidation site.
 			 */
-			stats_recollected = fasttrun_collect_and_store(rel, sample,
-														   sample_count,
-														   tuples_count,
-														   tuples_count > sample_target,
-														   &evicted);
-			stats_visibility_changed |= evicted;
+			collect_result = fasttrun_collect_and_store(rel, sample,
+															  sample_count,
+															  tuples_count,
+															  tuples_count > sample_target);
+			stats_recollected = collect_result.published_any;
+			stats_visibility_changed |= collect_result.became_neutral;
 		}
 
 		if (sample != NULL)
@@ -6114,6 +6139,9 @@ fasttrun_collect_stats(PG_FUNCTION_ARGS)
 	int			sample_count = 0;
 	int			sample_target;
 	int			i;
+	bool		relation_policy_changed;
+	bool		planner_fallback_changed;
+	FasttrunCollectResult collect_result = {false, false};
 
 	relvar = fasttrun_make_rangevar(name);
 	relOid = RangeVarGetRelid(relvar, AccessShareLock, true);
@@ -6134,8 +6162,10 @@ fasttrun_collect_stats(PG_FUNCTION_ARGS)
 	if (rel->rd_tableam != GetHeapamTableAmRoutine())
 		elog(ERROR, "fasttrun_collect_stats: relation \"%s\" is not heap-AM",
 			 RelationGetRelationName(rel));
-	(void) fasttrun_stats_set_relation_policy(rel,
-											FASTTRUN_REL_LOCAL_NEUTRAL);
+	relation_policy_changed = fasttrun_stats_set_relation_policy(rel,
+													FASTTRUN_REL_LOCAL_NEUTRAL);
+	planner_fallback_changed = relation_policy_changed &&
+		fasttrun_relation_has_core_stats(rel);
 
 	/* Register for per-xact bookkeeping -- callbacks walk this list only. */
 	fasttrun_xact_mark_relid(relOid, relOid,
@@ -6148,6 +6178,8 @@ fasttrun_collect_stats(PG_FUNCTION_ARGS)
 
 		if (sample_target <= 0)
 		{
+			if (planner_fallback_changed)
+				fasttrun_invalidate_local_plan_cache(relOid);
 			table_close(rel, AccessShareLock);
 			PG_RETURN_VOID();
 		}
@@ -6160,17 +6192,20 @@ fasttrun_collect_stats(PG_FUNCTION_ARGS)
 
 	if (sample_count > 0)
 	{
-		/* Eviction inside is covered by the unconditional inval below. */
-		fasttrun_collect_and_store(rel, sample, sample_count, tuples_count,
-								   tuples_count > sample_target, NULL);
-		fasttrun_invalidate_local_plan_cache(relOid);
+		collect_result = fasttrun_collect_and_store(rel, sample, sample_count,
+														 tuples_count,
+														 tuples_count > sample_target);
 	}
-	else if (fasttrun_stats_cache_evict_relid(relOid))
+	else
 	{
-		(void) fasttrun_update_index_relstats(rel, NIL, NULL, 0, tuples_count,
-										  true);
-		fasttrun_invalidate_local_plan_cache(relOid);
+		collect_result.became_neutral =
+			fasttrun_stats_cache_evict_relid(relOid);
+		(void) fasttrun_update_index_relstats(rel, NIL, NULL, 0,
+										  tuples_count, true);
 	}
+	if (planner_fallback_changed || collect_result.published_any ||
+		collect_result.became_neutral)
+		fasttrun_invalidate_local_plan_cache(relOid);
 
 	for (i = 0; i < sample_count; i++)
 		heap_freetuple(sample[i]);

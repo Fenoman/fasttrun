@@ -494,6 +494,44 @@ DEALLOCATE q_flip;
 COMMIT;
 DROP TABLE t_vis_flip;
 
+-- ----------------------------------------------------------------------
+-- 13. При track_counts=off явный сбор сбрасывает кеш планов только тогда,
+--     когда планировщик перестаёт видеть прежнюю статистику. Из четырёх
+--     переходов DEBUG должен показать только переходы от каталожной и от
+--     свежей локальной статистики к скрытому состоянию.
+-- ----------------------------------------------------------------------
+BEGIN;
+CREATE TEMP TABLE t_tc_absent (id int);
+SET LOCAL track_counts = off;
+SET client_min_messages = debug1;
+SELECT fasttrun_collect_stats('t_tc_absent');
+RESET client_min_messages;
+
+CREATE TEMP TABLE t_tc_unknown (id int);
+INSERT INTO t_tc_unknown SELECT generate_series(1,1000);
+ANALYZE t_tc_unknown;
+SET LOCAL track_counts = off;
+SET client_min_messages = debug1;
+SELECT fasttrun_collect_stats('t_tc_unknown');
+RESET client_min_messages;
+
+SET LOCAL track_counts = on;
+CREATE TEMP TABLE t_tc_visible (id int);
+INSERT INTO t_tc_visible SELECT generate_series(1,1000);
+SELECT fasttrun_collect_stats('t_tc_visible');
+SET LOCAL track_counts = off;
+SET client_min_messages = debug1;
+SELECT fasttrun_collect_stats('t_tc_visible');
+RESET client_min_messages;
+
+SET client_min_messages = debug1;
+SELECT fasttrun_collect_stats('t_tc_visible');
+RESET client_min_messages;
+COMMIT;
+DROP TABLE t_tc_absent;
+DROP TABLE t_tc_unknown;
+DROP TABLE t_tc_visible;
+
 DROP FUNCTION f_inner();
 DROP TABLE t_rsd_details;
 DROP TABLE t_balance_out;
