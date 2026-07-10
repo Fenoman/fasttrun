@@ -8,6 +8,7 @@ PSQL=${PSQL:-"$PG_BINDIR/psql"}
 INITDB=${INITDB:-"$PG_BINDIR/initdb"}
 PG_CTL=${PG_CTL:-"$PG_BINDIR/pg_ctl"}
 CREATEDB=${CREATEDB:-"$PG_BINDIR/createdb"}
+PYTHON=${PYTHON:-python3}
 BPFTRACE=${BPFTRACE:-bpftrace}
 SUDO=${SUDO:-sudo}
 PG_RUN_AS=${PG_RUN_AS:-}
@@ -15,10 +16,11 @@ PORT=${PGPORT:-55436}
 WORKDIR=${WORKDIR:-$(mktemp -d /tmp/fasttrun-perf.XXXXXX)}
 DBNAME=${DBNAME:-fasttrun_perf}
 TRACE_SECONDS=${TRACE_SECONDS:-6}
+KEEP_WORKDIR=${KEEP_WORKDIR:-0}
 FASTTRUN_SO=${FASTTRUN_SO:-"$PG_PKGLIBDIR/fasttrun.so"}
-# Строгий SLO fasttruncate на 1M-row temp таблице с индексом, мс.
-# pg_regress-порог в sql/fasttrun_bench.sql намеренно мягкий (500 мс,
-# не флапает на медленных боксах); жёсткая планка живёт здесь.
+# Строгий предел времени fasttruncate для таблицы из 1 млн строк и
+# 50 колонок, мс. В pg_regress оставлен мягкий предел 500 мс, чтобы тест
+# не зависел от скорости машины.
 MAX_TRUNC_MS=${MAX_TRUNC_MS:-100}
 
 run_pg()
@@ -39,7 +41,11 @@ cleanup()
 	if [ -f "$WORKDIR/data/postmaster.pid" ]; then
 		run_pg "$PG_CTL" -D "$WORKDIR/data" -w stop >/dev/null 2>&1 || true
 	fi
-	rm -rf "$WORKDIR"
+	if [ "$KEEP_WORKDIR" -eq 0 ]; then
+		rm -rf "$WORKDIR"
+	else
+		echo "performance test files kept in $WORKDIR" >&2
+	fi
 }
 trap cleanup EXIT
 
@@ -55,6 +61,7 @@ require_cmd "$PSQL"
 require_cmd "$INITDB"
 require_cmd "$PG_CTL"
 require_cmd "$CREATEDB"
+require_cmd "$PYTHON"
 require_cmd "$BPFTRACE"
 if [ -n "$PG_RUN_AS" ]; then
 	require_cmd runuser
@@ -350,28 +357,158 @@ assert_count "no-DML smgrnblocks" \
 	"$(map_count @smgr "$WORKDIR/no_dml_analyze.trace")" eq 0
 echo "no_dml_analyze passed"
 
-# Строгий тайминговый SLO: fasttruncate 1M-row temp таблицы с индексом
-# укладывается в MAX_TRUNC_MS.  Чистый psql, bpftrace не нужен.
+# Основная проверка: 1 млн строк, 50 колонок, четыре пользовательских индекса
+# и внешний TOAST. Результат для небольшой таблицы печатается отдельно и не
+# отменяет ошибку основной проверки.
 cat >"$WORKDIR/trunc_slo.sql" <<SQL
-CREATE TEMP TABLE ft_trunc_slo (id bigint, payload text);
-INSERT INTO ft_trunc_slo
-SELECT g, md5(g::text) FROM generate_series(1, 1000000) g;
-CREATE INDEX ON ft_trunc_slo (id);
-DO \$\$
-DECLARE
-    t_start timestamptz;
-    t_ms    numeric;
+DO \$fixture\$
+DECLARE ddl text := 'CREATE TEMP TABLE ft_trunc_wide (id bigint PRIMARY KEY';
+DECLARE i int;
 BEGIN
-    t_start := clock_timestamp();
-    PERFORM fasttruncate('ft_trunc_slo');
-    t_ms := EXTRACT(EPOCH FROM (clock_timestamp() - t_start)) * 1000;
-    RAISE NOTICE 'fasttruncate 1M-row temp table: % ms (limit $MAX_TRUNC_MS ms)',
-                 round(t_ms, 2);
-    IF t_ms > $MAX_TRUNC_MS THEN
-        RAISE EXCEPTION 'fasttruncate SLO exceeded: % ms > $MAX_TRUNC_MS ms',
-                        round(t_ms, 2);
-    END IF;
-END\$\$;
+  FOR i IN 1..35 LOOP
+    ddl := ddl || format(', i%s int', to_char(i, 'FM00'));
+  END LOOP;
+  FOR i IN 1..5 LOOP
+    ddl := ddl || format(', n%s numeric(18,4)', to_char(i, 'FM00'));
+  END LOOP;
+  FOR i IN 1..4 LOOP
+    ddl := ddl || format(', d%s date', to_char(i, 'FM00'));
+  END LOOP;
+  FOR i IN 1..4 LOOP
+    ddl := ddl || format(', t%s text', to_char(i, 'FM00'));
+  END LOOP;
+  ddl := ddl || ', payload text)';
+  EXECUTE ddl;
+  EXECUTE 'ALTER TABLE ft_trunc_wide ALTER COLUMN payload SET STORAGE EXTERNAL';
+  IF (SELECT count(*) FROM pg_attribute
+      WHERE attrelid = 'ft_trunc_wide'::regclass
+        AND attnum > 0 AND NOT attisdropped) <> 50 THEN
+    RAISE EXCEPTION 'wide test table must have exactly 50 columns';
+  END IF;
+END
+\$fixture\$;
+
+CREATE PROCEDURE pg_temp.fill_ft_trunc_wide()
+LANGUAGE plpgsql AS \$fill\$
+DECLARE expr text := 'g::bigint';
+DECLARE i int;
+BEGIN
+  FOR i IN 1..35 LOOP
+    expr := expr || format(', (g %% %s)::int', 1000 + i);
+  END LOOP;
+  FOR i IN 1..5 LOOP
+    expr := expr || format(', round(g::numeric / %s, 4)', i + 1);
+  END LOOP;
+  FOR i IN 1..4 LOOP
+    expr := expr || format(', date ''2020-01-01'' + (g %% %s)::int', 365 * i);
+  END LOOP;
+  FOR i IN 1..4 LOOP
+    expr := expr || format(', md5((g * %s)::text)', i);
+  END LOOP;
+  expr := expr || \$payload\$,
+    CASE WHEN g % 1000 = 0 THEN
+      (SELECT string_agg(md5((g * 1000 + s)::text), '' ORDER BY s)
+         FROM generate_series(1,160) AS toast_s(s))
+    ELSE md5(g::text) || md5((g + 1)::text)
+      || md5((g + 2)::text) || md5((g + 3)::text)
+    END\$payload\$;
+  EXECUTE 'INSERT INTO ft_trunc_wide SELECT ' || expr
+       || ' FROM generate_series(1,1000000) g';
+END
+\$fill\$;
+
+CREATE PROCEDURE pg_temp.assert_ft_trunc_wide_toast()
+LANGUAGE plpgsql AS \$assert\$
+DECLARE toast_oid oid;
+DECLARE chunk_count bigint;
+BEGIN
+  SELECT reltoastrelid INTO toast_oid
+  FROM pg_class WHERE oid = 'ft_trunc_wide'::regclass;
+  IF toast_oid = 0 OR pg_relation_size(toast_oid) <= 0 THEN
+    RAISE EXCEPTION 'wide test table has no physical external TOAST';
+  END IF;
+  EXECUTE format('SELECT count(*) FROM %s', toast_oid::regclass)
+  INTO chunk_count;
+  IF chunk_count <= 0 THEN
+    RAISE EXCEPTION 'wide test table TOAST relation has no chunks';
+  END IF;
+END
+\$assert\$;
+
+CALL pg_temp.fill_ft_trunc_wide();
+CREATE INDEX ft_trunc_wide_i01_idx ON ft_trunc_wide (i01);
+CREATE INDEX ft_trunc_wide_i02_i03_idx ON ft_trunc_wide (i02, i03);
+CREATE INDEX ft_trunc_wide_payload_idx ON ft_trunc_wide ((left(payload, 16)));
+CALL pg_temp.assert_ft_trunc_wide_toast();
+
+DO \$wide_bench\$
+DECLARE sample_no int;
+DECLARE started timestamptz;
+DECLARE elapsed_ms numeric;
+BEGIN
+  FOR sample_no IN 1..7 LOOP
+    started := clock_timestamp();
+    PERFORM fasttruncate('ft_trunc_wide');
+    elapsed_ms := extract(epoch FROM clock_timestamp() - started) * 1000;
+    RAISE NOTICE 'WIDE_SAMPLE|%|%', sample_no, round(elapsed_ms, 3);
+    CALL pg_temp.fill_ft_trunc_wide();
+    CALL pg_temp.assert_ft_trunc_wide_toast();
+  END LOOP;
+END
+\$wide_bench\$;
+
+DO \$wide_metrics\$
+DECLARE toast_oid oid;
+DECLARE chunk_count bigint;
+DECLARE user_index_bytes bigint;
+DECLARE workset_relations int;
+BEGIN
+  SELECT reltoastrelid INTO toast_oid
+  FROM pg_class WHERE oid = 'ft_trunc_wide'::regclass;
+  EXECUTE format('SELECT count(*) FROM %s', toast_oid::regclass)
+  INTO chunk_count;
+  SELECT coalesce(sum(pg_relation_size(indexrelid)), 0), count(*)
+  INTO user_index_bytes, workset_relations
+  FROM pg_index WHERE indrelid = 'ft_trunc_wide'::regclass;
+  workset_relations := 1 + workset_relations + 1 +
+    (SELECT count(*) FROM pg_index WHERE indrelid = toast_oid);
+  RAISE NOTICE 'WIDE_STORAGE|%|%|%|%|%|%',
+    pg_total_relation_size('ft_trunc_wide'::regclass),
+    pg_relation_size('ft_trunc_wide'::regclass),
+    user_index_bytes,
+    pg_total_relation_size(toast_oid),
+    chunk_count,
+    workset_relations;
+END
+\$wide_metrics\$;
+
+CREATE TEMP TABLE ft_trunc_skinny (id bigint, payload text);
+CREATE INDEX ft_trunc_skinny_id_idx ON ft_trunc_skinny (id);
+CREATE PROCEDURE pg_temp.fill_ft_trunc_skinny()
+LANGUAGE SQL AS \$fill\$
+  INSERT INTO ft_trunc_skinny
+  SELECT g, md5(g::text) FROM generate_series(1, 1000000) g;
+\$fill\$;
+CALL pg_temp.fill_ft_trunc_skinny();
+
+DO \$skinny_bench\$
+DECLARE sample_no int;
+DECLARE started timestamptz;
+DECLARE elapsed_ms numeric;
+BEGIN
+  FOR sample_no IN 1..7 LOOP
+    started := clock_timestamp();
+    PERFORM fasttruncate('ft_trunc_skinny');
+    elapsed_ms := extract(epoch FROM clock_timestamp() - started) * 1000;
+    RAISE NOTICE 'SKINNY_SAMPLE|%|%', sample_no, round(elapsed_ms, 3);
+    CALL pg_temp.fill_ft_trunc_skinny();
+  END LOOP;
+END
+\$skinny_bench\$;
+
+SELECT 'SERVER_VERSION|' || version();
+SELECT 'BLOCK_SIZE|' || current_setting('block_size');
+SELECT 'TEMP_BUFFERS|' || current_setting('temp_buffers');
 SQL
 run_pg "$PSQL" -h "$WORKDIR" -p "$PORT" -d "$DBNAME" -X -qAt \
 	-v ON_ERROR_STOP=1 -f "$WORKDIR/trunc_slo.sql" \
@@ -380,7 +517,63 @@ run_pg "$PSQL" -h "$WORKDIR" -p "$PORT" -d "$DBNAME" -X -qAt \
 	echo "trunc_slo failed" >&2
 	exit 1
 }
-grep 'fasttruncate 1M-row' "$WORKDIR/trunc_slo.psql.out" || true
-echo "trunc_slo passed"
+
+cpu_model=$(awk -F: '/model name/{sub(/^[[:space:]]*/, "", $2); print $2; exit}' \
+	/proc/cpuinfo 2>/dev/null || true)
+cpu_model=${cpu_model:-unknown}
+if command -v findmnt >/dev/null 2>&1; then
+	fs_type=$(findmnt -no FSTYPE -T "$WORKDIR" 2>/dev/null || true)
+else
+	fs_type=$(stat -f -c %T "$WORKDIR" 2>/dev/null || true)
+fi
+fs_type=${fs_type:-unknown}
+echo "ENV|PG_CONFIG_VERSION|$($PG_CONFIG --version)"
+echo "ENV|PG_CONFIGURE|$($PG_CONFIG --configure)"
+echo "ENV|CPU_MODEL|$cpu_model"
+echo "ENV|FILESYSTEM|$fs_type"
+cat "$WORKDIR/trunc_slo.psql.out"
+
+"$PYTHON" - "$WORKDIR/trunc_slo.psql.out" "$MAX_TRUNC_MS" <<'PY'
+import math
+import re
+import statistics
+import sys
+from pathlib import Path
+
+text = Path(sys.argv[1]).read_text(errors="replace")
+limit = float(sys.argv[2])
+failed = False
+
+
+def samples(prefix):
+    rows = re.findall(rf"{prefix}_SAMPLE\|(\d+)\|([0-9]+(?:\.[0-9]+)?)", text)
+    if len(rows) != 7 or [int(row[0]) for row in rows] != list(range(1, 8)):
+        raise SystemExit(f"{prefix}: expected seven ordered samples, got {rows}")
+    return [float(row[1]) for row in rows]
+
+
+wide = samples("WIDE")
+skinny = samples("SKINNY")
+for label, values in (("wide_1m_x50", wide), ("skinny_secondary", skinny)):
+    ordered = sorted(values)
+    median = statistics.median(values)
+    p95 = ordered[math.ceil(0.95 * len(ordered)) - 1]
+    rendered = ",".join(f"{value:.3f}" for value in values)
+    print(f"{label} samples_ms=[{rendered}] median_ms={median:.3f} p95_ms={p95:.3f}")
+
+wide_median = statistics.median(wide)
+if wide_median > limit:
+    print(f"FAIL: wide median {wide_median:.3f} ms > {limit:.3f} ms", file=sys.stderr)
+    failed = True
+if max(wide) > 2.0 * limit:
+    print(
+        f"FAIL: wide sample {max(wide):.3f} ms > 2x limit {2.0 * limit:.3f} ms",
+        file=sys.stderr,
+    )
+    failed = True
+if failed:
+    raise SystemExit(1)
+PY
+echo "strict truncate SLO passed"
 
 echo "fasttrun perf smoke passed"
