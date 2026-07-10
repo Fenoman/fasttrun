@@ -1756,4 +1756,39 @@ SELECT count(DISTINCT name) = 0 AS handoff_contexts_pruned
                 'fasttrun stats cache',
                 'fasttrun stats relid cache');
 DROP TABLE t_handoff_prune;
+
+-- ----------------------------------------------------------------------
+-- 41. В PG18 виртуальные вычисляемые колонки не хранят значение.
+--     Как обычный ANALYZE, оба способа сбора их пропускают.
+-- ----------------------------------------------------------------------
+DO $test$
+DECLARE got smallint[];
+BEGIN
+  IF current_setting('server_version_num')::int >= 180000 THEN
+    EXECUTE 'CREATE TEMP TABLE t_virtual_guard ('
+         || 'a int, b int GENERATED ALWAYS AS (a * 2) VIRTUAL)';
+    EXECUTE 'INSERT INTO t_virtual_guard(a) SELECT generate_series(1,1000)';
+
+    PERFORM set_config('fasttrun.use_typanalyze', 'on', true);
+    PERFORM fasttrun_analyze('t_virtual_guard');
+    SELECT array_agg(staattnum ORDER BY staattnum) INTO got
+      FROM fasttrun_inspect_stats('t_virtual_guard');
+    IF got IS DISTINCT FROM ARRAY[1]::smallint[] THEN
+      RAISE EXCEPTION 'typanalyze collected virtual column: %', got;
+    END IF;
+
+    PERFORM fasttruncate('t_virtual_guard');
+    EXECUTE 'INSERT INTO t_virtual_guard(a) SELECT generate_series(1,1000)';
+    PERFORM set_config('fasttrun.use_typanalyze', 'off', true);
+    PERFORM fasttrun_analyze('t_virtual_guard');
+    SELECT array_agg(staattnum ORDER BY staattnum) INTO got
+      FROM fasttrun_inspect_stats('t_virtual_guard');
+    IF got IS DISTINCT FROM ARRAY[1]::smallint[] THEN
+      RAISE EXCEPTION 'Haas-Stokes collected virtual column: %', got;
+    END IF;
+    EXECUTE 'DROP TABLE t_virtual_guard';
+  END IF;
+END
+$test$;
+\echo virtual_generated_guard_ok
 DROP EXTENSION fasttrun;

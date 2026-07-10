@@ -4300,6 +4300,19 @@ fasttrun_get_attstattarget(Relation rel, AttrNumber attnum)
 	return attstattarget;
 }
 
+/* Core ANALYZE has no stored sample value for a PG18 virtual column. */
+static inline bool
+fasttrun_attribute_is_analyzable(Form_pg_attribute attr)
+{
+	if (attr->attisdropped)
+		return false;
+#if PG_VERSION_NUM >= 180000
+	if (attr->attgenerated == ATTRIBUTE_GENERATED_VIRTUAL)
+		return false;
+#endif
+	return true;
+}
+
 /*
  * Standard fetch function for compute_stats -- pulls a column value out
  * of one of our sample tuples.  Mirrors std_fetch_func() in core
@@ -4339,7 +4352,7 @@ fasttrun_examine_attribute(Relation rel, int attnum, MemoryContext anl_context)
 	bool		ok;
 	MemoryContext oldcxt;
 
-	if (attr->attisdropped)
+	if (!fasttrun_attribute_is_analyzable(attr))
 		return NULL;
 	attstattarget = fasttrun_get_attstattarget(rel, attnum);
 	if (attstattarget == 0)
@@ -4850,13 +4863,9 @@ fasttrun_collect_and_store(Relation rel, HeapTuple *sample, int sample_count,
 
 		for (a = 0; a < natts; a++)
 		{
-			Form_pg_attribute	attr = TupleDescAttr(tupdesc, a);
 			AttrNumber			attnum = a + 1;
 			VacAttrStats	   *stats;
 			HeapTuple			stats_tuple;
-
-			if (attr->attisdropped)
-				continue;
 
 			CHECK_FOR_INTERRUPTS();
 			MemoryContextReset(per_col_mcxt);
@@ -4942,7 +4951,7 @@ fasttrun_collect_and_store(Relation rel, HeapTuple *sample, int sample_count,
 			float4			   stadistinct;
 			HeapTuple		   stats_tuple;
 
-			if (attr->attisdropped)
+			if (!fasttrun_attribute_is_analyzable(attr))
 				continue;
 			attstattarget = fasttrun_get_attstattarget(rel, attnum);
 			if (attstattarget == 0)
@@ -7883,19 +7892,15 @@ fasttrun_vacuum_option_enabled(VacuumStmt *stmt, const char *name)
 }
 
 static bool
-fasttrun_attribute_is_analyzable(Relation rel, AttrNumber attnum)
+fasttrun_attribute_target_is_analyzable(Relation rel, AttrNumber attnum)
 {
 	Form_pg_attribute attr;
 
 	if (attnum <= 0 || attnum > RelationGetDescr(rel)->natts)
 		return false;
 	attr = TupleDescAttr(RelationGetDescr(rel), attnum - 1);
-	if (attr->attisdropped)
+	if (!fasttrun_attribute_is_analyzable(attr))
 		return false;
-#if PG_VERSION_NUM >= 180000
-	if (attr->attgenerated == ATTRIBUTE_GENERATED_VIRTUAL)
-		return false;
-#endif
 	return fasttrun_get_attstattarget(rel, attnum) != 0;
 }
 
@@ -7924,7 +7929,7 @@ fasttrun_analyze_target_attnums(Relation rel, List *va_cols)
 			bms_free(attnums);
 			return NULL;
 		}
-		if (fasttrun_attribute_is_analyzable(rel, attnum))
+		if (fasttrun_attribute_target_is_analyzable(rel, attnum))
 			attnums = bms_add_member(attnums, attnum);
 	}
 	return attnums;
