@@ -207,23 +207,14 @@ typedef enum FasttrunTouchFlags
 	FASTTRUN_TOUCH_STATS = 1 << 1,
 	FASTTRUN_TOUCH_DML = 1 << 2,
 	FASTTRUN_TOUCH_DROPPED = 1 << 3,
-	FASTTRUN_TOUCH_TRUNCATE_PREPARED = 1 << 4,
-	FASTTRUN_TOUCH_TRUNCATE_MUTATED = 1 << 5,
-	FASTTRUN_TOUCH_TRUNCATE_COMPLETE = 1 << 6,
-	FASTTRUN_TOUCH_PLAN_INVALIDATE = 1 << 7
+	FASTTRUN_TOUCH_PLAN_INVALIDATE = 1 << 4
 } FasttrunTouchFlags;
-
-#define FASTTRUN_TOUCH_TRUNCATE_MASK \
-	(FASTTRUN_TOUCH_TRUNCATE_PREPARED | \
-	 FASTTRUN_TOUCH_TRUNCATE_MUTATED | \
-	 FASTTRUN_TOUCH_TRUNCATE_COMPLETE)
 
 typedef struct FasttrunXactRelEntry
 {
 	Oid			relid;			/* hash key */
 	Oid			root_relid;		/* owning heap */
 	uint32		flags;
-	uint64		truncate_generation;
 } FasttrunXactRelEntry;
 
 typedef struct FasttrunXactFrame
@@ -293,7 +284,6 @@ fasttrun_xact_mark_relid(Oid relid, Oid root_relid, uint32 flags)
 
 	if (!OidIsValid(relid))
 		return NULL;
-	Assert((flags & FASTTRUN_TOUCH_TRUNCATE_MASK) == 0);
 	if (!OidIsValid(root_relid))
 		root_relid = relid;
 
@@ -304,7 +294,6 @@ fasttrun_xact_mark_relid(Oid relid, Oid root_relid, uint32 flags)
 	{
 		entry->root_relid = root_relid;
 		entry->flags = 0;
-		entry->truncate_generation = 0;
 	}
 	else if (OidIsValid(root_relid))
 		entry->root_relid = root_relid;
@@ -322,45 +311,10 @@ fasttrun_xact_mark_relid(Oid relid, Oid root_relid, uint32 flags)
 		{
 			root_entry->root_relid = root_relid;
 			root_entry->flags = 0;
-			root_entry->truncate_generation = 0;
 		}
 		root_entry->flags |= FASTTRUN_TOUCH_PLAN_INVALIDATE;
 	}
 
-	return entry;
-}
-
-static int
-fasttrun_truncate_phase_rank(uint32 phase)
-{
-	if (phase == FASTTRUN_TOUCH_TRUNCATE_COMPLETE)
-		return 3;
-	if (phase == FASTTRUN_TOUCH_TRUNCATE_MUTATED)
-		return 2;
-	Assert(phase == FASTTRUN_TOUCH_TRUNCATE_PREPARED);
-	return 1;
-}
-
-static inline FasttrunXactRelEntry *
-fasttrun_xact_mark_truncate(Oid relid, Oid root_relid, uint64 generation,
-							uint32 phase)
-{
-	FasttrunXactRelEntry *entry;
-	uint32		old_phase;
-
-	Assert((phase & FASTTRUN_TOUCH_TRUNCATE_MASK) == phase);
-	Assert(phase != 0 && (phase & (phase - 1)) == 0);
-	entry = fasttrun_xact_mark_relid(relid, root_relid, 0);
-	old_phase = entry->flags & FASTTRUN_TOUCH_TRUNCATE_MASK;
-	if (generation > entry->truncate_generation ||
-		(generation == entry->truncate_generation &&
-		 (old_phase == 0 ||
-		  fasttrun_truncate_phase_rank(phase) >
-		  fasttrun_truncate_phase_rank(old_phase))))
-	{
-		entry->flags = (entry->flags & ~FASTTRUN_TOUCH_TRUNCATE_MASK) | phase;
-		entry->truncate_generation = generation;
-	}
 	return entry;
 }
 
@@ -369,8 +323,6 @@ fasttrun_xact_merge_entry(FasttrunXactFrame *parent,
 						  FasttrunXactRelEntry *child)
 {
 	FasttrunXactRelEntry *dst;
-	uint32		child_phase = child->flags & FASTTRUN_TOUCH_TRUNCATE_MASK;
-	uint32		dst_phase;
 	bool		found;
 
 	dst = (FasttrunXactRelEntry *)
@@ -382,18 +334,7 @@ fasttrun_xact_merge_entry(FasttrunXactFrame *parent,
 	}
 
 	dst->root_relid = child->root_relid;
-	dst->flags |= child->flags & ~FASTTRUN_TOUCH_TRUNCATE_MASK;
-	dst_phase = dst->flags & FASTTRUN_TOUCH_TRUNCATE_MASK;
-	if (child_phase != 0 &&
-		(child->truncate_generation > dst->truncate_generation ||
-		 (child->truncate_generation == dst->truncate_generation &&
-		  (dst_phase == 0 ||
-		   fasttrun_truncate_phase_rank(child_phase) >
-		   fasttrun_truncate_phase_rank(dst_phase)))))
-	{
-		dst->flags = (dst->flags & ~FASTTRUN_TOUCH_TRUNCATE_MASK) | child_phase;
-		dst->truncate_generation = child->truncate_generation;
-	}
+	dst->flags |= child->flags;
 }
 
 static bool
@@ -5809,10 +5750,6 @@ fasttrun_execute_truncate_storage(FasttrunTruncateOperation *operation,
 	int			ordinal = 0;
 	int			toast_ordinal = 0;
 
-	fasttrun_xact_mark_truncate(operation->root_relid,
-								operation->root_relid,
-								operation->generation,
-								FASTTRUN_TOUCH_TRUNCATE_MUTATED);
 	operation->phase = FASTTRUN_TRUNCATE_MUTATED;
 
 	foreach(lc, opened->user_indexes)
@@ -6127,8 +6064,6 @@ fasttruncate(PG_FUNCTION_ARGS)
 														 truncate_generation);
 		cleanup_operation = operation;
 		cleanup_generation = truncate_generation;
-		fasttrun_xact_mark_truncate(relOid, relOid, truncate_generation,
-									FASTTRUN_TOUCH_TRUNCATE_PREPARED);
 		(void) fasttrun_poison_reserve(operation);
 		cleanup_pending_published = true;
 		FASTTRUN_TEST_FAILPOINT("after_prepare", 0);
@@ -6142,8 +6077,6 @@ fasttruncate(PG_FUNCTION_ARGS)
 		FASTTRUN_TEST_FAILPOINT("before_publish", 0);
 		fasttrun_publish_empty_workset(operation, &opened);
 
-		fasttrun_xact_mark_truncate(relOid, relOid, truncate_generation,
-									FASTTRUN_TOUCH_TRUNCATE_COMPLETE);
 		operation->phase = FASTTRUN_TRUNCATE_COMPLETE;
 		fasttrun_poison_complete(operation);
 		cleanup_operation = NULL;
