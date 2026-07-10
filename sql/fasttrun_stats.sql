@@ -1170,8 +1170,10 @@ SELECT count(*) = 0 AS empty_for_missing
 FROM fasttrun_inspect_stats('nonexistent_temp_xxx');
 
 -- Empty result для таблицы без fasttrun-статистики
+CREATE TEMP TABLE t_no_stats (id int);
 SELECT count(*) = 0 AS empty_for_no_stats_yet
-FROM fasttrun_inspect_stats('t_stats');
+FROM fasttrun_inspect_stats('t_no_stats');
+DROP TABLE t_no_stats;
 COMMIT;
 DROP TABLE t_inspect;
 

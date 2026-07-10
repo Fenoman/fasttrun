@@ -469,140 +469,52 @@ fasttrun_make_rangevar(text *name)
  */
 
 /*
- * Stack frame saved on every cross-subxact stats_baseline_* overwrite.
- * fasttrun_subxact_callback pops this on ROLLBACK TO SAVEPOINT to fully
- * restore the pre-subxact baseline (and not just the per-column stats
- * cache, which has its own undo).  Allocated in fasttrun_analyze_mcxt.
+ * Every field that can change planner decisions travels in one COW snapshot.
+ * Restoring only relstats or only the pgstat anchors can combine states from
+ * different subtransactions.  The allocation-free lazy probe stays outside.
  */
-typedef struct FasttrunAnalyzeBaselineUndo
-{
-	bool		has_stats_baseline;
-	int64		stats_baseline_inserted;
-	int64		stats_baseline_updated;
-	int64		stats_baseline_deleted;
-	bool		stats_baseline_truncdropped;
-	SubTransactionId	stats_baseline_subid;
-	struct FasttrunAnalyzeBaselineUndo *older;
-} FasttrunAnalyzeBaselineUndo;
-
-typedef struct FasttrunAnalyzeRelstatsUndo
+typedef struct FasttrunAnalyzeState
 {
 	bool		has_relstats;
+	RelFileLocator cached_locator;
 	BlockNumber	cached_pages;
 	int64		cached_tuples;
 	BlockNumber	cached_allvisible;
-	RelFileLocator cached_locator;
+	BlockNumber	last_inval_pages;
+	float4		last_inval_tuples;
+	bool		last_inval_valid;
+	RelFileLocatorBackend probe_rlb;
+	Oid			heap_relid;
+	RelFileLocatorBackend heap_rlb;
 	bool		has_delta_state;
 	int64		cached_inserted;
 	int64		cached_updated;
 	int64		cached_deleted;
 	bool		cached_truncdropped;
-	SubTransactionId relstats_subid;
-	struct FasttrunAnalyzeRelstatsUndo *older;
-} FasttrunAnalyzeRelstatsUndo;
-
-typedef struct FasttrunAnalyzeCacheEntry
-{
-	Oid			relid;			/* hash key -- must be first */
-
-	/*
-	 * Planner-visible relstats.  These are session-local and can survive a
-	 * transaction boundary, unlike the delta-math state below.  cached_locator
-	 * guards against same-OID/new-relfilenode reuse after SQL TRUNCATE/rewrite.
-	 */
-	bool		has_relstats;
-	RelFileLocator cached_locator;
-	BlockNumber	cached_pages;
-	int64		cached_tuples;
-	BlockNumber	cached_allvisible;
-
-	/*
-	 * rd_rel values published at the moment of the last local plan-cache
-	 * invalidation.  The invalidate_threshold gate measures drift against
-	 * these, so sub-threshold steps accumulate instead of re-anchoring on
-	 * every call.
-	 */
-	BlockNumber	last_inval_pages;
-	float4		last_inval_tuples;
-	bool		last_inval_valid;
-
-	/*
-	 * Storage identity for abort-time probes.  probe_rlb is THIS relation's
-	 * storage; heap_relid/heap_rlb identify the owning heap for index
-	 * entries (equal to the entry itself for heaps).  The subxact-abort path
-	 * checks storage emptiness at smgr level through these -- relcache and
-	 * syscache lookups are unsafe while the transaction state is aborted.
-	 */
-	RelFileLocatorBackend probe_rlb;
-	Oid			heap_relid;
-	RelFileLocatorBackend heap_rlb;
-
-	/*
-	 * Delta-math state is valid only inside the transaction where pgstat
-	 * xact counters were captured.  XACT COMMIT keeps has_relstats but clears
-	 * this part so the next transaction cold-scans before doing delta math.
-	 */
-	bool		has_delta_state;
-	int64		cached_inserted;
-	int64		cached_updated;
-	int64		cached_deleted;
-	bool		cached_truncdropped;	/* OR of truncdropped over subxact stack */
-	SubTransactionId relstats_subid;
-	FasttrunAnalyzeRelstatsUndo *relstats_undo;
-
-	/*
-	 * Stats-collection baseline: pgstat counters captured the last time
-	 * we successfully collected (or explicitly reset) the column-stats
-	 * cache for this relid.  Used by the delta-hit refresh path to
-	 * decide whether DML churn since that point has crossed
-	 * fasttrun.stats_refresh_threshold.
-	 *
-	 * Lives here (not in the per-(relid,attnum) stats cache) so that
-	 * (a) lookup is O(1), not O(N) over the stats hash, and
-	 * (b) when a refresh on an emptied table finds zero visible
-	 *     tuples, we can still advance the baseline without leaving a
-	 *     stats-cache entry behind -- otherwise the next analyze would
-	 *     keep re-entering the refresh path forever.
-	 *
-	 * has_stats_baseline=false means "we never collected column stats
-	 * for this relid in the current xact"; refresh path skips and
-	 * leaves the planner to use defaults / whatever the hook returns.
-	 *
-	 * stats_baseline_subid + stats_baseline_undo carry the same
-	 * savepoint-aware semantics as the per-column stats cache: an
-	 * overwrite that crosses a subxact boundary pushes the old baseline
-	 * onto the undo stack, and ROLLBACK TO SAVEPOINT pops it back.
-	 * This keeps refresh-path churn computation consistent with the
-	 * stats cache after a partial rollback (otherwise the first post-
-	 * rollback analyze would re-enter the refresh path with a
-	 * "from-the-future" baseline).
-	 */
 	bool		has_stats_baseline;
 	int64		stats_baseline_inserted;
 	int64		stats_baseline_updated;
 	int64		stats_baseline_deleted;
 	bool		stats_baseline_truncdropped;
-	SubTransactionId	stats_baseline_subid;
-	FasttrunAnalyzeBaselineUndo *stats_baseline_undo;
-
-	/*
-	 * Partial-index rescan anchor: pgstat counters captured when the
-	 * partial-index relstats were last brought in sync with the heap
-	 * (sample-based rescan, or any refresh that publishes a stats
-	 * baseline).  The rescan probe measures churn from here, NOT from the
-	 * stats baseline: the baseline deliberately stays put on sub-threshold
-	 * churn, and measuring against it would re-sample the partial indexes
-	 * on every analyze after a single small DML.  An invalid anchor falls
-	 * back to the baseline -- at worst one extra rescan, never a missed
-	 * one.  Subid-tagged like the lazy-probe memo: reset when the
-	 * recording subxact aborts (its counters rolled back with it),
-	 * promoted to the parent on subcommit.
-	 */
 	bool		partial_scan_valid;
 	int64		partial_scan_inserted;
 	int64		partial_scan_updated;
 	int64		partial_scan_deleted;
-	SubTransactionId	partial_scan_subid;
+} FasttrunAnalyzeState;
+
+typedef struct FasttrunAnalyzeUndo
+{
+	FasttrunAnalyzeState state;
+	SubTransactionId state_subid;
+	struct FasttrunAnalyzeUndo *older;
+} FasttrunAnalyzeUndo;
+
+typedef struct FasttrunAnalyzeCacheEntry
+{
+	Oid			relid;			/* hash key -- must be first */
+	FasttrunAnalyzeState state;
+	SubTransactionId state_subid;
+	FasttrunAnalyzeUndo *undo;
 
 	/*
 	 * Memo for the lazy empty-storage probe in fasttrun_reinject_relstats().
@@ -625,12 +537,13 @@ static HTAB			   *fasttrun_analyze_cache = NULL;
 static MemoryContext	fasttrun_analyze_mcxt = NULL;
 
 static void fasttrun_xact_callback(XactEvent event, void *arg);
+static void fasttrun_analyze_save_undo(FasttrunAnalyzeCacheEntry *entry);
 
 static bool
 fasttrun_relation_has_same_locator(Relation rel, FasttrunAnalyzeCacheEntry *entry)
 {
-	return entry->has_relstats &&
-		RelFileLocatorEquals(rel->rd_locator, entry->cached_locator);
+	return entry->state.has_relstats &&
+		RelFileLocatorEquals(rel->rd_locator, entry->state.cached_locator);
 }
 
 /*
@@ -658,20 +571,20 @@ fasttrun_cache_make_empty_storage_authoritative(FasttrunAnalyzeCacheEntry *entry
 {
 	SMgrRelation own;
 
-	*plan_relid = entry->heap_relid;
+	*plan_relid = entry->state.heap_relid;
 
-	if (!entry->has_relstats || !OidIsValid(entry->heap_relid))
+	if (!entry->state.has_relstats || !OidIsValid(entry->state.heap_relid))
 		return false;
 
-	own = smgropen(entry->probe_rlb.locator, entry->probe_rlb.backend);
+	own = smgropen(entry->state.probe_rlb.locator, entry->state.probe_rlb.backend);
 	if (!smgrexists(own, MAIN_FORKNUM))
 		return false;
 
-	if (entry->heap_relid != entry->relid)
+	if (entry->state.heap_relid != entry->relid)
 	{
 		/* Index entry: emptiness is the owning heap's emptiness. */
-		SMgrRelation heap = smgropen(entry->heap_rlb.locator,
-									 entry->heap_rlb.backend);
+		SMgrRelation heap = smgropen(entry->state.heap_rlb.locator,
+									 entry->state.heap_rlb.backend);
 
 		if (!smgrexists(heap, MAIN_FORKNUM) ||
 			smgrnblocks(heap, MAIN_FORKNUM) != 0)
@@ -681,12 +594,12 @@ fasttrun_cache_make_empty_storage_authoritative(FasttrunAnalyzeCacheEntry *entry
 		return false;
 
 	/* Heap gives 0 pages here; a rebuilt index keeps its metapage. */
-	entry->has_relstats = true;
-	entry->cached_pages = smgrnblocks(own, MAIN_FORKNUM);
-	entry->cached_tuples = 0;
-	entry->cached_allvisible = 0;
-	entry->relstats_subid = InvalidSubTransactionId;
-	entry->has_delta_state = false;
+	entry->state.has_relstats = true;
+	entry->state.cached_pages = smgrnblocks(own, MAIN_FORKNUM);
+	entry->state.cached_tuples = 0;
+	entry->state.cached_allvisible = 0;
+	entry->state_subid = InvalidSubTransactionId;
+	entry->state.has_delta_state = false;
 	/* cached_pages drifted -- drop the lazy memo. */
 	entry->lazy_check_subid = InvalidSubTransactionId;
 	entry->lazy_check_pages = 0;
@@ -704,30 +617,14 @@ fasttrun_count_allvisible(Relation rel)
 	return relallvisible;
 }
 
-/*
- * Free the entire baseline undo chain hanging off an analyze-cache entry.
- * Used both on full xact reset and when an entry is evicted (fasttruncate).
- */
 static void
-fasttrun_baseline_free_undo(FasttrunAnalyzeCacheEntry *entry)
+fasttrun_analyze_free_undo(FasttrunAnalyzeCacheEntry *entry)
 {
-	while (entry->stats_baseline_undo != NULL)
+	while (entry->undo != NULL)
 	{
-		FasttrunAnalyzeBaselineUndo *popped = entry->stats_baseline_undo;
+		FasttrunAnalyzeUndo *popped = entry->undo;
 
-		entry->stats_baseline_undo = popped->older;
-		pfree(popped);
-	}
-}
-
-static void
-fasttrun_relstats_free_undo(FasttrunAnalyzeCacheEntry *entry)
-{
-	while (entry->relstats_undo != NULL)
-	{
-		FasttrunAnalyzeRelstatsUndo *popped = entry->relstats_undo;
-
-		entry->relstats_undo = popped->older;
+		entry->undo = popped->older;
 		pfree(popped);
 	}
 }
@@ -735,11 +632,10 @@ fasttrun_relstats_free_undo(FasttrunAnalyzeCacheEntry *entry)
 static void
 fasttrun_cache_reset_partial_scan_anchor(FasttrunAnalyzeCacheEntry *entry)
 {
-	entry->partial_scan_valid = false;
-	entry->partial_scan_inserted = 0;
-	entry->partial_scan_updated = 0;
-	entry->partial_scan_deleted = 0;
-	entry->partial_scan_subid = InvalidSubTransactionId;
+	entry->state.partial_scan_valid = false;
+	entry->state.partial_scan_inserted = 0;
+	entry->state.partial_scan_updated = 0;
+	entry->state.partial_scan_deleted = 0;
 }
 
 /*
@@ -751,11 +647,11 @@ static void
 fasttrun_cache_set_partial_scan_anchor(FasttrunAnalyzeCacheEntry *entry,
 									   int64 ins, int64 upd, int64 del)
 {
-	entry->partial_scan_valid = true;
-	entry->partial_scan_inserted = ins;
-	entry->partial_scan_updated = upd;
-	entry->partial_scan_deleted = del;
-	entry->partial_scan_subid = GetCurrentSubTransactionId();
+	fasttrun_analyze_save_undo(entry);
+	entry->state.partial_scan_valid = true;
+	entry->state.partial_scan_inserted = ins;
+	entry->state.partial_scan_updated = upd;
+	entry->state.partial_scan_deleted = del;
 }
 
 /* Drop the analyze HTAB + its mcxt (frees all baseline undo chains). */
@@ -842,29 +738,26 @@ fasttrun_cache_commit_xact(void)
 		 */
 		if (fasttrun_xact_entry_dropped(xentry))
 		{
-			fasttrun_baseline_free_undo(entry);
-			fasttrun_relstats_free_undo(entry);
+			fasttrun_analyze_free_undo(entry);
 			(void) hash_search(fasttrun_analyze_cache, &relid,
 							   HASH_REMOVE, NULL);
 			continue;
 		}
 
-		fasttrun_baseline_free_undo(entry);
-		fasttrun_relstats_free_undo(entry);
+		fasttrun_analyze_free_undo(entry);
 
-		entry->has_delta_state = false;
-		entry->cached_inserted = 0;
-		entry->cached_updated = 0;
-		entry->cached_deleted = 0;
-		entry->cached_truncdropped = false;
-		entry->relstats_subid = InvalidSubTransactionId;
+		entry->state.has_delta_state = false;
+		entry->state.cached_inserted = 0;
+		entry->state.cached_updated = 0;
+		entry->state.cached_deleted = 0;
+		entry->state.cached_truncdropped = false;
 
-		entry->has_stats_baseline = false;
-		entry->stats_baseline_inserted = 0;
-		entry->stats_baseline_updated = 0;
-		entry->stats_baseline_deleted = 0;
-		entry->stats_baseline_truncdropped = false;
-		entry->stats_baseline_subid = InvalidSubTransactionId;
+		entry->state.has_stats_baseline = false;
+		entry->state.stats_baseline_inserted = 0;
+		entry->state.stats_baseline_updated = 0;
+		entry->state.stats_baseline_deleted = 0;
+		entry->state.stats_baseline_truncdropped = false;
+		entry->state_subid = InvalidSubTransactionId;
 
 		/* Anchored to this xact's pgstat counters -- meaningless outside. */
 		fasttrun_cache_reset_partial_scan_anchor(entry);
@@ -877,7 +770,7 @@ fasttrun_cache_commit_xact(void)
 		entry->lazy_check_subid = InvalidSubTransactionId;
 		entry->lazy_check_pages = 0;
 
-		if (!entry->has_relstats)
+		if (!entry->state.has_relstats)
 			(void) hash_search(fasttrun_analyze_cache, &relid,
 							   HASH_REMOVE, NULL);
 	}
@@ -903,8 +796,22 @@ fasttrun_xact_callback(XactEvent event, void *arg)
 			fasttrun_stats_cache_commit_xact();
 			break;
 		case XACT_EVENT_ABORT:
-		case XACT_EVENT_PREPARE:
 		case XACT_EVENT_PARALLEL_ABORT:
+			/*
+			 * Reuse the frame-local undo path.  An unrelated abort has no frame
+			 * and therefore leaves committed session-local statistics untouched.
+			 */
+			while (fasttrun_xact_frame != NULL)
+			{
+				FasttrunXactFrame *frame = fasttrun_xact_frame;
+
+				fasttrun_subxact_callback(SUBXACT_EVENT_ABORT_SUB,
+									  frame->subid,
+									  InvalidSubTransactionId, NULL);
+			}
+			break;
+		case XACT_EVENT_PREPARE:
+			/* Prepared xacts cannot retain backend-private temp state. */
 			fasttrun_cache_reset();
 			fasttrun_stats_cache_reset();
 			break;
@@ -973,32 +880,10 @@ fasttrun_cache_enter(Oid relid)
 													  HASH_ENTER, &found);
 	if (!found)
 	{
-		entry->has_relstats = false;
-		memset(&entry->cached_locator, 0, sizeof(entry->cached_locator));
-		entry->cached_pages = 0;
-		entry->cached_tuples = 0;
-		entry->cached_allvisible = 0;
-		entry->last_inval_pages = 0;
-		entry->last_inval_tuples = 0;
-		entry->last_inval_valid = false;
-		memset(&entry->probe_rlb, 0, sizeof(entry->probe_rlb));
-		entry->heap_relid = InvalidOid;
-		memset(&entry->heap_rlb, 0, sizeof(entry->heap_rlb));
-		entry->has_delta_state = false;
-		entry->cached_inserted = 0;
-		entry->cached_updated = 0;
-		entry->cached_deleted = 0;
-		entry->cached_truncdropped = false;
-		entry->relstats_subid = InvalidSubTransactionId;
-		entry->relstats_undo = NULL;
-		entry->has_stats_baseline = false;
-		entry->stats_baseline_inserted = 0;
-		entry->stats_baseline_updated = 0;
-		entry->stats_baseline_deleted = 0;
-		entry->stats_baseline_truncdropped = false;
-		entry->stats_baseline_subid = InvalidSubTransactionId;
-		entry->stats_baseline_undo = NULL;
-		fasttrun_cache_reset_partial_scan_anchor(entry);
+		memset(&entry->state, 0, sizeof(entry->state));
+		entry->state.heap_relid = InvalidOid;
+		entry->state_subid = InvalidSubTransactionId;
+		entry->undo = NULL;
 		entry->lazy_check_pages = 0;
 		entry->lazy_check_subid = InvalidSubTransactionId;
 	}
@@ -1006,32 +891,24 @@ fasttrun_cache_enter(Oid relid)
 }
 
 static void
-fasttrun_cache_save_relstats_undo(FasttrunAnalyzeCacheEntry *entry)
+fasttrun_analyze_save_undo(FasttrunAnalyzeCacheEntry *entry)
 {
 	SubTransactionId cur_subid = GetCurrentSubTransactionId();
 	MemoryContext oldcxt;
-	FasttrunAnalyzeRelstatsUndo *saved;
+	FasttrunAnalyzeUndo *saved;
 
-	if (entry->relstats_subid == cur_subid)
+	if (entry->state_subid == cur_subid)
 		return;
 
 	oldcxt = MemoryContextSwitchTo(fasttrun_analyze_mcxt);
-	saved = (FasttrunAnalyzeRelstatsUndo *) palloc(sizeof(*saved));
+	saved = (FasttrunAnalyzeUndo *) palloc(sizeof(*saved));
 	MemoryContextSwitchTo(oldcxt);
 
-	saved->has_relstats = entry->has_relstats;
-	saved->cached_pages = entry->cached_pages;
-	saved->cached_tuples = entry->cached_tuples;
-	saved->cached_allvisible = entry->cached_allvisible;
-	saved->cached_locator = entry->cached_locator;
-	saved->has_delta_state = entry->has_delta_state;
-	saved->cached_inserted = entry->cached_inserted;
-	saved->cached_updated = entry->cached_updated;
-	saved->cached_deleted = entry->cached_deleted;
-	saved->cached_truncdropped = entry->cached_truncdropped;
-	saved->relstats_subid = entry->relstats_subid;
-	saved->older = entry->relstats_undo;
-	entry->relstats_undo = saved;
+	saved->state = entry->state;
+	saved->state_subid = entry->state_subid;
+	saved->older = entry->undo;
+	entry->undo = saved;
+	entry->state_subid = cur_subid;
 }
 
 static FasttrunAnalyzeCacheEntry *
@@ -1041,19 +918,18 @@ fasttrun_cache_store_relstats(Relation rel, BlockNumber pages, int64 tuples,
 	FasttrunAnalyzeCacheEntry *entry;
 
 	entry = fasttrun_cache_enter(RelationGetRelid(rel));
-	fasttrun_cache_save_relstats_undo(entry);
+	fasttrun_analyze_save_undo(entry);
 
-	entry->has_relstats = true;
-	entry->cached_locator = rel->rd_locator;
-	entry->cached_pages = pages;
-	entry->cached_tuples = tuples;
-	entry->cached_allvisible = allvisible;
-	entry->probe_rlb.locator = rel->rd_locator;
-	entry->probe_rlb.backend = rel->rd_backend;
+	entry->state.has_relstats = true;
+	entry->state.cached_locator = rel->rd_locator;
+	entry->state.cached_pages = pages;
+	entry->state.cached_tuples = tuples;
+	entry->state.cached_allvisible = allvisible;
+	entry->state.probe_rlb.locator = rel->rd_locator;
+	entry->state.probe_rlb.backend = rel->rd_backend;
 	/* Default: the entry is its own heap; index call sites override. */
-	entry->heap_relid = RelationGetRelid(rel);
-	entry->heap_rlb = entry->probe_rlb;
-	entry->relstats_subid = GetCurrentSubTransactionId();
+	entry->state.heap_relid = RelationGetRelid(rel);
+	entry->state.heap_rlb = entry->state.probe_rlb;
 	/* cached_pages changed -- the lazy-probe memo is now stale. */
 	entry->lazy_check_subid = InvalidSubTransactionId;
 	entry->lazy_check_pages = 0;
@@ -1077,13 +953,13 @@ fasttrun_cache_set_owning_heap(FasttrunAnalyzeCacheEntry *entry,
 {
 	uint32		flags = FASTTRUN_TOUCH_ANALYZE;
 
-	entry->heap_relid = RelationGetRelid(heaprel);
-	entry->heap_rlb.locator = heaprel->rd_locator;
-	entry->heap_rlb.backend = heaprel->rd_backend;
+	entry->state.heap_relid = RelationGetRelid(heaprel);
+	entry->state.heap_rlb.locator = heaprel->rd_locator;
+	entry->state.heap_rlb.backend = heaprel->rd_backend;
 	/* TOAST has no user plan of its own; its main heap already owns the plan. */
 	if (heaprel->rd_rel->relkind != RELKIND_TOASTVALUE)
 		flags |= FASTTRUN_TOUCH_PLAN_INVALIDATE;
-	fasttrun_xact_mark_relid(entry->relid, entry->heap_relid,
+	fasttrun_xact_mark_relid(entry->relid, entry->state.heap_relid,
 							flags);
 }
 
@@ -1092,35 +968,11 @@ fasttrun_cache_store_delta_state(FasttrunAnalyzeCacheEntry *entry,
 								 int64 ins, int64 upd, int64 del,
 								 bool truncdropped)
 {
-	entry->has_delta_state = true;
-	entry->cached_inserted = ins;
-	entry->cached_updated = upd;
-	entry->cached_deleted = del;
-	entry->cached_truncdropped = truncdropped;
-}
-
-static void
-fasttrun_cache_save_baseline_undo(FasttrunAnalyzeCacheEntry *entry)
-{
-	SubTransactionId cur_subid = GetCurrentSubTransactionId();
-	MemoryContext oldcxt;
-	FasttrunAnalyzeBaselineUndo *saved;
-
-	if (entry->stats_baseline_subid == cur_subid)
-		return;
-
-	oldcxt = MemoryContextSwitchTo(fasttrun_analyze_mcxt);
-	saved = (FasttrunAnalyzeBaselineUndo *) palloc(sizeof(*saved));
-	MemoryContextSwitchTo(oldcxt);
-
-	saved->has_stats_baseline = entry->has_stats_baseline;
-	saved->stats_baseline_inserted = entry->stats_baseline_inserted;
-	saved->stats_baseline_updated = entry->stats_baseline_updated;
-	saved->stats_baseline_deleted = entry->stats_baseline_deleted;
-	saved->stats_baseline_truncdropped = entry->stats_baseline_truncdropped;
-	saved->stats_baseline_subid = entry->stats_baseline_subid;
-	saved->older = entry->stats_baseline_undo;
-	entry->stats_baseline_undo = saved;
+	entry->state.has_delta_state = true;
+	entry->state.cached_inserted = ins;
+	entry->state.cached_updated = upd;
+	entry->state.cached_deleted = del;
+	entry->state.cached_truncdropped = truncdropped;
 }
 
 /*
@@ -1143,16 +995,14 @@ fasttrun_cache_set_stats_baseline(Oid relid, int64 ins, int64 upd, int64 del,
 								  bool truncdropped)
 {
 	FasttrunAnalyzeCacheEntry *entry = fasttrun_cache_enter(relid);
-	SubTransactionId cur_subid = GetCurrentSubTransactionId();
 
-	fasttrun_cache_save_baseline_undo(entry);
+	fasttrun_analyze_save_undo(entry);
 
-	entry->has_stats_baseline = true;
-	entry->stats_baseline_inserted = ins;
-	entry->stats_baseline_updated = upd;
-	entry->stats_baseline_deleted = del;
-	entry->stats_baseline_truncdropped = truncdropped;
-	entry->stats_baseline_subid = cur_subid;
+	entry->state.has_stats_baseline = true;
+	entry->state.stats_baseline_inserted = ins;
+	entry->state.stats_baseline_updated = upd;
+	entry->state.stats_baseline_deleted = del;
+	entry->state.stats_baseline_truncdropped = truncdropped;
 
 	/*
 	 * Every baseline publish follows a refresh that also brought the index
@@ -1190,7 +1040,6 @@ static void
 fasttrun_cache_mark_evicted(Oid relid)
 {
 	FasttrunAnalyzeCacheEntry *entry;
-	SubTransactionId cur_subid = GetCurrentSubTransactionId();
 
 	if (fasttrun_analyze_cache == NULL)
 		return;
@@ -1199,17 +1048,14 @@ fasttrun_cache_mark_evicted(Oid relid)
 	if (entry == NULL)
 		return;
 
-	fasttrun_cache_save_relstats_undo(entry);
-	fasttrun_cache_save_baseline_undo(entry);
+	fasttrun_analyze_save_undo(entry);
 
-	entry->has_relstats = false;
-	entry->has_delta_state = false;
-	entry->relstats_subid = cur_subid;
+	entry->state.has_relstats = false;
+	entry->state.has_delta_state = false;
 	/* Eviction retires the published state -- the drift anchor with it. */
-	entry->last_inval_valid = false;
+	entry->state.last_inval_valid = false;
 
-	entry->has_stats_baseline = false;
-	entry->stats_baseline_subid = cur_subid;
+	entry->state.has_stats_baseline = false;
 
 	/* Eviction retires the rescan bookkeeping too. */
 	fasttrun_cache_reset_partial_scan_anchor(entry);
@@ -1230,10 +1076,7 @@ fasttrun_cache_remove(Oid relid)
 
 	entry = fasttrun_cache_lookup(relid);
 	if (entry != NULL)
-	{
-		fasttrun_baseline_free_undo(entry);
-		fasttrun_relstats_free_undo(entry);
-	}
+		fasttrun_analyze_free_undo(entry);
 
 	(void) hash_search(fasttrun_analyze_cache, &relid, HASH_REMOVE, NULL);
 }
@@ -1305,7 +1148,6 @@ fasttrun_cache_seed_after_truncate(Relation rel)
 	int64		del_now = 0;
 	bool		truncdropped_now = false;
 	FasttrunAnalyzeCacheEntry *entry;
-	SubTransactionId cur_subid;
 
 	/* Drop any prior entry (and its baseline undo chain) first. */
 	fasttrun_cache_remove(relid);
@@ -1313,15 +1155,13 @@ fasttrun_cache_seed_after_truncate(Relation rel)
 	entry = fasttrun_cache_store_relstats(rel, 0, 0, 0);
 
 	/* fasttruncate just invalidated local plans -- anchor the gate here. */
-	entry->last_inval_pages = 0;
-	entry->last_inval_tuples = 0;
-	entry->last_inval_valid = true;
+	entry->state.last_inval_pages = 0;
+	entry->state.last_inval_tuples = 0;
+	entry->state.last_inval_valid = true;
 
 	if (!fasttrun_read_pgstat_counters(rel, &ins_now, &upd_now, &del_now,
 									   &truncdropped_now))
 		return;	/* no pgstat -> no delta seed; next analyze will cold-scan */
-
-	cur_subid = GetCurrentSubTransactionId();
 
 	/* Delta-math state: post-truncate empty table. */
 	fasttrun_cache_store_delta_state(entry, ins_now, upd_now, del_now,
@@ -1333,13 +1173,12 @@ fasttrun_cache_seed_after_truncate(Relation rel)
 	 * resulting churn ratio (any INSERT N / max(N,1) = 1) clears the
 	 * default 0.2 threshold and triggers a full reservoir collect.
 	 */
-	entry->has_stats_baseline = true;
-	entry->stats_baseline_inserted = ins_now;
-	entry->stats_baseline_updated = upd_now;
-	entry->stats_baseline_deleted = del_now;
-	entry->stats_baseline_truncdropped = truncdropped_now;
-	entry->stats_baseline_subid = cur_subid;
-	/* stats_baseline_undo stays NULL -- no prior version to restore. */
+	entry->state.has_stats_baseline = true;
+	entry->state.stats_baseline_inserted = ins_now;
+	entry->state.stats_baseline_updated = upd_now;
+	entry->state.stats_baseline_deleted = del_now;
+	entry->state.stats_baseline_truncdropped = truncdropped_now;
+	/* The truncate phase owns this replacement; no older state survives. */
 }
 
 /*
@@ -1384,7 +1223,7 @@ fasttrun_reinject_relstats(Relation rel, FasttrunAnalyzeCacheEntry *entry)
 	 */
 	{
 		SubTransactionId cur_subid = GetCurrentSubTransactionId();
-		bool		probe_needed = (entry->cached_pages > 0 &&
+		bool		probe_needed = (entry->state.cached_pages > 0 &&
 									rel->rd_rel->relpersistence == RELPERSISTENCE_TEMP &&
 									RELKIND_HAS_STORAGE(rel->rd_rel->relkind));
 
@@ -1396,7 +1235,7 @@ fasttrun_reinject_relstats(Relation rel, FasttrunAnalyzeCacheEntry *entry)
 		 */
 		if (probe_needed &&
 			entry->lazy_check_subid == cur_subid &&
-			entry->lazy_check_pages == entry->cached_pages)
+			entry->lazy_check_pages == entry->state.cached_pages)
 			probe_needed = false;
 
 		if (probe_needed)
@@ -1443,14 +1282,14 @@ fasttrun_reinject_relstats(Relation rel, FasttrunAnalyzeCacheEntry *entry)
 				 * btree/hash metapage stays put.  One nblocks call returns
 				 * the right number for either case.
 				 */
-				entry->cached_pages = RelationGetNumberOfBlocks(rel);
-				entry->cached_tuples = 0;
-				entry->cached_allvisible = 0;
-				entry->has_delta_state = false;
-				entry->cached_inserted = 0;
-				entry->cached_updated = 0;
-				entry->cached_deleted = 0;
-				entry->cached_truncdropped = false;
+				entry->state.cached_pages = RelationGetNumberOfBlocks(rel);
+				entry->state.cached_tuples = 0;
+				entry->state.cached_allvisible = 0;
+				entry->state.has_delta_state = false;
+				entry->state.cached_inserted = 0;
+				entry->state.cached_updated = 0;
+				entry->state.cached_deleted = 0;
+				entry->state.cached_truncdropped = false;
 				/*
 				 * Cached per-column stats for the now-empty relation get
 				 * hidden by the freshness check in
@@ -1467,20 +1306,20 @@ fasttrun_reinject_relstats(Relation rel, FasttrunAnalyzeCacheEntry *entry)
 			 * snapshot we just verified.
 			 */
 			entry->lazy_check_subid = cur_subid;
-			entry->lazy_check_pages = entry->cached_pages;
+			entry->lazy_check_pages = entry->state.cached_pages;
 		}
 	}
 
-	cached_tuples = (float4) entry->cached_tuples;
+	cached_tuples = (float4) entry->state.cached_tuples;
 
-	if (rel->rd_rel->relpages == entry->cached_pages &&
+	if (rel->rd_rel->relpages == entry->state.cached_pages &&
 		rel->rd_rel->reltuples == cached_tuples &&
-		rel->rd_rel->relallvisible == (int32) entry->cached_allvisible)
+		rel->rd_rel->relallvisible == (int32) entry->state.cached_allvisible)
 		return;
 
-	rel->rd_rel->relpages = entry->cached_pages;
+	rel->rd_rel->relpages = entry->state.cached_pages;
 	rel->rd_rel->reltuples = cached_tuples;
-	rel->rd_rel->relallvisible = (int32) entry->cached_allvisible;
+	rel->rd_rel->relallvisible = (int32) entry->state.cached_allvisible;
 }
 
 static void
@@ -1489,7 +1328,7 @@ fasttrun_reinject_cached_relation(Relation rel)
 	FasttrunAnalyzeCacheEntry *entry;
 
 	entry = fasttrun_cache_lookup(RelationGetRelid(rel));
-	if (entry == NULL || !entry->has_relstats)
+	if (entry == NULL || !entry->state.has_relstats)
 		return;
 
 	fasttrun_reinject_relstats(rel, entry);
@@ -2008,7 +1847,7 @@ fasttrun_stats_entry_usable(Oid relid, const FasttrunStatsEntry *entry,
 	}
 
 	aentry = fasttrun_cache_lookup(relid);
-	if (aentry == NULL || !aentry->has_relstats)
+	if (aentry == NULL || !aentry->state.has_relstats)
 		return false;
 
 	churn = (ins_now - entry->collected_ins)
@@ -2016,7 +1855,7 @@ fasttrun_stats_entry_usable(Oid relid, const FasttrunStatsEntry *entry,
 		+ (del_now - entry->collected_del);
 	if (churn < 0)
 		churn = -churn;
-	baseline = (double) Max(aentry->cached_tuples, 1);
+	baseline = (double) Max(aentry->state.cached_tuples, 1);
 
 	/* stadistinct < 0 is a negative fraction of rows; > 0 is an absolute count. */
 	stadistinct = ((Form_pg_statistic) GETSTRUCT(entry->statsTuple))->stadistinct;
@@ -3344,8 +3183,7 @@ fasttrun_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 
 		if (aentry != NULL)
 		{
-
-			if (aentry->relstats_subid == mySubid)
+			if (aentry->state_subid == mySubid)
 			{
 				if (event == SUBXACT_EVENT_ABORT_SUB)
 				{
@@ -3361,128 +3199,60 @@ fasttrun_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 						 * chain; make the observed empty storage the new
 						 * outer-subxact truth instead.
 						 */
-						fasttrun_relstats_free_undo(aentry);
-						fasttrun_baseline_free_undo(aentry);
+						fasttrun_analyze_free_undo(aentry);
 
-						aentry->has_stats_baseline = false;
-						aentry->stats_baseline_inserted = 0;
-						aentry->stats_baseline_updated = 0;
-						aentry->stats_baseline_deleted = 0;
-						aentry->stats_baseline_truncdropped = false;
-						aentry->stats_baseline_subid = InvalidSubTransactionId;
+						aentry->state.has_stats_baseline = false;
+						aentry->state.stats_baseline_inserted = 0;
+						aentry->state.stats_baseline_updated = 0;
+						aentry->state.stats_baseline_deleted = 0;
+						aentry->state.stats_baseline_truncdropped = false;
 						fasttrun_cache_reset_partial_scan_anchor(aentry);
 
 						if (OidIsValid(plan_relid))
 							fasttrun_stats_cache_evict_relid(plan_relid);
-						aentry->last_inval_valid = false;
+						aentry->state.last_inval_valid = false;
 						goto finish_entry;
 					}
 
-					if (aentry->relstats_undo != NULL)
+					if (aentry->undo != NULL)
 					{
-						FasttrunAnalyzeRelstatsUndo *popped =
-							aentry->relstats_undo;
+						FasttrunAnalyzeUndo *popped = aentry->undo;
 
-						aentry->has_relstats = popped->has_relstats;
-						aentry->cached_pages = popped->cached_pages;
-						aentry->cached_tuples = popped->cached_tuples;
-						aentry->cached_allvisible = popped->cached_allvisible;
-						aentry->cached_locator = popped->cached_locator;
-						aentry->has_delta_state = popped->has_delta_state;
-						aentry->cached_inserted = popped->cached_inserted;
-						aentry->cached_updated = popped->cached_updated;
-						aentry->cached_deleted = popped->cached_deleted;
-						aentry->cached_truncdropped = popped->cached_truncdropped;
-						aentry->relstats_subid = popped->relstats_subid;
-						aentry->relstats_undo = popped->older;
+						aentry->state = popped->state;
+						aentry->state_subid = popped->state_subid;
+						aentry->undo = popped->older;
 						pfree(popped);
 					}
 					else
 					{
-						aentry->has_relstats = false;
-						aentry->has_delta_state = false;
-						aentry->relstats_subid = InvalidSubTransactionId;
+						(void) hash_search(fasttrun_analyze_cache, &relid,
+										   HASH_REMOVE, NULL);
+						aentry = NULL;
 					}
-					/* Published state rolled back -- the drift anchor with it. */
-					aentry->last_inval_valid = false;
 				}
 				else
 				{
-					aentry->relstats_subid = parentSubid;
-					if (aentry->relstats_undo != NULL &&
-						aentry->relstats_undo->relstats_subid == parentSubid)
+					aentry->state_subid = parentSubid;
+					if (aentry->undo != NULL &&
+						aentry->undo->state_subid == parentSubid)
 					{
-						FasttrunAnalyzeRelstatsUndo *obsolete =
-							aentry->relstats_undo;
+						FasttrunAnalyzeUndo *obsolete = aentry->undo;
 
-						aentry->relstats_undo = obsolete->older;
+						aentry->undo = obsolete->older;
 						pfree(obsolete);
 					}
 				}
 			}
 
-			if (aentry->stats_baseline_subid == mySubid)
+			/* A row restored to its pre-creation empty state has no owner. */
+			if (event == SUBXACT_EVENT_ABORT_SUB && aentry != NULL &&
+				!aentry->state.has_relstats &&
+				!aentry->state.has_stats_baseline &&
+				aentry->undo == NULL)
 			{
-				if (event == SUBXACT_EVENT_ABORT_SUB)
-				{
-					if (aentry->stats_baseline_undo != NULL)
-					{
-						FasttrunAnalyzeBaselineUndo *popped =
-							aentry->stats_baseline_undo;
-
-						aentry->has_stats_baseline = popped->has_stats_baseline;
-						aentry->stats_baseline_inserted = popped->stats_baseline_inserted;
-						aentry->stats_baseline_updated = popped->stats_baseline_updated;
-						aentry->stats_baseline_deleted = popped->stats_baseline_deleted;
-						aentry->stats_baseline_truncdropped = popped->stats_baseline_truncdropped;
-						aentry->stats_baseline_subid = popped->stats_baseline_subid;
-						aentry->stats_baseline_undo = popped->older;
-						pfree(popped);
-					}
-					else
-					{
-						/*
-						 * Baseline was published from scratch inside this
-						 * subxact and is now rolled back.  Mark "no
-						 * baseline" so the next refresh check stays away
-						 * from the refresh path until a real cold scan
-						 * (or a fresh refresh) re-establishes one.
-						 */
-						aentry->has_stats_baseline = false;
-						aentry->stats_baseline_subid = InvalidSubTransactionId;
-					}
-				}
-				else	/* SUBXACT_EVENT_COMMIT_SUB */
-				{
-					aentry->stats_baseline_subid = parentSubid;
-
-					if (aentry->stats_baseline_undo != NULL &&
-						aentry->stats_baseline_undo->stats_baseline_subid == parentSubid)
-					{
-						FasttrunAnalyzeBaselineUndo *obsolete =
-							aentry->stats_baseline_undo;
-
-						aentry->stats_baseline_undo = obsolete->older;
-						pfree(obsolete);
-					}
-				}
-			}
-
-			/*
-			 * Partial-rescan anchor.  A rescan recorded in an aborted
-			 * subxact must not survive it: the pgstat counters it anchors
-			 * rolled back with the subxact, and a stale anchor could
-			 * report zero churn while live churn exists.  Reset instead of
-			 * undo-restore -- the probe then falls back to the stats
-			 * baseline, which at worst re-samples once.  On subcommit
-			 * promote to the parent like the lazy memo below.
-			 */
-			if (aentry->partial_scan_subid == mySubid)
-			{
-				if (event == SUBXACT_EVENT_ABORT_SUB)
-					fasttrun_cache_reset_partial_scan_anchor(aentry);
-				else		/* SUBXACT_EVENT_COMMIT_SUB */
-					aentry->partial_scan_subid = parentSubid;
+				(void) hash_search(fasttrun_analyze_cache, &relid,
+								   HASH_REMOVE, NULL);
+				aentry = NULL;
 			}
 
 			/*
@@ -3494,7 +3264,7 @@ fasttrun_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 			 * cached_pages.  On COMMIT_SUB we promote it to the parent
 			 * subxact so plans there keep skipping the probe.
 			 */
-			if (aentry->lazy_check_subid == mySubid)
+			if (aentry != NULL && aentry->lazy_check_subid == mySubid)
 			{
 				if (event == SUBXACT_EVENT_ABORT_SUB)
 				{
@@ -3504,15 +3274,6 @@ fasttrun_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 				else		/* SUBXACT_EVENT_COMMIT_SUB */
 					aentry->lazy_check_subid = parentSubid;
 			}
-
-			/* A cache row created wholly inside an aborted frame has no owner. */
-			if (event == SUBXACT_EVENT_ABORT_SUB &&
-				!aentry->has_relstats &&
-				!aentry->has_stats_baseline &&
-				aentry->relstats_undo == NULL &&
-				aentry->stats_baseline_undo == NULL)
-				(void) hash_search(fasttrun_analyze_cache, &relid,
-								   HASH_REMOVE, NULL);
 		}
 
 	finish_entry:
@@ -5297,16 +5058,16 @@ fasttrun_analyze_relation(Relation rel)
 	{
 		entry = fasttrun_cache_lookup(relOid);
 		if (entry != NULL
-			&& entry->has_delta_state
+			&& entry->state.has_delta_state
 			&& fasttrun_relation_has_same_locator(rel, entry)
-			&& entry->cached_truncdropped == truncdropped_now)
+			&& entry->state.cached_truncdropped == truncdropped_now)
 		{
 			int64	new_tuples;
 
-			delta_ins = ins_now - entry->cached_inserted;
-			delta_upd = upd_now - entry->cached_updated;
-			delta_del = del_now - entry->cached_deleted;
-			new_tuples = entry->cached_tuples + delta_ins - delta_del;
+			delta_ins = ins_now - entry->state.cached_inserted;
+			delta_upd = upd_now - entry->state.cached_updated;
+			delta_del = del_now - entry->state.cached_deleted;
+			new_tuples = entry->state.cached_tuples + delta_ins - delta_del;
 
 			if (new_tuples >= 0)
 			{
@@ -5320,7 +5081,7 @@ fasttrun_analyze_relation(Relation rel)
 					 * authoritative value and avoid one smgrnblocks/lseek
 					 * per hot no-op fasttrun_analyze().
 					 */
-					pages_now = entry->cached_pages;
+					pages_now = entry->state.cached_pages;
 					pages_now_known = true;
 					tuples_count = new_tuples;
 					scan_needed = false;
@@ -5329,7 +5090,7 @@ fasttrun_analyze_relation(Relation rel)
 				{
 					pages_now = RelationGetNumberOfBlocks(rel);
 					pages_now_known = true;
-					if (pages_now >= entry->cached_pages)
+					if (pages_now >= entry->state.cached_pages)
 					{
 						tuples_count = new_tuples;
 						scan_needed = false;
@@ -5353,15 +5114,15 @@ fasttrun_analyze_relation(Relation rel)
 	 */
 	if (!scan_needed && have_counters && fasttrun_auto_collect_stats &&
 		fasttrun_sample_rows != 0 &&
-		entry != NULL && entry->has_stats_baseline)
+		entry != NULL && entry->state.has_stats_baseline)
 	{
 		int64		churn;
 		double		baseline;
 
 		/* Compute churn BEFORE advancing baseline. */
-		churn = (ins_now - entry->stats_baseline_inserted)
-			+ (upd_now - entry->stats_baseline_updated)
-			+ (del_now - entry->stats_baseline_deleted);
+		churn = (ins_now - entry->state.stats_baseline_inserted)
+			+ (upd_now - entry->state.stats_baseline_updated)
+			+ (del_now - entry->state.stats_baseline_deleted);
 		if (churn < 0)
 			churn = -churn;
 		baseline = (double) Max(tuples_count, 1);
@@ -5434,7 +5195,7 @@ fasttrun_analyze_relation(Relation rel)
 		bool		trailing_refresh = !pure_delta_noop;
 
 		if (have_counters && fasttrun_sample_rows != 0 &&
-			entry != NULL && entry->has_stats_baseline)
+			entry != NULL && entry->state.has_stats_baseline)
 		{
 			/*
 			 * Churn is measured from the rescan anchor (the counters at the
@@ -5443,14 +5204,14 @@ fasttrun_analyze_relation(Relation rel)
 			 * against it would re-sample the partial indexes on every
 			 * analyze after a single small DML.
 			 */
-			if (entry->partial_scan_valid)
-				churn = (ins_now - entry->partial_scan_inserted)
-					+ (upd_now - entry->partial_scan_updated)
-					+ (del_now - entry->partial_scan_deleted);
+			if (entry->state.partial_scan_valid)
+				churn = (ins_now - entry->state.partial_scan_inserted)
+					+ (upd_now - entry->state.partial_scan_updated)
+					+ (del_now - entry->state.partial_scan_deleted);
 			else
-				churn = (ins_now - entry->stats_baseline_inserted)
-					+ (upd_now - entry->stats_baseline_updated)
-					+ (del_now - entry->stats_baseline_deleted);
+				churn = (ins_now - entry->state.stats_baseline_inserted)
+					+ (upd_now - entry->state.stats_baseline_updated)
+					+ (del_now - entry->state.stats_baseline_deleted);
 			if (churn < 0)
 				churn = -churn;
 		}
@@ -5613,12 +5374,12 @@ fasttrun_analyze_relation(Relation rel)
 											  del_now, truncdropped_now);
 	}
 
-	if (pure_delta_noop && entry != NULL && entry->has_relstats)
-		allvisible_now = entry->cached_allvisible;
+	if (pure_delta_noop && entry != NULL && entry->state.has_relstats)
+		allvisible_now = entry->state.cached_allvisible;
 	else
 		allvisible_now = fasttrun_count_allvisible(rel);
 
-	if (!(pure_delta_noop && entry != NULL && entry->has_relstats))
+	if (!(pure_delta_noop && entry != NULL && entry->state.has_relstats))
 	{
 		entry = fasttrun_cache_store_relstats(rel, pages_now, tuples_count,
 											 allvisible_now);
@@ -5674,10 +5435,10 @@ fasttrun_analyze_relation(Relation rel)
 		double		ratio_pages;
 		double		worst;
 
-		if (entry != NULL && entry->last_inval_valid)
+		if (entry != NULL && entry->state.last_inval_valid)
 		{
-			anchor_pages = entry->last_inval_pages;
-			anchor_tuples = entry->last_inval_tuples;
+			anchor_pages = entry->state.last_inval_pages;
+			anchor_tuples = entry->state.last_inval_tuples;
 		}
 
 		baseline_tuples = (anchor_tuples > 0.0f)
@@ -5698,9 +5459,9 @@ fasttrun_analyze_relation(Relation rel)
 		fasttrun_invalidate_local_plan_cache(relOid);
 		if (entry != NULL)
 		{
-			entry->last_inval_pages = pages_now;
-			entry->last_inval_tuples = (float4) tuples_count;
-			entry->last_inval_valid = true;
+			entry->state.last_inval_pages = pages_now;
+			entry->state.last_inval_tuples = (float4) tuples_count;
+			entry->state.last_inval_valid = true;
 		}
 	}
 

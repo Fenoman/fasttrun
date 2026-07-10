@@ -476,6 +476,79 @@ SELECT relpages > 1 AS idx_troff_pages_fresh
 COMMIT;
 DROP TABLE t_idx_troff;
 -- ----------------------------------------------------------------------
+-- 12. Откат верхней транзакции восстанавливает последнюю сохранённую
+--     статистику. Ошибка в другой транзакции не должна очищать кеш сессии,
+--     а откат повторного анализа возвращает статистику таблицы и индекса.
+-- ----------------------------------------------------------------------
+CREATE TEMP TABLE t_top_abort (id int, grp int);
+CREATE INDEX t_top_abort_grp_idx ON t_top_abort (grp);
+INSERT INTO t_top_abort SELECT g, g % 100 FROM generate_series(1, 10000) g;
+SELECT fasttrun_analyze('t_top_abort');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+SELECT (fasttrun_relstats('t_top_abort')).reltuples::int AS top_before;
+ top_before 
+------------
+      10000
+(1 row)
+
+SELECT (fasttrun_relstats('t_top_abort_grp_idx')).reltuples::int
+       AS top_index_before;
+ top_index_before 
+------------------
+            10000
+(1 row)
+
+SELECT count(*) AS top_stats_before FROM fasttrun_inspect_stats('t_top_abort');
+ top_stats_before 
+------------------
+                2
+(1 row)
+
+BEGIN;
+SELECT 1 / 0;
+ERROR:  division by zero
+ROLLBACK;
+SELECT count(*) AS top_stats_after_unrelated_abort
+FROM fasttrun_inspect_stats('t_top_abort');
+ top_stats_after_unrelated_abort 
+---------------------------------
+                               2
+(1 row)
+
+BEGIN;
+INSERT INTO t_top_abort SELECT g, g FROM generate_series(10001, 30000) g;
+SELECT fasttrun_analyze('t_top_abort');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+ROLLBACK;
+SELECT (fasttrun_relstats('t_top_abort')).reltuples::int AS top_after;
+ top_after 
+-----------
+     10000
+(1 row)
+
+SELECT (fasttrun_relstats('t_top_abort_grp_idx')).reltuples::int
+       AS top_index_after;
+ top_index_after 
+-----------------
+           10000
+(1 row)
+
+SELECT count(*) AS top_stats_after FROM fasttrun_inspect_stats('t_top_abort');
+ top_stats_after 
+-----------------
+               2
+(1 row)
+
+DROP TABLE t_top_abort;
+-- ----------------------------------------------------------------------
 -- Очистка
 -- ----------------------------------------------------------------------
 DROP TABLE t_survive;

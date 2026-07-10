@@ -317,6 +317,36 @@ COMMIT;
 DROP TABLE t_idx_troff;
 
 -- ----------------------------------------------------------------------
+-- 12. Откат верхней транзакции восстанавливает последнюю сохранённую
+--     статистику. Ошибка в другой транзакции не должна очищать кеш сессии,
+--     а откат повторного анализа возвращает статистику таблицы и индекса.
+-- ----------------------------------------------------------------------
+CREATE TEMP TABLE t_top_abort (id int, grp int);
+CREATE INDEX t_top_abort_grp_idx ON t_top_abort (grp);
+INSERT INTO t_top_abort SELECT g, g % 100 FROM generate_series(1, 10000) g;
+SELECT fasttrun_analyze('t_top_abort');
+SELECT (fasttrun_relstats('t_top_abort')).reltuples::int AS top_before;
+SELECT (fasttrun_relstats('t_top_abort_grp_idx')).reltuples::int
+       AS top_index_before;
+SELECT count(*) AS top_stats_before FROM fasttrun_inspect_stats('t_top_abort');
+
+BEGIN;
+SELECT 1 / 0;
+ROLLBACK;
+SELECT count(*) AS top_stats_after_unrelated_abort
+FROM fasttrun_inspect_stats('t_top_abort');
+
+BEGIN;
+INSERT INTO t_top_abort SELECT g, g FROM generate_series(10001, 30000) g;
+SELECT fasttrun_analyze('t_top_abort');
+ROLLBACK;
+SELECT (fasttrun_relstats('t_top_abort')).reltuples::int AS top_after;
+SELECT (fasttrun_relstats('t_top_abort_grp_idx')).reltuples::int
+       AS top_index_after;
+SELECT count(*) AS top_stats_after FROM fasttrun_inspect_stats('t_top_abort');
+DROP TABLE t_top_abort;
+
+-- ----------------------------------------------------------------------
 -- Очистка
 -- ----------------------------------------------------------------------
 DROP TABLE t_survive;
