@@ -117,6 +117,34 @@ COMMIT;
 DROP TABLE t_stale;
 
 -- ----------------------------------------------------------------------
+-- 8b. После сброса локальной статистики планировщик не должен читать
+--     старые значения остальных колонок из pg_statistic.
+-- ----------------------------------------------------------------------
+CREATE TEMP TABLE t_policy_default (id int, grp int);
+INSERT INTO t_policy_default SELECT g, 1 FROM generate_series(1, 10000) g;
+ANALYZE t_policy_default;
+SELECT fasttruncate('t_policy_default');
+INSERT INTO t_policy_default SELECT g, g FROM generate_series(1, 10000) g;
+SET fasttrun.auto_collect_stats = off;
+SELECT fasttrun_analyze('t_policy_default');
+DO $$
+DECLARE ln text; est int := NULL;
+BEGIN
+  FOR ln IN EXPLAIN SELECT * FROM t_policy_default WHERE grp = 1 LOOP
+    IF ln ~ 'on t_policy_default' THEN
+      est := substring(ln FROM 'rows=(\d+)')::int;
+      EXIT;
+    END IF;
+  END LOOP;
+  IF est IS NULL OR est < 20 OR est > 100 THEN
+    RAISE EXCEPTION 'stale core stats escaped neutral policy: est=%', est;
+  END IF;
+END$$;
+SELECT 'relation_policy_blocks_core' AS marker;
+RESET fasttrun.auto_collect_stats;
+DROP TABLE t_policy_default;
+
+-- ----------------------------------------------------------------------
 -- 9. fasttruncate должен явно вытеснить кэш статистики по OID таблицы
 --    (запасной механизм на случай, когда pgstat недоступен или
 --    счётчики сброшены).
