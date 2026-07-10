@@ -47,6 +47,7 @@ PG_CTL=${PG_CTL:-"$PG_BINDIR/pg_ctl"}
 CREATEDB=${CREATEDB:-"$PG_BINDIR/createdb"}
 BPFTRACE=${BPFTRACE:-bpftrace}
 SUDO=${SUDO:-sudo}
+PG_RUN_AS=${PG_RUN_AS:-}
 PORT=${PGPORT:-55438}
 WORKDIR=${WORKDIR:-$(mktemp -d /tmp/fasttrun-inval.XXXXXX)}
 DBNAME=${DBNAME:-fasttrun_inval}
@@ -56,6 +57,15 @@ MAX_COMMIT_INVAL=${MAX_COMMIT_INVAL:-5}
 MAX_EMPTY_AUTH=${MAX_EMPTY_AUTH:-5}
 FASTTRUN_SO=${FASTTRUN_SO:-"$PG_PKGLIBDIR/fasttrun.so"}
 
+run_pg()
+{
+	if [ -n "$PG_RUN_AS" ]; then
+		runuser -u "$PG_RUN_AS" -- "$@"
+	else
+		"$@"
+	fi
+}
+
 cleanup()
 {
 	if [ -n "${TRACE_PID:-}" ]; then
@@ -63,7 +73,7 @@ cleanup()
 		wait "$TRACE_PID" >/dev/null 2>&1 || true
 	fi
 	if [ -f "$WORKDIR/data/postmaster.pid" ]; then
-		"$PG_CTL" -D "$WORKDIR/data" -w stop >/dev/null 2>&1 || true
+		run_pg "$PG_CTL" -D "$WORKDIR/data" -w stop >/dev/null 2>&1 || true
 	fi
 	rm -rf "$WORKDIR"
 }
@@ -82,18 +92,24 @@ require_cmd "$INITDB"
 require_cmd "$PG_CTL"
 require_cmd "$CREATEDB"
 require_cmd "$BPFTRACE"
+if [ -n "$PG_RUN_AS" ]; then
+	require_cmd runuser
+fi
 
 if [ ! -f "$FASTTRUN_SO" ]; then
 	echo "не нашёл shared library fasttrun: $FASTTRUN_SO" >&2
 	exit 1
 fi
 
-"$INITDB" -D "$WORKDIR/data" --no-locale -E UTF8 >/dev/null
-"$PG_CTL" -D "$WORKDIR/data" \
-	-o "-k $WORKDIR -p $PORT -c shared_preload_libraries=fasttrun -c track_counts=on" \
+if [ -n "$PG_RUN_AS" ]; then
+	chown "$PG_RUN_AS" "$WORKDIR"
+fi
+run_pg "$INITDB" -D "$WORKDIR/data" --no-locale -E UTF8 >/dev/null
+run_pg "$PG_CTL" -D "$WORKDIR/data" \
+	-o "-k $WORKDIR -p $PORT -c listen_addresses='' -c shared_preload_libraries=fasttrun -c track_counts=on" \
 	-l "$WORKDIR/postgres.log" -w start >/dev/null
-"$CREATEDB" -h "$WORKDIR" -p "$PORT" "$DBNAME"
-"$PSQL" -h "$WORKDIR" -p "$PORT" -d "$DBNAME" -X -qAt \
+run_pg "$CREATEDB" -h "$WORKDIR" -p "$PORT" "$DBNAME"
+run_pg "$PSQL" -h "$WORKDIR" -p "$PORT" -d "$DBNAME" -X -qAt \
 	-v ON_ERROR_STOP=1 -c "CREATE EXTENSION fasttrun" >/dev/null
 
 cat >"$WORKDIR/repro.sql" <<SQL
@@ -131,7 +147,7 @@ SELECT 'WORKLOAD_DONE';
 SELECT pg_sleep(2);
 SQL
 
-"$PSQL" -h "$WORKDIR" -p "$PORT" -d "$DBNAME" -X -qAt \
+run_pg "$PSQL" -h "$WORKDIR" -p "$PORT" -d "$DBNAME" -X -qAt \
 	-v ON_ERROR_STOP=1 -f "$WORKDIR/repro.sql" \
 	>"$WORKDIR/repro.psql.out" 2>"$WORKDIR/repro.psql.err" &
 psql_pid=$!

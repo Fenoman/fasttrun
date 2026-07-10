@@ -34,6 +34,7 @@ PG_CTL=${PG_CTL:-"$PG_BINDIR/pg_ctl"}
 CREATEDB=${CREATEDB:-"$PG_BINDIR/createdb"}
 BPFTRACE=${BPFTRACE:-bpftrace}
 SUDO=${SUDO:-sudo}
+PG_RUN_AS=${PG_RUN_AS:-}
 PORT=${PGPORT:-55439}
 WORKDIR=${WORKDIR:-$(mktemp -d /tmp/fasttrun-bulk.XXXXXX)}
 DBNAME=${DBNAME:-fasttrun_bulk}
@@ -44,6 +45,15 @@ BASE_ROWS=${BASE_ROWS:-10000}
 MIN_CUT_PCT=${MIN_CUT_PCT:-30}
 FASTTRUN_SO=${FASTTRUN_SO:-"$PG_PKGLIBDIR/fasttrun.so"}
 
+run_pg()
+{
+	if [ -n "$PG_RUN_AS" ]; then
+		runuser -u "$PG_RUN_AS" -- "$@"
+	else
+		"$@"
+	fi
+}
+
 BPF_PID=""
 cleanup()
 {
@@ -52,7 +62,7 @@ cleanup()
 		wait "$BPF_PID" >/dev/null 2>&1 || true
 	fi
 	if [ -f "$WORKDIR/data/postmaster.pid" ]; then
-		"$PG_CTL" -D "$WORKDIR/data" -w stop >/dev/null 2>&1 || true
+		run_pg "$PG_CTL" -D "$WORKDIR/data" -w stop >/dev/null 2>&1 || true
 	fi
 	rm -rf "$WORKDIR"
 }
@@ -64,15 +74,21 @@ require_cmd()
 }
 require_cmd "$PSQL"; require_cmd "$INITDB"; require_cmd "$PG_CTL"
 require_cmd "$CREATEDB"; require_cmd "$BPFTRACE"
+if [ -n "$PG_RUN_AS" ]; then
+	require_cmd runuser
+fi
 
 [ -f "$FASTTRUN_SO" ] || { echo "не нашёл shared library fasttrun: $FASTTRUN_SO" >&2; exit 1; }
 
-"$INITDB" -D "$WORKDIR/data" --no-locale -E UTF8 >/dev/null
-"$PG_CTL" -D "$WORKDIR/data" \
-	-o "-k $WORKDIR -p $PORT -c shared_preload_libraries=fasttrun -c track_counts=on" \
+if [ -n "$PG_RUN_AS" ]; then
+	chown "$PG_RUN_AS" "$WORKDIR"
+fi
+run_pg "$INITDB" -D "$WORKDIR/data" --no-locale -E UTF8 >/dev/null
+run_pg "$PG_CTL" -D "$WORKDIR/data" \
+	-o "-k $WORKDIR -p $PORT -c listen_addresses='' -c shared_preload_libraries=fasttrun -c track_counts=on" \
 	-l "$WORKDIR/postgres.log" -w start >/dev/null
-"$CREATEDB" -h "$WORKDIR" -p "$PORT" "$DBNAME"
-"$PSQL" -h "$WORKDIR" -p "$PORT" -d "$DBNAME" -X -qAt \
+run_pg "$CREATEDB" -h "$WORKDIR" -p "$PORT" "$DBNAME"
+run_pg "$PSQL" -h "$WORKDIR" -p "$PORT" -d "$DBNAME" -X -qAt \
 	-v ON_ERROR_STOP=1 -c "CREATE EXTENSION fasttrun" >/dev/null
 
 # Резолвится ли core-символ PlanCacheRelCallback на этом бинаре?
@@ -178,7 +194,7 @@ declare -A vpid
 run_variant()
 {
 	local v=$1
-	"$PSQL" -h "$WORKDIR" -p "$PORT" -d "$DBNAME" -X -qAt \
+	run_pg "$PSQL" -h "$WORKDIR" -p "$PORT" -d "$DBNAME" -X -qAt \
 		-v ON_ERROR_STOP=1 -f "$WORKDIR/variant_${v}.sql" \
 		>"$WORKDIR/out_${v}" 2>"$WORKDIR/err_${v}"
 	local pid
