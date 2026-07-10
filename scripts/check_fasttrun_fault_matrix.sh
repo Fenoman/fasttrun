@@ -46,7 +46,7 @@ PORT=${PGPORT:-$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.
 
 run_pg "$INITDB" -D "$DATA" --no-locale -E UTF8 >/dev/null
 run_pg "$PG_CTL" -D "$DATA" -l "$LOG" \
-	-o "-k $SOCKET_DIR -p $PORT -c listen_addresses='' -c track_counts=on" \
+	-o "-k $SOCKET_DIR -p $PORT -c listen_addresses='' -c track_counts=on -c max_prepared_transactions=10" \
 	-w start >/dev/null
 run_pg "$CREATEDB" -h "$SOCKET_DIR" -p "$PORT" "$DBNAME"
 run_pg "$PSQL" -h "$SOCKET_DIR" -p "$PORT" -d "$DBNAME" -XAtq \
@@ -369,6 +369,17 @@ SELECT fasttruncate('ft_abort');
 SELECT 1 / (count(*) = 0)::int FROM ft_abort;
 SELECT pg_temp.assert_operation_context_zero('top-abort repair');
 DROP TABLE ft_abort;
+
+/* An unrelated prepared transaction must not remove a physical block. */
+SELECT pg_temp.make_fixture('ft_prepare_poison');
+SELECT pg_temp.inject('ft_prepare_poison', 'after_main_heap');
+BEGIN;
+PREPARE TRANSACTION 'fasttrun_poison_lifecycle';
+ROLLBACK PREPARED 'fasttrun_poison_lifecycle';
+SELECT pg_temp.expect_poison('SELECT count(*) FROM ft_prepare_poison');
+SELECT fasttruncate('ft_prepare_poison');
+SELECT pg_temp.assert_operation_context_zero('prepared transaction repair');
+DROP TABLE ft_prepare_poison;
 
 /* A failed retry before file changes must preserve the existing block. */
 SELECT pg_temp.make_fixture('ft_repair');

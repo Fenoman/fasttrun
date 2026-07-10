@@ -937,8 +937,7 @@ fasttrun_xact_callback(XactEvent event, void *arg)
 			}
 			break;
 		case XACT_EVENT_PREPARE:
-			/* Prepared xacts cannot retain backend-private temp state. */
-			fasttrun_poison_clear_all();
+			/* Prepared xacts cannot retain backend-private temp statistics. */
 			fasttrun_cache_reset();
 			fasttrun_stats_cache_reset();
 			break;
