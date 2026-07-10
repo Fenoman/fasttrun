@@ -2997,6 +2997,15 @@ fasttrun_stats_relid_nblocks_at_commit(const FasttrunStatsRelidEntry *relentry)
 		return 0;
 
 	reln = smgropen(relentry->heap_rlb.locator, relentry->heap_rlb.backend);
+	/*
+	 * A local temp locator has one owning backend.  Core truncation leaves
+	 * its live SMgrRelation cache at zero; a later smgrextend either advances
+	 * that zero or invalidates it.  Therefore zero is authoritative here and
+	 * avoids a filesystem size probe for ON COMMIT DELETE ROWS.  Nonzero and
+	 * unknown cache states still take the exact path below.
+	 */
+	if (reln->smgr_cached_nblocks[MAIN_FORKNUM] == 0)
+		return 0;
 	if (!smgrexists(reln, MAIN_FORKNUM))
 		return 0;
 
@@ -3473,16 +3482,16 @@ fasttrun_stats_cache_commit_xact(void)
 	{
 		Oid			relid = xentry->relid;
 		FasttrunStatsRelidEntry *relentry;
-		List	   *keys;
+		List	   *unlink_keys = NIL;
 		ListCell   *klc;
 		int64		ins_now = 0;
 		int64		upd_now = 0;
 		int64		del_now = 0;
 		bool		truncdropped_now = false;
-		BlockNumber	pages_now = 0;
 		bool		have_counters = false;
 		bool		counters_attempted = false;
 		bool		plan_inval_needed = false;
+		bool		storage_nonempty = false;
 
 		if ((xentry->flags & (FASTTRUN_TOUCH_DML |
 							 FASTTRUN_TOUCH_STATS |
@@ -3495,14 +3504,6 @@ fasttrun_stats_cache_commit_xact(void)
 			continue;
 
 		/*
-		 * Snapshot the attkey list.  Drop paths below call
-		 * fasttrun_stats_relid_drop_key which mutates relentry->attkeys
-		 * mid-iteration -- iterating the live list would invalidate our
-		 * ListCells.
-		 */
-		keys = list_copy(relentry->attkeys);
-
-		/*
 		 * Relation dropped this xact (ON COMMIT DROP fires before this
 		 * callback, plus any plain DROP earlier in the xact)?  Drop the
 		 * column-stats entries.  The OAT_DROP note replaces the syscache
@@ -3511,7 +3512,7 @@ fasttrun_stats_cache_commit_xact(void)
 		 */
 		if (fasttrun_xact_entry_dropped(xentry))
 		{
-			foreach(klc, keys)
+			foreach(klc, relentry->attkeys)
 			{
 				FasttrunStatsKey *kptr = (FasttrunStatsKey *) lfirst(klc);
 				FasttrunStatsKey key = *kptr;
@@ -3526,7 +3527,6 @@ fasttrun_stats_cache_commit_xact(void)
 					heap_freetuple(entry->statsTuple);
 				(void) hash_search(fasttrun_stats_cache, &key, HASH_REMOVE, NULL);
 			}
-			list_free(keys);
 			list_free_deep(relentry->attkeys);
 			fasttrun_stats_relid_free_undo(relentry);
 			(void) hash_search(fasttrun_stats_relid_cache, &relid,
@@ -3534,7 +3534,13 @@ fasttrun_stats_cache_commit_xact(void)
 			continue;
 		}
 
-		foreach(klc, keys)
+		/*
+		 * The common candidate path never mutates attkeys.  Walk it in place
+		 * and defer the rare stale/handoff unlinks until after the loop.  A
+		 * list_copy per touched relation used to dominate short COMMITs with
+		 * many analyzed temp tables.
+		 */
+		foreach(klc, relentry->attkeys)
 		{
 			FasttrunStatsKey *kptr = (FasttrunStatsKey *) lfirst(klc);
 			FasttrunStatsKey key = *kptr;	/* value copy -- drop_key may pfree source */
@@ -3544,8 +3550,8 @@ fasttrun_stats_cache_commit_xact(void)
 				hash_search(fasttrun_stats_cache, &key, HASH_FIND, NULL);
 			if (entry == NULL)
 			{
-				/* Stale backref -- unlink it and defer relid pruning. */
-				fasttrun_stats_relid_unlink_key(relentry, &key);
+				/* Stale backref -- unlink after this live-list walk. */
+				unlink_keys = lappend(unlink_keys, kptr);
 				continue;
 			}
 
@@ -3566,7 +3572,7 @@ fasttrun_stats_cache_commit_xact(void)
 						heap_freetuple(entry->statsTuple);
 					(void) hash_search(fasttrun_stats_cache, &key,
 									   HASH_REMOVE, NULL);
-					fasttrun_stats_relid_unlink_key(relentry, &key);
+					unlink_keys = lappend(unlink_keys, kptr);
 					continue;
 				}
 				fasttrun_stats_entry_free_undo(entry);
@@ -3578,7 +3584,7 @@ fasttrun_stats_cache_commit_xact(void)
 			 * Read pgstat once per relid, not once per attkey.  All
 			 * statsTuples for this relid share the same counters; the
 			 * scalar-per-entry loop just compared them against the same
-			 * (ins, upd, del, truncdropped) tuple anyway.  Both reads are
+			 * (ins, upd, del, truncdropped) tuple anyway.  The read is
 			 * relcache-free: this callback runs at TRANS_COMMIT, where
 			 * catalog access is forbidden.
 			 */
@@ -3589,7 +3595,6 @@ fasttrun_stats_cache_commit_xact(void)
 					fasttrun_read_pgstat_counters_at_commit(relid, &ins_now,
 															&upd_now, &del_now,
 															&truncdropped_now);
-				pages_now = fasttrun_stats_relid_nblocks_at_commit(relentry);
 			}
 
 			/*
@@ -3599,9 +3604,17 @@ fasttrun_stats_cache_commit_xact(void)
 			 * statistics to hidden on a nonempty table, invalidate its plans once
 			 * after the column loop.
 			 */
+			/*
+			 * The physical-size backstop belongs to the planner hook after
+			 * pgstat's temp counters reset.  Here the current xact counters are
+			 * still live.  Treat an exact counter match as physically stable so
+			 * core ON COMMIT DELETE can take the documented lazy-empty path
+			 * without one smgrnblocks probe per analyzed relation.
+			 */
 			if (!have_counters ||
 				!fasttrun_stats_entry_usable(relid, entry, ins_now, upd_now,
-											 del_now, truncdropped_now, pages_now))
+										 del_now, truncdropped_now,
+										 entry->collected_pages))
 			{
 				if (entry->was_usable)
 					plan_inval_needed = true;
@@ -3623,13 +3636,22 @@ fasttrun_stats_cache_commit_xact(void)
 			entry->state_subid = InvalidSubTransactionId;
 		}
 
-		list_free(keys);
+		foreach(klc, unlink_keys)
+		{
+			FasttrunStatsKey *key = (FasttrunStatsKey *) lfirst(klc);
+
+			fasttrun_stats_relid_unlink_key(relentry, key);
+		}
+		list_free(unlink_keys);
 		relentry = (FasttrunStatsRelidEntry *)
 			hash_search(fasttrun_stats_relid_cache, &relid, HASH_FIND, NULL);
 		if (relentry == NULL)
 			continue;
 		fasttrun_stats_relid_free_undo(relentry);
 		relentry->state_subid = InvalidSubTransactionId;
+		if (plan_inval_needed)
+			storage_nonempty =
+				fasttrun_stats_relid_nblocks_at_commit(relentry) > 0;
 		fasttrun_stats_relid_maybe_drop(relid, relentry);
 		/*
 		 * ON COMMIT DELETE ROWS has already truncated local storage before
@@ -3639,7 +3661,7 @@ fasttrun_stats_cache_commit_xact(void)
 		 * that must not turn N tables into N plan-cache walks per COMMIT.
 		 * Ordinary DELETE keeps heap pages and therefore still invalidates.
 		 */
-		if (plan_inval_needed && pages_now > 0)
+		if (plan_inval_needed && storage_nonempty)
 			fasttrun_invalidate_local_plan_cache(xentry->root_relid);
 	}
 
