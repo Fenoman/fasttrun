@@ -281,7 +281,11 @@ def start_cluster(args):
     psql = bindir / "psql"
 
     run([str(initdb), "-D", str(data), "--no-locale", "-E", "UTF8"])
-    run([str(pg_ctl), "-D", str(data), "-o", f"-k {socket_dir} -p {port}",
+    server_options = (
+        f"-k {socket_dir} -p {port} -c listen_addresses='' "
+        "-c fsync=off -c full_page_writes=off -c track_counts=on"
+    )
+    run([str(pg_ctl), "-D", str(data), "-o", server_options,
          "-l", str(workdir / "postgres.log"), "-w", "start"])
     run([str(createdb), "-h", str(socket_dir), "-p", str(port),
          args.dbname])
