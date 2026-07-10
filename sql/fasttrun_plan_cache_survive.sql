@@ -818,6 +818,232 @@ RESET fasttrun.sample_rows;
 RESET fasttrun.auto_collect_stats;
 RESET plan_cache_mode;
 
+-- ----------------------------------------------------------------------
+-- 17. План, построенный на статистике, временно скрытой из-за DML, не
+--     должен пережить откат DML. Проверяем откат точки сохранения после
+--     UPDATE и откат всей транзакции после COPY FROM. До отката общий план
+--     видит стандартную оценку (~50 строк), после — почти уникальную
+--     статистику (~1 строка). DML без планирования не сбрасывает планы.
+-- ----------------------------------------------------------------------
+SET plan_cache_mode = force_generic_plan;
+SET fasttrun.stats_refresh_threshold = 0.001;
+BEGIN;
+CREATE TEMP TABLE t_dml_plan_abort (id int, grp int);
+INSERT INTO t_dml_plan_abort SELECT g, g FROM generate_series(1, 10000) g;
+SELECT fasttrun_analyze('t_dml_plan_abort');
+COMMIT;
+
+BEGIN;
+SAVEPOINT sp_dml_plan;
+UPDATE t_dml_plan_abort SET grp = 1 WHERE id <= 20;
+PREPARE q_dml_savepoint(int) AS
+SELECT count(*) FROM t_dml_plan_abort WHERE grp = $1;
+EXECUTE q_dml_savepoint(1);
+DO $$
+DECLARE ln text; est int := NULL;
+BEGIN
+  FOR ln IN EXPLAIN EXECUTE q_dml_savepoint(1) LOOP
+    IF ln ~ 'on t_dml_plan_abort' THEN
+      est := substring(ln FROM 'rows=(\d+)')::int;
+      EXIT;
+    END IF;
+  END LOOP;
+  IF est IS NULL OR est < 20 THEN
+    RAISE EXCEPTION 'savepoint fixture did not hide candidate stats: est=%', est;
+  END IF;
+END$$;
+SET client_min_messages = debug1;
+ROLLBACK TO SAVEPOINT sp_dml_plan;
+RESET client_min_messages;
+DO $$
+DECLARE ln text; est int := NULL;
+BEGIN
+  FOR ln IN EXPLAIN EXECUTE q_dml_savepoint(1) LOOP
+    IF ln ~ 'on t_dml_plan_abort' THEN
+      est := substring(ln FROM 'rows=(\d+)')::int;
+      EXIT;
+    END IF;
+  END LOOP;
+  IF est IS NULL OR est > 2 THEN
+    RAISE EXCEPTION 'savepoint rollback kept DML-hidden generic plan: est=%', est;
+  END IF;
+END$$;
+SELECT 'dml_savepoint_plan_replanned' AS marker;
+DEALLOCATE q_dml_savepoint;
+COMMIT;
+
+BEGIN;
+COPY t_dml_plan_abort (id, grp) FROM STDIN;
+10001	1
+10002	1
+10003	1
+10004	1
+10005	1
+10006	1
+10007	1
+10008	1
+10009	1
+10010	1
+10011	1
+10012	1
+10013	1
+10014	1
+10015	1
+10016	1
+10017	1
+10018	1
+10019	1
+10020	1
+\.
+PREPARE q_dml_top(int) AS
+SELECT count(*) FROM t_dml_plan_abort WHERE grp = $1;
+EXECUTE q_dml_top(1);
+DO $$
+DECLARE ln text; est int := NULL;
+BEGIN
+  FOR ln IN EXPLAIN EXECUTE q_dml_top(1) LOOP
+    IF ln ~ 'on t_dml_plan_abort' THEN
+      est := substring(ln FROM 'rows=(\d+)')::int;
+      EXIT;
+    END IF;
+  END LOOP;
+  IF est IS NULL OR est < 20 THEN
+    RAISE EXCEPTION 'top-level fixture did not hide candidate stats: est=%', est;
+  END IF;
+END$$;
+SET client_min_messages = debug1;
+ROLLBACK;
+RESET client_min_messages;
+DO $$
+DECLARE ln text; est int := NULL;
+BEGIN
+  FOR ln IN EXPLAIN EXECUTE q_dml_top(1) LOOP
+    IF ln ~ 'on t_dml_plan_abort' THEN
+      est := substring(ln FROM 'rows=(\d+)')::int;
+      EXIT;
+    END IF;
+  END LOOP;
+  IF est IS NULL OR est > 2 THEN
+    RAISE EXCEPTION 'top-level rollback kept DML-hidden generic plan: est=%', est;
+  END IF;
+END$$;
+SELECT 'dml_top_plan_replanned' AS marker;
+DEALLOCATE q_dml_top;
+
+BEGIN;
+SAVEPOINT sp_dml_no_plan;
+UPDATE t_dml_plan_abort SET grp = 1 WHERE id <= 20;
+SET client_min_messages = debug1;
+ROLLBACK TO SAVEPOINT sp_dml_no_plan;
+RESET client_min_messages;
+COMMIT;
+SELECT 'dml_without_plan_no_inval' AS marker;
+
+-- При выключенных счётчиках статистика скрыта независимо от отката DML.
+-- План строится на стандартной оценке, но сбрасывать его при откате нельзя.
+SET track_counts = off;
+BEGIN;
+SAVEPOINT sp_tc_off;
+UPDATE t_dml_plan_abort SET grp = 1 WHERE id <= 20;
+PREPARE q_tc_off_savepoint(int) AS
+SELECT count(*) FROM t_dml_plan_abort WHERE grp = $1;
+EXECUTE q_tc_off_savepoint(1);
+DO $$
+DECLARE ln text; est int := NULL;
+BEGIN
+  FOR ln IN EXPLAIN EXECUTE q_tc_off_savepoint(1) LOOP
+    IF ln ~ 'on t_dml_plan_abort' THEN
+      est := substring(ln FROM 'rows=(\d+)')::int;
+      EXIT;
+    END IF;
+  END LOOP;
+  IF est IS NULL OR est < 20 THEN
+    RAISE EXCEPTION 'track_counts=off plan did not use defaults: est=%', est;
+  END IF;
+END$$;
+SET client_min_messages = debug1;
+ROLLBACK TO SAVEPOINT sp_tc_off;
+RESET client_min_messages;
+DEALLOCATE q_tc_off_savepoint;
+COMMIT;
+SELECT 'track_counts_off_savepoint_no_inval' AS marker;
+
+BEGIN;
+UPDATE t_dml_plan_abort SET grp = 1 WHERE id <= 20;
+PREPARE q_tc_off_top(int) AS
+SELECT count(*) FROM t_dml_plan_abort WHERE grp = $1;
+EXECUTE q_tc_off_top(1);
+DO $$
+DECLARE ln text; est int := NULL;
+BEGIN
+  FOR ln IN EXPLAIN EXECUTE q_tc_off_top(1) LOOP
+    IF ln ~ 'on t_dml_plan_abort' THEN
+      est := substring(ln FROM 'rows=(\d+)')::int;
+      EXIT;
+    END IF;
+  END LOOP;
+  IF est IS NULL OR est < 20 THEN
+    RAISE EXCEPTION 'track_counts=off top plan did not use defaults: est=%', est;
+  END IF;
+END$$;
+SET client_min_messages = debug1;
+ROLLBACK;
+RESET client_min_messages;
+DEALLOCATE q_tc_off_top;
+SELECT 'track_counts_off_top_no_inval' AS marker;
+SET track_counts = on;
+
+-- Только ближайший DML-уровень мог вернуть видимость при своём откате.
+-- После его отката общий план перестраивается; откат родителя уже ничего
+-- не меняет и не должен повторно сбрасывать планы.
+SET fasttrun.stats_refresh_threshold = 0.01;
+BEGIN;
+UPDATE t_dml_plan_abort SET grp = 1 WHERE id <= 50;
+SAVEPOINT sp_nearest_dml;
+UPDATE t_dml_plan_abort SET grp = 1 WHERE id > 50 AND id <= 150;
+PREPARE q_nearest_dml(int) AS
+SELECT count(*) FROM t_dml_plan_abort WHERE grp = $1;
+EXECUTE q_nearest_dml(1);
+DO $$
+DECLARE ln text; est int := NULL;
+BEGIN
+  FOR ln IN EXPLAIN EXECUTE q_nearest_dml(1) LOOP
+    IF ln ~ 'on t_dml_plan_abort' THEN
+      est := substring(ln FROM 'rows=(\d+)')::int;
+      EXIT;
+    END IF;
+  END LOOP;
+  IF est IS NULL OR est < 20 THEN
+    RAISE EXCEPTION 'child DML did not hide statistics: est=%', est;
+  END IF;
+END$$;
+SET client_min_messages = debug1;
+ROLLBACK TO SAVEPOINT sp_nearest_dml;
+RESET client_min_messages;
+DO $$
+DECLARE ln text; est int := NULL;
+BEGIN
+  FOR ln IN EXPLAIN EXECUTE q_nearest_dml(1) LOOP
+    IF ln ~ 'on t_dml_plan_abort' THEN
+      est := substring(ln FROM 'rows=(\d+)')::int;
+      EXIT;
+    END IF;
+  END LOOP;
+  IF est IS NULL OR est > 2 THEN
+    RAISE EXCEPTION 'child rollback kept hidden plan: est=%', est;
+  END IF;
+END$$;
+SELECT 'nearest_dml_child_replanned' AS marker;
+SET client_min_messages = debug1;
+ROLLBACK;
+RESET client_min_messages;
+DEALLOCATE q_nearest_dml;
+SELECT 'nearest_dml_parent_no_inval' AS marker;
+
+RESET fasttrun.stats_refresh_threshold;
+RESET plan_cache_mode;
+DROP TABLE t_dml_plan_abort;
+
 DROP FUNCTION f_inner();
 DROP TABLE t_rsd_details;
 DROP TABLE t_balance_out;

@@ -334,6 +334,37 @@ fasttrun_xact_mark_relid(Oid relid, Oid root_relid, uint32 flags)
 	return entry;
 }
 
+/* План увидел статистику, скрытую DML этих уровней. */
+static void
+fasttrun_xact_mark_dml_plan_dependency(Oid relid)
+{
+	FasttrunXactFrame *frame;
+
+	if (!fasttrun_in_planner)
+		return;
+	for (frame = fasttrun_xact_frame; frame != NULL; frame = frame->parent)
+	{
+		FasttrunXactRelEntry *entry;
+
+		entry = (FasttrunXactRelEntry *)
+			hash_search(frame->entries, &relid, HASH_FIND, NULL);
+		if (entry == NULL || (entry->flags & FASTTRUN_TOUCH_DML) == 0)
+			continue;
+		entry->flags |= FASTTRUN_TOUCH_PLAN_INVALIDATE;
+		if (entry->root_relid != entry->relid)
+		{
+			FasttrunXactRelEntry *root_entry;
+
+			root_entry = (FasttrunXactRelEntry *)
+				hash_search(frame->entries, &entry->root_relid,
+							HASH_FIND, NULL);
+			if (root_entry != NULL)
+				root_entry->flags |= FASTTRUN_TOUCH_PLAN_INVALIDATE;
+		}
+		return;
+	}
+}
+
 static void
 fasttrun_xact_merge_entry(FasttrunXactFrame *parent,
 						  FasttrunXactRelEntry *child)
@@ -2646,7 +2677,10 @@ fasttrun_get_relation_stats_hook(PlannerInfo *root, RangeTblEntry *rte,
 
 	if (!fasttrun_stats_entry_usable(rte->relid, entry, ins_now, upd_now,
 									 del_now, truncdropped_now, pages_now))
+	{
+		fasttrun_xact_mark_dml_plan_dependency(rte->relid);
 		return true;		/* handled: deliberately hide core stats too */
+	}
 
 	vardata->statsTuple = entry->statsTuple;
 	vardata->freefunc = fasttrun_stats_noop_free;
@@ -2737,7 +2771,10 @@ fasttrun_get_attavgwidth_hook(Oid relid, AttrNumber attnum)
 
 	if (!fasttrun_stats_entry_usable(relid, entry, ins_now, upd_now,
 									 del_now, truncdropped_now, pages_now))
+	{
+		fasttrun_xact_mark_dml_plan_dependency(relid);
 		return fasttrun_type_default_width(relid, attnum);
+	}
 
 	stawidth = ((Form_pg_statistic) GETSTRUCT(entry->statsTuple))->stawidth;
 	if (stawidth > 0)
