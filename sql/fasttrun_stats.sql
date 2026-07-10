@@ -145,6 +145,30 @@ RESET fasttrun.auto_collect_stats;
 DROP TABLE t_policy_default;
 
 -- ----------------------------------------------------------------------
+-- 8c. Скрытая статистика должна безопасно работать и с BRIN.
+--     BRIN передаёт хуку неинициализированный VariableStatData, поэтому
+--     ветка без локального statsTuple обязана явно вернуть NULL.
+-- ----------------------------------------------------------------------
+DO $$
+DECLARE ln text;
+BEGIN
+  EXECUTE 'CREATE TEMP TABLE t_brin_hidden_stats (id int, grp int)';
+  EXECUTE 'INSERT INTO t_brin_hidden_stats SELECT g, g FROM generate_series(1, 100000) g';
+  EXECUTE 'CREATE INDEX ON t_brin_hidden_stats USING brin (grp)';
+  EXECUTE 'ANALYZE t_brin_hidden_stats';
+  PERFORM fasttruncate('t_brin_hidden_stats');
+  EXECUTE 'INSERT INTO t_brin_hidden_stats SELECT g, g FROM generate_series(1, 10000) g';
+  PERFORM set_config('enable_seqscan', 'off', true);
+  FOR ln IN EXECUTE
+      'EXPLAIN (COSTS OFF) SELECT * FROM t_brin_hidden_stats WHERE grp BETWEEN 10 AND 20'
+  LOOP
+    NULL;
+  END LOOP;
+END$$;
+\echo brin_hidden_stats_safe
+DROP TABLE t_brin_hidden_stats;
+
+-- ----------------------------------------------------------------------
 -- 9. fasttruncate должен явно вытеснить кэш статистики по OID таблицы
 --    (запасной механизм на случай, когда pgstat недоступен или
 --    счётчики сброшены).

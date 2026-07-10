@@ -2457,6 +2457,10 @@ fasttrun_get_relation_stats_hook(PlannerInfo *root, RangeTblEntry *rte,
 	bool			truncdropped_now = false;
 	BlockNumber		pages_now = 0;
 
+	/* Some core callers do not initialize these output fields. */
+	vardata->statsTuple = NULL;
+	vardata->freefunc = NULL;
+
 	if (fasttrun_stats_cache == NULL || fasttrun_stats_relid_cache == NULL)
 		goto chain;
 	relentry = (FasttrunStatsRelidEntry *)
