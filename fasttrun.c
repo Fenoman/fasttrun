@@ -95,6 +95,7 @@ PG_FUNCTION_INFO_V1(fasttrun_analyze_bulk);
 PG_FUNCTION_INFO_V1(fasttrun_relstats);
 PG_FUNCTION_INFO_V1(fasttrun_collect_stats);
 PG_FUNCTION_INFO_V1(fasttrun_inspect_stats);
+PG_FUNCTION_INFO_V1(fasttrun_cache_stats);
 PG_FUNCTION_INFO_V1(fasttrun_hot_temp_tables);
 PG_FUNCTION_INFO_V1(fasttrun_prewarm);
 PG_FUNCTION_INFO_V1(fasttrun_reset_temp_stats);
@@ -109,6 +110,7 @@ Datum	fasttrun_analyze_bulk(PG_FUNCTION_ARGS);
 Datum	fasttrun_relstats(PG_FUNCTION_ARGS);
 Datum	fasttrun_collect_stats(PG_FUNCTION_ARGS);
 Datum	fasttrun_inspect_stats(PG_FUNCTION_ARGS);
+Datum	fasttrun_cache_stats(PG_FUNCTION_ARGS);
 Datum	fasttrun_hot_temp_tables(PG_FUNCTION_ARGS);
 Datum	fasttrun_prewarm(PG_FUNCTION_ARGS);
 Datum	fasttrun_reset_temp_stats(PG_FUNCTION_ARGS);
@@ -126,6 +128,7 @@ static double	fasttrun_invalidate_threshold = 0.2;
 static bool		fasttrun_use_typanalyze = true;
 static bool		fasttrun_zero_sinval_truncate = true;
 static int		fasttrun_max_analyze_pages = 100000;
+static int		fasttrun_max_stats_memory = 0;	/* KB, 0 = no cap */
 
 #ifdef USE_ASSERT_CHECKING
 static char *fasttrun_test_failpoint = "";
@@ -198,6 +201,9 @@ static FasttrunFreshnessCacheEntry
 
 /* "Silent killer" warning -- one shot per backend. */
 static bool		fasttrun_warned_track_counts_off = false;
+
+/* fasttrun.max_stats_memory warning -- one shot per backend. */
+static bool		fasttrun_warned_stats_budget = false;
 
 /* RNG state for reservoir sampling */
 static pg_prng_state fasttrun_prng_state;
@@ -1951,6 +1957,62 @@ fasttrun_stats_relid_exists(Oid relid)
 
 	return hash_search(fasttrun_stats_relid_cache, &relid,
 					   HASH_FIND, NULL) != NULL;
+}
+
+/* True when the relid already holds column-stats keys in the cache. */
+static bool
+fasttrun_stats_relid_has_columns(Oid relid)
+{
+	FasttrunStatsRelidEntry *entry;
+
+	if (fasttrun_stats_relid_cache == NULL)
+		return false;
+
+	entry = (FasttrunStatsRelidEntry *)
+		hash_search(fasttrun_stats_relid_cache, &relid, HASH_FIND, NULL);
+	return entry != NULL && entry->attkeys != NIL;
+}
+
+/*
+ * Soft cap on the column-stats cache: fasttrun.max_stats_memory.
+ *
+ * Returns true when a first-time collection for rel must be skipped: the
+ * cap is set, the relation holds no cached column stats yet, and the
+ * cache memory is already over the cap.  The relation then behaves as
+ * with fasttrun.auto_collect_stats = off -- relation-level statistics
+ * keep working, column stats are absent.  Relations that already hold
+ * cached column stats keep refreshing without this check, and nothing is
+ * ever evicted.
+ *
+ * Signals: the auto-collect path warns once per backend; an explicit
+ * fasttrun_collect_stats() call gets a NOTICE every time.
+ */
+static bool
+fasttrun_stats_budget_blocks_collect(Relation rel, bool explicit_collect)
+{
+	if (fasttrun_max_stats_memory <= 0)
+		return false;
+	if (fasttrun_stats_mcxt == NULL)
+		return false;
+	if (fasttrun_stats_relid_has_columns(RelationGetRelid(rel)))
+		return false;
+	if (MemoryContextMemAllocated(fasttrun_stats_mcxt, true) <=
+		(Size) fasttrun_max_stats_memory * 1024)
+		return false;
+
+	if (explicit_collect)
+		ereport(NOTICE,
+				(errmsg("fasttrun_collect_stats: column statistics for \"%s\" not cached, cache exceeds fasttrun.max_stats_memory",
+						RelationGetRelationName(rel))));
+	else if (!fasttrun_warned_stats_budget)
+	{
+		ereport(WARNING,
+				(errmsg("fasttrun: column statistics cache exceeds fasttrun.max_stats_memory, new tables are left without column statistics"),
+				 errdetail("A table without cached column statistics behaves as with fasttrun.auto_collect_stats = off: relation-level statistics keep working, the planner falls back to default selectivity. Tables that already hold cached column statistics keep refreshing; nothing is evicted."),
+				 errhint("Raise fasttrun.max_stats_memory, or recycle the connection to free the cache. fasttrun_cache_stats() reports the current cache size.")));
+		fasttrun_warned_stats_budget = true;
+	}
+	return true;
 }
 
 static void
@@ -6526,7 +6588,8 @@ fasttrun_analyze_relation(Relation rel)
 			double		churn_ratio = (double) churn / baseline;
 
 			if (fasttrun_stats_refresh_threshold < 1.0 &&
-				churn_ratio >= fasttrun_stats_refresh_threshold)
+				churn_ratio >= fasttrun_stats_refresh_threshold &&
+				!fasttrun_stats_budget_blocks_collect(rel, false))
 			{
 				int			sample_target = fasttrun_effective_sample_target(rel);
 
@@ -6699,7 +6762,8 @@ fasttrun_analyze_relation(Relation rel)
 
 		/* Reservoir-sample inside the same scan if auto-collect is on. */
 		if (pages_now > 0 && fasttrun_auto_collect_stats &&
-			fasttrun_sample_rows != 0)
+			fasttrun_sample_rows != 0 &&
+			!fasttrun_stats_budget_blocks_collect(rel, false))
 		{
 			sample_target = fasttrun_effective_sample_target(rel);
 			if (sample_target > 0)
@@ -7117,6 +7181,53 @@ fasttrun_relstats(PG_FUNCTION_ARGS)
 }
 
 /*
+ * fasttrun_cache_stats()
+ *
+ * Capacity monitoring.  Returns the sizes of the session-local caches:
+ * relids in the analyze cache, relids and column entries in the
+ * column-stats cache, and the memory allocated by the stats subsystem
+ * (hash tables + cached statsTuples).  Read-only: no locks, no catalog
+ * access; missing caches read as zeroes.
+ */
+Datum
+fasttrun_cache_stats(PG_FUNCTION_ARGS)
+{
+	TupleDesc	tupdesc;
+	Datum		values[4];
+	bool		nulls[4] = {false, false, false, false};
+	HeapTuple	tuple;
+	int64		analyze_tables = 0;
+	int64		stats_tables = 0;
+	int64		stats_columns = 0;
+	int64		stats_bytes = 0;
+
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("function returning record called in context "
+						"that cannot accept type record")));
+	tupdesc = BlessTupleDesc(tupdesc);
+
+	if (fasttrun_analyze_cache != NULL)
+		analyze_tables = hash_get_num_entries(fasttrun_analyze_cache);
+	if (fasttrun_stats_relid_cache != NULL)
+		stats_tables = hash_get_num_entries(fasttrun_stats_relid_cache);
+	if (fasttrun_stats_cache != NULL)
+		stats_columns = hash_get_num_entries(fasttrun_stats_cache);
+	if (fasttrun_stats_mcxt != NULL)
+		stats_bytes = (int64) MemoryContextMemAllocated(fasttrun_stats_mcxt,
+														true);
+
+	values[0] = Int32GetDatum((int32) analyze_tables);
+	values[1] = Int32GetDatum((int32) stats_tables);
+	values[2] = Int32GetDatum((int32) stats_columns);
+	values[3] = Int64GetDatum(stats_bytes);
+
+	tuple = heap_form_tuple(tupdesc, values, nulls);
+	PG_RETURN_DATUM(HeapTupleGetDatum(tuple));
+}
+
+/*
  * fasttrun_collect_stats(text)
  *
  * Explicit-call sample -> per-column n_distinct/null_frac/width ->
@@ -7190,7 +7301,8 @@ fasttrun_collect_stats(PG_FUNCTION_ARGS)
 	{
 		sample_target = fasttrun_effective_sample_target(rel);
 
-		if (sample_target <= 0)
+		if (sample_target <= 0 ||
+			fasttrun_stats_budget_blocks_collect(rel, true))
 		{
 			if (planner_fallback_changed)
 				fasttrun_invalidate_local_plan_cache(relOid);
@@ -9167,6 +9279,28 @@ _PG_init(void)
 							INT_MAX,
 							PGC_USERSET,
 							0,
+							NULL, NULL, NULL);
+
+	DefineCustomIntVariable("fasttrun.max_stats_memory",
+							"Soft memory cap for the session-local "
+							"column-statistics cache",
+							"Default 0 = no cap.  When the cache already "
+							"holds more than this much memory, column "
+							"statistics are not collected for tables that "
+							"have none cached yet -- such a table behaves "
+							"as with fasttrun.auto_collect_stats = off: "
+							"relation-level statistics keep working.  "
+							"Tables that already hold cached column "
+							"statistics keep refreshing regardless of the "
+							"cap, and nothing is evicted.  "
+							"fasttrun_cache_stats() reports the current "
+							"cache size.",
+							&fasttrun_max_stats_memory,
+							0,
+							0,
+							MAX_KILOBYTES,
+							PGC_USERSET,
+							GUC_UNIT_KB,
 							NULL, NULL, NULL);
 
 	pg_prng_seed(&fasttrun_prng_state, (uint64) MyProcPid);

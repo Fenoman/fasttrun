@@ -1965,4 +1965,119 @@ END$$;
 SELECT 'expression_stats_core_readable_ok' AS marker;
 DROP TABLE t_expr_hidden;
 DROP TABLE t_expr_core;
+
+-- ----------------------------------------------------------------------
+-- 44. Ёмкость: fasttrun_cache_stats() и fasttrun.max_stats_memory.
+--     Сверх бюджета таблица без кешированной column-статы остаётся без
+--     неё (WARNING один раз на бэкенд на авто-пути, NOTICE на каждый
+--     явный сбор), relation-level relstats продолжают работать.
+--     Таблицы с уже собранной статой рефрешатся без проверки бюджета,
+--     эвикции нет. 0 (default) — без лимита.
+-- ----------------------------------------------------------------------
+DISCARD TEMP;
+-- Пустые кэши читаются как нули.
+SELECT * FROM fasttrun_cache_stats();
+SET fasttrun.max_stats_memory = '64kB';
+-- Узкая таблица A: кэш ещё под бюджетом, стата собирается.
+CREATE TEMP TABLE t44_a (id int, name text);
+INSERT INTO t44_a SELECT g, 'val_' || g FROM generate_series(1, 10000) g;
+SELECT fasttrun_analyze('t44_a');
+SELECT count(*) > 0 AS a_stats_cached FROM fasttrun_inspect_stats('t44_a');
+SELECT analyze_tables, stats_tables, stats_columns,
+       stats_bytes > 0 AS stats_bytes_positive
+FROM fasttrun_cache_stats();
+-- Заполнитель с широкими значениями доводит кэш сверх бюджета.
+CREATE TEMP TABLE t44_fill (c1 text, c2 text, c3 text, c4 text);
+INSERT INTO t44_fill
+  SELECT 'a' || g || repeat('x', 200), 'b' || g || repeat('y', 200),
+         'c' || g || repeat('z', 200), 'd' || g || repeat('w', 200)
+  FROM generate_series(1, 3000) g;
+SELECT fasttrun_analyze('t44_fill');
+SELECT stats_bytes > 64 * 1024 AS fill_pushed_over_budget
+FROM fasttrun_cache_stats();
+-- B сверх бюджета: WARNING, column-статы нет, relstats живут.
+CREATE TEMP TABLE t44_b (id int, name text);
+INSERT INTO t44_b SELECT g, 'val_' || g FROM generate_series(1, 10000) g;
+SELECT fasttrun_analyze('t44_b');
+SELECT count(*) = 0 AS b_stats_absent FROM fasttrun_inspect_stats('t44_b');
+SELECT reltuples::int AS b_reltuples FROM fasttrun_relstats('t44_b');
+-- Стата A остаётся видимой: уникальная колонка -> rows=1.
+DO $$
+DECLARE ln text; est int := NULL;
+BEGIN
+  FOR ln IN EXPLAIN SELECT * FROM t44_a WHERE name = 'val_1' LOOP
+    IF ln ~ 'on t44_a' THEN
+      est := substring(ln FROM 'rows=(\d+)')::int;
+      EXIT;
+    END IF;
+  END LOOP;
+  IF est IS NULL OR est > 3 THEN
+    RAISE EXCEPTION 'cached stats of table A lost after budget block: est=%', est;
+  END IF;
+END$$;
+SELECT 'a_stats_still_visible_ok' AS marker;
+-- B без column-статы планируется по дефолтной селективности (~0.5%).
+DO $$
+DECLARE ln text; est int := NULL;
+BEGIN
+  FOR ln IN EXPLAIN SELECT * FROM t44_b WHERE name = 'val_1' LOOP
+    IF ln ~ 'on t44_b' THEN
+      est := substring(ln FROM 'rows=(\d+)')::int;
+      EXIT;
+    END IF;
+  END LOOP;
+  IF est IS NULL OR est < 20 OR est > 500 THEN
+    RAISE EXCEPTION 'blocked table B got non-default estimate: est=%', est;
+  END IF;
+END$$;
+SELECT 'b_default_estimate_ok' AS marker;
+-- Второй заблокированный автосбор: WARNING один на бэкенд, повтора нет.
+CREATE TEMP TABLE t44_b2 (id int, name text);
+INSERT INTO t44_b2 SELECT g, 'val_' || g FROM generate_series(1, 1000) g;
+SELECT fasttrun_analyze('t44_b2');
+SELECT count(*) = 0 AS b2_stats_absent FROM fasttrun_inspect_stats('t44_b2');
+-- Delta-refresh не-managed таблицы в одной транзакции: тоже блокируется,
+-- тихо (WARNING уже был).
+BEGIN;
+SELECT fasttrun_analyze('t44_b');
+INSERT INTO t44_b SELECT g, 'zz_' || g FROM generate_series(1, 5000) g;
+SELECT fasttrun_analyze('t44_b');
+COMMIT;
+SELECT count(*) = 0 AS b_stats_absent_after_delta_refresh
+FROM fasttrun_inspect_stats('t44_b');
+-- Явный сбор сверх бюджета: NOTICE на каждый вызов.
+SELECT fasttrun_collect_stats('t44_b');
+SELECT fasttrun_collect_stats('t44_b');
+SELECT count(*) = 0 AS b_stats_still_absent FROM fasttrun_inspect_stats('t44_b');
+-- Managed-таблица A рефрешится сверх порога, бюджет не мешает.
+INSERT INTO t44_a SELECT g, 'dup' FROM generate_series(1, 10000) g;
+SELECT fasttrun_analyze('t44_a');
+DO $$
+DECLARE ln text; est int := NULL;
+BEGIN
+  FOR ln IN EXPLAIN SELECT * FROM t44_a WHERE name = 'dup' LOOP
+    IF ln ~ 'on t44_a' THEN
+      est := substring(ln FROM 'rows=(\d+)')::int;
+      EXIT;
+    END IF;
+  END LOOP;
+  IF est IS NULL OR est < 5000 THEN
+    RAISE EXCEPTION 'budget blocked refresh of managed table A: est=%', est;
+  END IF;
+END$$;
+SELECT 'a_managed_refresh_ok' AS marker;
+-- Без лимита новая таблица C собирается несмотря на размер кэша.
+RESET fasttrun.max_stats_memory;
+CREATE TEMP TABLE t44_c (id int, name text);
+INSERT INTO t44_c SELECT g, 'val_' || g FROM generate_series(1, 1000) g;
+SELECT fasttrun_analyze('t44_c');
+SELECT count(*) > 0 AS c_stats_cached FROM fasttrun_inspect_stats('t44_c');
+SELECT analyze_tables, stats_tables, stats_columns,
+       stats_bytes > 0 AS stats_bytes_positive
+FROM fasttrun_cache_stats();
+DROP TABLE t44_a;
+DROP TABLE t44_fill;
+DROP TABLE t44_b;
+DROP TABLE t44_b2;
+DROP TABLE t44_c;
 DROP EXTENSION fasttrun;

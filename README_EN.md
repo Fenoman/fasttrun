@@ -24,11 +24,12 @@ This fasttrun fork tries to solve both problems:
 | `fasttrun_collect_stats(text)` | Explicit column statistics collection. In 99% of cases `fasttrun_analyze` is enough — it does the same automatically on the first pass. This function is needed only if auto-collection is disabled (`auto_collect_stats=off`) or you want to force a rebuild | **no** |
 | `fasttrun_relstats(text)` | Returns current `relpages/reltuples` from process memory | **no** |
 | `fasttrun_inspect_stats(text)` | Returns cached statsTuple in `pg_statistic` format (for debugging) | **no** |
+| `fasttrun_cache_stats()` | Capacity monitoring: number of tables in the analyze cache, number of tables and column entries in the column-stats cache, and the stats subsystem memory in bytes. Read-only, no locks, no catalog access; empty caches read as zeroes | **no** |
 | `fasttrun_hot_temp_tables(n)` | Top-N most frequently created temp tables (requires `shared_preload_libraries`) | **no** |
 | `fasttrun_prewarm()` | Creates top-N hot temp tables via `create_temp_table` | **no** |
 | `fasttrun_reset_temp_stats()` | Resets temp table creation counters | **no** |
 
-The public API contains 9 SQL functions.
+The public API contains 10 SQL functions.
 
 Functions that accept a temporary table name:
 * accept a local temporary heap table name (schema-qualified is allowed);
@@ -137,6 +138,7 @@ A separate commit-boundary backstop: a temp table's pgstat counters reset at eve
 | `fasttrun.stats_refresh_threshold` | `0.2` | DML change ratio threshold governing both stats refresh and freshness tolerance: below it cached column stats stay visible to the planner, past it they are hidden. For freshness the effective threshold scales with column cardinality (`threshold·(1−dratio)`, floored at 5%): near-unique columns are stricter (guarding against a stale skewed estimate), low-cardinality columns keep the full threshold. A visible→hidden flip observed by `fasttrun_analyze` (including in the band between the scaled floor and the refresh threshold) invalidates cached SPI/PREPARE plans — a plan built on the now-hidden distribution does not outlive the flip while new plans already see defaults. `0` — refresh on any DML, visible only on an exact counter match. `1` — auto refresh disabled, freshness tolerates churn up to 100% (subject to the scaling) |
 | `fasttrun.invalidate_threshold` | `0.2` | `relpages`/`reltuples` drift ratio below which `fasttrun_analyze` does NOT invalidate cached SPI/PREPARE plans. Drift is measured cumulatively — against the values published at the last invalidation, not against the previous call: a series of small steps, each below the threshold, still invalidates the plan once the accumulated drift reaches it. Symmetric with `stats_refresh_threshold` — below 20% DML neither refresh nor plan invalidation fires. `0` — invalidate on any drift (the 2.2.0 behaviour). Invalidations triggered by a column-stats refresh, a stats-visibility flip, or an index relstats change always fire, regardless of this threshold |
 | `fasttrun.zero_sinval_truncate` | `on` | `on` clears files directly and sends no shared SMGR messages. `off` calls `RelationTruncate` for each relation and sends one message after each successful call |
+| `fasttrun.max_stats_memory` | `0` | Soft memory cap for the column-stats cache (in KB; `0` = no cap, the current behaviour). Once the cache already holds more than the cap, column statistics are not collected for tables that have none cached yet — such a table behaves as with `auto_collect_stats = off`: relation-level relstats keep working, the planner falls back to default selectivity. The auto-collect path warns with a `WARNING` once per backend; an explicit `fasttrun_collect_stats` call gets a `NOTICE` every time. Tables that already hold cached statistics keep refreshing without the budget check; live statistics are never evicted. `fasttrun_cache_stats()` reports the current cache size |
 
 ## Performance
 
@@ -310,7 +312,7 @@ PERFORM fasttruncate('temp_xxx');
 
 In a typical PL/pgSQL calculation, one backend works with 10-30 temporary tables, each going through this cycle many times. With a pooler (pg_doorman, odyssey) the backend lives long and serves hundreds of clients in a row — temporary tables accumulate and get reused. `fasttruncate` resets data and statistics so the next client doesn't inherit anything from the previous one.
 
-Statistics cache memory: the column-stats cache is a per-backend copy of `pg_statistic` rows. A column with collected statistics (MCV + histogram at `default_statistics_target = 100`) takes roughly 1-3 KB; estimate the footprint as tables × columns × ~2 KB. With a "hundreds of temp tables per backend behind a pooler" profile this adds up to tens of MB per server connection — account for it when sizing the pool's RAM. Periodic pooler connection recycling bounds the growth.
+Statistics cache memory: the column-stats cache is a per-backend copy of `pg_statistic` rows. A column with collected statistics (MCV + histogram at `default_statistics_target = 100`) takes roughly 1-3 KB; estimate the footprint as tables × columns × ~2 KB. With a "hundreds of temp tables per backend behind a pooler" profile this adds up to tens of MB per server connection — account for it when sizing the pool's RAM. Periodic pooler connection recycling bounds the growth. The actual cache sizes are visible through `fasttrun_cache_stats()` (table counts, column entries, and bytes), and the soft cap `fasttrun.max_stats_memory` bounds the growth: over the budget, new tables are left without column stats while tables with already-collected statistics keep refreshing; nothing is evicted.
 
 ## Hot table prewarming
 

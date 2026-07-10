@@ -74,6 +74,23 @@ RETURNS SETOF pg_catalog.pg_statistic
 AS 'MODULE_PATHNAME', 'fasttrun_inspect_stats'
 LANGUAGE C STRICT VOLATILE;
 
+-- ----------------------------------------------------------------------
+-- fasttrun_cache_stats()
+-- Мониторинг ёмкости session-local кэшей: число таблиц в analyze-кэше,
+-- число таблиц и колоночных записей в кэше column-статистики и память,
+-- занятая подсистемой статистики (хэш-таблицы + кешированные statsTuple,
+-- через MemoryContextMemAllocated).  Read-only, без блокировок и без
+-- обращений к каталогу; пустые кэши читаются как нули.  Пара к GUC
+-- fasttrun.max_stats_memory (мягкий предохранитель памяти кэша).
+-- ----------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION fasttrun_cache_stats(
+    OUT analyze_tables int,
+    OUT stats_tables int,
+    OUT stats_columns int,
+    OUT stats_bytes bigint)
+RETURNS record AS 'MODULE_PATHNAME', 'fasttrun_cache_stats'
+LANGUAGE C VOLATILE;
+
 -- Tracking: top-N самых создаваемых temp tables (shared memory)
 CREATE OR REPLACE FUNCTION fasttrun_hot_temp_tables(
     n int DEFAULT 100,
