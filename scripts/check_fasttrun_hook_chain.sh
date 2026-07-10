@@ -169,6 +169,8 @@ SELECT g, g % 1000, (g % 10000)::numeric / 100, md5(g::text)
 FROM generate_series(1, 50000) g;
 CREATE INDEX ON t_hook_probe (grp);
 CREATE INDEX ON t_hook_probe (amount);
+CREATE INDEX ON t_hook_probe (lower(payload));
+ANALYZE t_hook_probe;
 SELECT fasttrun_analyze('t_hook_probe');
 
 \if :probe_after
@@ -182,11 +184,16 @@ LANGUAGE C;
 \endif
 
 SELECT pg_temp.fasttrun_hook_probe_reset();
+SELECT set_config('fasttrun_probe.probe_after', :'probe_after', false);
 DO $check$
 DECLARE
   plan_line text;
   grp_rows int := NULL;
   range_rows int := NULL;
+  expr_rows int := NULL;
+  managed_counts bigint[];
+  final_counts bigint[];
+  probe_after boolean := current_setting('fasttrun_probe.probe_after')::boolean;
 BEGIN
   FOR plan_line IN EXPLAIN SELECT * FROM t_hook_probe WHERE grp = 42 LOOP
     IF plan_line ~ 'rows=' THEN
@@ -208,11 +215,40 @@ BEGIN
     RAISE EXCEPTION 'test hook range estimate out of bounds: %', range_rows;
   END IF;
 
+  FOR plan_line IN EXPLAIN
+      SELECT * FROM t_hook_probe WHERE lower(payload) = md5('42') LOOP
+    IF plan_line ~ 'on t_hook_probe' THEN
+      expr_rows := substring(plan_line FROM 'rows=(\d+)')::int;
+      EXIT;
+    END IF;
+  END LOOP;
+  IF expr_rows IS NULL OR expr_rows < 100 OR expr_rows > 500 THEN
+    RAISE EXCEPTION 'managed expression stats were not hidden: %', expr_rows;
+  END IF;
+  managed_counts := pg_temp.fasttrun_hook_probe_counts();
+
   /* A miss must chain through both stats hooks in either load order. */
   FOR plan_line IN EXPLAIN
       SELECT payload FROM hook_probe_perm WHERE grp = 42 ORDER BY payload LOOP
     NULL;
   END LOOP;
+  FOR plan_line IN EXPLAIN
+      SELECT * FROM hook_probe_perm WHERE lower(payload) = md5('42') LOOP
+    NULL;
+  END LOOP;
+  final_counts := pg_temp.fasttrun_hook_probe_counts();
+  IF probe_after AND managed_counts[4] <= 0 THEN
+    RAISE EXCEPTION 'probe-after order missed managed index hook: %',
+                    managed_counts;
+  END IF;
+  IF NOT probe_after AND managed_counts[4] <> 0 THEN
+    RAISE EXCEPTION 'managed hide chained to probe-before hook: %',
+                    managed_counts;
+  END IF;
+  IF final_counts[4] <= managed_counts[4] THEN
+    RAISE EXCEPTION 'unmanaged expression miss did not chain: before=%, after=%',
+                    managed_counts, final_counts;
+  END IF;
 END
 $check$;
 
@@ -222,9 +258,9 @@ DO $check$
 DECLARE counts bigint[];
 BEGIN
   counts := pg_temp.fasttrun_hook_probe_counts();
-  IF array_length(counts, 1) <> 5 OR
+  IF array_length(counts, 1) <> 7 OR
      counts[1] <= 0 OR counts[2] <= 0 OR counts[3] <= 0 OR
-     counts[4] <= 0 OR counts[5] <= 0 THEN
+     counts[4] <= 0 OR counts[5] <= 0 OR counts[6] <= 0 THEN
     RAISE EXCEPTION 'test hook counters are incomplete: %', counts;
   END IF;
 END
@@ -256,6 +292,7 @@ CREATE EXTENSION fasttrun;
 CREATE TABLE hook_probe_perm (id int PRIMARY KEY, grp int, payload text);
 INSERT INTO hook_probe_perm
 SELECT g, g % 1000, md5(g::text) FROM generate_series(1, 50000) g;
+CREATE INDEX hook_probe_perm_expr_idx ON hook_probe_perm (lower(payload));
 ANALYZE hook_probe_perm;
 SQL
 run_synthetic_order probe_before_fasttrun 1 0

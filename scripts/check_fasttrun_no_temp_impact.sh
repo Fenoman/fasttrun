@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Check the same permanent-table query in three fasttrun states:
+# Check the same permanent expression-index query in three fasttrun states:
 #   1. local statistics caches were never created;
 #   2. an unrelated temporary table has neutral local statistics;
 #   3. the last managed temporary table was dropped and its caches released.
@@ -25,6 +25,7 @@ PLAN_REPETITIONS=${PLAN_REPETITIONS:-7}
 PLAN_QUERIES=${PLAN_QUERIES:-1000}
 KEEP_WORKDIR=${KEEP_WORKDIR:-0}
 BASELINE=${FASTTRUN_NO_TEMP_BASELINE_JSON:-}
+PLANNER_PROBE=${FASTTRUN_NO_TEMP_PLANNER_PROBE:-0}
 
 run_pg()
 {
@@ -75,6 +76,10 @@ fi
 require_positive_int EXECUTIONS "$EXECUTIONS"
 require_positive_int PLAN_REPETITIONS "$PLAN_REPETITIONS"
 require_positive_int PLAN_QUERIES "$PLAN_QUERIES"
+case "$PLANNER_PROBE" in
+	0|1) ;;
+	*) echo "FASTTRUN_NO_TEMP_PLANNER_PROBE must be 0 or 1" >&2; exit 1 ;;
+esac
 if [ -n "$BASELINE" ] && [ ! -f "$BASELINE" ]; then
 	echo "baseline JSON does not exist: $BASELINE" >&2
 	exit 1
@@ -98,6 +103,7 @@ CREATE EXTENSION fasttrun;
 CREATE TABLE perm_no_temp (id int PRIMARY KEY, grp int, payload text);
 INSERT INTO perm_no_temp
 SELECT g, g % 100, md5(g::text) FROM generate_series(1,100000) g;
+CREATE INDEX perm_no_temp_payload_expr_idx ON perm_no_temp (lower(payload));
 ANALYZE perm_no_temp;
 
 CREATE FUNCTION public.fasttrun_no_temp_marker_begin(marker text)
@@ -127,6 +133,7 @@ run_state()
 	local out=$WORKDIR/$state.out
 	local err=$WORKDIR/$state.err
 	local plan_file=$WORKDIR/$state.plan.json
+	local post_plan_file=$WORKDIR/$state.post-plan.json
 	local result_file=$WORKDIR/$state.result.json
 
 	echo "measuring no-temp state: $state" >&2
@@ -139,9 +146,17 @@ run_state()
 		-v plan_repetitions="$PLAN_REPETITIONS" \
 		-v plan_queries="$PLAN_QUERIES" \
 		-v plan_file="$plan_file" \
+		-v post_plan_file="$post_plan_file" \
+		-v planner_probe="$PLANNER_PROBE" \
 		-v result_file="$result_file" >"$out" 2>"$err" <<'SQL'
 SELECT 'BACKEND_PID|' || pg_backend_pid();
 SET plan_cache_mode = force_generic_plan;
+
+\if :planner_probe
+CREATE FUNCTION pg_temp.fasttrun_test_planner_probe(boolean)
+RETURNS bigint[] AS '$libdir/fasttrun', 'fasttrun_test_planner_probe'
+LANGUAGE C STRICT;
+\endif
 
 \if :make_neutral
 CREATE TEMP TABLE ft_no_temp_state (id int, grp int, payload text);
@@ -158,12 +173,12 @@ END
 $check$;
 \endif
 
-PREPARE q_perm(int) AS
+PREPARE q_perm(text) AS
 SELECT count(*), min(payload), max(payload)
 FROM perm_no_temp
-WHERE grp = $1;
+WHERE lower(payload) = $1;
 \o /dev/null
-EXECUTE q_perm(42);
+EXECUTE q_perm(md5('42'));
 \o
 
 \if :make_neutral
@@ -212,19 +227,51 @@ $check$;
 \endif
 \endif
 
+\if :planner_probe
+SELECT set_config('fasttrun_probe.state', :'state', false);
+SELECT pg_temp.fasttrun_test_planner_probe(true);
+\endif
+PREPARE q_perm_post AS
+SELECT count(*), min(payload), max(payload)
+FROM perm_no_temp
+WHERE lower(payload) = md5('42');
+\o :post_plan_file
+EXPLAIN (FORMAT JSON, COSTS ON, SUMMARY OFF) EXECUTE q_perm_post;
+\o
+\if :planner_probe
+DO $check$
+DECLARE
+  counts bigint[];
+  state text := current_setting('fasttrun_probe.state');
+BEGIN
+  counts := pg_temp.fasttrun_test_planner_probe(false);
+  IF state = 'never_initialized' AND counts[5] <> 0 THEN
+    RAISE EXCEPTION 'unused hooks ran in never-initialized state: %', counts;
+  END IF;
+  IF state <> 'never_initialized' AND counts[5] = 0 THEN
+    RAISE EXCEPTION 'fresh permanent plan missed index stats hook';
+  END IF;
+  IF counts[3] <> 0 THEN
+    RAISE EXCEPTION 'fresh permanent plan opened % index owners', counts[3];
+  END IF;
+END
+$check$;
+\endif
+DEALLOCATE q_perm_post;
+
 SET log_planner_stats = on;
 SELECT public.fasttrun_no_temp_marker_begin(:'state');
-EXECUTE q_perm(42);
+EXECUTE q_perm(md5('42'));
 SET log_planner_stats = off;
 SELECT public.fasttrun_no_temp_marker_end(:'state');
 
 \o :plan_file
-EXPLAIN (FORMAT JSON, COSTS OFF, SUMMARY OFF) EXECUTE q_perm(42);
+EXPLAIN (FORMAT JSON, COSTS OFF, SUMMARY OFF) EXECUTE q_perm(md5('42'));
 \o
 \o :result_file
 SELECT json_build_array(count(*), min(payload), max(payload))::text
 FROM perm_no_temp
-WHERE grp = 42;
+WHERE lower(payload) = md5('42');
 \o
 
 SELECT format('MEM_WARM|%s|%s|%s',
@@ -235,7 +282,8 @@ FROM pg_backend_memory_contexts
 WHERE name LIKE 'fasttrun%';
 
 \o /dev/null
-SELECT 'EXECUTE q_perm(42);' FROM generate_series(1, :executions) \gexec
+SELECT format('EXECUTE q_perm(%L);', md5('42'))
+FROM generate_series(1, :executions) \gexec
 \o
 
 SELECT format('MEM_FINAL|%s|%s|%s',
@@ -252,7 +300,9 @@ DECLARE i int; started timestamptz; elapsed_ms numeric;
 BEGIN
   started := clock_timestamp();
   FOR i IN 1..%s LOOP
-    EXECUTE format('EXPLAIN (COSTS OFF) SELECT * FROM perm_no_temp WHERE id = %%s', i);
+    EXECUTE format(
+      'EXPLAIN (COSTS OFF) SELECT * FROM perm_no_temp WHERE lower(payload) = %%L',
+      md5(i::text));
   END LOOP;
   elapsed_ms := extract(epoch FROM clock_timestamp() - started) * 1000;
   RAISE NOTICE 'NO_TEMP_PLAN_MS=%%', round(elapsed_ms, 3);
@@ -326,6 +376,27 @@ def planner_blocks(state):
                for line in log_lines[begins[0] + 1:ends[0]])
 
 
+def scan_rows(plan_value, state):
+    def walk(node):
+        if node.get("Relation Name") == "perm_no_temp":
+            return node.get("Plan Rows")
+        for child in node.get("Plans", []):
+            found = walk(child)
+            if found is not None:
+                return found
+        return None
+
+    try:
+        rows = walk(plan_value[0]["Plan"])
+    except Exception as exc:
+        failures.append(f"{state}: invalid post-transition plan shape: {exc}")
+        return None
+    if not isinstance(rows, int) or rows <= 0:
+        failures.append(f"{state}: invalid post-transition scan rows: {rows!r}")
+        return None
+    return rows
+
+
 report = {
     "postgres_version": pg_version,
     "executions": executions,
@@ -342,6 +413,13 @@ for state in states:
     except Exception as exc:
         failures.append(f"{state}: invalid plan JSON: {exc}")
         plan_value = None
+    try:
+        post_plan_value = json.loads(
+            (workdir / f"{state}.post-plan.json").read_text()
+        )
+    except Exception as exc:
+        failures.append(f"{state}: invalid post-transition plan JSON: {exc}")
+        post_plan_value = None
     try:
         result_value = json.loads((workdir / f"{state}.result.json").read_text())
     except Exception as exc:
@@ -371,6 +449,8 @@ for state in states:
         failures.append(f"{state}: warmed permanent plan rebuilt {blocks} time(s)")
     report["states"][state] = {
         "plan_sha256": canonical_hash(plan_value),
+        "post_transition_plan_sha256": canonical_hash(post_plan_value),
+        "post_transition_scan_rows": scan_rows(post_plan_value, state),
         "result_sha256": canonical_hash(result_value),
         "planner_statistics_blocks": blocks,
         "memory_warm": warm,
@@ -382,10 +462,25 @@ for state in states:
 
 plan_hashes = {entry["plan_sha256"] for entry in report["states"].values()}
 result_hashes = {entry["result_sha256"] for entry in report["states"].values()}
+post_plan_hashes = {
+    entry["post_transition_plan_sha256"] for entry in report["states"].values()
+}
+post_plan_rows = {
+    entry["post_transition_scan_rows"] for entry in report["states"].values()
+}
 if len(plan_hashes) != 1:
     failures.append(f"plan hashes differ across states: {sorted(plan_hashes)}")
 if len(result_hashes) != 1:
     failures.append(f"result hashes differ across states: {sorted(result_hashes)}")
+if len(post_plan_hashes) != 1:
+    failures.append(
+        f"post-transition plan hashes differ across states: {sorted(post_plan_hashes)}"
+    )
+if len(post_plan_rows) != 1:
+    failures.append(
+        "post-transition scan estimates differ across states: "
+        f"{sorted(map(repr, post_plan_rows))}"
+    )
 
 if baseline_path:
     baseline = json.loads(Path(baseline_path).read_text())

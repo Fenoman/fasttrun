@@ -104,6 +104,10 @@ PG_FUNCTION_INFO_V1(fasttrun_test_subxact_visits);
 PG_FUNCTION_INFO_V1(fasttrun_test_poison_locator_mismatch);
 PG_FUNCTION_INFO_V1(fasttrun_test_track_set);
 #endif
+#ifdef USE_ASSERT_CHECKING
+PG_FUNCTION_INFO_V1(fasttrun_test_planner_probe);
+PG_FUNCTION_INFO_V1(fasttrun_test_call_attavgwidth);
+#endif
 Datum	fasttruncate(PG_FUNCTION_ARGS);
 Datum	fasttrun_analyze(PG_FUNCTION_ARGS);
 Datum	fasttrun_analyze_bulk(PG_FUNCTION_ARGS);
@@ -211,6 +215,14 @@ static pg_prng_state fasttrun_prng_state;
 #ifdef USE_ASSERT_CHECKING
 /* Test probe: counts relids examined by subxact cleanup. */
 static uint64 fasttrun_test_subxact_visited = 0;
+#endif
+
+#ifdef USE_ASSERT_CHECKING
+static uint64 fasttrun_test_locator_opens = 0;
+static uint64 fasttrun_test_counter_opens = 0;
+static uint64 fasttrun_test_owner_opens = 0;
+static uint64 fasttrun_test_plan_invalidations = 0;
+static uint64 fasttrun_test_index_hook_calls = 0;
 #endif
 
 /* One bounded journal frame per subtransaction that mutates local state. */
@@ -2604,6 +2616,9 @@ fasttrun_stats_relid_locator_valid(Oid relid,
 	}
 
 	rel = RelationIdGetRelation(relid);
+#ifdef USE_ASSERT_CHECKING
+	fasttrun_test_locator_opens++;
+#endif
 	if (!RelationIsValid(rel))
 		valid = false;
 	else
@@ -2834,7 +2849,12 @@ fasttrun_index_owning_heap(Oid indexOid)
 		heap_relid = aentry->state.heap_relid;
 	else
 	{
-		Relation	indexrel = RelationIdGetRelation(indexOid);
+		Relation	indexrel;
+
+#ifdef USE_ASSERT_CHECKING
+		fasttrun_test_owner_opens++;
+#endif
+		indexrel = RelationIdGetRelation(indexOid);
 
 		if (RelationIsValid(indexrel))
 		{
@@ -2864,11 +2884,15 @@ fasttrun_get_index_stats_hook(PlannerInfo *root, Oid indexOid,
 							  AttrNumber indexattnum,
 							  VariableStatData *vardata)
 {
+#ifdef USE_ASSERT_CHECKING
+	fasttrun_test_index_hook_calls++;
+#endif
 	/* Some core callers do not initialize these output fields. */
 	vardata->statsTuple = NULL;
 	vardata->freefunc = NULL;
 
-	if (fasttrun_stats_cache != NULL && fasttrun_stats_relid_cache != NULL)
+	if (fasttrun_in_planner &&
+		fasttrun_stats_cache != NULL && fasttrun_stats_relid_cache != NULL)
 	{
 		Oid			heap_relid = fasttrun_index_owning_heap(indexOid);
 
@@ -3111,6 +3135,24 @@ fasttrun_poison_check_query(Query *query)
 								 QTW_IGNORE_CTE_SUBQUERIES);
 }
 
+static void
+fasttrun_restore_planner_frame(bool saved_in_planner,
+							  int saved_cache_used, int saved_next_evict)
+{
+	fasttrun_in_planner = saved_in_planner;
+	if (saved_in_planner)
+	{
+		/* Вложенный планировщик перезаписал массив: внешний кэш перечитается. */
+		fasttrun_freshness_cache_used = 0;
+		fasttrun_freshness_cache_next_evict = 0;
+	}
+	else
+	{
+		fasttrun_freshness_cache_used = saved_cache_used;
+		fasttrun_freshness_cache_next_evict = saved_next_evict;
+	}
+}
+
 static PlannedStmt *
 fasttrun_planner_hook(Query *parse, const char *query_string,
 					  int cursorOptions, ParamListInfo boundParams)
@@ -3146,11 +3188,38 @@ fasttrun_planner_hook(Query *parse, const char *query_string,
 	 */
 	if (!stats_frame_needed)
 	{
-		if (prev_planner_hook)
-			return prev_planner_hook(parse, query_string, cursorOptions,
-									 boundParams);
-		return standard_planner(parse, query_string, cursorOptions,
-								boundParams);
+		if (!saved_in_planner)
+		{
+			if (prev_planner_hook)
+				return prev_planner_hook(parse, query_string, cursorOptions,
+										 boundParams);
+			return standard_planner(parse, query_string, cursorOptions,
+									boundParams);
+		}
+
+		/* Вложенный немаршрутизируемый запрос не наследует внешний фрейм. */
+		fasttrun_in_planner = false;
+		PG_TRY();
+		{
+			if (prev_planner_hook)
+				result = prev_planner_hook(parse, query_string, cursorOptions,
+									   boundParams);
+			else
+				result = standard_planner(parse, query_string, cursorOptions,
+									  boundParams);
+		}
+		PG_CATCH();
+		{
+			fasttrun_restore_planner_frame(saved_in_planner,
+										 saved_freshness_cache_used,
+										 saved_freshness_cache_next_evict);
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
+		fasttrun_restore_planner_frame(saved_in_planner,
+									 saved_freshness_cache_used,
+									 saved_freshness_cache_next_evict);
+		return result;
 	}
 
 	fasttrun_in_planner = true;
@@ -3168,16 +3237,16 @@ fasttrun_planner_hook(Query *parse, const char *query_string,
 	}
 	PG_CATCH();
 	{
-		fasttrun_in_planner = saved_in_planner;
-		fasttrun_freshness_cache_used = saved_freshness_cache_used;
-		fasttrun_freshness_cache_next_evict = saved_freshness_cache_next_evict;
+		fasttrun_restore_planner_frame(saved_in_planner,
+									 saved_freshness_cache_used,
+									 saved_freshness_cache_next_evict);
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
 
-	fasttrun_in_planner = saved_in_planner;
-	fasttrun_freshness_cache_used = saved_freshness_cache_used;
-	fasttrun_freshness_cache_next_evict = saved_freshness_cache_next_evict;
+	fasttrun_restore_planner_frame(saved_in_planner,
+								 saved_freshness_cache_used,
+								 saved_freshness_cache_next_evict);
 
 	return result;
 }
@@ -3327,6 +3396,9 @@ fasttrun_read_pgstat_counters_for_hook(Oid relid,
 		}
 	}
 
+#ifdef USE_ASSERT_CHECKING
+	fasttrun_test_counter_opens++;
+#endif
 	rel = RelationIdGetRelation(relid);
 	if (rel == NULL)
 	{
@@ -6296,6 +6368,10 @@ fasttrun_invalidate_local_plan_cache(Oid relid)
 {
 	SharedInvalidationMessage msg;
 
+#ifdef USE_ASSERT_CHECKING
+	fasttrun_test_plan_invalidations++;
+#endif
+
 	/* InvalidOid would target the whole relcache; defend against that. */
 	Assert(OidIsValid(relid));
 
@@ -9219,6 +9295,42 @@ fasttrun_test_subxact_visits(PG_FUNCTION_ARGS)
 	if (reset)
 		fasttrun_test_subxact_visited = 0;
 	PG_RETURN_INT64((int64) prior);
+}
+#endif
+
+#ifdef USE_ASSERT_CHECKING
+/* Счётчики проверок планировщика; true возвращает и сбрасывает. */
+Datum
+fasttrun_test_planner_probe(PG_FUNCTION_ARGS)
+{
+	bool		reset = PG_GETARG_BOOL(0);
+	Datum		values[5];
+
+	values[0] = Int64GetDatum((int64) fasttrun_test_locator_opens);
+	values[1] = Int64GetDatum((int64) fasttrun_test_counter_opens);
+	values[2] = Int64GetDatum((int64) fasttrun_test_owner_opens);
+	values[3] = Int64GetDatum((int64) fasttrun_test_plan_invalidations);
+	values[4] = Int64GetDatum((int64) fasttrun_test_index_hook_calls);
+	if (reset)
+	{
+		fasttrun_test_locator_opens = 0;
+		fasttrun_test_counter_opens = 0;
+		fasttrun_test_owner_opens = 0;
+		fasttrun_test_plan_invalidations = 0;
+		fasttrun_test_index_hook_calls = 0;
+	}
+	PG_RETURN_ARRAYTYPE_P(construct_array(values, 5, INT8OID,
+									  8, true, TYPALIGN_DOUBLE));
+}
+
+/* Прямой вызов хука ширины вне планировщика. */
+Datum
+fasttrun_test_call_attavgwidth(PG_FUNCTION_ARGS)
+{
+	Oid			relid = PG_GETARG_OID(0);
+	AttrNumber	attnum = PG_GETARG_INT16(1);
+
+	PG_RETURN_INT32(fasttrun_get_attavgwidth_hook(relid, attnum));
 }
 #endif
 
