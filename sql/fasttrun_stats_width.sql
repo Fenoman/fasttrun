@@ -32,6 +32,20 @@ RESET fasttrun.use_typanalyze;
 RESET fasttrun.sample_rows;
 DROP TABLE t_w;
 
+-- Для колонок фиксированного размера из одних NULL сохраняется attlen;
+-- для varlena, как и в ядре, остаётся ноль.
+CREATE TEMP TABLE t_allnull_width (i int4, u uuid, t text);
+INSERT INTO t_allnull_width
+SELECT NULL, NULL, NULL FROM generate_series(1, 1000);
+SET fasttrun.use_typanalyze = off;
+DO $$ BEGIN PERFORM fasttrun_analyze('t_allnull_width'); END $$;
+SELECT array_agg(stawidth ORDER BY staattnum) = ARRAY[4,16,0]
+       AS allnull_widths_match_core
+  FROM fasttrun_inspect_stats('t_allnull_width') \gset
+\echo allnull_widths_match_core :allnull_widths_match_core
+RESET fasttrun.use_typanalyze;
+DROP TABLE t_allnull_width;
+
 -- ======================================================================
 -- Паритет с ядерным ANALYZE в Haas-Stokes пути: nullable-unique колонка
 -- даёт n_distinct = -(1-nullfrac), varlena stawidth считается с

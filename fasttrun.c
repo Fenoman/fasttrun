@@ -5030,7 +5030,7 @@ fasttrun_collect_and_store(Relation rel, HeapTuple *sample, int sample_count,
 			if (n_nonnull == 0)
 			{
 				stanullfrac = 1.0f;
-				stawidth = 0;
+				stawidth = (attr->attlen > 0) ? attr->attlen : 0;
 				stadistinct = 0.0f;
 			}
 			else
