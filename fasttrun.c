@@ -6248,8 +6248,8 @@ fasttruncate(PG_FUNCTION_ARGS)
  * Behaviour:
  *
  *   * Resolves the relation name; silently returns on a missing
- *     relation, raises ERROR on a non-temp relation (same contract as
- *     fasttruncate).
+ *     relation, raises ERROR on a non-temp relation or on a
+ *     partitioned / inheritance parent (same contract as fasttruncate).
  *
  *   * Reads the actual on-disk page count via RelationGetNumberOfBlocks
  *     when the cache/delta state cannot prove that storage size is
@@ -6292,7 +6292,7 @@ fasttruncate(PG_FUNCTION_ARGS)
  * Caller is responsible for:
  *   - resolving the RangeVar to relOid + table_open(NoLock);
  *   - verifying relpersistence == RELPERSISTENCE_TEMP, isTempNamespace,
- *     heap-AM;
+ *     heap-AM, no inheritance/partition parent;
  *   - recording relOid in the current transaction frame;
  *   - table_close(rel, AccessShareLock) afterwards.
  *
@@ -6763,7 +6763,8 @@ fasttrun_analyze_relation(Relation rel)
  * invalidation.
  *
  * For the function-level contract -- silent return on missing relation,
- * ERROR on non-temp or non-heap, what gets cached, when sinval fires --
+ * ERROR on non-temp, non-heap or inheritance/partition parent, what
+ * gets cached, when sinval fires --
  * see the comment block above fasttrun_analyze_relation() and the
  * section "Lazy-mode cache for fasttrun_analyze" near the top of this
  * file.
@@ -6789,6 +6790,22 @@ fasttrun_analyze(PG_FUNCTION_ARGS)
 		table_close(rel, NoLock);
 		elog(ERROR, "fasttrun_analyze: relation \"%s\" is not a local temporary table",
 			 RelationGetRelationName(rel));
+	}
+
+	/*
+	 * Inheritance/partition parents are out of contract, same as in
+	 * fasttruncate: local inh=false stats would hide core inherited
+	 * stats during appendrel planning.
+	 */
+	if (rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE ||
+		rel->rd_rel->relhassubclass)
+	{
+		table_close(rel, NoLock);
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("fasttrun_analyze: relation \"%s\" is partitioned or an inheritance parent",
+						RelationGetRelationName(rel)),
+				 errhint("Use core SQL ANALYZE for inheritance or partition traversal.")));
 	}
 	if (rel->rd_tableam != GetHeapamTableAmRoutine())
 	{
@@ -6827,9 +6844,9 @@ fasttrun_analyze(PG_FUNCTION_ARGS)
  * of walks.
  *
  * NULL array elements are silently skipped.  Missing relations are
- * silently skipped -- same contract as fasttrun_analyze.  Non-temp or
- * non-heap relations raise an error -- same contract.  The batch aborts
- * at the first failure.  Relations analyzed before the failure keep
+ * silently skipped -- same contract as fasttrun_analyze.  Non-temp,
+ * non-heap or parent relations raise an error -- same contract.  The
+ * batch aborts at the first failure.  Relations analyzed before it keep
  * their refreshed cache state -- per-xact rollback semantics kick in
  * via the surrounding xact or savepoint.
  */
@@ -6876,6 +6893,16 @@ fasttrun_analyze_bulk(PG_FUNCTION_ARGS)
 			elog(ERROR, "fasttrun_analyze_bulk: relation \"%s\" "
 						"is not a local temporary table",
 				 RelationGetRelationName(rel));
+		}
+		if (rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE ||
+			rel->rd_rel->relhassubclass)
+		{
+			table_close(rel, NoLock);
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("fasttrun_analyze_bulk: relation \"%s\" is partitioned or an inheritance parent",
+							RelationGetRelationName(rel)),
+					 errhint("Use core SQL ANALYZE for inheritance or partition traversal.")));
 		}
 		if (rel->rd_tableam != GetHeapamTableAmRoutine())
 		{
@@ -7022,6 +7049,17 @@ fasttrun_collect_stats(PG_FUNCTION_ARGS)
 		table_close(rel, NoLock);
 		elog(ERROR, "fasttrun_collect_stats: relation \"%s\" is not a local temporary table",
 			 RelationGetRelationName(rel));
+	}
+
+	if (rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE ||
+		rel->rd_rel->relhassubclass)
+	{
+		table_close(rel, NoLock);
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("fasttrun_collect_stats: relation \"%s\" is partitioned or an inheritance parent",
+						RelationGetRelationName(rel)),
+				 errhint("Use core SQL ANALYZE for inheritance or partition traversal.")));
 	}
 
 	if (rel->rd_tableam != GetHeapamTableAmRoutine())

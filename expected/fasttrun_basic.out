@@ -613,11 +613,13 @@ CREATE TEMP TABLE t_part (a int) PARTITION BY RANGE (a);
 SELECT fasttruncate('t_part');
 ERROR:  fasttruncate: relation "t_part" is not heap-AM
 SELECT fasttrun_analyze('t_part');
-ERROR:  fasttrun_analyze: relation "t_part" is not heap-AM
+ERROR:  fasttrun_analyze: relation "t_part" is partitioned or an inheritance parent
+HINT:  Use core SQL ANALYZE for inheritance or partition traversal.
 SELECT * FROM fasttrun_relstats('t_part');
 ERROR:  fasttrun_relstats: relation "t_part" is not heap-AM
 SELECT fasttrun_collect_stats('t_part');
-ERROR:  fasttrun_collect_stats: relation "t_part" is not heap-AM
+ERROR:  fasttrun_collect_stats: relation "t_part" is partitioned or an inheritance parent
+HINT:  Use core SQL ANALYZE for inheritance or partition traversal.
 DROP TABLE t_part;
 -- ----------------------------------------------------------------------
 -- 12. fasttrun_analyze_bulk(VARIADIC text[]): batch wrapper над
@@ -690,7 +692,8 @@ SELECT reltuples = 300::real AS c_unchanged FROM fasttrun_relstats('t_bulk_c');
 -- Non-temp / non-heap raises ERROR.
 CREATE TEMP TABLE t_bulk_part (a int) PARTITION BY RANGE (a);
 SELECT fasttrun_analyze_bulk('t_bulk_a', 't_bulk_part');
-ERROR:  fasttrun_analyze_bulk: relation "t_bulk_part" is not heap-AM
+ERROR:  fasttrun_analyze_bulk: relation "t_bulk_part" is partitioned or an inheritance parent
+HINT:  Use core SQL ANALYZE for inheritance or partition traversal.
 DROP TABLE t_bulk_part;
 DROP TABLE t_bulk_a, t_bulk_b, t_bulk_c;
 -- ----------------------------------------------------------------------

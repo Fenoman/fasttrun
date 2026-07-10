@@ -35,10 +35,12 @@ Functions that accept a temporary table name:
 * silently return an empty result if the table does not exist;
 * raise an error if the table is not temporary.
 
-Only local temporary heap tables are supported. Partitioned tables and
-inheritance parents return an error. Foreign keys are not checked,
-`TRUNCATE ... CASCADE` is not supported, and SERIAL/IDENTITY sequences are
-not reset.
+Only local temporary heap tables are supported. `fasttruncate`,
+`fasttrun_analyze`, `fasttrun_analyze_bulk` and `fasttrun_collect_stats`
+reject partitioned tables and inheritance parents with an error: local
+stats for a parent would hide core inherited statistics during planning.
+Foreign keys are not checked, `TRUNCATE ... CASCADE` is not supported,
+and SERIAL/IDENTITY sequences are not reset.
 
 ## How fasttruncate works
 

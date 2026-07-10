@@ -1864,4 +1864,51 @@ BEGIN
 END
 $test$;
 \echo virtual_generated_guard_ok
+
+-- ----------------------------------------------------------------------
+-- 42. Статистические API отклоняют секционированные таблицы и родителей
+--     наследования, как fasttruncate: локальная inh=false статистика
+--     родителя спрятала бы ядерную inherited-статистику при
+--     appendrel-планировании. Ядерная оценка переживает отклонённые вызовы.
+-- ----------------------------------------------------------------------
+CREATE TEMP TABLE t_inh_stats_parent (x int);
+CREATE TEMP TABLE t_inh_stats_child () INHERITS (t_inh_stats_parent);
+INSERT INTO t_inh_stats_child SELECT g % 5 FROM generate_series(1, 100000) g;
+ANALYZE t_inh_stats_parent;
+DO $$
+DECLARE ln text; est int := NULL;
+BEGIN
+  FOR ln IN EXPLAIN SELECT x FROM t_inh_stats_parent GROUP BY x LOOP
+    IF est IS NULL THEN est := substring(ln FROM 'rows=(\d+)')::int; END IF;
+  END LOOP;
+  IF est IS NULL OR est > 100 THEN
+    RAISE EXCEPTION 'inherited group estimate lost before fasttrun calls: est=%', est;
+  END IF;
+END$$;
+SELECT 'inherited_estimate_baseline_ok' AS marker;
+\set ON_ERROR_STOP 0
+SELECT fasttrun_analyze('t_inh_stats_parent');
+SELECT fasttrun_collect_stats('t_inh_stats_parent');
+-- Batch прерывается на родителе (контракт bulk); обычная таблица
+-- обрабатывается вызовом без родителя в списке.
+CREATE TEMP TABLE t_inh_stats_flat (id int);
+INSERT INTO t_inh_stats_flat SELECT generate_series(1, 100);
+SELECT fasttrun_analyze_bulk('t_inh_stats_flat', 't_inh_stats_parent');
+\set ON_ERROR_STOP 1
+SELECT fasttrun_analyze_bulk('t_inh_stats_flat');
+SELECT reltuples = 100::real AS flat_processed FROM fasttrun_relstats('t_inh_stats_flat');
+-- Ядерная inherited-стата не спрятана отклонёнными вызовами.
+DO $$
+DECLARE ln text; est int := NULL;
+BEGIN
+  FOR ln IN EXPLAIN SELECT x FROM t_inh_stats_parent GROUP BY x LOOP
+    IF est IS NULL THEN est := substring(ln FROM 'rows=(\d+)')::int; END IF;
+  END LOOP;
+  IF est IS NULL OR est > 100 THEN
+    RAISE EXCEPTION 'fasttrun hid core inherited stats: est=%', est;
+  END IF;
+END$$;
+SELECT 'inherited_estimate_preserved_ok' AS marker;
+DROP TABLE t_inh_stats_parent CASCADE;
+DROP TABLE t_inh_stats_flat;
 DROP EXTENSION fasttrun;
