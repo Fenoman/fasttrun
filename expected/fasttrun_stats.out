@@ -269,6 +269,55 @@ END$$;
 brin_hidden_stats_safe
 DROP TABLE t_brin_hidden_stats;
 -- ----------------------------------------------------------------------
+-- 8d. DDL нетронутой таблицы не должен скрывать её ядерную статистику,
+--     даже если кэши fasttrun уже созданы для другой таблицы.
+-- ----------------------------------------------------------------------
+DO $$
+DECLARE ln text; est int; stat_count int;
+BEGIN
+  EXECUTE 'CREATE TEMP TABLE t_unmanaged_ddl_seed (id int)';
+  EXECUTE 'INSERT INTO t_unmanaged_ddl_seed SELECT generate_series(1, 100)';
+  PERFORM fasttrun_analyze('t_unmanaged_ddl_seed');
+
+  EXECUTE 'CREATE TEMP TABLE t_unmanaged_index (id int, v int)';
+  EXECUTE 'INSERT INTO t_unmanaged_index SELECT g, g FROM generate_series(1, 10000) g';
+  EXECUTE 'ANALYZE t_unmanaged_index';
+  EXECUTE 'CREATE INDEX ON t_unmanaged_index (id)';
+  FOR ln IN EXECUTE 'EXPLAIN SELECT * FROM t_unmanaged_index WHERE v = 4242' LOOP
+    IF ln ~ 'on t_unmanaged_index' THEN
+      est := substring(ln FROM 'rows=(\d+)')::int;
+      EXIT;
+    END IF;
+  END LOOP;
+  SELECT count(*) INTO stat_count FROM pg_statistic
+   WHERE starelid = 't_unmanaged_index'::regclass;
+  IF est IS DISTINCT FROM 1 OR stat_count <> 2 THEN
+    RAISE EXCEPTION 'CREATE INDEX hid core stats: est=%, rows=%', est, stat_count;
+  END IF;
+
+  EXECUTE 'CREATE TEMP TABLE t_unmanaged_alter (id int, v int)';
+  EXECUTE 'INSERT INTO t_unmanaged_alter SELECT g, g FROM generate_series(1, 10000) g';
+  EXECUTE 'ANALYZE t_unmanaged_alter';
+  EXECUTE 'ALTER TABLE t_unmanaged_alter SET (autovacuum_enabled = false)';
+  est := NULL;
+  FOR ln IN EXECUTE 'EXPLAIN SELECT * FROM t_unmanaged_alter WHERE v = 4242' LOOP
+    IF ln ~ 'on t_unmanaged_alter' THEN
+      est := substring(ln FROM 'rows=(\d+)')::int;
+      EXIT;
+    END IF;
+  END LOOP;
+  SELECT count(*) INTO stat_count FROM pg_statistic
+   WHERE starelid = 't_unmanaged_alter'::regclass;
+  IF est IS DISTINCT FROM 1 OR stat_count <> 2 THEN
+    RAISE EXCEPTION 'ALTER TABLE hid core stats: est=%, rows=%', est, stat_count;
+  END IF;
+END$$;
+\echo unmanaged_ddl_keeps_core_stats
+unmanaged_ddl_keeps_core_stats
+DROP TABLE t_unmanaged_ddl_seed;
+DROP TABLE t_unmanaged_index;
+DROP TABLE t_unmanaged_alter;
+-- ----------------------------------------------------------------------
 -- 9. fasttruncate должен явно вытеснить кэш статистики по OID таблицы
 --    (запасной механизм на случай, когда pgstat недоступен или
 --    счётчики сброшены).

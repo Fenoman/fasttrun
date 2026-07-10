@@ -445,6 +445,7 @@ static void fasttrun_executor_start(QueryDesc *queryDesc, int eflags);
 static bool fasttrun_stats_relid_exists(Oid relid);
 static void fasttrun_stats_relid_ref(Oid relid);
 static void fasttrun_stats_relid_unref(Oid relid);
+static bool fasttrun_manages_relid(Oid relid);
 static bool fasttrun_query_contains_stats_relid(Query *query);
 static bool fasttrun_contains_stats_sublink_walker(Node *node, void *context);
 static bool fasttrun_reinject_query_relstats(Query *query, bool detect_stats);
@@ -7613,6 +7614,8 @@ fasttrun_evict_temp_relid(Oid relid)
 	bool		is_our_temp;
 
 	if (!OidIsValid(relid))
+		return;
+	if (!fasttrun_manages_relid(relid))
 		return;
 
 	/*
