@@ -212,7 +212,10 @@ typedef enum FasttrunTouchFlags
 	FASTTRUN_TOUCH_STATS = 1 << 1,
 	FASTTRUN_TOUCH_DML = 1 << 2,
 	FASTTRUN_TOUCH_DROPPED = 1 << 3,
-	FASTTRUN_TOUCH_PLAN_INVALIDATE = 1 << 4
+	/* Planner-visible mutation: abort must invalidate local cached plans. */
+	FASTTRUN_TOUCH_PLAN_INVALIDATE = 1 << 4,
+	/* Column-stats entries were written: subxact end must walk attkeys. */
+	FASTTRUN_TOUCH_COLSTATS = 1 << 5
 } FasttrunTouchFlags;
 
 typedef struct FasttrunXactRelEntry
@@ -1266,6 +1269,20 @@ fasttrun_cache_store_relstats(Relation rel, BlockNumber pages, int64 tuples,
 	FasttrunAnalyzeCacheEntry *entry;
 
 	entry = fasttrun_cache_enter(RelationGetRelid(rel));
+
+	/*
+	 * Register this relid so the xact-end callback walks it.  Index entries
+	 * land here too (via fasttrun_update_index_relstats and
+	 * fasttrun_rebuild_one_index) without going through the top-level touch
+	 * in fasttrun_analyze or fasttruncate.  Publishing relstats is
+	 * planner-visible: an abort restores the old values, so plans built on
+	 * the new ones must not survive it.  Mark before mutating -- a
+	 * mid-operation error keeps the abort path conservative.
+	 */
+	fasttrun_xact_mark_relid(RelationGetRelid(rel), RelationGetRelid(rel),
+							FASTTRUN_TOUCH_ANALYZE |
+							FASTTRUN_TOUCH_PLAN_INVALIDATE);
+
 	fasttrun_analyze_save_undo(entry);
 
 	entry->state.has_relstats = true;
@@ -1281,15 +1298,6 @@ fasttrun_cache_store_relstats(Relation rel, BlockNumber pages, int64 tuples,
 	/* cached_pages changed -- the lazy-probe memo is now stale. */
 	entry->lazy_check_subid = InvalidSubTransactionId;
 	entry->lazy_check_pages = 0;
-
-	/*
-	 * Register this relid so the xact-end callback walks it.  Index entries
-	 * land here too (via fasttrun_update_index_relstats and
-	 * fasttrun_rebuild_one_index) without going through the top-level touch
-	 * in fasttrun_analyze or fasttruncate.
-	 */
-	fasttrun_xact_mark_relid(RelationGetRelid(rel), RelationGetRelid(rel),
-							FASTTRUN_TOUCH_ANALYZE);
 
 	return entry;
 }
@@ -2192,6 +2200,15 @@ fasttrun_stats_set_relation_policy(Relation rel,
 	changed = !found || entry->policy != policy ||
 		!entry->heap_rlb_valid || !fasttrun_rlb_equals(entry->heap_rlb, rlb);
 
+	/*
+	 * A policy flip is planner-visible; a same-value overwrite is pure
+	 * subxact bookkeeping and must not cost a plan invalidation on abort.
+	 * Mark before mutating so a mid-operation error stays conservative.
+	 */
+	fasttrun_xact_mark_relid(relid, relid,
+							FASTTRUN_TOUCH_STATS |
+							(changed ? FASTTRUN_TOUCH_PLAN_INVALIDATE : 0));
+
 	if (found)
 		fasttrun_stats_relid_save_undo(entry);
 	else
@@ -2200,9 +2217,6 @@ fasttrun_stats_set_relation_policy(Relation rel,
 	entry->policy = policy;
 	entry->heap_rlb = rlb;
 	entry->heap_rlb_valid = true;
-	fasttrun_xact_mark_relid(relid, relid,
-							FASTTRUN_TOUCH_STATS |
-							FASTTRUN_TOUCH_PLAN_INVALIDATE);
 	return changed;
 }
 
@@ -3289,7 +3303,7 @@ fasttrun_stats_set_column_state(Relation rel, AttrNumber attnum, bool inh,
 	fasttrun_stats_cache_init();
 	fasttrun_xact_mark_relid(relid, relid,
 							FASTTRUN_TOUCH_STATS |
-							FASTTRUN_TOUCH_PLAN_INVALIDATE);
+							FASTTRUN_TOUCH_COLSTATS);
 
 	fasttrun_stats_key_init(&key, relid, attnum, inh);
 
@@ -3313,9 +3327,20 @@ fasttrun_stats_set_column_state(Relation rel, AttrNumber attnum, bool inh,
 	}
 
 	old_candidate = fasttrun_stats_entry_is_candidate(entry);
+	new_candidate = (state == FASTTRUN_COLUMN_LOCAL_CANDIDATE &&
+					 tuple != NULL);
 	changed = !found || entry->state != state ||
-		old_candidate != (state == FASTTRUN_COLUMN_LOCAL_CANDIDATE &&
-						 tuple != NULL);
+		old_candidate != new_candidate;
+
+	/*
+	 * A state flip or a fresh statsTuple (even same-state: the distribution
+	 * behind it moved) is planner-visible.  Allocation-free: the relid is
+	 * already in the frame from the mark above.
+	 */
+	if (changed || new_candidate)
+		fasttrun_xact_mark_relid(relid, relid,
+								FASTTRUN_TOUCH_PLAN_INVALIDATE);
+
 	if (found && entry->state_subid != cur_subid)
 		fasttrun_stats_entry_save_undo(entry);
 	else if (found && entry->statsTuple != NULL)
@@ -3324,8 +3349,6 @@ fasttrun_stats_set_column_state(Relation rel, AttrNumber attnum, bool inh,
 		entry->statsTuple = NULL;
 	}
 
-	new_candidate = (state == FASTTRUN_COLUMN_LOCAL_CANDIDATE &&
-					 tuple != NULL);
 	if (old_candidate && !new_candidate)
 		fasttrun_stats_relid_unref(relid);
 	else if (!old_candidate && new_candidate)
@@ -3436,6 +3459,13 @@ fasttrun_stats_entry_neutralize(Oid relid, FasttrunStatsEntry *entry)
 
 	if (!changed)
 		return false;
+
+	/* Hiding stats is planner-visible; mark before mutating. */
+	fasttrun_xact_mark_relid(relid, relid,
+							FASTTRUN_TOUCH_STATS |
+							FASTTRUN_TOUCH_COLSTATS |
+							FASTTRUN_TOUCH_PLAN_INVALIDATE);
+
 	if (entry->state_subid != cur_subid)
 		fasttrun_stats_entry_save_undo(entry);
 	else if (entry->statsTuple != NULL)
@@ -3992,7 +4022,14 @@ fasttrun_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 		fasttrun_test_subxact_visited++;
 #endif
 
-		if (fasttrun_stats_cache != NULL && fasttrun_stats_relid_cache != NULL)
+		/*
+		 * Walk the column-stats entries only when this frame actually wrote
+		 * some (COLSTATS).  A relid touched only through the relstats path
+		 * (pure-delta analyze) has no per-column undo to process, and the
+		 * list_copy(attkeys) + per-column lookups would be wasted work.
+		 */
+		if ((xentry->flags & FASTTRUN_TOUCH_COLSTATS) != 0 &&
+			fasttrun_stats_cache != NULL && fasttrun_stats_relid_cache != NULL)
 		{
 			FasttrunStatsRelidEntry *relentry;
 			List	   *keys;
@@ -6761,10 +6798,15 @@ fasttrun_analyze(PG_FUNCTION_ARGS)
 	}
 	fasttrun_poison_check_relation(rel, "fasttrun_analyze", false);
 
+	/*
+	 * No PLAN_INVALIDATE here: the flag is raised by the planner-visible
+	 * mutation sites themselves (relstats publish, column-stats store/hide,
+	 * policy flip).  A pure no-op analyze rolled back by a savepoint must
+	 * not cost a plan-cache walk.
+	 */
 	fasttrun_xact_mark_relid(relOid, relOid,
 							FASTTRUN_TOUCH_ANALYZE |
-							FASTTRUN_TOUCH_STATS |
-							FASTTRUN_TOUCH_PLAN_INVALIDATE);
+							FASTTRUN_TOUCH_STATS);
 	fasttrun_analyze_relation(rel);
 	table_close(rel, AccessShareLock);
 
@@ -6843,10 +6885,10 @@ fasttrun_analyze_bulk(PG_FUNCTION_ARGS)
 		}
 		fasttrun_poison_check_relation(rel, "fasttrun_analyze_bulk", false);
 
+		/* PLAN_INVALIDATE comes from the actual mutation sites. */
 		fasttrun_xact_mark_relid(relOid, relOid,
 								FASTTRUN_TOUCH_ANALYZE |
-								FASTTRUN_TOUCH_STATS |
-								FASTTRUN_TOUCH_PLAN_INVALIDATE);
+								FASTTRUN_TOUCH_STATS);
 		fasttrun_analyze_relation(rel);
 		table_close(rel, AccessShareLock);
 	}
@@ -6994,11 +7036,13 @@ fasttrun_collect_stats(PG_FUNCTION_ARGS)
 	planner_fallback_changed = relation_policy_changed &&
 		fasttrun_relation_has_core_stats(rel);
 
-	/* Register for per-xact bookkeeping -- callbacks walk this list only. */
+	/*
+	 * Register for per-xact bookkeeping -- callbacks walk this list only.
+	 * PLAN_INVALIDATE comes from the actual mutation sites.
+	 */
 	fasttrun_xact_mark_relid(relOid, relOid,
 							FASTTRUN_TOUCH_ANALYZE |
-							FASTTRUN_TOUCH_STATS |
-							FASTTRUN_TOUCH_PLAN_INVALIDATE);
+							FASTTRUN_TOUCH_STATS);
 
 	{
 		sample_target = fasttrun_effective_sample_target(rel);

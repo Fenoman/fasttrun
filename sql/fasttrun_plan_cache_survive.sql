@@ -654,6 +654,52 @@ DROP TABLE t_commit_on_delete;
 DROP TABLE t_commit_copy;
 DROP TABLE t_commit_flip;
 
+-- ----------------------------------------------------------------------
+-- 15. Откат подтранзакции после no-op fasttrun_analyze (без нового DML)
+--     не инвалидирует локальный кеш планов: ничего planner-visible не
+--     изменилось.  EXCEPTION-цикл PL/pgSQL — каждая итерация свой subxact.
+--     Контроль в той же транзакции: итерация с реальным DML перед analyze
+--     инвалидирует на откате (плюс одна инлайн-инвалидация от публикации
+--     свежей статы самим analyze).  Считаем по DEBUG-строке из
+--     fasttrun_invalidate_local_plan_cache.
+-- ----------------------------------------------------------------------
+CREATE TEMP TABLE t_noop_abort (id int, grp int);
+INSERT INTO t_noop_abort SELECT g, g FROM generate_series(1, 1000) g;
+
+BEGIN;
+SELECT fasttrun_analyze('t_noop_abort');
+SET client_min_messages = debug1;
+DO $$
+DECLARE i int;
+BEGIN
+  FOR i IN 1..3 LOOP
+    BEGIN
+      PERFORM fasttrun_analyze('t_noop_abort');
+      RAISE EXCEPTION 'force noop rollback';
+    EXCEPTION WHEN raise_exception THEN
+      NULL;
+    END;
+  END LOOP;
+END$$;
+RESET client_min_messages;
+SELECT 'noop_abort_no_inval_ok' AS marker;
+
+SET client_min_messages = debug1;
+DO $$
+BEGIN
+  BEGIN
+    INSERT INTO t_noop_abort SELECT g, g FROM generate_series(1001, 2000) g;
+    PERFORM fasttrun_analyze('t_noop_abort');
+    RAISE EXCEPTION 'force dml rollback';
+  EXCEPTION WHEN raise_exception THEN
+    NULL;
+  END;
+END$$;
+RESET client_min_messages;
+SELECT 'dml_abort_inval_ok' AS marker;
+COMMIT;
+DROP TABLE t_noop_abort;
+
 DROP FUNCTION f_inner();
 DROP TABLE t_rsd_details;
 DROP TABLE t_balance_out;
