@@ -1537,8 +1537,223 @@ RESET client_min_messages;
 COMMIT;
 DROP TABLE t_partial_sp;
 
--- Очистка
+-- ----------------------------------------------------------------------
+-- 34. Обычный ANALYZE со списком колонок передаёт ядру только
+--     перечисленные колонки. Для b сохраняется локальная статистика,
+--     полный ANALYZE передаёт ядру обе колонки.
+-- ----------------------------------------------------------------------
+CREATE TEMP TABLE t_handoff (a int, b int);
+INSERT INTO t_handoff SELECT g, 1 FROM generate_series(1, 100000) g;
+ANALYZE t_handoff;
+UPDATE t_handoff SET b = a;
+SELECT fasttrun_analyze('t_handoff');
+SELECT coalesce(array_agg(staattnum ORDER BY staattnum) =
+                ARRAY[1, 2]::smallint[], false) AS handoff_local_both
+  FROM fasttrun_inspect_stats('t_handoff');
+
+ANALYZE t_handoff (a);
+SELECT coalesce(array_agg(staattnum ORDER BY staattnum) =
+                ARRAY[2]::smallint[], false) AS handoff_partial_kept_b
+  FROM fasttrun_inspect_stats('t_handoff');
+DO $$
+DECLARE ln text; est_a int := NULL; est_b int := NULL;
+BEGIN
+  FOR ln IN EXPLAIN SELECT * FROM t_handoff WHERE a = 1 LOOP
+    IF ln ~ 'on t_handoff' THEN est_a := substring(ln FROM 'rows=(\d+)')::int; EXIT; END IF;
+  END LOOP;
+  FOR ln IN EXPLAIN SELECT * FROM t_handoff WHERE b = 1 LOOP
+    IF ln ~ 'on t_handoff' THEN est_b := substring(ln FROM 'rows=(\d+)')::int; EXIT; END IF;
+  END LOOP;
+  IF est_a IS NULL OR est_a > 100 OR est_b IS NULL OR est_b > 100 THEN
+    RAISE EXCEPTION 'partial ANALYZE ownership mismatch: a=%, b=%', est_a, est_b;
+  END IF;
+END$$;
+SELECT 'partial_analyze_handoff_ok' AS marker;
+
+ANALYZE t_handoff;
+SELECT count(*) = 0 AS handoff_full_core
+  FROM fasttrun_inspect_stats('t_handoff');
+
+-- Откат к точке сохранения должен восстановить локальную статистику
+-- обеих колонок.
+SELECT fasttrun_analyze('t_handoff');
+BEGIN;
+SAVEPOINT handoff_sp;
+ANALYZE t_handoff (a);
+SELECT coalesce(array_agg(staattnum ORDER BY staattnum) =
+                ARRAY[2]::smallint[], false) AS handoff_inside_savepoint
+  FROM fasttrun_inspect_stats('t_handoff');
+ROLLBACK TO SAVEPOINT handoff_sp;
+SELECT coalesce(array_agg(staattnum ORDER BY staattnum) =
+                ARRAY[1, 2]::smallint[], false) AS handoff_after_rollback
+  FROM fasttrun_inspect_stats('t_handoff');
+COMMIT;
+BEGIN;
+ANALYZE t_handoff;
+ROLLBACK;
+SELECT coalesce(array_agg(staattnum ORDER BY staattnum) =
+                ARRAY[1, 2]::smallint[], false) AS handoff_top_rollback
+  FROM fasttrun_inspect_stats('t_handoff');
+DROP TABLE t_handoff;
+
+-- ----------------------------------------------------------------------
+-- 35. VACUUM без ANALYZE не меняет локальную статистику.
+-- ----------------------------------------------------------------------
+CREATE TEMP TABLE t_vacuum_keep (a int, b text);
+INSERT INTO t_vacuum_keep SELECT g, md5(g::text) FROM generate_series(1, 5000) g;
+SELECT fasttrun_analyze('t_vacuum_keep');
+CREATE TEMP TABLE t_vacuum_snapshot AS
+SELECT staattnum, s::text AS snapshot
+  FROM fasttrun_inspect_stats('t_vacuum_keep') AS s;
+VACUUM t_vacuum_keep;
+SELECT count(*) = 2 AND
+       coalesce(bool_and(v.snapshot = s::text), false) AS plain_vacuum_preserved
+  FROM t_vacuum_snapshot v
+  FULL JOIN fasttrun_inspect_stats('t_vacuum_keep') AS s USING (staattnum);
+DROP TABLE t_vacuum_snapshot;
+DROP TABLE t_vacuum_keep;
+
+-- ----------------------------------------------------------------------
+-- 36. VACUUM (ANALYZE) со списком колонок ведёт себя как ANALYZE;
+--     вызов без списка передаёт ядру все колонки.
+-- ----------------------------------------------------------------------
+CREATE TEMP TABLE t_vacuum_analyze (a int, b int);
+INSERT INTO t_vacuum_analyze SELECT g, 1 FROM generate_series(1, 100000) g;
+ANALYZE t_vacuum_analyze;
+UPDATE t_vacuum_analyze SET b = a;
+SELECT fasttrun_analyze('t_vacuum_analyze');
+VACUUM (ANALYZE) t_vacuum_analyze (a);
+SELECT coalesce(array_agg(staattnum ORDER BY staattnum) =
+                ARRAY[2]::smallint[], false) AS vacuum_analyze_partial_kept_b
+  FROM fasttrun_inspect_stats('t_vacuum_analyze');
+DO $$
+DECLARE ln text; est int := NULL;
+BEGIN
+  FOR ln IN EXPLAIN SELECT * FROM t_vacuum_analyze WHERE b = 1 LOOP
+    IF ln ~ 'on t_vacuum_analyze' THEN est := substring(ln FROM 'rows=(\d+)')::int; EXIT; END IF;
+  END LOOP;
+  IF est IS NULL OR est > 100 THEN
+    RAISE EXCEPTION 'VACUUM ANALYZE exposed stale b stats: est=%', est;
+  END IF;
+END$$;
+SELECT 'vacuum_analyze_partial_ok' AS marker;
+VACUUM (ANALYZE) t_vacuum_analyze;
+SELECT count(*) = 0 AS vacuum_analyze_full_core
+  FROM fasttrun_inspect_stats('t_vacuum_analyze');
+DROP TABLE t_vacuum_analyze;
+
+-- ----------------------------------------------------------------------
+-- 37. VACUUM FULL и CLUSTER скрывают старую статистику до нового сбора.
+--     CLUSTER и его откат уже проверены в разделе 20a.
+-- ----------------------------------------------------------------------
+CREATE TEMP TABLE t_vacuum_full (a int, b int);
+INSERT INTO t_vacuum_full SELECT g, 1 FROM generate_series(1, 100000) g;
+ANALYZE t_vacuum_full;
+UPDATE t_vacuum_full SET b = a;
+SELECT fasttrun_analyze('t_vacuum_full');
+VACUUM FULL t_vacuum_full;
+SELECT count(*) = 0 AS vacuum_full_local_neutral
+  FROM fasttrun_inspect_stats('t_vacuum_full');
+DO $$
+DECLARE ln text; est int := NULL;
+BEGIN
+  FOR ln IN EXPLAIN SELECT * FROM t_vacuum_full WHERE b = 1 LOOP
+    IF ln ~ 'on t_vacuum_full' THEN est := substring(ln FROM 'rows=(\d+)')::int; EXIT; END IF;
+  END LOOP;
+  IF est IS NULL OR est < 100 OR est > 5000 THEN
+    RAISE EXCEPTION 'VACUUM FULL did not block stale core stats: est=%', est;
+  END IF;
+END$$;
+SELECT 'vacuum_full_neutral_ok' AS marker;
+DROP TABLE t_vacuum_full;
+
+-- ----------------------------------------------------------------------
+-- 38. ANALYZE без списка таблиц обрабатывает только временные таблицы
+--     под управлением fasttrun. Откат восстанавливает локальную статистику.
+-- ----------------------------------------------------------------------
+CREATE TEMP TABLE t_analyze_all_1 (a int, b int);
+CREATE TEMP TABLE t_analyze_all_2 (a int, b int);
+INSERT INTO t_analyze_all_1 SELECT g, g FROM generate_series(1, 1000) g;
+INSERT INTO t_analyze_all_2 SELECT g, g FROM generate_series(1, 1000) g;
+SELECT fasttrun_analyze('t_analyze_all_1');
+SELECT fasttrun_analyze('t_analyze_all_2');
+BEGIN;
+ANALYZE;
+SELECT count(*) = 0 AS analyze_all_inside
+  FROM fasttrun_inspect_stats('t_analyze_all_1');
+ROLLBACK;
+SELECT (SELECT count(*) FROM fasttrun_inspect_stats('t_analyze_all_1')) = 2 AND
+       (SELECT count(*) FROM fasttrun_inspect_stats('t_analyze_all_2')) = 2
+       AS analyze_all_rollback_restored;
+ANALYZE;
+SELECT (SELECT count(*) FROM fasttrun_inspect_stats('t_analyze_all_1')) = 0 AND
+       (SELECT count(*) FROM fasttrun_inspect_stats('t_analyze_all_2')) = 0
+       AS analyze_all_handoff;
+DROP TABLE t_analyze_all_1;
+DROP TABLE t_analyze_all_2;
+
+-- ----------------------------------------------------------------------
+-- 39. После ошибки многотабличного VACUUM (ANALYZE) локальная
+--     статистика всех затронутых таблиц остаётся скрытой.
+-- ----------------------------------------------------------------------
+CREATE TEMP TABLE t_vacuum_good (a int, b int);
+CREATE TEMP TABLE t_vacuum_bad (a int, b int);
+INSERT INTO t_vacuum_good SELECT g, g FROM generate_series(1, 1000) g;
+INSERT INTO t_vacuum_bad SELECT g, g FROM generate_series(1, 1000) g;
+SELECT fasttrun_analyze('t_vacuum_good');
+SELECT fasttrun_analyze('t_vacuum_bad');
+VACUUM (ANALYZE) t_vacuum_good, t_vacuum_bad;
+SELECT (SELECT count(*) FROM fasttrun_inspect_stats('t_vacuum_good')) = 0 AND
+       (SELECT count(*) FROM fasttrun_inspect_stats('t_vacuum_bad')) = 0
+       AS vacuum_multi_success_handoff;
+UPDATE t_vacuum_good SET b = 1;
+UPDATE t_vacuum_bad SET b = 1;
+ANALYZE t_vacuum_good;
+ANALYZE t_vacuum_bad;
+UPDATE t_vacuum_good SET b = a;
+UPDATE t_vacuum_bad SET b = a;
+SELECT fasttrun_analyze('t_vacuum_good');
+SELECT fasttrun_analyze('t_vacuum_bad');
+\set ON_ERROR_STOP 0
+VACUUM (ANALYZE) t_vacuum_good, t_vacuum_bad (missing_col);
+\set ON_ERROR_STOP 1
+SELECT (SELECT count(*) FROM fasttrun_inspect_stats('t_vacuum_good')) = 0 AND
+       (SELECT count(*) FROM fasttrun_inspect_stats('t_vacuum_bad')) = 0
+       AS vacuum_multi_error_fail_closed;
+DO $$
+DECLARE ln text; est_good int := NULL; est_bad int := NULL;
+BEGIN
+  FOR ln IN EXPLAIN SELECT * FROM t_vacuum_good WHERE b = 1 LOOP
+    IF ln ~ 'on t_vacuum_good' THEN est_good := substring(ln FROM 'rows=(\d+)')::int; EXIT; END IF;
+  END LOOP;
+  FOR ln IN EXPLAIN SELECT * FROM t_vacuum_bad WHERE b = 1 LOOP
+    IF ln ~ 'on t_vacuum_bad' THEN est_bad := substring(ln FROM 'rows=(\d+)')::int; EXIT; END IF;
+  END LOOP;
+  IF est_good IS NULL OR est_good > 50 OR est_bad IS NULL OR est_bad > 50 THEN
+    RAISE EXCEPTION 'multi-target error exposed stale core: good=%, bad=%', est_good, est_bad;
+  END IF;
+END$$;
+SELECT 'vacuum_multi_error_neutral_ok' AS marker;
+DROP TABLE t_vacuum_good;
+DROP TABLE t_vacuum_bad;
+
+-- Удаляем исходные таблицы перед отдельной проверкой памяти.
 DROP TABLE t_stats;
 DROP TABLE t_multi;
 DROP TABLE t_stats_persist;
+
+-- ----------------------------------------------------------------------
+-- 40. После успешного полного ANALYZE удаляются ненужные локальные
+--     записи и контексты памяти.
+-- ----------------------------------------------------------------------
+CREATE TEMP TABLE t_handoff_prune (a int, b int);
+INSERT INTO t_handoff_prune SELECT g, g FROM generate_series(1, 1000) g;
+SELECT fasttrun_analyze('t_handoff_prune');
+ANALYZE t_handoff_prune;
+SELECT count(DISTINCT name) = 0 AS handoff_contexts_pruned
+  FROM pg_backend_memory_contexts
+ WHERE name IN ('fasttrun analyze cache',
+                'fasttrun stats cache',
+                'fasttrun stats relid cache');
+DROP TABLE t_handoff_prune;
 DROP EXTENSION fasttrun;

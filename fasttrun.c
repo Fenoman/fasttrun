@@ -31,9 +31,11 @@
 #include "catalog/index.h"
 #include "catalog/namespace.h"
 #include "catalog/objectaccess.h"
+#include "catalog/pg_attribute.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_statistic.h"
 #include "catalog/pg_type.h"
+#include "commands/defrem.h"
 #include "commands/tablecmds.h"
 #include "commands/vacuum.h"
 #include "common/pg_prng.h"
@@ -1539,6 +1541,12 @@ typedef struct FasttrunStatsRelidEntry
 	FasttrunStatsRelidSavedState *undo;
 } FasttrunStatsRelidEntry;
 
+typedef struct FasttrunAnalyzeHandoffTarget
+{
+	Oid			relid;
+	Bitmapset  *attnums;		/* NULL means every analyzable user column */
+} FasttrunAnalyzeHandoffTarget;
+
 static HTAB			   *fasttrun_stats_cache = NULL;
 static HTAB			   *fasttrun_stats_relid_cache = NULL;
 static MemoryContext	fasttrun_stats_mcxt = NULL;
@@ -1856,19 +1864,10 @@ fasttrun_stats_relid_remember_locator(Relation heaprel)
 }
 
 static void
-fasttrun_stats_relid_drop_key(const FasttrunStatsKey *key)
+fasttrun_stats_relid_unlink_key(FasttrunStatsRelidEntry *entry,
+								 const FasttrunStatsKey *key)
 {
-	FasttrunStatsRelidEntry *entry;
 	ListCell   *lc;
-
-	if (fasttrun_stats_relid_cache == NULL)
-		return;
-
-	entry = (FasttrunStatsRelidEntry *) hash_search(fasttrun_stats_relid_cache,
-													&key->relid,
-													HASH_FIND, NULL);
-	if (entry == NULL)
-		return;
 
 	foreach(lc, entry->attkeys)
 	{
@@ -1883,7 +1882,23 @@ fasttrun_stats_relid_drop_key(const FasttrunStatsKey *key)
 			break;
 		}
 	}
+}
 
+static void
+fasttrun_stats_relid_drop_key(const FasttrunStatsKey *key)
+{
+	FasttrunStatsRelidEntry *entry;
+
+	if (fasttrun_stats_relid_cache == NULL)
+		return;
+
+	entry = (FasttrunStatsRelidEntry *) hash_search(fasttrun_stats_relid_cache,
+													&key->relid,
+													HASH_FIND, NULL);
+	if (entry == NULL)
+		return;
+
+	fasttrun_stats_relid_unlink_key(entry, key);
 	fasttrun_stats_relid_maybe_drop(key->relid, entry);
 }
 
@@ -1904,6 +1919,7 @@ fasttrun_stats_set_relation_policy(Relation rel,
 	RelFileLocatorBackend rlb;
 	bool		found;
 	bool		changed;
+	SubTransactionId cur_subid = GetCurrentSubTransactionId();
 
 	fasttrun_stats_cache_init();
 	rlb.locator = rel->rd_locator;
@@ -1911,7 +1927,8 @@ fasttrun_stats_set_relation_policy(Relation rel,
 	entry = (FasttrunStatsRelidEntry *)
 		hash_search(fasttrun_stats_relid_cache, &relid, HASH_FIND, NULL);
 	if (entry != NULL && entry->heap_rlb_valid &&
-		!fasttrun_rlb_equals(entry->heap_rlb, rlb))
+		!fasttrun_rlb_equals(entry->heap_rlb, rlb) &&
+		entry->state_subid != cur_subid)
 		fasttrun_stats_forget_relid(relid);
 	entry = fasttrun_stats_relid_enter(relid, &found);
 	changed = !found || entry->policy != policy ||
@@ -1920,7 +1937,7 @@ fasttrun_stats_set_relation_policy(Relation rel,
 	if (found)
 		fasttrun_stats_relid_save_undo(entry);
 	else
-		entry->state_subid = GetCurrentSubTransactionId();
+		entry->state_subid = cur_subid;
 
 	entry->policy = policy;
 	entry->heap_rlb = rlb;
@@ -3153,13 +3170,31 @@ fasttrun_stats_cache_commit_xact(void)
 				hash_search(fasttrun_stats_cache, &key, HASH_FIND, NULL);
 			if (entry == NULL)
 			{
-				/* Stale backref -- drop it and move on. */
-				fasttrun_stats_relid_drop_key(&key);
+				/* Stale backref -- unlink it and defer relid pruning. */
+				fasttrun_stats_relid_unlink_key(relentry, &key);
 				continue;
 			}
 
 			if (!fasttrun_stats_entry_is_candidate(entry))
 			{
+				/*
+				 * A full successful handoff leaves CORE_ALLOWED overrides
+				 * redundant under a CORE_ALLOWED relation default.  Keep them
+				 * through subcommit for rollback, then prune only here when the
+				 * top-level outcome is irreversible.  A core override under a
+				 * LOCAL_NEUTRAL default remains meaningful after partial ANALYZE.
+				 */
+				if (entry->state == FASTTRUN_COLUMN_CORE_ALLOWED &&
+					relentry->policy == FASTTRUN_REL_CORE_ALLOWED)
+				{
+					fasttrun_stats_entry_free_undo(entry);
+					if (entry->statsTuple != NULL)
+						heap_freetuple(entry->statsTuple);
+					(void) hash_search(fasttrun_stats_cache, &key,
+									   HASH_REMOVE, NULL);
+					fasttrun_stats_relid_unlink_key(relentry, &key);
+					continue;
+				}
 				fasttrun_stats_entry_free_undo(entry);
 				entry->state_subid = InvalidSubTransactionId;
 				continue;
@@ -3373,10 +3408,30 @@ fasttrun_stats_handoff_columns(Relation rel, Bitmapset *attnums,
 	FasttrunStatsRelidEntry *relentry;
 	List	   *keys;
 	ListCell   *lc;
+	int			attnum = -1;
 
-	if (full_relation)
-		(void) fasttrun_stats_set_relation_policy(rel,
-											  FASTTRUN_REL_CORE_ALLOWED);
+	if (!full_relation)
+	{
+		/*
+		 * PREPARE normally created a neutral override for every selected
+		 * attribute.  VACUUM can own transaction boundaries, though, and a
+		 * rewrite can replace the locator before post-success handoff.  Create
+		 * missing CORE_ALLOWED overrides here too; relation default may still
+		 * be LOCAL_NEUTRAL after a partial ANALYZE.
+		 */
+		while ((attnum = bms_next_member(attnums, attnum)) >= 0)
+		{
+			if (attnum == 0)
+				continue;		/* partial target with no analyzable columns */
+			(void) fasttrun_stats_set_column_state(rel, attnum, false,
+										 FASTTRUN_COLUMN_CORE_ALLOWED,
+										 NULL, NULL);
+		}
+		return;
+	}
+
+	(void) fasttrun_stats_set_relation_policy(rel,
+									  FASTTRUN_REL_CORE_ALLOWED);
 	if (fasttrun_stats_cache == NULL || fasttrun_stats_relid_cache == NULL)
 		return;
 	relentry = (FasttrunStatsRelidEntry *)
@@ -3389,10 +3444,9 @@ fasttrun_stats_handoff_columns(Relation rel, Bitmapset *attnums,
 	{
 		FasttrunStatsKey *key = (FasttrunStatsKey *) lfirst(lc);
 
-		if (full_relation || bms_is_member(key->attnum, attnums))
-			(void) fasttrun_stats_set_column_state(rel, key->attnum, key->inh,
-												 FASTTRUN_COLUMN_CORE_ALLOWED,
-												 NULL, NULL);
+		(void) fasttrun_stats_set_column_state(rel, key->attnum, key->inh,
+										 FASTTRUN_COLUMN_CORE_ALLOWED,
+										 NULL, NULL);
 	}
 	list_free(keys);
 }
@@ -6918,6 +6972,470 @@ fasttrun_evict_all_session_caches(void)
 	fasttrun_stats_cache_reset();
 }
 
+typedef struct FasttrunOidSetEntry
+{
+	Oid			relid;			/* hash key -- must be first */
+} FasttrunOidSetEntry;
+
+static bool
+fasttrun_manages_relid(Oid relid)
+{
+	return fasttrun_cache_lookup(relid) != NULL ||
+		fasttrun_stats_relid_exists(relid);
+}
+
+/*
+ * Snapshot the union of analyze-cache owning heaps and stats-cache relids.
+ * ANALYZE/CLUSTER without an explicit relation list must not scan unrelated
+ * catalogs just to discover which tables this backend manages.
+ */
+static List *
+fasttrun_managed_temp_relids(void)
+{
+	HASHCTL		ctl;
+	HTAB	   *set;
+	HASH_SEQ_STATUS status;
+	FasttrunOidSetEntry *setentry;
+	List	   *relids = NIL;
+	long		initial_size = 16;
+
+	if (fasttrun_analyze_cache != NULL)
+		initial_size += hash_get_num_entries(fasttrun_analyze_cache);
+	if (fasttrun_stats_relid_cache != NULL)
+		initial_size += hash_get_num_entries(fasttrun_stats_relid_cache);
+
+	memset(&ctl, 0, sizeof(ctl));
+	ctl.keysize = sizeof(Oid);
+	ctl.entrysize = sizeof(FasttrunOidSetEntry);
+	ctl.hcxt = CurrentMemoryContext;
+	set = hash_create("fasttrun utility managed relids", initial_size,
+					  &ctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+
+	if (fasttrun_stats_relid_cache != NULL)
+	{
+		FasttrunStatsRelidEntry *entry;
+
+		hash_seq_init(&status, fasttrun_stats_relid_cache);
+		while ((entry = (FasttrunStatsRelidEntry *)
+				hash_seq_search(&status)) != NULL)
+			(void) hash_search(set, &entry->relid, HASH_ENTER, NULL);
+	}
+
+	if (fasttrun_analyze_cache != NULL)
+	{
+		FasttrunAnalyzeCacheEntry *entry;
+
+		hash_seq_init(&status, fasttrun_analyze_cache);
+		while ((entry = (FasttrunAnalyzeCacheEntry *)
+				hash_seq_search(&status)) != NULL)
+		{
+			Oid			root_relid = OidIsValid(entry->state.heap_relid) ?
+				entry->state.heap_relid : entry->relid;
+
+			(void) hash_search(set, &root_relid, HASH_ENTER, NULL);
+		}
+	}
+
+	hash_seq_init(&status, set);
+	while ((setentry = (FasttrunOidSetEntry *) hash_seq_search(&status)) != NULL)
+		relids = lappend_oid(relids, setentry->relid);
+	hash_destroy(set);
+	return relids;
+}
+
+static Relation
+fasttrun_try_open_managed_heap(Oid relid)
+{
+	Relation	rel;
+
+	if (!OidIsValid(relid))
+		return NULL;
+	rel = try_relation_open(relid, AccessShareLock);
+	if (rel == NULL)
+		return NULL;
+	if (rel->rd_rel->relpersistence != RELPERSISTENCE_TEMP ||
+		!isTempNamespace(RelationGetNamespace(rel)) ||
+		rel->rd_tableam != GetHeapamTableAmRoutine())
+	{
+		relation_close(rel, AccessShareLock);
+		return NULL;
+	}
+	return rel;
+}
+
+static bool
+fasttrun_vacuum_option_enabled(VacuumStmt *stmt, const char *name)
+{
+	ListCell   *lc;
+
+	foreach(lc, stmt->options)
+	{
+		DefElem    *opt = (DefElem *) lfirst(lc);
+
+		if (strcmp(opt->defname, name) == 0)
+			return defGetBoolean(opt);
+	}
+	return false;
+}
+
+static bool
+fasttrun_attribute_is_analyzable(Relation rel, AttrNumber attnum)
+{
+	Form_pg_attribute attr;
+
+	if (attnum <= 0 || attnum > RelationGetDescr(rel)->natts)
+		return false;
+	attr = TupleDescAttr(RelationGetDescr(rel), attnum - 1);
+	if (attr->attisdropped)
+		return false;
+#if PG_VERSION_NUM >= 180000
+	if (attr->attgenerated == ATTRIBUTE_GENERATED_VIRTUAL)
+		return false;
+#endif
+	return fasttrun_get_attstattarget(rel, attnum) != 0;
+}
+
+/*
+ * A non-NULL bitmap denotes selected columns.  Member zero distinguishes a
+ * valid list without analyzable columns from a request for all columns.  An
+ * invalid name returns NULL deliberately: core will report the error, and if
+ * VACUUM already committed an earlier table, its statistics remain hidden.
+ */
+static Bitmapset *
+fasttrun_analyze_target_attnums(Relation rel, List *va_cols)
+{
+	Bitmapset  *attnums;
+	ListCell   *lc;
+
+	if (va_cols == NIL)
+		return NULL;
+	attnums = bms_make_singleton(0);
+	foreach(lc, va_cols)
+	{
+		const char *attname = strVal(lfirst(lc));
+		AttrNumber	attnum = get_attnum(RelationGetRelid(rel), attname);
+
+		if (attnum <= 0 || attnum > RelationGetDescr(rel)->natts)
+		{
+			bms_free(attnums);
+			return NULL;
+		}
+		if (fasttrun_attribute_is_analyzable(rel, attnum))
+			attnums = bms_add_member(attnums, attnum);
+	}
+	return attnums;
+}
+
+static void
+fasttrun_stats_neutralize_target(Relation rel, Bitmapset *attnums)
+{
+	int			attnum = -1;
+
+	if (attnums == NULL)
+	{
+		(void) fasttrun_stats_neutralize_relation(rel);
+		return;
+	}
+	while ((attnum = bms_next_member(attnums, attnum)) >= 0)
+	{
+		if (attnum == 0)
+			continue;
+		(void) fasttrun_stats_set_column_state(rel, attnum, false,
+										 FASTTRUN_COLUMN_LOCAL_NEUTRAL,
+										 NULL, NULL);
+	}
+}
+
+/* Relstats written by core ANALYZE/rewrite supersede the session snapshot. */
+static void
+fasttrun_prepare_relstats_handoff(Relation rel)
+{
+	Oid			relid = RelationGetRelid(rel);
+	List	   *index_oids;
+	ListCell   *lc;
+
+	fasttrun_xact_mark_relid(relid, relid,
+							FASTTRUN_TOUCH_ANALYZE |
+							FASTTRUN_TOUCH_PLAN_INVALIDATE);
+	index_oids = RelationGetIndexList(rel);
+	foreach(lc, index_oids)
+		fasttrun_xact_mark_relid(lfirst_oid(lc), relid,
+								FASTTRUN_TOUCH_ANALYZE |
+								FASTTRUN_TOUCH_PLAN_INVALIDATE);
+	list_free(index_oids);
+	fasttrun_cache_mark_rel_and_indexes_evicted(rel);
+}
+
+static void
+fasttrun_prepare_relation_handoff(Relation rel, Bitmapset *attnums,
+								  bool do_analyze, bool do_rewrite,
+								  List **analyze_targets,
+								  List **rewrite_relids)
+{
+	Oid			relid = RelationGetRelid(rel);
+
+	Assert(!do_analyze || analyze_targets != NULL);
+	Assert(rewrite_relids != NULL);
+
+	if (do_rewrite)
+		(void) fasttrun_stats_neutralize_relation(rel);
+	else if (do_analyze)
+		fasttrun_stats_neutralize_target(rel, attnums);
+	fasttrun_prepare_relstats_handoff(rel);
+
+	if (do_analyze)
+	{
+		FasttrunAnalyzeHandoffTarget *target;
+
+		target = (FasttrunAnalyzeHandoffTarget *) palloc(sizeof(*target));
+		target->relid = relid;
+		target->attnums = attnums;
+		*analyze_targets = lappend(*analyze_targets, target);
+	}
+	if (do_rewrite && !list_member_oid(*rewrite_relids, relid))
+		*rewrite_relids = lappend_oid(*rewrite_relids, relid);
+}
+
+static void
+fasttrun_prepare_vacuum_handoff(VacuumStmt *stmt,
+								List **analyze_targets,
+								List **rewrite_relids)
+{
+	bool		do_analyze = !stmt->is_vacuumcmd ||
+		fasttrun_vacuum_option_enabled(stmt, "analyze");
+	bool		do_rewrite = stmt->is_vacuumcmd &&
+		fasttrun_vacuum_option_enabled(stmt, "full");
+	ListCell   *lc;
+
+	/* Plain VACUUM changes neither distribution ownership nor local state. */
+	if (!do_analyze && !do_rewrite)
+		return;
+
+	/*
+	 * Core VACUUM may commit between tables.  Hide local statistics for every
+	 * target before calling core, and allow core statistics only after the
+	 * whole command succeeds.  If a later table fails, statistics for earlier
+	 * tables stay hidden instead of mixing old and partially refreshed values.
+	 */
+
+	if (stmt->rels == NIL)
+	{
+		List	   *relids = fasttrun_managed_temp_relids();
+
+		foreach(lc, relids)
+		{
+			Oid			relid = lfirst_oid(lc);
+			Relation	rel = fasttrun_try_open_managed_heap(relid);
+
+			if (rel == NULL)
+				continue;
+			fasttrun_prepare_relation_handoff(rel, NULL, do_analyze,
+										  do_rewrite, analyze_targets,
+										  rewrite_relids);
+			relation_close(rel, AccessShareLock);
+		}
+		list_free(relids);
+		return;
+	}
+
+	foreach(lc, stmt->rels)
+	{
+		VacuumRelation *vrel = (VacuumRelation *) lfirst(lc);
+		Oid			relid = vrel->oid;
+		Relation	rel;
+		Bitmapset  *attnums = NULL;
+
+		if (!OidIsValid(relid) && vrel->relation != NULL)
+			relid = RangeVarGetRelid(vrel->relation, NoLock, true);
+		if (!OidIsValid(relid) || !fasttrun_manages_relid(relid))
+			continue;
+		rel = fasttrun_try_open_managed_heap(relid);
+		if (rel == NULL)
+			continue;
+		if (do_analyze)
+			attnums = fasttrun_analyze_target_attnums(rel, vrel->va_cols);
+		fasttrun_prepare_relation_handoff(rel, attnums, do_analyze,
+									  do_rewrite, analyze_targets,
+									  rewrite_relids);
+		relation_close(rel, AccessShareLock);
+	}
+}
+
+static bool
+fasttrun_relation_has_clustered_index(Relation rel)
+{
+	List	   *index_oids = RelationGetIndexList(rel);
+	ListCell   *lc;
+	bool		has_clustered = false;
+
+	foreach(lc, index_oids)
+	{
+		if (get_index_isclustered(lfirst_oid(lc)))
+		{
+			has_clustered = true;
+			break;
+		}
+	}
+	list_free(index_oids);
+	return has_clustered;
+}
+
+static void
+fasttrun_prepare_cluster_handoff(ClusterStmt *stmt, List **rewrite_relids)
+{
+	List	   *relids;
+	ListCell   *lc;
+	bool		all_relations = stmt->relation == NULL;
+
+	if (all_relations)
+		relids = fasttrun_managed_temp_relids();
+	else
+	{
+		Oid			relid = RangeVarGetRelid(stmt->relation, NoLock, true);
+
+		if (!OidIsValid(relid) || !fasttrun_manages_relid(relid))
+			return;
+		relids = list_make1_oid(relid);
+	}
+
+	foreach(lc, relids)
+	{
+		Relation	rel = fasttrun_try_open_managed_heap(lfirst_oid(lc));
+
+		if (rel == NULL)
+			continue;
+		if (!all_relations || fasttrun_relation_has_clustered_index(rel))
+			fasttrun_prepare_relation_handoff(rel, NULL, false, true,
+										  NULL, rewrite_relids);
+		relation_close(rel, AccessShareLock);
+	}
+	list_free(relids);
+}
+
+static void
+fasttrun_remember_managed_rebind(RangeVar *relation, List **rewrite_relids)
+{
+	Oid			relid;
+
+	if (relation == NULL)
+		return;
+	relid = RangeVarGetRelid(relation, NoLock, true);
+	if (OidIsValid(relid) && fasttrun_manages_relid(relid) &&
+		!list_member_oid(*rewrite_relids, relid))
+		*rewrite_relids = lappend_oid(*rewrite_relids, relid);
+}
+
+static void
+fasttrun_prepare_utility_handoff(Node *parsetree,
+								 List **analyze_targets,
+								 List **rewrite_relids)
+{
+	if (parsetree == NULL ||
+		(fasttrun_analyze_cache == NULL && fasttrun_stats_cache == NULL))
+		return;
+	if (IsA(parsetree, VacuumStmt))
+		fasttrun_prepare_vacuum_handoff((VacuumStmt *) parsetree,
+									  analyze_targets, rewrite_relids);
+	else if (IsA(parsetree, ClusterStmt))
+		fasttrun_prepare_cluster_handoff((ClusterStmt *) parsetree,
+									  rewrite_relids);
+	else if (IsA(parsetree, AlterTableStmt))
+		fasttrun_remember_managed_rebind(
+			((AlterTableStmt *) parsetree)->relation, rewrite_relids);
+	else if (IsA(parsetree, IndexStmt))
+		fasttrun_remember_managed_rebind(
+			((IndexStmt *) parsetree)->relation, rewrite_relids);
+	else if (IsA(parsetree, TruncateStmt))
+	{
+		ListCell   *lc;
+
+		foreach(lc, ((TruncateStmt *) parsetree)->relations)
+			fasttrun_remember_managed_rebind((RangeVar *) lfirst(lc),
+										 rewrite_relids);
+	}
+}
+
+/*
+ * A heap rewrite changes relfilenode.  Rebind the current neutral state to
+ * the new locator without losing the undo nodes that restore the old locator
+ * on ROLLBACK TO SAVEPOINT.  Non-rewriting DDL targets share this post-step;
+ * for them the locator assignment is an intentional no-op.
+ */
+static void
+fasttrun_finish_rewrite_handoff(List *rewrite_relids)
+{
+	ListCell   *lc;
+
+	foreach(lc, rewrite_relids)
+	{
+		Relation	rel = fasttrun_try_open_managed_heap(lfirst_oid(lc));
+		FasttrunStatsRelidEntry *relentry;
+		ListCell   *klc;
+		Oid			relid;
+
+		if (rel == NULL)
+			continue;
+		relid = RelationGetRelid(rel);
+		(void) fasttrun_stats_neutralize_relation(rel);
+		relentry = (FasttrunStatsRelidEntry *)
+			hash_search(fasttrun_stats_relid_cache,
+						&relid, HASH_FIND, NULL);
+		if (relentry != NULL)
+		{
+			foreach(klc, relentry->attkeys)
+			{
+				FasttrunStatsKey *key = (FasttrunStatsKey *) lfirst(klc);
+				FasttrunStatsEntry *entry;
+
+				entry = (FasttrunStatsEntry *)
+					hash_search(fasttrun_stats_cache, key, HASH_FIND, NULL);
+				if (entry == NULL)
+					continue;
+				entry->heap_rlb.locator = rel->rd_locator;
+				entry->heap_rlb.backend = rel->rd_backend;
+				entry->heap_rlb_valid = true;
+			}
+		}
+		relation_close(rel, AccessShareLock);
+	}
+}
+
+static void
+fasttrun_finish_analyze_handoff(List *analyze_targets)
+{
+	ListCell   *lc;
+
+	foreach(lc, analyze_targets)
+	{
+		FasttrunAnalyzeHandoffTarget *target =
+			(FasttrunAnalyzeHandoffTarget *) lfirst(lc);
+		Relation	rel = fasttrun_try_open_managed_heap(target->relid);
+
+		if (rel == NULL)
+			continue;
+		fasttrun_stats_handoff_columns(rel, target->attnums,
+									 target->attnums == NULL);
+		relation_close(rel, AccessShareLock);
+	}
+}
+
+static void
+fasttrun_free_analyze_handoff(List *analyze_targets)
+{
+	ListCell   *lc;
+
+	foreach(lc, analyze_targets)
+	{
+		FasttrunAnalyzeHandoffTarget *target =
+			(FasttrunAnalyzeHandoffTarget *) lfirst(lc);
+
+		if (target->attnums != NULL)
+			bms_free(target->attnums);
+		pfree(target);
+	}
+	list_free(analyze_targets);
+}
+
 static void
 fasttrun_evict_utility_caches(Node *parsetree)
 {
@@ -6950,44 +7468,6 @@ fasttrun_evict_utility_caches(Node *parsetree)
 				IndexStmt  *stmt = (IndexStmt *) parsetree;
 
 				fasttrun_evict_rangevar(stmt->relation);
-				break;
-			}
-		case T_ClusterStmt:
-			{
-				ClusterStmt *stmt = (ClusterStmt *) parsetree;
-
-				/*
-				 * CLUSTER rewrites the heap: the physical order (and with it
-				 * the cached correlation) changes while pgstat counters stay
-				 * put, so freshness cannot catch it.  Bare CLUSTER revisits
-				 * every previously clustered table -- drop both caches whole.
-				 */
-				if (stmt->relation != NULL)
-					fasttrun_evict_rangevar(stmt->relation);
-				else
-					fasttrun_evict_all_session_caches();
-				break;
-			}
-		case T_VacuumStmt:
-			{
-				VacuumStmt *stmt = (VacuumStmt *) parsetree;
-				ListCell   *lc;
-
-				if (stmt->rels == NIL)
-				{
-					fasttrun_evict_all_session_caches();
-					break;
-				}
-
-				foreach(lc, stmt->rels)
-				{
-					VacuumRelation *vrel = (VacuumRelation *) lfirst(lc);
-
-					if (OidIsValid(vrel->oid))
-						fasttrun_evict_temp_relid(vrel->oid);
-					else
-						fasttrun_evict_rangevar(vrel->relation);
-				}
 				break;
 			}
 		case T_DropStmt:
@@ -7024,39 +7504,6 @@ fasttrun_evict_utility_caches(Node *parsetree)
 			}
 		default:
 			break;
-	}
-}
-
-/* Hand off all cached columns for each explicit ANALYZE target. */
-static void
-fasttrun_handoff_analyze_utility(Node *parsetree)
-{
-	VacuumStmt *stmt;
-	ListCell   *lc;
-
-	if (parsetree == NULL || !IsA(parsetree, VacuumStmt))
-		return;
-	stmt = (VacuumStmt *) parsetree;
-	if (stmt->is_vacuumcmd || stmt->rels == NIL)
-		return;
-
-	foreach(lc, stmt->rels)
-	{
-		VacuumRelation *vrel = (VacuumRelation *) lfirst(lc);
-		Oid			relid = vrel->oid;
-		Relation	rel;
-
-		if (!OidIsValid(relid) && vrel->relation != NULL)
-			relid = RangeVarGetRelid(vrel->relation, NoLock, true);
-		if (!OidIsValid(relid) || !fasttrun_stats_relid_exists(relid))
-			continue;
-		rel = try_relation_open(relid, AccessShareLock);
-		if (rel == NULL)
-			continue;
-		if (rel->rd_rel->relpersistence == RELPERSISTENCE_TEMP &&
-			isTempNamespace(RelationGetNamespace(rel)))
-			fasttrun_stats_handoff_columns(rel, NULL, true);
-		relation_close(rel, AccessShareLock);
 	}
 }
 
@@ -7120,6 +7567,8 @@ fasttrun_utility_hook(PlannedStmt *pstmt,
 					  QueryCompletion *qc)
 {
 	Node   *parsetree = pstmt->utilityStmt;
+	List   *analyze_targets = NIL;
+	List   *rewrite_relids = NIL;
 
 	/* Track CREATE TEMP TABLE before execution. */
 	if (fasttrun_track_enabled && fasttrun_track_htab != NULL &&
@@ -7179,6 +7628,8 @@ fasttrun_utility_hook(PlannedStmt *pstmt,
 	}
 
 	fasttrun_mark_copy_from(parsetree);
+	fasttrun_prepare_utility_handoff(parsetree, &analyze_targets,
+									 &rewrite_relids);
 	fasttrun_evict_utility_caches(parsetree);
 
 	/* Chain to next hook or standard ProcessUtility. */
@@ -7189,7 +7640,10 @@ fasttrun_utility_hook(PlannedStmt *pstmt,
 		standard_ProcessUtility(pstmt, queryString, readOnlyTree, context,
 								params, queryEnv, dest, qc);
 
-	fasttrun_handoff_analyze_utility(parsetree);
+	fasttrun_finish_rewrite_handoff(rewrite_relids);
+	fasttrun_finish_analyze_handoff(analyze_targets);
+	fasttrun_free_analyze_handoff(analyze_targets);
+	list_free(rewrite_relids);
 }
 
 /* SQL: fasttrun_hot_temp_tables(n) -- returns top-N most created temp tables. */
