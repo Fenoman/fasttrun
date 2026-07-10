@@ -23,7 +23,12 @@ CREATE TEMP TABLE t_zsc (id int, v int, big text);
 CREATE INDEX t_zsc_btree ON t_zsc (v);
 CREATE INDEX t_zsc_hash ON t_zsc USING hash (v);
 CREATE INDEX t_zsc_gin ON t_zsc USING gin (to_tsvector('simple', big));
-INSERT INTO t_zsc SELECT g, g % 50, repeat('w', 60) || g FROM generate_series(1, 5000) g;
+ALTER TABLE t_zsc ALTER COLUMN big SET STORAGE EXTERNAL;
+INSERT INTO t_zsc
+SELECT g, g % 50, string_agg(md5((g * 1000 + s)::text), ' ')
+FROM generate_series(1, 200) g
+CROSS JOIN LATERAL generate_series(1, 450) s
+GROUP BY g;
 SELECT fasttrun_analyze('t_zsc');
  fasttrun_analyze 
 ------------------
@@ -44,15 +49,32 @@ DECLARE
   heap_rp0 int; heap_rp1 int;
   heap_rt0 real; heap_rt1 real;
   nstat0 int; nstat1 int;
+  toast_oid oid;
+  toast_chunks0 bigint; toast_chunks_empty bigint; toast_chunks1 bigint;
+  checksum0 text; checksum1 text;
 BEGIN
   SELECT relfilenode, relpages, reltuples INTO heap_rf0, heap_rp0, heap_rt0
     FROM pg_class WHERE oid = 't_zsc'::regclass;
   SELECT array_agg(relfilenode ORDER BY relname) INTO idx_rf0
     FROM pg_class WHERE oid IN (SELECT indexrelid FROM pg_index WHERE indrelid = 't_zsc'::regclass);
   SELECT count(*) INTO nstat0 FROM pg_statistic WHERE starelid = 't_zsc'::regclass;
+  SELECT reltoastrelid INTO toast_oid
+    FROM pg_class WHERE oid = 't_zsc'::regclass;
+  EXECUTE format('SELECT count(*) FROM %s', toast_oid::regclass)
+    INTO toast_chunks0;
+  SELECT md5(string_agg(md5(big), '' ORDER BY id)) INTO checksum0 FROM t_zsc;
 
   PERFORM fasttruncate('t_zsc');
-  INSERT INTO t_zsc SELECT g, g % 50, repeat('w', 60) || g FROM generate_series(1, 5000) g;
+  EXECUTE format('SELECT count(*) FROM %s', toast_oid::regclass)
+    INTO toast_chunks_empty;
+  INSERT INTO t_zsc
+  SELECT g, g % 50, string_agg(md5((900000 + g * 1000 + s)::text), ' ')
+  FROM generate_series(1, 200) g
+  CROSS JOIN LATERAL generate_series(1, 450) s
+  GROUP BY g;
+  EXECUTE format('SELECT count(*) FROM %s', toast_oid::regclass)
+    INTO toast_chunks1;
+  SELECT md5(string_agg(md5(big), '' ORDER BY id)) INTO checksum1 FROM t_zsc;
   PERFORM fasttrun_analyze('t_zsc');
   PERFORM fasttrun_analyze_bulk('t_zsc');
   PERFORM fasttrun_collect_stats('t_zsc');
@@ -68,12 +90,19 @@ BEGIN
   RAISE NOTICE 'heap_catalog_relpages_untouched=%', (heap_rp0 = heap_rp1);
   RAISE NOTICE 'heap_catalog_reltuples_untouched=%', (heap_rt0 = heap_rt1);
   RAISE NOTICE 'no_pg_statistic_rows=%', (nstat0 = 0 AND nstat1 = 0);
+  RAISE NOTICE 'external_toast_before=%', (toast_chunks0 > 0);
+  RAISE NOTICE 'toast_empty_after_truncate=%', (toast_chunks_empty = 0);
+  RAISE NOTICE 'toast_refill_different=%',
+    (toast_chunks1 > 0 AND checksum1 <> checksum0);
 END$$;
 NOTICE:  heap_relfilenode_unchanged=t
 NOTICE:  index_relfilenodes_unchanged=t
 NOTICE:  heap_catalog_relpages_untouched=t
 NOTICE:  heap_catalog_reltuples_untouched=t
 NOTICE:  no_pg_statistic_rows=t
+NOTICE:  external_toast_before=t
+NOTICE:  toast_empty_after_truncate=t
+NOTICE:  toast_refill_different=t
 -- ----------------------------------------------------------------------
 -- 2. Позитивный контроль: ядерные TRUNCATE и ANALYZE на ПОСТОЯННОЙ
 --    таблице ДОЛЖНЫ менять каталог. Доказывает, что наблюдения выше не
