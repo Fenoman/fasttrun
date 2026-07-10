@@ -277,6 +277,29 @@ BEGIN
 
     RAISE NOTICE '3d OK: tracking re-ON, counter grew to 23';
 
+    -- prewarm_count=0 полностью отключает прогрев
+    SELECT count(*) INTO _count
+    FROM pg_class c WHERE c.relnamespace = pg_my_temp_schema()
+        AND c.relname IN ('temp_calc_main', 'temp_calc_detail');
+    IF _count != 0 THEN
+        RAISE EXCEPTION 'prewarm_count=0 setup expected 0 tables, found %', _count;
+    END IF;
+
+    SET LOCAL fasttrun.prewarm_count = 0;
+    SELECT fasttrun_prewarm() INTO _prewarm;
+    IF _prewarm != 0 THEN
+        RAISE EXCEPTION 'prewarm_count=0 expected 0, got %', _prewarm;
+    END IF;
+
+    SELECT count(*) INTO _count
+    FROM pg_class c WHERE c.relnamespace = pg_my_temp_schema()
+        AND c.relname IN ('temp_calc_main', 'temp_calc_detail');
+    IF _count != 0 THEN
+        RAISE EXCEPTION 'prewarm_count=0 created % tables', _count;
+    END IF;
+
+    RAISE NOTICE 'prewarm_count=0 disabled prewarm';
+
     -- 3e. Prewarm: создаёт таблицы из top-N
     SET LOCAL fasttrun.prewarm_count = 2;
     SELECT fasttrun_prewarm() INTO _prewarm;
@@ -409,6 +432,7 @@ NOTICE:  shmem available — running tracking tests
 NOTICE:  3b OK: tracking ON counted 20 + 5
 NOTICE:  3c OK: tracking OFF, counter stayed at 20
 NOTICE:  3d OK: tracking re-ON, counter grew to 23
+NOTICE:  prewarm_count=0 disabled prewarm
 NOTICE:  3e OK: prewarm created 2 tables
 NOTICE:  3f OK: second prewarm (fasttruncate path)
 NOTICE:  3g OK: reset cleared everything, prewarm returns 0

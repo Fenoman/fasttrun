@@ -8659,7 +8659,7 @@ fasttrun_prewarm(PG_FUNCTION_ARGS)
 	FasttrunTrackSnapshot snapshot;
 	FasttrunTrackEntry *sorted;
 
-	if (fasttrun_track_htab == NULL)
+	if (limit == 0 || fasttrun_track_htab == NULL)
 		PG_RETURN_INT32(0);
 
 	snapshot = fasttrun_track_snapshot(limit);
