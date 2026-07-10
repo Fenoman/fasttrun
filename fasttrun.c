@@ -157,9 +157,11 @@ fasttrun_test_fail(const char *name, int ordinal)
  *
  * A single plan can ask get_relation_stats_hook dozens of times for the same
  * temp relation (one call per predicate/column).  The expensive part is not
- * the stats hash lookup, but reopening the relation and walking pgstat xact
- * counters on every call.  While standard_planner runs, cache that pgstat
- * snapshot per relid; outside planner_hook, fall back to direct reads.
+ * the stats hash lookup, but reopening the relation on every call -- once for
+ * the storage-locator check and once for the pgstat xact counters.  While
+ * standard_planner runs, memoize both per relid (a relation cannot be dropped
+ * and recreated mid-plan, the same consistency model the pgstat snapshot
+ * relies on); outside planner_hook, fall back to direct reads.
  *
  * One slot per distinct temp relid that supplied column stats in the current
  * plan.  256 slots cover join/CTE/partition-by-temp patterns; once a plan
@@ -175,6 +177,9 @@ fasttrun_test_fail(const char *name, int ordinal)
 typedef struct FasttrunFreshnessCacheEntry
 {
 	Oid			relid;
+	bool		locator_checked;	/* locator_ok is filled in */
+	bool		locator_ok;		/* memoized storage-locator verdict */
+	bool		counters_cached;	/* pgstat/pages fields are filled in */
 	bool		have;
 	int64		ins;
 	int64		upd;
@@ -2256,6 +2261,18 @@ fasttrun_stats_noop_free(HeapTuple tuple)
 #define FASTTRUN_STALE_SIZE_FACTOR	3.0
 
 /*
+ * Per-relid input to the churn tolerance below: the analyze cache's row-count
+ * baseline.  All columns of a relid share it, so column loops resolve it once
+ * and reuse it (lazily -- the no-DML early path never needs it).
+ */
+typedef struct FasttrunUsableBaseline
+{
+	bool		resolved;
+	bool		available;
+	double		tuples;
+} FasttrunUsableBaseline;
+
+/*
  * Soft freshness: is this column-stats entry close enough to keep serving?
  * True while the DML churn since collect time stays below the effective
  * tolerance -- stats_refresh_threshold scaled down by the column's cardinality
@@ -2264,14 +2281,15 @@ fasttrun_stats_noop_free(HeapTuple tuple)
  * ANALYZE runs the same way).  A truncdropped flip means the storage was
  * emptied or rewritten; a missing analyze-cache row-count baseline means we
  * cannot bound the drift.  Either makes the entry unusable.  Caller guarantees
- * entry->statsTuple != NULL.
+ * entry->statsTuple != NULL and passes rel_baseline zero-initialized (or
+ * carried over from previous columns of the same relid).
  */
 static bool
-fasttrun_stats_entry_usable(Oid relid, const FasttrunStatsEntry *entry,
-							int64 ins_now, int64 upd_now, int64 del_now,
-							bool truncdropped_now, BlockNumber pages_now)
+fasttrun_stats_entry_usable_ext(Oid relid, const FasttrunStatsEntry *entry,
+								int64 ins_now, int64 upd_now, int64 del_now,
+								bool truncdropped_now, BlockNumber pages_now,
+								FasttrunUsableBaseline *rel_baseline)
 {
-	FasttrunAnalyzeCacheEntry *aentry;
 	int64		churn;
 	double		baseline;
 	double		threshold;
@@ -2325,8 +2343,17 @@ fasttrun_stats_entry_usable(Oid relid, const FasttrunStatsEntry *entry,
 		return true;			/* no DML and size stable -- exactly fresh */
 	}
 
-	aentry = fasttrun_cache_lookup(relid);
-	if (aentry == NULL || !aentry->state.has_relstats)
+	if (!rel_baseline->resolved)
+	{
+		FasttrunAnalyzeCacheEntry *aentry = fasttrun_cache_lookup(relid);
+
+		rel_baseline->resolved = true;
+		rel_baseline->available = (aentry != NULL &&
+								   aentry->state.has_relstats);
+		rel_baseline->tuples = rel_baseline->available
+			? (double) Max(aentry->state.cached_tuples, 1) : 1.0;
+	}
+	if (!rel_baseline->available)
 		return false;
 
 	churn = (ins_now - entry->collected_ins)
@@ -2334,7 +2361,7 @@ fasttrun_stats_entry_usable(Oid relid, const FasttrunStatsEntry *entry,
 		+ (del_now - entry->collected_del);
 	if (churn < 0)
 		churn = -churn;
-	baseline = (double) Max(aentry->state.cached_tuples, 1);
+	baseline = rel_baseline->tuples;
 
 	/* stadistinct < 0 is a negative fraction of rows; > 0 is an absolute count. */
 	stadistinct = ((Form_pg_statistic) GETSTRUCT(entry->statsTuple))->stadistinct;
@@ -2355,6 +2382,63 @@ fasttrun_stats_entry_usable(Oid relid, const FasttrunStatsEntry *entry,
 	return ((double) churn / baseline) < threshold;
 }
 
+/* Single-column convenience wrapper: resolves the baseline itself. */
+static bool
+fasttrun_stats_entry_usable(Oid relid, const FasttrunStatsEntry *entry,
+							int64 ins_now, int64 upd_now, int64 del_now,
+							bool truncdropped_now, BlockNumber pages_now)
+{
+	FasttrunUsableBaseline rel_baseline = {0};
+
+	return fasttrun_stats_entry_usable_ext(relid, entry, ins_now, upd_now,
+										   del_now, truncdropped_now,
+										   pages_now, &rel_baseline);
+}
+
+/*
+ * Find or create the freshness-cache slot for a relid.  Planner scope only:
+ * callers must check fasttrun_in_planner first.  A new slot starts with both
+ * memo flags clear.  When the cache is full the slot is claimed round-robin;
+ * FIFO is good enough for the planner-scoped lifetime, and an overwritten
+ * relid is a miss on its next probe, never a wrong answer.
+ */
+static FasttrunFreshnessCacheEntry *
+fasttrun_freshness_cache_slot(Oid relid)
+{
+	FasttrunFreshnessCacheEntry *slot;
+	int			i;
+
+	for (i = 0; i < fasttrun_freshness_cache_used; i++)
+	{
+		slot = &fasttrun_freshness_cache[i];
+		if (slot->relid == relid)
+			return slot;
+	}
+
+	if (fasttrun_freshness_cache_used < FASTTRUN_FRESHNESS_CACHE_SLOTS)
+	{
+		slot = &fasttrun_freshness_cache[fasttrun_freshness_cache_used++];
+	}
+	else
+	{
+		slot = &fasttrun_freshness_cache[fasttrun_freshness_cache_next_evict];
+		fasttrun_freshness_cache_next_evict =
+			(fasttrun_freshness_cache_next_evict + 1) % FASTTRUN_FRESHNESS_CACHE_SLOTS;
+	}
+
+	slot->relid = relid;
+	slot->locator_checked = false;
+	slot->locator_ok = false;
+	slot->counters_cached = false;
+	return slot;
+}
+
+/*
+ * Does the relid still map to the storage the stats were collected for?
+ * Both stats hooks call this once per Var, so while the planner runs the
+ * verdict is memoized per relid: one RelationIdGetRelation per relid per
+ * plan.  Outside the planner every call probes directly.
+ */
 static bool
 fasttrun_stats_relid_locator_valid(Oid relid,
 								   FasttrunStatsRelidEntry *relentry)
@@ -2362,21 +2446,35 @@ fasttrun_stats_relid_locator_valid(Oid relid,
 	Relation	rel;
 	RelFileLocatorBackend rlb;
 	bool		valid;
+	FasttrunFreshnessCacheEntry *slot = NULL;
 
 	if (!relentry->heap_rlb_valid)
 		return false;
+
+	if (fasttrun_in_planner)
+	{
+		slot = fasttrun_freshness_cache_slot(relid);
+		if (slot->locator_checked)
+			return slot->locator_ok;
+	}
+
 	rel = RelationIdGetRelation(relid);
 	if (!RelationIsValid(rel))
+		valid = false;
+	else
 	{
-		fasttrun_stats_forget_relid(relid);
-		return false;
+		rlb.locator = rel->rd_locator;
+		rlb.backend = rel->rd_backend;
+		valid = fasttrun_rlb_equals(relentry->heap_rlb, rlb);
+		RelationClose(rel);
 	}
-	rlb.locator = rel->rd_locator;
-	rlb.backend = rel->rd_backend;
-	valid = fasttrun_rlb_equals(relentry->heap_rlb, rlb);
-	RelationClose(rel);
 	if (!valid)
 		fasttrun_stats_forget_relid(relid);
+	if (slot != NULL)
+	{
+		slot->locator_checked = true;
+		slot->locator_ok = valid;
+	}
 	return valid;
 }
 
@@ -2962,7 +3060,7 @@ fasttrun_read_pgstat_counters_for_hook(Oid relid,
 									   int64 *ins, int64 *upd, int64 *del,
 									   bool *truncdropped, BlockNumber *pages)
 {
-	int		i;
+	FasttrunFreshnessCacheEntry *slot = NULL;
 	Relation rel;
 	bool	have;
 
@@ -2970,13 +3068,9 @@ fasttrun_read_pgstat_counters_for_hook(Oid relid,
 
 	if (fasttrun_in_planner)
 	{
-		for (i = 0; i < fasttrun_freshness_cache_used; i++)
+		slot = fasttrun_freshness_cache_slot(relid);
+		if (slot->counters_cached)
 		{
-			FasttrunFreshnessCacheEntry *slot = &fasttrun_freshness_cache[i];
-
-			if (slot->relid != relid)
-				continue;
-
 			*ins = slot->ins;
 			if (upd != NULL)
 				*upd = slot->upd;
@@ -3011,29 +3105,9 @@ fasttrun_read_pgstat_counters_for_hook(Oid relid,
 		RelationClose(rel);
 	}
 
-	if (fasttrun_in_planner)
+	if (slot != NULL)
 	{
-		FasttrunFreshnessCacheEntry *slot;
-
-		if (fasttrun_freshness_cache_used < FASTTRUN_FRESHNESS_CACHE_SLOTS)
-		{
-			slot = &fasttrun_freshness_cache[fasttrun_freshness_cache_used++];
-		}
-		else
-		{
-			/*
-			 * Cache full -- replace round-robin.  FIFO is good enough for
-			 * the planner-scoped lifetime; the only way to keep filling here
-			 * is plans that genuinely touch more than
-			 * FASTTRUN_FRESHNESS_CACHE_SLOTS different temp relids, where the
-			 * working set itself does not fit anyway.
-			 */
-			slot = &fasttrun_freshness_cache[fasttrun_freshness_cache_next_evict];
-			fasttrun_freshness_cache_next_evict =
-				(fasttrun_freshness_cache_next_evict + 1) % FASTTRUN_FRESHNESS_CACHE_SLOTS;
-		}
-
-		slot->relid = relid;
+		slot->counters_cached = true;
 		slot->have = have;
 		slot->ins = *ins;
 		slot->upd = (upd != NULL) ? *upd : 0;
@@ -3817,6 +3891,7 @@ fasttrun_stats_note_visibility(Oid relid, bool have_counters,
 	FasttrunStatsRelidEntry *relentry;
 	ListCell   *lc;
 	bool		flipped = false;
+	FasttrunUsableBaseline rel_baseline = {0};
 
 	if (fasttrun_stats_cache == NULL || fasttrun_stats_relid_cache == NULL)
 		return false;
@@ -3839,8 +3914,9 @@ fasttrun_stats_note_visibility(Oid relid, bool have_counters,
 
 		/* The planner hook hides stats when pgstat is unavailable too. */
 		usable_now = have_counters &&
-			fasttrun_stats_entry_usable(relid, entry, ins_now, upd_now,
-										del_now, truncdropped_now, pages_now);
+			fasttrun_stats_entry_usable_ext(relid, entry, ins_now, upd_now,
+											del_now, truncdropped_now,
+											pages_now, &rel_baseline);
 		if (entry->was_usable && !usable_now)
 		{
 			flipped = true;
