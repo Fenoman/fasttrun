@@ -20,12 +20,9 @@
 #   (syscache в TRANS_COMMIT запрещён).  Если relation dropped --
 #   HASH_REMOVE entry полностью.  Никакого linear growth.
 #
-# Pass criteria (по умолчанию ITERATIONS=500):
-#   - "fasttrun analyze cache" used_bytes после прогона не должен
-#     отличаться от baseline (initial allocation) больше чем на
-#     MAX_GROWTH_BYTES (по умолчанию 4096 байт -- запас на один-два
-#     служебных слота HTAB).  Если кэш растёт линейно по N циклов --
-#     leak вернулся.
+# Условия успеха при ITERATIONS=500: сумма used_bytes по всем контекстам
+# fasttrun в двух финальных точках не превышает прогретое значение более чем
+# на 64 KiB, а число контекстов не меняется. Так учитывается и дочерний кеш.
 #
 set -euo pipefail
 
@@ -40,16 +37,26 @@ PSQL=${PSQL:-"$PG_BINDIR/psql"}
 INITDB=${INITDB:-"$PG_BINDIR/initdb"}
 PG_CTL=${PG_CTL:-"$PG_BINDIR/pg_ctl"}
 CREATEDB=${CREATEDB:-"$PG_BINDIR/createdb"}
+PG_RUN_AS=${PG_RUN_AS:-}
 PORT=${PGPORT:-55457}
 WORKDIR=${WORKDIR:-$(mktemp -d /tmp/fasttrun-leak.XXXXXX)}
 DBNAME=${DBNAME:-fasttrun_leak}
 ITERATIONS=${ITERATIONS:-500}
-MAX_GROWTH_BYTES=${MAX_GROWTH_BYTES:-4096}
+MAX_GROWTH_BYTES=${MAX_GROWTH_BYTES:-65536}
+
+run_pg()
+{
+	if [ -n "$PG_RUN_AS" ]; then
+		runuser -u "$PG_RUN_AS" -- "$@"
+	else
+		"$@"
+	fi
+}
 
 cleanup()
 {
 	if [ -f "$WORKDIR/data/postmaster.pid" ]; then
-		"$PG_CTL" -D "$WORKDIR/data" -w stop >/dev/null 2>&1 || true
+		run_pg "$PG_CTL" -D "$WORKDIR/data" -w stop >/dev/null 2>&1 || true
 	fi
 	rm -rf "$WORKDIR"
 }
@@ -67,13 +74,19 @@ require_cmd "$PSQL"
 require_cmd "$INITDB"
 require_cmd "$PG_CTL"
 require_cmd "$CREATEDB"
+if [ -n "$PG_RUN_AS" ]; then
+	require_cmd runuser
+fi
 
-"$INITDB" -D "$WORKDIR/data" --no-locale -E UTF8 >/dev/null
-"$PG_CTL" -D "$WORKDIR/data" \
-	-o "-k $WORKDIR -p $PORT -c shared_preload_libraries=fasttrun -c track_counts=on" \
+if [ -n "$PG_RUN_AS" ]; then
+	chown "$PG_RUN_AS" "$WORKDIR"
+fi
+run_pg "$INITDB" -D "$WORKDIR/data" --no-locale -E UTF8 >/dev/null
+run_pg "$PG_CTL" -D "$WORKDIR/data" \
+	-o "-k $WORKDIR -p $PORT -c listen_addresses='' -c shared_preload_libraries=fasttrun -c track_counts=on" \
 	-l "$WORKDIR/postgres.log" -w start >/dev/null
-"$CREATEDB" -h "$WORKDIR" -p "$PORT" "$DBNAME"
-"$PSQL" -h "$WORKDIR" -p "$PORT" -d "$DBNAME" -X -qAt \
+run_pg "$CREATEDB" -h "$WORKDIR" -p "$PORT" "$DBNAME"
+run_pg "$PSQL" -h "$WORKDIR" -p "$PORT" -d "$DBNAME" -X -qAt \
 	-v ON_ERROR_STOP=1 -c "CREATE EXTENSION fasttrun" >/dev/null
 
 # Reproducer: один backend, $ITERATIONS отдельных xact'ов, каждый
@@ -87,13 +100,10 @@ cat >"$WORKDIR/leak.sql" <<SQL
 \\pset tuples_only on
 \\pset fieldsep '|'
 
--- Baseline: cache ещё не аллоцирован.
-SELECT 'BASELINE_BEGIN';
-SELECT name, used_bytes
+SELECT 'BASELINE|' || coalesce(sum(total_bytes), 0) || '|' ||
+       coalesce(sum(used_bytes), 0) || '|' || count(*)
 FROM pg_backend_memory_contexts
-WHERE name ~ 'fasttrun analyze cache'
-ORDER BY name;
-SELECT 'BASELINE_END';
+WHERE name LIKE 'fasttrun%';
 
 -- "Warmup" -- forced lazy init: первая итерация аллоцирует HTAB.
 -- Это нужно ДО baseline чтобы наш baseline учитывал служебные слоты
@@ -104,12 +114,10 @@ INSERT INTO ft_leak_warmup SELECT 1;
 SELECT fasttrun_analyze('ft_leak_warmup');
 COMMIT;
 
-SELECT 'WARMED_BEGIN';
-SELECT name, used_bytes
+SELECT 'WARM|' || coalesce(sum(total_bytes), 0) || '|' ||
+       coalesce(sum(used_bytes), 0) || '|' || count(*)
 FROM pg_backend_memory_contexts
-WHERE name ~ 'fasttrun analyze cache'
-ORDER BY name;
-SELECT 'WARMED_END';
+WHERE name LIKE 'fasttrun%';
 
 -- N циклов worst-case паттерна.
 DO \$do\$
@@ -123,16 +131,19 @@ BEGIN
   END LOOP;
 END\$do\$;
 
-SELECT 'AFTER_BEGIN';
-SELECT name, used_bytes
+SELECT 'FINAL|' || coalesce(sum(total_bytes), 0) || '|' ||
+       coalesce(sum(used_bytes), 0) || '|' || count(*)
 FROM pg_backend_memory_contexts
-WHERE name ~ 'fasttrun analyze cache'
-ORDER BY name;
-SELECT 'AFTER_END';
+WHERE name LIKE 'fasttrun%';
+SELECT pg_sleep(0.1);
+SELECT 'STABLE|' || coalesce(sum(total_bytes), 0) || '|' ||
+       coalesce(sum(used_bytes), 0) || '|' || count(*)
+FROM pg_backend_memory_contexts
+WHERE name LIKE 'fasttrun%';
 SQL
 
 psql_rc=0
-"$PSQL" -h "$WORKDIR" -p "$PORT" -d "$DBNAME" -X \
+run_pg "$PSQL" -h "$WORKDIR" -p "$PORT" -d "$DBNAME" -X \
 	-v ON_ERROR_STOP=1 -f "$WORKDIR/leak.sql" \
 	>"$WORKDIR/leak.out" 2>"$WORKDIR/leak.err" || psql_rc=$?
 
@@ -144,52 +155,43 @@ if [ "$psql_rc" -ne 0 ]; then
 	exit 1
 fi
 
-extract_bytes()
+metric()
 {
-	# вывод: "fasttrun analyze cache|<used_bytes>"; суммируем used_bytes
-	# по ВСЕМ строкам совпадения -- контекстов с этим именем может быть
-	# несколько (родитель + дочерние), и утечка в непервом была бы
-	# невидима при захвате только первой строки.
-	local begin="$1"
-	local end="$2"
-	awk -v b="$begin" -v e="$end" '
-		$0 == b { capture=1; next }
-		$0 == e { capture=0; next }
-		capture && /fasttrun analyze cache\|/ {
-			n = $0
-			sub(/^.*\|/, "", n)
-			sum += n
-			seen = 1
-		}
-		END { if (seen) print sum }
-	' "$WORKDIR/leak.out"
+	awk -F'|' -v key="$1" '$1 == key {print $2 " " $3 " " $4}' \
+		"$WORKDIR/leak.out" | tail -1
 }
 
-warmed=$(extract_bytes WARMED_BEGIN WARMED_END)
-after=$(extract_bytes AFTER_BEGIN AFTER_END)
+read -r warm_total warm_used warm_contexts <<<"$(metric WARM)"
+read -r final_total final_used final_contexts <<<"$(metric FINAL)"
+read -r stable_total stable_used stable_contexts <<<"$(metric STABLE)"
+for value in "$warm_total" "$warm_used" "$warm_contexts" \
+	"$final_total" "$final_used" "$final_contexts" \
+	"$stable_total" "$stable_used" "$stable_contexts"; do
+	case "$value" in
+		''|*[!0-9]*) echo "неверная метрика памяти ON COMMIT DROP: $value" >&2; exit 1 ;;
+	esac
+done
 
-# Пустой захват означает, что контекст 'fasttrun analyze cache' отсутствует:
-# кэш опустел, fasttrun снёс HTAB вместе с его контекстом (fasttrun_cache_reset
-# -> MemoryContextDelete).  Нет контекста == ничего не удержано == 0 байт.
-# Это лучший исход, а не сбой измерения.
-[ -z "$warmed" ] && warmed=0
-[ -z "$after" ] && after=0
-
-growth=$((after - warmed))
+growth=$((final_used - warm_used))
+stable_growth=$((stable_used - warm_used))
 
 echo ""
-echo "fasttrun analyze cache на старте (после warmup): $warmed байт"
-echo "fasttrun analyze cache после $ITERATIONS циклов: $after байт"
-echo "delta:                                          $growth байт"
-echo "лимит:                                          $MAX_GROWTH_BYTES байт"
+echo "fasttrun после прогрева, всего/занято/контекстов: $warm_total/$warm_used/$warm_contexts"
+echo "fasttrun после циклов, всего/занято/контекстов:  $final_total/$final_used/$final_contexts"
+echo "fasttrun после ожидания, всего/занято/контекстов: $stable_total/$stable_used/$stable_contexts"
+echo "рост занятой памяти, сразу/после ожидания:       $growth/$stable_growth байт"
+echo "лимит:                            $MAX_GROWTH_BYTES байт"
 
-if [ "$growth" -gt "$MAX_GROWTH_BYTES" ]; then
+if [ "$growth" -gt "$MAX_GROWTH_BYTES" ] || \
+	[ "$stable_growth" -gt "$MAX_GROWTH_BYTES" ] || \
+	[ "$final_contexts" -ne "$warm_contexts" ] || \
+	[ "$stable_contexts" -ne "$warm_contexts" ]; then
 	echo ""
-	echo "FAIL: fasttrun analyze cache вырос на $growth байт за $ITERATIONS циклов" >&2
-	echo "ON COMMIT DROP entries не эвиктятся в fasttrun_cache_commit_xact" >&2
+	echo "FAIL: память fasttrun не стабилизировалась за $ITERATIONS циклов" >&2
+	echo "записи ON COMMIT DROP не удаляются в fasttrun_cache_commit_xact" >&2
 	echo "См. fasttrun.c:fasttrun_cache_commit_xact (SearchSysCacheExists1 проверка)" >&2
 	exit 1
 fi
 
 echo ""
-echo "regression-проверка fasttrun ON COMMIT DROP leak прошла"
+echo "проверка памяти fasttrun при ON COMMIT DROP прошла"

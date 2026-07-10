@@ -12,33 +12,47 @@ PSQL=${PSQL:-"$PG_BINDIR/psql"}
 INITDB=${INITDB:-"$PG_BINDIR/initdb"}
 PG_CTL=${PG_CTL:-"$PG_BINDIR/pg_ctl"}
 CREATEDB=${CREATEDB:-"$PG_BINDIR/createdb"}
+PG_RUN_AS=${PG_RUN_AS:-}
 WORKDIR=${WORKDIR:-$(mktemp -d /tmp/fasttrun-fault-matrix.XXXXXX)}
 DATA=$WORKDIR/data
 SOCKET_DIR=$WORKDIR/socket
 LOG=$WORKDIR/postgres.log
 DBNAME=${DBNAME:-fasttrun_fault_matrix}
 
+run_pg()
+{
+	if [ -n "$PG_RUN_AS" ]; then
+		runuser -u "$PG_RUN_AS" -- "$@"
+	else
+		"$@"
+	fi
+}
+
 cleanup()
 {
 	if [ -f "$DATA/postmaster.pid" ]; then
-		"$PG_CTL" -D "$DATA" -m fast -w stop >/dev/null 2>&1 || true
+		run_pg "$PG_CTL" -D "$DATA" -m fast -w stop >/dev/null 2>&1 || true
 	fi
 	rm -rf "$WORKDIR"
 }
 trap cleanup EXIT
 
 mkdir -p "$SOCKET_DIR"
+if [ -n "$PG_RUN_AS" ]; then
+	command -v runuser >/dev/null 2>&1 || { echo "missing runuser" >&2; exit 1; }
+	chown "$PG_RUN_AS" "$WORKDIR" "$SOCKET_DIR"
+fi
 PORT=${PGPORT:-$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')}
 
-"$INITDB" -D "$DATA" --no-locale -E UTF8 >/dev/null
-"$PG_CTL" -D "$DATA" -l "$LOG" \
+run_pg "$INITDB" -D "$DATA" --no-locale -E UTF8 >/dev/null
+run_pg "$PG_CTL" -D "$DATA" -l "$LOG" \
 	-o "-k $SOCKET_DIR -p $PORT -c listen_addresses='' -c track_counts=on" \
 	-w start >/dev/null
-"$CREATEDB" -h "$SOCKET_DIR" -p "$PORT" "$DBNAME"
-"$PSQL" -h "$SOCKET_DIR" -p "$PORT" -d "$DBNAME" -XAtq \
+run_pg "$CREATEDB" -h "$SOCKET_DIR" -p "$PORT" "$DBNAME"
+run_pg "$PSQL" -h "$SOCKET_DIR" -p "$PORT" -d "$DBNAME" -XAtq \
 	-v ON_ERROR_STOP=1 -c 'CREATE EXTENSION fasttrun' >/dev/null
 
-if [ "$("$PSQL" -h "$SOCKET_DIR" -p "$PORT" -d "$DBNAME" \
+if [ "$(run_pg "$PSQL" -h "$SOCKET_DIR" -p "$PORT" -d "$DBNAME" \
 	-XAtq -c 'SHOW debug_assertions')" != on ]; then
 	echo "SKIP: truncate fault matrix requires a cassert PostgreSQL build" >&2
 	exit 77
@@ -203,6 +217,13 @@ $case$;
 
 DEALLOCATE ft_prepared;
 DROP TABLE ft_fault, ft_expected, ft_case_meta;
+SELECT 'BOUNDARY_MEMORY_1 ' || coalesce(sum(total_bytes), 0) || ' ' ||
+       coalesce(sum(used_bytes), 0) || ' ' || count(*)
+FROM pg_backend_memory_contexts WHERE name LIKE 'fasttrun%';
+SELECT pg_sleep(0.1);
+SELECT 'BOUNDARY_MEMORY_2 ' || coalesce(sum(total_bytes), 0) || ' ' ||
+       coalesce(sum(used_bytes), 0) || ' ' || count(*)
+FROM pg_backend_memory_contexts WHERE name LIKE 'fasttrun%';
 SELECT 'BOUNDARY_OK ' || :'mode' || ' ' || :'failpoint';
 SQL
 
@@ -215,7 +236,7 @@ run_boundary_case()
 	local out="$WORKDIR/${mode}_${label}.out"
 	local err="$WORKDIR/${mode}_${label}.err"
 
-	if ! "$PSQL" -h "$SOCKET_DIR" -p "$PORT" -d "$DBNAME" -XAtq \
+	if ! run_pg "$PSQL" -h "$SOCKET_DIR" -p "$PORT" -d "$DBNAME" -XAtq \
 		-v mode="$mode" -v failpoint="$failpoint" -v phase="$phase" \
 		-f "$WORKDIR/boundary.sql" >"$out" 2>"$err"; then
 		cat "$out" "$err" >&2
@@ -225,6 +246,12 @@ run_boundary_case()
 	if ! grep -q "^BOUNDARY_OK $mode $failpoint$" "$out"; then
 		cat "$out" "$err" >&2
 		echo "FAIL: missing boundary marker for $mode/$failpoint" >&2
+		exit 1
+	fi
+	if ! grep -q '^BOUNDARY_MEMORY_1 0 0 0$' "$out" || \
+		! grep -q '^BOUNDARY_MEMORY_2 0 0 0$' "$out"; then
+		cat "$out" "$err" >&2
+		echo "FAIL: aggregate boundary memory did not return to zero" >&2
 		exit 1
 	fi
 	echo "boundary passed: mode=$mode failpoint=$failpoint"
@@ -420,11 +447,18 @@ $case$;
 SELECT 1 / (count(*) = 2)::int FROM ft_parent;
 DROP TABLE ft_parent CASCADE;
 
+SELECT 'LIFECYCLE_MEMORY_1 ' || coalesce(sum(total_bytes), 0) || ' ' ||
+       coalesce(sum(used_bytes), 0) || ' ' || count(*)
+FROM pg_backend_memory_contexts WHERE name LIKE 'fasttrun%';
+SELECT pg_sleep(0.1);
+SELECT 'LIFECYCLE_MEMORY_2 ' || coalesce(sum(total_bytes), 0) || ' ' ||
+       coalesce(sum(used_bytes), 0) || ' ' || count(*)
+FROM pg_backend_memory_contexts WHERE name LIKE 'fasttrun%';
 SELECT 'LIFECYCLE_OK ' || :'mode';
 SQL
 
 for mode in on off; do
-	if ! "$PSQL" -h "$SOCKET_DIR" -p "$PORT" -d "$DBNAME" -XAtq \
+	if ! run_pg "$PSQL" -h "$SOCKET_DIR" -p "$PORT" -d "$DBNAME" -XAtq \
 		-v mode="$mode" -f "$WORKDIR/lifecycle.sql" \
 		>"$WORKDIR/lifecycle_${mode}.out" \
 		2>"$WORKDIR/lifecycle_${mode}.err"; then
@@ -438,6 +472,14 @@ for mode in on off; do
 		echo "FAIL: missing lifecycle marker for $mode" >&2
 		exit 1
 	}
+	if ! grep -q '^LIFECYCLE_MEMORY_1 0 0 0$' \
+		"$WORKDIR/lifecycle_${mode}.out" || \
+		! grep -q '^LIFECYCLE_MEMORY_2 0 0 0$' \
+		"$WORKDIR/lifecycle_${mode}.out"; then
+		cat "$WORKDIR/lifecycle_${mode}.out" >&2
+		echo "FAIL: lifecycle aggregate memory did not stabilize" >&2
+		exit 1
+	fi
 	echo "lifecycle passed: mode=$mode"
 done
 
@@ -464,13 +506,17 @@ END
 $case$;
 SET fasttrun.test_failpoint = '';
 :discard_command
-SELECT 'DISCARD_CONTEXTS ' || count(*)
-FROM pg_backend_memory_contexts
-WHERE name LIKE 'fasttrun%';
+SELECT 'DISCARD_MEMORY_1 ' || coalesce(sum(total_bytes), 0) || ' ' ||
+       coalesce(sum(used_bytes), 0) || ' ' || count(*)
+FROM pg_backend_memory_contexts WHERE name LIKE 'fasttrun%';
+SELECT pg_sleep(0.1);
+SELECT 'DISCARD_MEMORY_2 ' || coalesce(sum(total_bytes), 0) || ' ' ||
+       coalesce(sum(used_bytes), 0) || ' ' || count(*)
+FROM pg_backend_memory_contexts WHERE name LIKE 'fasttrun%';
 SQL
 
 for target in TEMP ALL; do
-	if ! "$PSQL" -h "$SOCKET_DIR" -p "$PORT" -d "$DBNAME" -XAtq \
+	if ! run_pg "$PSQL" -h "$SOCKET_DIR" -p "$PORT" -d "$DBNAME" -XAtq \
 		-v discard_command="DISCARD $target;" -f "$WORKDIR/discard.sql" \
 		>"$WORKDIR/discard_${target}.out" \
 		2>"$WORKDIR/discard_${target}.err"; then
@@ -479,7 +525,10 @@ for target in TEMP ALL; do
 		echo "FAIL: DISCARD $target" >&2
 		exit 1
 	fi
-	if ! grep -q '^DISCARD_CONTEXTS 0$' "$WORKDIR/discard_${target}.out"; then
+	if ! grep -q '^DISCARD_MEMORY_1 0 0 0$' \
+		"$WORKDIR/discard_${target}.out" || \
+		! grep -q '^DISCARD_MEMORY_2 0 0 0$' \
+		"$WORKDIR/discard_${target}.out"; then
 		cat "$WORKDIR/discard_${target}.out" >&2
 		echo "FAIL: DISCARD $target left fasttrun contexts" >&2
 		exit 1
