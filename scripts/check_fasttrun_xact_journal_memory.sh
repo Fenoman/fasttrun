@@ -122,6 +122,88 @@ FROM pg_backend_memory_contexts
 WHERE name LIKE 'fasttrun%'
 ORDER BY name;
 COMMIT;
+
+/* Successful calls must release the state left by earlier calls. */
+CREATE TEMP TABLE ft_truncate_memory(
+  id int PRIMARY KEY,
+  payload text
+);
+ALTER TABLE ft_truncate_memory ALTER COLUMN payload SET STORAGE EXTERNAL;
+CREATE TEMP TABLE ft_payload AS
+SELECT string_agg(md5(s::text), '') AS value
+FROM generate_series(1, 450) s;
+INSERT INTO ft_truncate_memory SELECT 1, value FROM ft_payload;
+
+BEGIN;
+DO $truncate_warm$
+DECLARE i int;
+BEGIN
+  FOR i IN 1..100 LOOP
+    PERFORM fasttruncate('ft_truncate_memory');
+    INSERT INTO ft_truncate_memory SELECT i, value FROM ft_payload;
+  END LOOP;
+END
+$truncate_warm$;
+SELECT 'TRUNCATE_WARM_USED ' || coalesce(sum(used_bytes), 0)
+FROM pg_backend_memory_contexts
+WHERE name = 'fasttrun operation context';
+
+DO $truncate_final$
+DECLARE i int;
+BEGIN
+  FOR i IN 101..2000 LOOP
+    PERFORM fasttruncate('ft_truncate_memory');
+    INSERT INTO ft_truncate_memory SELECT i, value FROM ft_payload;
+  END LOOP;
+END
+$truncate_final$;
+SELECT 'TRUNCATE_FINAL_USED ' || coalesce(sum(used_bytes), 0)
+FROM pg_backend_memory_contexts
+WHERE name = 'fasttrun operation context';
+COMMIT;
+
+/* A successful retry after each caught error must release the block. */
+DO $poison_cycles$
+DECLARE i int;
+BEGIN
+  FOR i IN 1..200 LOOP
+    PERFORM set_config('fasttrun.test_failpoint', 'after_user_index:1', false);
+    BEGIN
+      PERFORM fasttruncate('ft_truncate_memory');
+    EXCEPTION WHEN SQLSTATE '55000' THEN
+      NULL;
+    END;
+    PERFORM set_config('fasttrun.test_failpoint', '', false);
+    PERFORM fasttruncate('ft_truncate_memory');
+    INSERT INTO ft_truncate_memory SELECT 2000 + i, value FROM ft_payload;
+  END LOOP;
+END
+$poison_cycles$;
+SELECT 'POISON_FINAL_USED ' || coalesce(sum(used_bytes), 0)
+FROM pg_backend_memory_contexts
+WHERE name = 'fasttrun operation context';
+
+/* One active block survives a transaction rollback and uses little memory. */
+BEGIN;
+DO $active_poison$
+BEGIN
+  PERFORM set_config('fasttrun.test_failpoint', 'after_user_index:1', false);
+  BEGIN
+    PERFORM fasttruncate('ft_truncate_memory');
+  EXCEPTION WHEN SQLSTATE '55000' THEN
+    NULL;
+  END;
+  PERFORM set_config('fasttrun.test_failpoint', '', false);
+END
+$active_poison$;
+ROLLBACK;
+SELECT 'ACTIVE_POISON_USED ' || coalesce(sum(used_bytes), 0)
+FROM pg_backend_memory_contexts
+WHERE name = 'fasttrun operation context';
+SELECT fasttruncate('ft_truncate_memory');
+SELECT 'REPAIRED_POISON_USED ' || coalesce(sum(used_bytes), 0)
+FROM pg_backend_memory_contexts
+WHERE name = 'fasttrun operation context';
 SQL
 
 "$PSQL" -h "$SOCKET_DIR" -p "$PORT" -d "$DBNAME" -XAtq \
@@ -140,8 +222,15 @@ visits=$(value VISITS)
 visit_frames=$(value VISIT_FRAMES)
 final_used=$(value FINAL_USED)
 final_frames=$(value FINAL_FRAMES)
+truncate_warm_used=$(value TRUNCATE_WARM_USED)
+truncate_final_used=$(value TRUNCATE_FINAL_USED)
+poison_final_used=$(value POISON_FINAL_USED)
+active_poison_used=$(value ACTIVE_POISON_USED)
+repaired_poison_used=$(value REPAIRED_POISON_USED)
 
-for item in "$warm_used" "$visits" "$visit_frames" "$final_used" "$final_frames"; do
+for item in "$warm_used" "$visits" "$visit_frames" "$final_used" \
+	"$final_frames" "$truncate_warm_used" "$truncate_final_used" \
+	"$poison_final_used" "$active_poison_used" "$repaired_poison_used"; do
 	case "$item" in
 		''|*[!0-9]*) echo "неверная метрика журнала: $item" >&2; exit 1 ;;
 	esac
@@ -149,8 +238,11 @@ done
 
 growth=$((final_used - warm_used))
 [ "$growth" -lt 0 ] && growth=0
+truncate_growth=$((truncate_final_used - truncate_warm_used))
+[ "$truncate_growth" -lt 0 ] && truncate_growth=0
 
 echo "журнал транзакций: обходы=$visits прогрев=$warm_used итог=$final_used рост=$growth уровни_при_обходе=$visit_frames уровни_в_конце=$final_frames"
+echo "память очистки: прогрев=$truncate_warm_used итог=$truncate_final_used рост=$truncate_growth после_восстановления=$repaired_poison_used активная_блокировка=$active_poison_used"
 
 if [ "$visits" -gt 400 ]; then
 	echo "FAIL: обработчик подтранзакций обошёл $visits таблиц, ожидалось не более 400" >&2
@@ -164,5 +256,22 @@ if [ "$growth" -gt 65536 ]; then
 	echo "FAIL: контексты fasttrun выросли на $growth байт, предел 65536" >&2
 	exit 1
 fi
+if [ "$truncate_growth" -gt 65536 ]; then
+	echo "FAIL: контекст операции очистки вырос на $truncate_growth байт" >&2
+	exit 1
+fi
+if [ "$poison_final_used" -ne 0 ] || [ "$repaired_poison_used" -ne 0 ]; then
+	echo "FAIL: после успешного восстановления остался контекст операции" >&2
+	exit 1
+fi
+if [ "$active_poison_used" -le 0 ] || [ "$active_poison_used" -gt 65536 ]; then
+	echo "FAIL: одна активная блокировка заняла $active_poison_used байт" >&2
+	exit 1
+fi
+if grep -Eq 'TRAP|Assertion|PANIC|server process .* was terminated' "$LOG"; then
+	grep -E 'TRAP|Assertion|PANIC|server process .* was terminated' "$LOG" >&2
+	echo "FAIL: проверка памяти вызвала Assert или завершение серверного процесса" >&2
+	exit 1
+fi
 
-echo "проверка памяти журнала транзакций прошла: обходы=$visits рост=$growth активных_уровней=0"
+echo "проверка памяти журнала транзакций прошла: обходы=$visits рост=$growth рост_очистки=$truncate_growth активных_уровней=0"
