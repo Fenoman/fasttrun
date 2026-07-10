@@ -7573,42 +7573,69 @@ fasttrun_track_save(int code, Datum arg)
 	int32				magic = FASTTRUN_TRACK_MAGIC;
 	int32				count = 0;
 
+	/* Don't try to dump during a crash: shared state may be inconsistent. */
+	if (code)
+		return;
+
 	if (fasttrun_track_htab == NULL)
 		return;
 
-	LWLockAcquire(fasttrun_track_lock, LW_SHARED);
-
 	f = AllocateFile(FASTTRUN_TRACK_FILE ".tmp", PG_BINARY_W);
 	if (f == NULL)
+		goto error;
+
+	LWLockAcquire(fasttrun_track_lock, LW_SHARED);
+
+	/* magic + count placeholder; count is rewritten below */
+	if (fwrite(&magic, sizeof(magic), 1, f) != 1 ||
+		fwrite(&count, sizeof(count), 1, f) != 1)
 	{
 		LWLockRelease(fasttrun_track_lock);
-		ereport(LOG, (errmsg("fasttrun: could not save temp stats")));
-		return;
+		goto error;
 	}
-
-	fwrite(&magic, sizeof(magic), 1, f);
-	/* placeholder for count -- will rewrite */
-	fwrite(&count, sizeof(count), 1, f);
 
 	hash_seq_init(&status, fasttrun_track_htab);
 	while ((entry = hash_seq_search(&status)) != NULL)
 	{
 		if (entry->create_count > 0)
 		{
-			fwrite(entry, sizeof(FasttrunTrackEntry), 1, f);
+			if (fwrite(entry, sizeof(FasttrunTrackEntry), 1, f) != 1)
+			{
+				hash_seq_term(&status);
+				LWLockRelease(fasttrun_track_lock);
+				goto error;
+			}
 			count++;
 		}
 	}
 
 	LWLockRelease(fasttrun_track_lock);
 
-	/* rewrite count */
-	fseek(f, sizeof(magic), SEEK_SET);
-	fwrite(&count, sizeof(count), 1, f);
+	/* rewrite count over the placeholder */
+	if (fseek(f, sizeof(magic), SEEK_SET) != 0 ||
+		fwrite(&count, sizeof(count), 1, f) != 1)
+		goto error;
 
-	FreeFile(f);
+	if (FreeFile(f))
+	{
+		f = NULL;
+		goto error;
+	}
+	f = NULL;
+
+	/* atomic replace: the old file stays intact if anything above failed */
 	(void) durable_rename(FASTTRUN_TRACK_FILE ".tmp",
 						  FASTTRUN_TRACK_FILE, LOG);
+	return;
+
+error:
+	ereport(LOG,
+			(errcode_for_file_access(),
+			 errmsg("fasttrun: could not write file \"%s\": %m",
+					FASTTRUN_TRACK_FILE ".tmp")));
+	if (f)
+		FreeFile(f);
+	unlink(FASTTRUN_TRACK_FILE ".tmp");
 }
 
 /* Load tracking stats from disk. Called at shmem startup. */
