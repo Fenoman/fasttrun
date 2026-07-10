@@ -560,13 +560,10 @@ DROP TABLE t_abort_anchor;
 RESET fasttrun.sample_rows;
 DROP FUNCTION f_outer(int, int);
 -- ----------------------------------------------------------------------
--- 11. ROLLBACK TO SAVEPOINT после fasttruncate инвалидирует локальный
---     plan cache РОВНО РАЗ на уникальный relid, а не по разу на индекс.
---     fasttruncate трогает heap + каждый индекс + toast как отдельные
---     relid'ы; empty-storage ветка abort-колбэка инвалидировала owning
---     heap на КАЖДОЙ индексной entry -> ~2N walk'ов на N индексов.
---     Дедуп через inval_seen: N уникальных relid = N DEBUG-строк.
---     Здесь heap + btree + hash + gin + toast + toast-idx = 6 уникальных.
+-- 11. ROLLBACK TO SAVEPOINT после fasttruncate сбрасывает локальный
+--     кеш планов один раз для основной таблицы, а не для каждого индекса.
+--     Одна корневая запись журнала объединяет таблицу, индексы и TOAST;
+--     в DEBUG появляется одна строка.
 -- ----------------------------------------------------------------------
 CREATE TEMP TABLE t_inval_dedup (a int, b int, c text);
 CREATE INDEX ON t_inval_dedup (a);
@@ -588,15 +585,9 @@ SELECT fasttruncate('t_inval_dedup');
 (1 row)
 
 -- Окно наблюдения: только ROLLBACK эмитит abort-инвалидации (fasttruncate
--- выше уже отработал на warning-уровне). Ожидаем 6 DEBUG-строк -- по одной
--- на уникальный relid, а не 2N+1.
+-- выше уже отработал на уровне WARNING). Ожидаем одну DEBUG-строку.
 SET client_min_messages = debug1;
 ROLLBACK TO SAVEPOINT sp_dedup;
-DEBUG:  fasttrun: invalidating backend-local cached plans
-DEBUG:  fasttrun: invalidating backend-local cached plans
-DEBUG:  fasttrun: invalidating backend-local cached plans
-DEBUG:  fasttrun: invalidating backend-local cached plans
-DEBUG:  fasttrun: invalidating backend-local cached plans
 DEBUG:  fasttrun: invalidating backend-local cached plans
 RESET client_min_messages;
 COMMIT;

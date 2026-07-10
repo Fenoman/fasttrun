@@ -371,6 +371,38 @@ SELECT count(*) = 1000 AS churn_after_commit FROM t_an_oidchurn;
 DROP TABLE t_an_oidchurn;
 
 -- ----------------------------------------------------------------------
+-- 17d. Одна таблица на разных уровнях точек сохранения должна иметь
+--      независимые копии состояния. RELEASE переносит состояние дочернего
+--      уровня родителю, ROLLBACK TO восстанавливает исходную статистику.
+-- ----------------------------------------------------------------------
+CREATE TEMP TABLE t_frame_nested (id int, grp int);
+INSERT INTO t_frame_nested SELECT g, g FROM generate_series(1, 10000) g;
+SELECT fasttrun_analyze('t_frame_nested');
+
+BEGIN;
+SAVEPOINT frame_parent;
+INSERT INTO t_frame_nested SELECT g, g FROM generate_series(10001, 11000) g;
+SELECT fasttrun_analyze('t_frame_nested');
+
+SAVEPOINT frame_child;
+INSERT INTO t_frame_nested SELECT g, g FROM generate_series(11001, 13000) g;
+SELECT fasttrun_analyze('t_frame_nested');
+ROLLBACK TO SAVEPOINT frame_child;
+SELECT (fasttrun_relstats('t_frame_nested')).reltuples = 11000
+       AS frame_child_restored;
+
+SAVEPOINT frame_child_2;
+INSERT INTO t_frame_nested SELECT g, g FROM generate_series(11001, 14000) g;
+SELECT fasttrun_analyze('t_frame_nested');
+RELEASE SAVEPOINT frame_child_2;
+ROLLBACK TO SAVEPOINT frame_parent;
+SELECT (fasttrun_relstats('t_frame_nested')).reltuples = 10000
+       AS frame_parent_restored;
+COMMIT;
+
+DROP TABLE t_frame_nested;
+
+-- ----------------------------------------------------------------------
 -- 18. Регрессионный тест: ошибка ленивого режима после SQL TRUNCATE
 --     (исправление приоритета P1).
 --

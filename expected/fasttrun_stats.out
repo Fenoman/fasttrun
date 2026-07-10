@@ -2387,10 +2387,8 @@ DEBUG:  fasttrun: invalidating backend-local cached plans
 
 ROLLBACK TO SAVEPOINT s;                    -- якорь сброшен, churn жив
 DEBUG:  fasttrun: invalidating backend-local cached plans
-DEBUG:  fasttrun: invalidating backend-local cached plans
 SELECT fasttrun_analyze('t_partial_sp');    -- рескан обязан повториться
 DEBUG:  fasttrun: block-sampling analyze scan
-DEBUG:  fasttrun: invalidating backend-local cached plans
  fasttrun_analyze 
 ------------------
  

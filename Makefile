@@ -60,7 +60,7 @@ include $(PGXS)
         check-zero-sinval check-commit-inval-overhead \
         check-bulk-overhead check-on-commit-drop-leak \
         check-commit-duration check-replace-catalog check-giant-temp \
-        check-deep-local
+        check-xact-journal-memory check-deep-local
 
 check-parity:
 	PG_CONFIG="$(PG_CONFIG)" scripts/check_fasttrun_analyze_parity.py --profile full
@@ -95,6 +95,9 @@ check-replace-catalog:
 
 check-giant-temp:
 	PG_CONFIG="$(PG_CONFIG)" scripts/check_fasttrun_giant_temp.sh
+
+check-xact-journal-memory:
+	PG_CONFIG="$(PG_CONFIG)" scripts/check_fasttrun_xact_journal_memory.sh
 
 check-deep-local: installcheck check-parity check-soak check-perf-smoke \
                   check-hook-chain check-zero-sinval \

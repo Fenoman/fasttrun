@@ -94,6 +94,9 @@ PG_FUNCTION_INFO_V1(fasttrun_inspect_stats);
 PG_FUNCTION_INFO_V1(fasttrun_hot_temp_tables);
 PG_FUNCTION_INFO_V1(fasttrun_prewarm);
 PG_FUNCTION_INFO_V1(fasttrun_reset_temp_stats);
+#ifdef USE_ASSERT_CHECKING
+PG_FUNCTION_INFO_V1(fasttrun_test_subxact_visits);
+#endif
 Datum	fasttruncate(PG_FUNCTION_ARGS);
 Datum	fasttrun_analyze(PG_FUNCTION_ARGS);
 Datum	fasttrun_analyze_bulk(PG_FUNCTION_ARGS);
@@ -161,170 +164,211 @@ static bool		fasttrun_warned_track_counts_off = false;
 /* RNG state for reservoir sampling */
 static pg_prng_state fasttrun_prng_state;
 
-/*
- * Relids touched in the current top transaction.
- *
- * Anyone who mutates the analyze or stats cache adds their relid here:
- * fasttrun_analyze, fasttrun_collect_stats, fasttruncate, utility-eviction.
- *
- * The list lives in TopTransactionContext.  Postgres reclaims that
- * context on xact end -- we only NIL the pointer.  Xact and subxact
- * callbacks walk this list, not the full cache.  Cost becomes
- * O(work-done-this-xact) instead of O(cache-size).
- *
- * Before this list existed, every COMMIT scanned every cache entry.
- * Each entry did try_relation_open + RelationGetNumberOfBlocks plus a
- * chain of fasttrun_invalidate_local_plan_cache calls.  A backend
- * holding many ON-COMMIT-DELETE-ROWS temp tables paid O(cache_size)
- * work per COMMIT.  That dominated CPU.
- *
- * Membership starts as list_member_oid -- a flat array of Oids that the
- * linear scan beats a hash on for typical temp workloads (a few dozen
- * relids per xact).  Past FASTTRUN_TOUCHED_LIST_MAX relids a membership
- * HTAB (also TopTransactionContext) takes over the duplicate check, or
- * the per-add scan would go quadratic on xacts touching thousands of
- * relids.  The list stays authoritative for walk order; the hash mirrors
- * its members and serves lookups only.
- */
-#define FASTTRUN_TOUCHED_LIST_MAX	64
+#ifdef USE_ASSERT_CHECKING
+/* Test probe: counts relids examined by subxact cleanup. */
+static uint64 fasttrun_test_subxact_visited = 0;
+#endif
 
-static List *fasttrun_xact_touched_oids = NIL;
-static HTAB *fasttrun_xact_touched_hash = NULL;
-
-static void
-fasttrun_xact_touched_promote(void)
+/* One bounded journal frame per subtransaction that mutates local state. */
+typedef enum FasttrunTouchFlags
 {
+	FASTTRUN_TOUCH_ANALYZE = 1 << 0,
+	FASTTRUN_TOUCH_STATS = 1 << 1,
+	FASTTRUN_TOUCH_DML = 1 << 2,
+	FASTTRUN_TOUCH_DROPPED = 1 << 3,
+	FASTTRUN_TOUCH_TRUNCATE_PREPARED = 1 << 4,
+	FASTTRUN_TOUCH_TRUNCATE_MUTATED = 1 << 5,
+	FASTTRUN_TOUCH_TRUNCATE_COMPLETE = 1 << 6,
+	FASTTRUN_TOUCH_PLAN_INVALIDATE = 1 << 7
+} FasttrunTouchFlags;
+
+#define FASTTRUN_TOUCH_TRUNCATE_MASK \
+	(FASTTRUN_TOUCH_TRUNCATE_PREPARED | \
+	 FASTTRUN_TOUCH_TRUNCATE_MUTATED | \
+	 FASTTRUN_TOUCH_TRUNCATE_COMPLETE)
+
+typedef struct FasttrunXactRelEntry
+{
+	Oid			relid;			/* hash key */
+	Oid			root_relid;		/* owning heap */
+	uint32		flags;
+	uint64		truncate_generation;
+} FasttrunXactRelEntry;
+
+typedef struct FasttrunXactFrame
+{
+	SubTransactionId subid;
+	MemoryContext mcxt;
+	HTAB	   *entries;
+	struct FasttrunXactFrame *parent;
+} FasttrunXactFrame;
+
+static FasttrunXactFrame *fasttrun_xact_frame = NULL;
+static uint64 fasttrun_truncate_generation = 0;
+
+static FasttrunXactFrame *
+fasttrun_xact_frame_for_current(bool create)
+{
+	SubTransactionId subid = GetCurrentSubTransactionId();
+	FasttrunXactFrame *volatile new_frame = NULL;
+	MemoryContext volatile new_mcxt = NULL;
+	MemoryContext oldcxt;
 	HASHCTL		ctl;
-	ListCell   *lc;
 
-	memset(&ctl, 0, sizeof(ctl));
-	ctl.keysize = sizeof(Oid);
-	ctl.entrysize = sizeof(Oid);
-	ctl.hcxt = TopTransactionContext;
-	fasttrun_xact_touched_hash =
-		hash_create("fasttrun touched relids",
-					2 * FASTTRUN_TOUCHED_LIST_MAX,
-					&ctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	if (fasttrun_xact_frame != NULL && fasttrun_xact_frame->subid == subid)
+		return fasttrun_xact_frame;
+	if (!create)
+		return NULL;
 
-	foreach(lc, fasttrun_xact_touched_oids)
+	new_mcxt = AllocSetContextCreate(TopTransactionContext,
+									 "fasttrun xact frame",
+									 ALLOCSET_SMALL_SIZES);
+	oldcxt = MemoryContextSwitchTo((MemoryContext) new_mcxt);
+	PG_TRY();
 	{
-		Oid			oid = lfirst_oid(lc);
+		new_frame = (FasttrunXactFrame *) palloc0(sizeof(*new_frame));
+		new_frame->subid = subid;
+		new_frame->mcxt = (MemoryContext) new_mcxt;
+		new_frame->parent = fasttrun_xact_frame;
 
-		(void) hash_search(fasttrun_xact_touched_hash, &oid, HASH_ENTER, NULL);
+		memset(&ctl, 0, sizeof(ctl));
+		ctl.keysize = sizeof(Oid);
+		ctl.entrysize = sizeof(FasttrunXactRelEntry);
+		ctl.hcxt = (MemoryContext) new_mcxt;
+		new_frame->entries = hash_create("fasttrun xact frame relids", 16,
+										 &ctl,
+										 HASH_ELEM | HASH_BLOBS |
+										 HASH_CONTEXT);
+		MemoryContextSwitchTo(oldcxt);
 	}
+	PG_CATCH();
+	{
+		MemoryContextSwitchTo(oldcxt);
+		MemoryContextDelete((MemoryContext) new_mcxt);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	fasttrun_xact_frame = (FasttrunXactFrame *) new_frame;
+	return fasttrun_xact_frame;
 }
 
-static inline void
-fasttrun_xact_touch_relid(Oid relid)
+static FasttrunXactRelEntry *
+fasttrun_xact_mark_relid(Oid relid, Oid root_relid, uint32 flags)
 {
-	MemoryContext oldcxt;
+	FasttrunXactFrame *frame;
+	FasttrunXactRelEntry *entry;
+	bool		found;
 
 	if (!OidIsValid(relid))
-		return;
+		return NULL;
+	Assert((flags & FASTTRUN_TOUCH_TRUNCATE_MASK) == 0);
+	if (!OidIsValid(root_relid))
+		root_relid = relid;
 
-	if (fasttrun_xact_touched_hash == NULL)
+	frame = fasttrun_xact_frame_for_current(true);
+	entry = (FasttrunXactRelEntry *)
+		hash_search(frame->entries, &relid, HASH_ENTER, &found);
+	if (!found)
 	{
-		if (list_member_oid(fasttrun_xact_touched_oids, relid))
-			return;
-		if (list_length(fasttrun_xact_touched_oids) >= FASTTRUN_TOUCHED_LIST_MAX)
-			fasttrun_xact_touched_promote();
+		entry->root_relid = root_relid;
+		entry->flags = 0;
+		entry->truncate_generation = 0;
+	}
+	else if (OidIsValid(root_relid))
+		entry->root_relid = root_relid;
+	entry->flags |= flags;
+
+	/* A root entry makes abort-time plan invalidation allocation-free. */
+	if ((flags & FASTTRUN_TOUCH_PLAN_INVALIDATE) != 0 &&
+		root_relid != relid)
+	{
+		FasttrunXactRelEntry *root_entry;
+
+		root_entry = (FasttrunXactRelEntry *)
+			hash_search(frame->entries, &root_relid, HASH_ENTER, &found);
+		if (!found)
+		{
+			root_entry->root_relid = root_relid;
+			root_entry->flags = 0;
+			root_entry->truncate_generation = 0;
+		}
+		root_entry->flags |= FASTTRUN_TOUCH_PLAN_INVALIDATE;
 	}
 
-	if (fasttrun_xact_touched_hash != NULL)
-	{
-		bool		found;
-
-		(void) hash_search(fasttrun_xact_touched_hash, &relid, HASH_ENTER,
-						   &found);
-		if (found)
-			return;
-	}
-
-	oldcxt = MemoryContextSwitchTo(TopTransactionContext);
-	fasttrun_xact_touched_oids = lappend_oid(fasttrun_xact_touched_oids, relid);
-	MemoryContextSwitchTo(oldcxt);
+	return entry;
 }
 
-/*
- * Relids dropped in the current top xact, recorded by the OAT_DROP hook
- * together with the subxact id of the drop.  The commit callbacks consult
- * this list instead of probing the syscache: XACT_EVENT_COMMIT runs at
- * TRANS_COMMIT, where catalog access is forbidden (RelationIdGetRelation
- * asserts IsTransactionState()).  ROLLBACK TO SAVEPOINT prunes the notes
- * of the aborted subxact, so a rolled-back DROP keeps its cache entries.
- */
-typedef struct FasttrunDroppedRelid
+static int
+fasttrun_truncate_phase_rank(uint32 phase)
 {
-	Oid			relid;
-	SubTransactionId subid;
-} FasttrunDroppedRelid;
+	if (phase == FASTTRUN_TOUCH_TRUNCATE_COMPLETE)
+		return 3;
+	if (phase == FASTTRUN_TOUCH_TRUNCATE_MUTATED)
+		return 2;
+	Assert(phase == FASTTRUN_TOUCH_TRUNCATE_PREPARED);
+	return 1;
+}
 
-static List *fasttrun_xact_dropped_relids = NIL;
+static inline FasttrunXactRelEntry *
+fasttrun_xact_mark_truncate(Oid relid, Oid root_relid, uint64 generation,
+							uint32 phase)
+{
+	FasttrunXactRelEntry *entry;
+	uint32		old_phase;
+
+	Assert((phase & FASTTRUN_TOUCH_TRUNCATE_MASK) == phase);
+	Assert(phase != 0 && (phase & (phase - 1)) == 0);
+	entry = fasttrun_xact_mark_relid(relid, root_relid, 0);
+	old_phase = entry->flags & FASTTRUN_TOUCH_TRUNCATE_MASK;
+	if (generation > entry->truncate_generation ||
+		(generation == entry->truncate_generation &&
+		 (old_phase == 0 ||
+		  fasttrun_truncate_phase_rank(phase) >
+		  fasttrun_truncate_phase_rank(old_phase))))
+	{
+		entry->flags = (entry->flags & ~FASTTRUN_TOUCH_TRUNCATE_MASK) | phase;
+		entry->truncate_generation = generation;
+	}
+	return entry;
+}
+
+static void
+fasttrun_xact_merge_entry(FasttrunXactFrame *parent,
+						  FasttrunXactRelEntry *child)
+{
+	FasttrunXactRelEntry *dst;
+	uint32		child_phase = child->flags & FASTTRUN_TOUCH_TRUNCATE_MASK;
+	uint32		dst_phase;
+	bool		found;
+
+	dst = (FasttrunXactRelEntry *)
+		hash_search(parent->entries, &child->relid, HASH_ENTER, &found);
+	if (!found)
+	{
+		*dst = *child;
+		return;
+	}
+
+	dst->root_relid = child->root_relid;
+	dst->flags |= child->flags & ~FASTTRUN_TOUCH_TRUNCATE_MASK;
+	dst_phase = dst->flags & FASTTRUN_TOUCH_TRUNCATE_MASK;
+	if (child_phase != 0 &&
+		(child->truncate_generation > dst->truncate_generation ||
+		 (child->truncate_generation == dst->truncate_generation &&
+		  (dst_phase == 0 ||
+		   fasttrun_truncate_phase_rank(child_phase) >
+		   fasttrun_truncate_phase_rank(dst_phase)))))
+	{
+		dst->flags = (dst->flags & ~FASTTRUN_TOUCH_TRUNCATE_MASK) | child_phase;
+		dst->truncate_generation = child->truncate_generation;
+	}
+}
 
 static bool
-fasttrun_xact_relid_dropped(Oid relid)
+fasttrun_xact_entry_dropped(const FasttrunXactRelEntry *entry)
 {
-	ListCell   *lc;
-
-	foreach(lc, fasttrun_xact_dropped_relids)
-	{
-		FasttrunDroppedRelid *note = (FasttrunDroppedRelid *) lfirst(lc);
-
-		if (note->relid == relid)
-			return true;
-	}
-	return false;
-}
-
-static void
-fasttrun_xact_note_dropped(Oid relid)
-{
-	MemoryContext oldcxt;
-	FasttrunDroppedRelid *note;
-
-	if (fasttrun_xact_relid_dropped(relid))
-		return;
-
-	oldcxt = MemoryContextSwitchTo(TopTransactionContext);
-	note = (FasttrunDroppedRelid *) palloc(sizeof(*note));
-	note->relid = relid;
-	note->subid = GetCurrentSubTransactionId();
-	fasttrun_xact_dropped_relids = lappend(fasttrun_xact_dropped_relids, note);
-	MemoryContextSwitchTo(oldcxt);
-}
-
-/* Promote drop notes on RELEASE SAVEPOINT, prune them on ROLLBACK TO SAVEPOINT. */
-static void
-fasttrun_xact_dropped_subxact(SubXactEvent event, SubTransactionId mySubid,
-							  SubTransactionId parentSubid)
-{
-	ListCell   *lc;
-
-	foreach(lc, fasttrun_xact_dropped_relids)
-	{
-		FasttrunDroppedRelid *note = (FasttrunDroppedRelid *) lfirst(lc);
-
-		if (note->subid != mySubid)
-			continue;
-		if (event == SUBXACT_EVENT_COMMIT_SUB)
-			note->subid = parentSubid;
-		else
-		{
-			fasttrun_xact_dropped_relids =
-				foreach_delete_current(fasttrun_xact_dropped_relids, lc);
-			pfree(note);
-		}
-	}
-}
-
-static inline void
-fasttrun_xact_touched_clear(void)
-{
-	/* Lists and membership hash sit in TopTransactionContext -- about to
-	 * be reset, or already was.  Just drop the pointers. */
-	fasttrun_xact_touched_oids = NIL;
-	fasttrun_xact_touched_hash = NULL;
-	fasttrun_xact_dropped_relids = NIL;
+	return (entry->flags & FASTTRUN_TOUCH_DROPPED) != 0;
 }
 
 /* Forward decls for stats infrastructure (defined below) */
@@ -771,14 +815,16 @@ fasttrun_cache_reset(void)
 static pg_noinline void
 fasttrun_cache_commit_xact(void)
 {
-	ListCell   *lc;
+	HASH_SEQ_STATUS status;
+	FasttrunXactRelEntry *xentry;
 
-	if (fasttrun_analyze_cache == NULL || fasttrun_xact_touched_oids == NIL)
+	if (fasttrun_analyze_cache == NULL || fasttrun_xact_frame == NULL)
 		return;
 
-	foreach(lc, fasttrun_xact_touched_oids)
+	hash_seq_init(&status, fasttrun_xact_frame->entries);
+	while ((xentry = (FasttrunXactRelEntry *) hash_seq_search(&status)) != NULL)
 	{
-		Oid			relid = lfirst_oid(lc);
+		Oid			relid = xentry->relid;
 		FasttrunAnalyzeCacheEntry *entry;
 
 		entry = (FasttrunAnalyzeCacheEntry *) hash_search(fasttrun_analyze_cache,
@@ -794,7 +840,7 @@ fasttrun_cache_commit_xact(void)
 		 * records the relid.  No syscache probe here -- this callback
 		 * runs at TRANS_COMMIT, where catalog access is forbidden.
 		 */
-		if (fasttrun_xact_relid_dropped(relid))
+		if (fasttrun_xact_entry_dropped(xentry))
 		{
 			fasttrun_baseline_free_undo(entry);
 			fasttrun_relstats_free_undo(entry);
@@ -866,12 +912,8 @@ fasttrun_xact_callback(XactEvent event, void *arg)
 			return;
 	}
 
-	/*
-	 * Touched-relid list lives in TopTransactionContext.  The xact machinery
-	 * resets and destroys that context right after this callback returns.
-	 * Drop our pointer so a fresh xact starts with an empty list.
-	 */
-	fasttrun_xact_touched_clear();
+	/* Frame contexts are children of TopTransactionContext. */
+	fasttrun_xact_frame = NULL;
 }
 
 /* Lazily allocate the analyze HTAB and its dedicated mcxt. */
@@ -1022,7 +1064,8 @@ fasttrun_cache_store_relstats(Relation rel, BlockNumber pages, int64 tuples,
 	 * fasttrun_rebuild_one_index) without going through the top-level touch
 	 * in fasttrun_analyze or fasttruncate.
 	 */
-	fasttrun_xact_touch_relid(RelationGetRelid(rel));
+	fasttrun_xact_mark_relid(RelationGetRelid(rel), RelationGetRelid(rel),
+							FASTTRUN_TOUCH_ANALYZE);
 
 	return entry;
 }
@@ -1032,9 +1075,16 @@ static void
 fasttrun_cache_set_owning_heap(FasttrunAnalyzeCacheEntry *entry,
 							   Relation heaprel)
 {
+	uint32		flags = FASTTRUN_TOUCH_ANALYZE;
+
 	entry->heap_relid = RelationGetRelid(heaprel);
 	entry->heap_rlb.locator = heaprel->rd_locator;
 	entry->heap_rlb.backend = heaprel->rd_backend;
+	/* TOAST has no user plan of its own; its main heap already owns the plan. */
+	if (heaprel->rd_rel->relkind != RELKIND_TOASTVALUE)
+		flags |= FASTTRUN_TOUCH_PLAN_INVALIDATE;
+	fasttrun_xact_mark_relid(entry->relid, entry->heap_relid,
+							flags);
 }
 
 static void
@@ -2659,7 +2709,9 @@ fasttrun_stats_cache_store(Oid relid, AttrNumber attnum, HeapTuple statsTuple,
 
 	fasttrun_stats_cache_init();
 	/* Publish path for per-column stats -- xact-end callbacks must see this relid. */
-	fasttrun_xact_touch_relid(relid);
+	fasttrun_xact_mark_relid(relid, relid,
+							FASTTRUN_TOUCH_STATS |
+							FASTTRUN_TOUCH_PLAN_INVALIDATE);
 
 	fasttrun_stats_key_init(&key, relid, attnum, false);
 
@@ -2761,16 +2813,18 @@ fasttrun_stats_entry_free_undo(FasttrunStatsEntry *entry)
 static pg_noinline void
 fasttrun_stats_cache_commit_xact(void)
 {
-	ListCell   *lc;
+	HASH_SEQ_STATUS status;
+	FasttrunXactRelEntry *xentry;
 
 	if (fasttrun_stats_cache == NULL ||
 		fasttrun_stats_relid_cache == NULL ||
-		fasttrun_xact_touched_oids == NIL)
+		fasttrun_xact_frame == NULL)
 		return;
 
-	foreach(lc, fasttrun_xact_touched_oids)
+	hash_seq_init(&status, fasttrun_xact_frame->entries);
+	while ((xentry = (FasttrunXactRelEntry *) hash_seq_search(&status)) != NULL)
 	{
-		Oid			relid = lfirst_oid(lc);
+		Oid			relid = xentry->relid;
 		FasttrunStatsRelidEntry *relentry;
 		List	   *keys;
 		ListCell   *klc;
@@ -2802,7 +2856,7 @@ fasttrun_stats_cache_commit_xact(void)
 		 * probe: TRANS_COMMIT forbids catalog access.  Symmetric to the
 		 * analyze-cache commit path.
 		 */
-		if (fasttrun_xact_relid_dropped(relid))
+		if (fasttrun_xact_entry_dropped(xentry))
 		{
 			foreach(klc, keys)
 			{
@@ -3148,28 +3202,13 @@ fasttrun_stats_note_visibility(Oid relid, bool have_counters,
  *   the aborted subxact's stats.  COMMIT_SUB promotes the snapshot to
  *   the parent subxact.
  */
-/*
- * Invalidate a relid's backend-local plans at most once per subxact-callback
- * pass.  fasttruncate touches the heap plus every index as separate relids;
- * each index's empty-storage abort branch also invalidates the owning heap,
- * so without this the heap relid is walked once per index.  `seen` spans the
- * whole callback (all touched relids), not one relid.
- */
-static void
-fasttrun_subxact_invalidate_once(Oid relid, List **seen)
-{
-	if (!OidIsValid(relid) || list_member_oid(*seen, relid))
-		return;
-	*seen = lappend_oid(*seen, relid);
-	fasttrun_invalidate_local_plan_cache(relid);
-}
-
 static void
 fasttrun_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 						  SubTransactionId parentSubid, void *arg)
 {
-	ListCell   *lc;
-	List	   *inval_seen = NIL;
+	FasttrunXactFrame *frame;
+	HASH_SEQ_STATUS status;
+	FasttrunXactRelEntry *xentry;
 
 	if (event != SUBXACT_EVENT_ABORT_SUB && event != SUBXACT_EVENT_COMMIT_SUB)
 		return;
@@ -3181,24 +3220,26 @@ fasttrun_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 	 * iteration is its own subxact) and similar savepoint-heavy patterns
 	 * skip the whole walk entirely.
 	 */
-	if (fasttrun_xact_touched_oids == NIL)
+	frame = fasttrun_xact_frame;
+	if (frame == NULL || frame->subid != mySubid)
 		return;
 
-	/* Keep the drop notes in step with the savepoint outcome. */
-	fasttrun_xact_dropped_subxact(event, mySubid, parentSubid);
-
 	/*
-	 * Walk per touched relid, not per cache entry.  For each relid we hit
+	 * Walk only the ending frame, not every relid touched by sibling
+	 * subtransactions.  For each relid we hit
 	 * the stats cache through fasttrun_stats_relid_cache.attkeys (O(K) per
 	 * relid) and the analyze cache via a single hash_search by relid.
-	 * Savepoint-heavy PL/pgSQL with a small touched set used to scan the
-	 * whole cache here; now the work is O(touched * cached-cols).
+	 * Sibling subtransactions release their frame context when they abort.
 	 */
-	foreach(lc, fasttrun_xact_touched_oids)
+	hash_seq_init(&status, frame->entries);
+	while ((xentry = (FasttrunXactRelEntry *) hash_seq_search(&status)) != NULL)
 	{
-		Oid			relid = lfirst_oid(lc);
+		Oid			relid = xentry->relid;
 		FasttrunAnalyzeCacheEntry *aentry;
-		bool		plan_inval_needed = false;
+
+#ifdef USE_ASSERT_CHECKING
+		fasttrun_test_subxact_visited++;
+#endif
 
 		if (fasttrun_stats_cache != NULL && fasttrun_stats_relid_cache != NULL)
 		{
@@ -3255,7 +3296,6 @@ fasttrun_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 							sentry->collected_subid = popped->collected_subid;
 							sentry->undo = popped->older;
 							pfree(popped);	/* popped->statsTuple now owned by entry */
-							plan_inval_needed = true;
 						}
 						else
 						{
@@ -3268,7 +3308,6 @@ fasttrun_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 							(void) hash_search(fasttrun_stats_cache, &key,
 											   HASH_REMOVE, NULL);
 							fasttrun_stats_relid_drop_key(&key);
-							plan_inval_needed = true;
 						}
 					}
 					else	/* SUBXACT_EVENT_COMMIT_SUB */
@@ -3336,9 +3375,7 @@ fasttrun_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 						if (OidIsValid(plan_relid))
 							fasttrun_stats_cache_evict_relid(plan_relid);
 						aentry->last_inval_valid = false;
-						fasttrun_subxact_invalidate_once(aentry->relid, &inval_seen);
-						fasttrun_subxact_invalidate_once(plan_relid, &inval_seen);
-						continue;
+						goto finish_entry;
 					}
 
 					if (aentry->relstats_undo != NULL)
@@ -3368,7 +3405,6 @@ fasttrun_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 					}
 					/* Published state rolled back -- the drift anchor with it. */
 					aentry->last_inval_valid = false;
-					plan_inval_needed = true;
 				}
 				else
 				{
@@ -3468,21 +3504,63 @@ fasttrun_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 				else		/* SUBXACT_EVENT_COMMIT_SUB */
 					aentry->lazy_check_subid = parentSubid;
 			}
+
+			/* A cache row created wholly inside an aborted frame has no owner. */
+			if (event == SUBXACT_EVENT_ABORT_SUB &&
+				!aentry->has_relstats &&
+				!aentry->has_stats_baseline &&
+				aentry->relstats_undo == NULL &&
+				aentry->stats_baseline_undo == NULL)
+				(void) hash_search(fasttrun_analyze_cache, &relid,
+								   HASH_REMOVE, NULL);
 		}
 
-		/*
-		 * One local invalidation per relid.  The call is idempotent, and the
-		 * per-column undo/drop paths above only need the plan cache walked
-		 * once -- repeating it per attkey just re-scans every cached plan.
-		 * The empty-storage branch skips this via continue: it has already
-		 * invalidated its relids directly.  inval_seen dedups across the whole
-		 * pass so a heap shared by many indexes is walked once, not per index.
-		 */
-		if (plan_inval_needed)
-			fasttrun_subxact_invalidate_once(relid, &inval_seen);
+	finish_entry:
+		/* The owning-heap entry deduplicates abort-time plan invalidation. */
+		if (event == SUBXACT_EVENT_ABORT_SUB &&
+			(xentry->flags & FASTTRUN_TOUCH_PLAN_INVALIDATE) != 0 &&
+			xentry->relid == xentry->root_relid)
+			fasttrun_invalidate_local_plan_cache(xentry->root_relid);
 	}
 
-	list_free(inval_seen);
+	if (event == SUBXACT_EVENT_ABORT_SUB)
+	{
+		/*
+		 * Unique relids from aborted sibling frames must not leave enlarged
+		 * empty hash tables in a long-lived backend.  Live session state keeps
+		 * either cache nonempty, so deleting an empty cache loses no snapshot.
+		 */
+		if (fasttrun_analyze_cache != NULL &&
+			hash_get_num_entries(fasttrun_analyze_cache) == 0)
+			fasttrun_cache_reset();
+		if (fasttrun_stats_cache != NULL &&
+			fasttrun_stats_relid_cache != NULL &&
+			hash_get_num_entries(fasttrun_stats_cache) == 0 &&
+			hash_get_num_entries(fasttrun_stats_relid_cache) == 0)
+			fasttrun_stats_cache_reset();
+
+		fasttrun_xact_frame = frame->parent;
+		MemoryContextDelete(frame->mcxt);
+	}
+	else if (frame->parent == NULL || frame->parent->subid != parentSubid)
+	{
+		/*
+		 * Frames are lazy, so the immediate parent may have no frame while an
+		 * older ancestor does.  Keep this frame and retag it; merging into the
+		 * ancestor would make a later ROLLBACK TO the empty parent invisible.
+		 */
+		frame->subid = parentSubid;
+	}
+	else
+	{
+		FasttrunXactFrame *parent = frame->parent;
+
+		hash_seq_init(&status, frame->entries);
+		while ((xentry = (FasttrunXactRelEntry *) hash_seq_search(&status)) != NULL)
+			fasttrun_xact_merge_entry(parent, xentry);
+		fasttrun_xact_frame = parent;
+		MemoryContextDelete(frame->mcxt);
+	}
 }
 
 /* ----------------------------------------------------------------------
@@ -5018,6 +5096,7 @@ fasttruncate(PG_FUNCTION_ARGS)
 	RangeVar	   *relvar;
 	Oid				relOid;
 	Relation		rel;
+	uint64			truncate_generation;
 
 	relvar = fasttrun_make_rangevar(name);
 	relOid = RangeVarGetRelid(relvar, AccessExclusiveLock, true);
@@ -5050,7 +5129,15 @@ fasttruncate(PG_FUNCTION_ARGS)
 	CheckTableNotInUse(rel, "fasttruncate");
 
 	/* Register for per-xact bookkeeping -- callbacks walk this list only. */
-	fasttrun_xact_touch_relid(relOid);
+	fasttrun_xact_mark_relid(relOid, relOid,
+							FASTTRUN_TOUCH_ANALYZE |
+							FASTTRUN_TOUCH_STATS |
+							FASTTRUN_TOUCH_PLAN_INVALIDATE);
+	truncate_generation = ++fasttrun_truncate_generation;
+	if (truncate_generation == 0)
+		truncate_generation = ++fasttrun_truncate_generation;
+	fasttrun_xact_mark_truncate(relOid, relOid, truncate_generation,
+								FASTTRUN_TOUCH_TRUNCATE_PREPARED);
 
 	/*
 	 * Evict/invalidate before touching storage.  If index rebuild later
@@ -5072,6 +5159,8 @@ fasttruncate(PG_FUNCTION_ARGS)
 		rel->rd_rel->relhasindex ||
 		OidIsValid(rel->rd_rel->reltoastrelid))
 	{
+		fasttrun_xact_mark_truncate(relOid, relOid, truncate_generation,
+								FASTTRUN_TOUCH_TRUNCATE_MUTATED);
 		if (fasttrun_zero_sinval_truncate)
 			fasttrun_full_bypass_truncate(rel);
 		else
@@ -5093,6 +5182,8 @@ fasttruncate(PG_FUNCTION_ARGS)
 	rel->rd_rel->relpages = 0;
 	rel->rd_rel->reltuples = 0;
 	rel->rd_rel->relallvisible = 0;
+	fasttrun_xact_mark_truncate(relOid, relOid, truncate_generation,
+								FASTTRUN_TOUCH_TRUNCATE_COMPLETE);
 
 	/* Release the AccessExclusiveLock taken by RangeVarGetRelid. */
 	table_close(rel, AccessExclusiveLock);
@@ -5157,7 +5248,7 @@ fasttruncate(PG_FUNCTION_ARGS)
  *   - resolving the RangeVar to relOid + table_open(NoLock);
  *   - verifying relpersistence == RELPERSISTENCE_TEMP, isTempNamespace,
  *     heap-AM;
- *   - calling fasttrun_xact_touch_relid(relOid);
+ *   - recording relOid in the current transaction frame;
  *   - table_close(rel, AccessShareLock) afterwards.
  *
  * fasttrun_analyze_bulk() invokes this once per relation in its array.
@@ -5659,7 +5750,10 @@ fasttrun_analyze(PG_FUNCTION_ARGS)
 			 RelationGetRelationName(rel));
 	}
 
-	fasttrun_xact_touch_relid(relOid);
+	fasttrun_xact_mark_relid(relOid, relOid,
+							FASTTRUN_TOUCH_ANALYZE |
+							FASTTRUN_TOUCH_STATS |
+							FASTTRUN_TOUCH_PLAN_INVALIDATE);
 	fasttrun_analyze_relation(rel);
 	table_close(rel, AccessShareLock);
 
@@ -5737,7 +5831,10 @@ fasttrun_analyze_bulk(PG_FUNCTION_ARGS)
 				 RelationGetRelationName(rel));
 		}
 
-		fasttrun_xact_touch_relid(relOid);
+		fasttrun_xact_mark_relid(relOid, relOid,
+								FASTTRUN_TOUCH_ANALYZE |
+								FASTTRUN_TOUCH_STATS |
+								FASTTRUN_TOUCH_PLAN_INVALIDATE);
 		fasttrun_analyze_relation(rel);
 		table_close(rel, AccessShareLock);
 	}
@@ -5874,7 +5971,10 @@ fasttrun_collect_stats(PG_FUNCTION_ARGS)
 			 RelationGetRelationName(rel));
 
 	/* Register for per-xact bookkeeping -- callbacks walk this list only. */
-	fasttrun_xact_touch_relid(relOid);
+	fasttrun_xact_mark_relid(relOid, relOid,
+							FASTTRUN_TOUCH_ANALYZE |
+							FASTTRUN_TOUCH_STATS |
+							FASTTRUN_TOUCH_PLAN_INVALIDATE);
 
 	{
 		sample_target = fasttrun_effective_sample_target(rel);
@@ -6518,7 +6618,10 @@ fasttrun_evict_temp_relid(Oid relid)
 		return;
 	}
 
-	fasttrun_xact_touch_relid(relid);
+	fasttrun_xact_mark_relid(relid, relid,
+							FASTTRUN_TOUCH_ANALYZE |
+							FASTTRUN_TOUCH_STATS |
+							FASTTRUN_TOUCH_PLAN_INVALIDATE);
 
 	if (rel->rd_rel->relkind == RELKIND_RELATION ||
 		rel->rd_rel->relkind == RELKIND_TOASTVALUE)
@@ -6527,7 +6630,9 @@ fasttrun_evict_temp_relid(Oid relid)
 		ListCell   *lc;
 
 		foreach(lc, index_oids)
-			fasttrun_xact_touch_relid(lfirst_oid(lc));
+			fasttrun_xact_mark_relid(lfirst_oid(lc), relid,
+								FASTTRUN_TOUCH_ANALYZE |
+								FASTTRUN_TOUCH_PLAN_INVALIDATE);
 		list_free(index_oids);
 
 		fasttrun_cache_mark_rel_and_indexes_evicted(rel);
@@ -6695,8 +6800,7 @@ fasttrun_object_access_hook(ObjectAccessType access, Oid classId,
 		!fasttrun_stats_relid_exists(objectId))
 		return;
 
-	fasttrun_xact_touch_relid(objectId);
-	fasttrun_xact_note_dropped(objectId);
+	fasttrun_xact_mark_relid(objectId, objectId, FASTTRUN_TOUCH_DROPPED);
 }
 
 /* ProcessUtility hook: track CREATE TEMP TABLE and evict stats on temp-table DDL. */
@@ -7064,6 +7168,20 @@ fasttrun_reset_temp_stats(PG_FUNCTION_ARGS)
 
 	PG_RETURN_VOID();
 }
+
+#ifdef USE_ASSERT_CHECKING
+/* Test function available only in cassert builds. */
+Datum
+fasttrun_test_subxact_visits(PG_FUNCTION_ARGS)
+{
+	bool		reset = PG_GETARG_BOOL(0);
+	uint64		prior = fasttrun_test_subxact_visited;
+
+	if (reset)
+		fasttrun_test_subxact_visited = 0;
+	PG_RETURN_INT64((int64) prior);
+}
+#endif
 
 /* Define GUCs and install the always-on utility hook. */
 void
