@@ -53,15 +53,20 @@ REGRESS = fasttrun_basic \
           fasttrun_zero_sinval_catalog
 
 PG_CONFIG ?= pg_config
+
+# Документация сверяется только с метаданными репозитория: эта цель должна
+# работать и без установленного PostgreSQL development toolchain.
+ifneq ($(MAKECMDGOALS),check-docs)
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
+endif
 
 .PHONY: check-parity check-soak check-perf-smoke check-hook-chain \
         check-zero-sinval check-commit-inval-overhead \
         check-bulk-overhead check-on-commit-drop-leak \
         check-commit-duration check-replace-catalog check-giant-temp \
         check-xact-journal-memory check-cache-init-faults check-fault-matrix \
-        check-tracking-order check-no-temp-impact check-deep-local
+        check-tracking-order check-no-temp-impact check-docs check-deep-local
 
 check-parity:
 	PG_CONFIG="$(PG_CONFIG)" scripts/check_fasttrun_analyze_parity.py --profile full
@@ -112,9 +117,12 @@ check-tracking-order:
 check-no-temp-impact:
 	PG_CONFIG="$(PG_CONFIG)" scripts/check_fasttrun_no_temp_impact.sh
 
+check-docs:
+	python3 scripts/check_docs_consistency.py
+
 check-deep-local: installcheck check-parity check-soak check-perf-smoke \
                   check-hook-chain check-zero-sinval \
                   check-commit-inval-overhead check-bulk-overhead \
                   check-on-commit-drop-leak check-commit-duration \
                   check-replace-catalog check-giant-temp \
-                  check-no-temp-impact
+                  check-no-temp-impact check-docs

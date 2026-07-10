@@ -2,7 +2,7 @@
 
 > English version is available: [README_EN.md](README_EN.md)
 
-Расширение для PostgreSQL 16 / 17 / 18.
+Расширение для PostgreSQL 16, PostgreSQL 17 и PostgreSQL 18.
 
 Быстрый `TRUNCATE` и `ANALYZE` для временных таблиц — **без единого сообщения инвалидации** в общую очередь (sinval).
 
@@ -30,10 +30,17 @@
 | `fasttrun_prewarm()` | Создаёт top-N горячих temp tables через `create_temp_table` | **нет** |
 | `fasttrun_reset_temp_stats()` | Сбрасывает счётчики создания temp tables | **нет** |
 
+Публичный API расширения содержит 9 SQL-функций.
+
 Функции, которые принимают имя временной таблицы:
-* принимают имя временной таблицы (можно с указанием схемы);
+* принимают имя локальной временной heap-таблицы (можно с указанием схемы);
 * молча возвращают пустой результат, если таблицы нет;
 * выдают ошибку, если таблица не временная.
+
+Поддерживаются только локальные временные heap-таблицы. Секционированная
+таблица или родитель наследования вернут ошибку. Внешние ключи не проверяются,
+`TRUNCATE ... CASCADE` не поддерживается, последовательности SERIAL/IDENTITY
+не сбрасываются.
 
 ## Как работает fasttruncate
 
@@ -41,7 +48,10 @@
 
 Безопасно потому, что временные таблицы живут в локальном буферном пуле бэкенда. Другие процессы не видят наш relfilenode, и инвалидация им бесполезна.
 
-При этом `fasttruncate` локально сбрасывает кэш планов текущего бэкенда. Это нужно, чтобы PL/pgSQL / SPI не переиспользовал старый план после очистки и повторного наполнения таблицы. В общую очередь sinval этот шаг ничего не пишет.
+При этом `fasttruncate` сбрасывает планы этой таблицы только в текущем
+серверном процессе. Это нужно, чтобы PL/pgSQL и SPI не использовали старый
+план после очистки и повторного наполнения таблицы. Глобальный
+`ResetPlanCache` не вызывается, общие сообщения инвалидации не отправляются.
 
 Помимо самой таблицы, `fasttruncate` обрабатывает:
 * **все пользовательские индексы, TOAST-таблицу и её индексы** — перед
@@ -63,10 +73,16 @@ fasttrun блокирует таблицу и возвращает `SQLSTATE 550
 
 Перед очисткой вызывается `CheckTableNotInUse` — та же проверка, что делает обычный SQL `TRUNCATE`. Если на таблице висит открытый курсор или активный запрос, будет понятная SQL-ошибка, а не PANIC.
 
+Ошибка внутри `RelationTruncate` обрабатывается самим PostgreSQL и приводит к
+`PANIC`. Расширение не может безопасно перехватить её и продолжить работу
+текущего серверного процесса.
+
 Запасной путь включается через `SET fasttrun.zero_sinval_truncate = off`.
 Он очищает отношения в том же порядке, но отдельно вызывает
 `RelationTruncate` для каждого из них. Каждый завершённый вызов отправляет одно
-общее SMGR-сообщение. Основной путь таких сообщений не отправляет.
+общее SMGR-сообщение: для основной таблицы, каждого пользовательского индекса,
+TOAST-таблицы и каждого её индекса. Основной путь общих сообщений не
+отправляет.
 
 ## Как работает fasttrun_analyze
 
@@ -100,6 +116,19 @@ Partial-индексы: их `reltuples` пересэмплируется при
 
 `relpages/reltuples/relallvisible` и статистика колонок живут в памяти backend'а и переживают `COMMIT`; xact-local delta-состояние очищается на границе транзакции. После DML ниже порога `stats_refresh_threshold` cached column stats остаются видимыми планировщику (soft freshness, как ядро PG между ANALYZE); выше порога — скрываются до пересбора.
 
+Если локальная статистика устарела или была сброшена, fasttrun не даёт
+планировщику использовать старые данные из `pg_statistic`. Для средней ширины
+колонки берётся безопасное значение по её типу. При `track_counts=off`
+расширение не может проверить свежесть, поэтому публикует только общую
+статистику таблицы, а статистику колонок скрывает. После включения счётчиков
+нужно снова вызвать `fasttrun_analyze` или `fasttrun_collect_stats`.
+
+Обычный `ANALYZE` возвращает статистику ядру PostgreSQL. Вызов без списка
+колонок удаляет локальную статистику для всей таблицы, а
+`ANALYZE table (col1, ...)` — только для перечисленных колонок. `VACUUM` без
+`ANALYZE` ничего не меняет. Команды, которые переписывают таблицу, скрывают
+локальную статистику до следующего сбора.
+
 Отдельный backstop для commit-границы: pgstat-счётчики temp-таблицы обнуляются на каждой транзакции (в shared pgstat temp не флашится), поэтому обычный SQL-refill temp-таблицы в отдельной транзакции без вызова `fasttrun_analyze` не виден счётчикам свежести. Чтобы такой refill не отдавал планировщику устаревшие MCV/n_distinct, freshness дополнительно якорится на физический размер: если число блоков изменилось на порядок (>=3x или <=1/3) с момента сбора статистики, cached column stats скрываются. Сигнал грубый (bloat-контаминирован), поэтому ловит только явный refill; refill той же величины с иным распределением, закоммиченный без `fasttrun_analyze`, остаётся неучтённым — вызывайте `fasttrun_analyze` после перезаполнения, как и задумано.
 
 ## Настройки (GUC)
@@ -116,7 +145,7 @@ Partial-индексы: их `reltuples` пересэмплируется при
 
 ## Производительность
 
-PostgreSQL 16.13, macOS arm64, один бэкенд:
+PostgreSQL 16, macOS arm64, один бэкенд:
 
 ```
 Сценарий                                         Время
@@ -177,14 +206,14 @@ make installcheck PG_CONFIG=/path/to/pg_config PGPORT=5433
 | `fasttrun_stats_reset` | Сброс `relpages/reltuples` после fasttruncate |
 | `fasttrun_analyze` | Дельта-математика, откат к savepoint, TRUNCATE внутри транзакции |
 | `fasttrun_migration` | Путь обновления 2.0 -> latest, включая обратную совместимость с `fasttruncate_c` |
-| `fasttrun_bench` | Синтетический бенчмарк на 1M строк × 50 колонок |
+| `fasttrun_bench` | Синтетический бенчмарк на 1M строк x 50 колонок |
 | `fasttrun_stats` | Хук статистики: EXPLAIN до/после, автосбор, sample_rows=0/-1, refresh threshold, DDL/TRUNCATE eviction, partial-index relstats |
 | `fasttrun_tracking` | Трекинг часто создаваемых temp tables и prewarm; есть expected для режима с `shared_preload_libraries` и без него |
 | `fasttrun_relstats_survive` | Сохранение relstats через relcache rebuild и `COMMIT` в рамках backend'а, включая таблицы, видимые только из SubLink-подзапросов |
 | `fasttrun_plan_cache_survive` | Локальный сброс кэша планов SPI/PL/pgSQL после fasttruncate, analyze, collect_stats и savepoint rollback |
 | `fasttrun_stats_width` | Корректный `stawidth` для by-value / varlena / fixed-length by-reference колонок |
 | `fasttrun_discard` | Эвикция кэшей при `DISCARD TEMP/ALL` и dependency-удалениях (`DROP ... CASCADE`), откат drop'а в savepoint |
-| `fasttrun_zero_sinval_catalog` | Канарейка на «ноль shared sinval»: fasttruncate/analyze/bulk/collect не пишут каталог (relfilenode таблицы и индексов неизменны, `pg_class`/`pg_statistic` не тронуты); позитивный контроль — ядерные TRUNCATE/ANALYZE каталог меняют |
+| `fasttrun_zero_sinval_catalog` | Проверяет, что функции расширения не меняют `pg_class`, `pg_statistic` и relfilenode; обычные `TRUNCATE` и `ANALYZE` подтверждают работу проверки |
 
 Все 13 наборов `pg_regress` проходят на PostgreSQL 16, 17 и 18.
 
@@ -199,9 +228,14 @@ make installcheck PG_CONFIG=/path/to/pg_config PGPORT=5433
 PG_CONFIG=/path/to/pg_config scripts/check_zero_shared_sinval.sh
 ```
 
-Он цепляется к backend'у и считает вызовы `SIInsertDataEntries` / `SendSharedInvalidMessages`: обычный `ANALYZE` должен дать positive control, а `fasttrun_analyze`, `fasttrun_collect_stats` и `fasttruncate` — ноль shared hits. На Ubuntu может понадобиться временно разрешить attach: `sudo sysctl -w kernel.yama.ptrace_scope=0`.
+Скрипт подключается к серверному процессу и считает вызовы
+`SIInsertDataEntries` и `SendSharedInvalidMessages`. Обычный `ANALYZE`
+проверяет, что подсчёт работает, а `fasttrun_analyze`,
+`fasttrun_collect_stats` и `fasttruncate` не должны отправлять общих
+сообщений. На Ubuntu может понадобиться временно разрешить подключение:
+`sudo sysctl -w kernel.yama.ptrace_scope=0`.
 
-После `make install` для более глубоких локальных проверок есть отдельные Linux-friendly harness scripts:
+После `make install` доступны дополнительные скрипты для Linux:
 
 ```bash
 make check-parity PG_CONFIG=/path/to/pg_config
@@ -209,26 +243,39 @@ make check-soak PG_CONFIG=/path/to/pg_config
 make check-perf-smoke PG_CONFIG=/path/to/pg_config
 make check-hook-chain PG_CONFIG=/path/to/pg_config
 make check-zero-sinval PG_CONFIG=/path/to/pg_config
+make check-fault-matrix PG_CONFIG=/path/to/pg_config
+make check-xact-journal-memory PG_CONFIG=/path/to/pg_config
+make check-no-temp-impact PG_CONFIG=/path/to/pg_config
+make check-docs
 ```
 
 `check-parity` запускает `scripts/check_fasttrun_analyze_parity.py` в двух режимах:
 
 | Режим | Настройки | Что доказывает |
 |---|---|---|
-| `full` | `fasttrun.sample_rows = -1`, `fasttrun.stats_refresh_threshold = 0` | Максимально близкое ANALYZE-like качество планов |
-| `default` | обычные дефолты fasttrun | Нет catastrophic/default estimates на поддержанных сценариях; column stats терпят churn ниже порога (soft freshness) |
+| `full` | `fasttrun.sample_rows = -1`, `fasttrun.stats_refresh_threshold = 0` | Планы, наиболее близкие к результату обычного `ANALYZE` |
+| `default` | настройки fasttrun по умолчанию | Допустимые оценки на поддерживаемых сценариях |
 
-Parity harness сравнивает `EXPLAIN (FORMAT JSON)` после обычного `ANALYZE` и после `fasttrun_analyze`. Это не byte-for-byte сравнение планов: выборка может отличаться, поэтому проверяются bounded estimates по `Plan Rows`.
+Скрипт сравнивает `EXPLAIN (FORMAT JSON)` после обычного `ANALYZE` и после
+`fasttrun_analyze`. Полного совпадения не требуется, потому что случайные
+выборки могут различаться. Проверяется, что оценка `Plan Rows` остаётся в
+допустимых пределах.
 
-Остальные checks:
+Остальные проверки:
 
 | Проверка | Что делает |
 |---|---|
-| `check-soak` | Один долгоживущий backend гоняет цикл `CREATE TEMP -> fasttrun_analyze -> DROP -> COMMIT` и проверяет `pg_backend_memory_contexts` |
-| `check-perf-smoke` | Через `bpftrace` проверяет lazy hooks, дешёвый miss-path для обычных таблиц, temp stats hit и no-DML hot path |
-| `check-hook-chain` | Поднимает best-effort prod-like preload cluster, грузит доступные расширения и проверяет, что fasttrun stats доходят до планировщика |
-| `check-zero-sinval` | Проверяет через `gdb`, что fasttrun операции не отправляют shared sinval |
-| `check-replace-catalog` | Фикстурная проверка `scripts/replace_analyze_in_catalog.sql`: замена только в statement-позиции, литералы `EXECUTE '...'` и комментарии не трогаются, функции остаются исполнимыми (кроссплатформенный, без sudo) |
+| `check-soak` | Один серверный процесс многократно создаёт, анализирует и удаляет временную таблицу; затем проверяется память |
+| `check-perf-smoke` | Проверяет подключение `bpftrace`, основной путь fasttrun и запросы к обычным таблицам |
+| `check-hook-chain` | Проверяет оба порядка вызова хуков встроенным тестовым модулем; установленное стороннее расширение используется при наличии |
+| `check-zero-sinval` | Через `gdb` проверяет отсутствие общих сообщений инвалидации |
+| `check-fault-matrix` | Имитирует ошибки на каждом шаге очистки файлов и проверяет восстановление |
+| `check-xact-journal-memory` | Проверяет журналы транзакций и подтранзакций, состояние очистки и память |
+| `check-no-temp-impact` | Сравнивает планы, результаты, повторное планирование, память и время планирования запросов к обычным таблицам |
+| `check-giant-temp` | Проверяет таблицу размером 1M x 50 и ограничение выборки по блокам |
+| `check-cassert_allversions.sh` | Запускает все проверки на PostgreSQL 16, 17 и 18 со включёнными проверочными утверждениями |
+| `check-docs` | Сверяет документацию с метаданными проекта |
+| `check-replace-catalog` | Проверяет, что скрипт замены не меняет строки и комментарии SQL |
 
 Полный локальный набор можно запустить одной целью:
 
@@ -311,7 +358,12 @@ SELECT fasttrun_prewarm();
 SELECT fasttrun_reset_temp_stats();
 ```
 
-`fasttrun_prewarm()` берёт top-N из собранной статистики (N задаётся через `fasttrun.prewarm_count`, по умолчанию 1000) и для каждой таблицы вызывает `create_temp_table()`. Если таблица уже есть — просто очищает через `fasttruncate`. Перед вызовом prewarm проверяет, что для таблицы существует чучело в схеме `fasttrun.prewarm_schema` — если чучела нет, таблица пропускается без ошибки.
+`fasttrun_prewarm()` выбирает N самых часто создаваемых таблиц; N задаётся
+через `fasttrun.prewarm_count` и по умолчанию равно 1000. Значение `0`
+полностью отключает прогрев. Для каждой выбранной таблицы вызывается
+`create_temp_table()`, а уже существующая таблица очищается через
+`fasttruncate`. Если в схеме `fasttrun.prewarm_schema` нет шаблона, таблица
+пропускается без ошибки.
 
 **Что попадает в статистику**: только таблицы, созданные через `CREATE TEMP TABLE ... (LIKE dummy_tmp.xxx ...)`. Если разработчик создаёт temp table напрямую (`CREATE TEMP TABLE foo (id int, ...)`), без LIKE из схемы чучел — она в статистику не попадает и не мешает прогреву.
 
@@ -322,13 +374,16 @@ SELECT fasttrun_reset_temp_stats();
 | Параметр | По умолчанию | Описание |
 |---|---|---|
 | `fasttrun.track_temp_creates` | `on` | Считать CREATE TEMP TABLE. Можно отключить через SET для отладки |
-| `fasttrun.prewarm_count` | `1000` | Сколько горячих таблиц создавать в `fasttrun_prewarm()` |
+| `fasttrun.prewarm_count` | `1000` | Сколько горячих таблиц создавать в `fasttrun_prewarm()`; `0` полностью отключает прогрев |
 | `fasttrun.prewarm_schema` | `dummy_tmp` | Схема с таблицами-шаблонами. Трекаются только CREATE с LIKE из этой схемы |
 | `fasttrun.track_schedule` | `'mon-fri 08:00-18:00'` | Расписание сбора статистики. Пусто — всегда. Формат см. ниже |
 
 ### Расписание сбора статистики
 
-По умолчанию fasttrun собирает статистику круглосуточно. Но в типичном проде ночью идут джобы, которые создают свои временные таблицы — они попадают в статистику и портят её. В результате `fasttrun_prewarm()` создаёт не те таблицы, что нужны для дневной работы пользователей.
+По умолчанию fasttrun собирает статистику по рабочим дням с 08:00 до 18:00
+(`mon-fri 08:00-18:00`). Пустая строка включает круглосуточный режим. Такое
+расписание не позволяет ночным заданиям вытеснять из списка таблицы дневной
+нагрузки.
 
 GUC `fasttrun.track_schedule` позволяет настроить "окно" когда трекинг активен:
 
@@ -342,7 +397,7 @@ fasttrun.track_schedule = 'mon-fri 08:00-18:00; sat 10:00-14:00'
 # Только определённые дни
 fasttrun.track_schedule = 'mon,wed,fri 09:00-17:00'
 
-# Пусто — трекать всегда (по умолчанию)
+# Пусто — трекать всегда
 fasttrun.track_schedule = ''
 ```
 
@@ -378,24 +433,24 @@ fasttrun.track_schedule = ''
 * **Полный `ROLLBACK` не возвращает очищенные данные** — после успешного `fasttruncate` таблица и её статистика остаются пустыми. После ошибки блокировка сохраняется до восстановления или удаления таблицы.
 * **Статистика expression indexes** — не собирается. Обычные btree-индексы по колонкам работают через статистику самих колонок, но для индексов вида `CREATE INDEX ON t ((lower(name)))` отдельной статистики выражения пока нет.
 * **ACL/RLS/security-barrier семантика ANALYZE не повторяется** — расширение предназначено для временных таблиц текущей сессии, а не для использования как общий security boundary.
-* **Cached plans инвалидируются только локально** — `fasttruncate`, `fasttrun_analyze`, `fasttrun_collect_stats`, DDL/TRUNCATE eviction и savepoint rollback сбрасывают plan cache текущего backend'а, но не рассылают shared sinval другим backend'ам. Смерть temp-таблиц мимо per-table DDL тоже отслеживается: `DISCARD TEMP/ALL` сбрасывает кэши целиком, а dependency-удаления (`DROP ... CASCADE`, `DROP OWNED BY`) добираются через `object_access_hook` — записи умерших relid'ов не копятся в долгоживущих pooled-сессиях.
+* **Планы сбрасываются только в текущем серверном процессе** — для каждой таблицы вызывается `PlanCacheRelCallback`. Глобальный `ResetPlanCache` и общие сообщения инвалидации не используются. `DISCARD TEMP/ALL` и зависимые удаления убирают записи уже удалённых таблиц.
 * **`TRUNCATE` с зависимостями не поддерживается** — расширение обрабатывает только явно перечисленные таблицы. Для наследования, секционирования и внешних ключей с `CASCADE` используйте обычный `TRUNCATE` PostgreSQL.
-* **Стоимость холодного прохода со сбором статистики** — ~50-150 мс на таблицу 1M строк × 50 колонок. Можно отключить через GUC.
+* **Стоимость холодного прохода со сбором статистики** — ~50-150 мс на таблицу 1M строк x 50 колонок. Можно отключить через GUC.
 
 ## Совместимость
 
 | PostgreSQL | Сборка | Тесты |
 |---|---|---|
-| 16.x | ✅ | ✅ |
-| 17.x | ✅ | ✅ |
-| 18.x | ✅ | ✅ |
+| PostgreSQL 16 | да | да |
+| PostgreSQL 17 | да | да |
+| PostgreSQL 18 | да | да |
 
 Один и тот же исходник, версионные различия обработаны через `#if PG_VERSION_NUM`.
 
 ## Файловая структура
 
 ```
-fasttrun.c                    # основной C-код (~5100 строк)
+fasttrun.c                    # основной C-код
 fasttrun.control              # метаданные расширения
 fasttrun--2.3.0.sql           # старая версия
 fasttrun--2.3.1.sql           # предыдущая версия
@@ -415,6 +470,6 @@ fasttrun--2.3.2--2.3.3.sql    # миграция 2.3.2 -> 2.3.3 (только C-
 fasttrun--2.3.3--2.3.4.sql    # миграция 2.3.3 -> 2.3.4 (только C-фиксы, без изменений SQL)
 Makefile                      # PGXS
 examples/                     # примеры (create_temp_table)
-sql/                          # тесты (12 файлов)
+sql/                          # 13 наборов pg_regress
 expected/                     # ожидаемый вывод
 ```

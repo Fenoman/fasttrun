@@ -1,16 +1,18 @@
-select fasttruncate('TABLE_NAME');
+fasttrun
+========
 
-Function truncates the temporary table and doesn't grow
-pg_class size.
+Актуальный полный контракт описан в README.md и README_EN.md.
 
-Warning: function isn't transaction safe!
+SELECT fasttruncate('TABLE_NAME');
 
-For tests:
-create or replace function f() returns void as $$
-begin
-for i in 1..1000
-loop
-         PERFORM fasttruncate('tt1');
-end loop;
-end;
-$$ language plpgsql;
+Функция очищает только локальную временную heap-таблицу вместе с её
+индексами и TOAST, не раздувая pg_class. Она намеренно нетранзакционна:
+ROLLBACK не восстанавливает уже очищенные файлы.
+
+Если ошибка возникает после начала очистки файлов, fasttrun блокирует таблицу.
+Повторите `fasttruncate`, удалите и создайте таблицу заново либо выполните
+`DISCARD TEMP/ALL`. До этого SELECT, DML, COPY и планирование вернут ошибку.
+
+Основной способ очистки не отправляет общих сообщений инвалидации. Запасной
+способ вызывает `RelationTruncate` и отправляет одно общее SMGR-сообщение для
+каждого отношения.
