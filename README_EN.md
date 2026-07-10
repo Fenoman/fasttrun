@@ -156,6 +156,8 @@ planner hooks (caches active)                  ~+0.26 us per planning
 
 Under load the gap is even wider — regular `ANALYZE` forces all other backends to drain the sinval queue, while `fasttrun_analyze` puts nothing into it.
 
+Queries without temporary tables are not affected: the observable impact is zero — identical plans and results, zero replans, zero memory growth (pinned by the `check-no-temp-impact` check). The `planner_hook` entry itself does run on every planning cycle and costs a fraction of a microsecond with a live cache — the "planner hooks" row in the table above.
+
 ## Production impact
 
 One of our production clusters (64 CPU, 75+ backends, thousands of `CREATE TEMP TABLE` per day) before the fasttrun rework:
@@ -308,6 +310,8 @@ PERFORM fasttruncate('temp_xxx');
 
 In a typical PL/pgSQL calculation, one backend works with 10-30 temporary tables, each going through this cycle many times. With a pooler (pg_doorman, odyssey) the backend lives long and serves hundreds of clients in a row — temporary tables accumulate and get reused. `fasttruncate` resets data and statistics so the next client doesn't inherit anything from the previous one.
 
+Statistics cache memory: the column-stats cache is a per-backend copy of `pg_statistic` rows. A column with collected statistics (MCV + histogram at `default_statistics_target = 100`) takes roughly 1-3 KB; estimate the footprint as tables × columns × ~2 KB. With a "hundreds of temp tables per backend behind a pooler" profile this adds up to tens of MB per server connection — account for it when sizing the pool's RAM. Periodic pooler connection recycling bounds the growth.
+
 ## Hot table prewarming
 
 When working with a pooler, a backend serves hundreds of clients. Each client can use dozens of temporary tables. If you have thousands of templates in the database, creating all of them on backend startup is slow and generates sinval. Instead, fasttrun can track which temp tables are created most often and prewarm only the hottest ones.
@@ -418,13 +422,14 @@ Statistics are saved to disk (`pg_stat/fasttrun_temp_stats`) on server shutdown 
 * **Heap AM only** — checked on entry of all functions. For columnar and other exotica — an error.
 * **Flat temporary heap tables only** — partitioned tables and inheritance parents are rejected before files are changed. Foreign keys are not checked and `TRUNCATE ... CASCADE` is not supported.
 * **Not transactional** — ROLLBACK does not restore files that were already cleared. If cleanup fails midway, the table remains blocked until another `fasttruncate` or DROP.
+* **After `fasttruncate` the table publishes `reltuples = 0`** — core `TRUNCATE` sets the `-1` sentinel, which for a small not-yet-analyzed table enables the 10-page minimum size estimate (a guard against premature nested loops). So always call `fasttrun_analyze` after a refill: refilling a small table without analyze yields more aggressive estimates than core PostgreSQL.
 * **`track_counts = on` is required for column stats freshness** — without pgstat counters the extension updates only relation-level statistics, emits a WARNING once per backend, and does not return cached column stats to the planner.
 * **Extended statistics** (`CREATE STATISTICS`) — not supported, there is no suitable hook in the core.
 * **Inheritance stats** — not supported. Temporary work tables normally do not use this path.
 * **Sequences** — `fasttruncate` does not reset SERIAL/IDENTITY sequences (same as regular `TRUNCATE` without `RESTART IDENTITY`).
 * **Cache is session-local only** — reused across transactions in one backend, but not across reconnects and never written to catalogs.
 * **A full `ROLLBACK` does not restore cleared data** — after a successful `fasttruncate`, the table and its statistics stay empty. After an error, the block remains until repair or DROP.
-* **Expression index statistics** — not collected. Regular btree indexes on table columns use the column statistics, but indexes like `CREATE INDEX ON t ((lower(name)))` do not yet get separate expression statistics.
+* **Expression index statistics** — not collected by `fasttrun_analyze`. Regular btree indexes on table columns use the column statistics, but indexes like `CREATE INDEX ON t ((lower(name)))` get no separate expression statistics. If a core `ANALYZE` ever ran on such a table, its expression statistics stay in `pg_statistic`: fasttrun neither updates nor hides them, so the planner may read stale expression estimates over the new data.
 * **ACL/RLS/security-barrier semantics of ANALYZE are not reproduced** — the extension is meant for temporary tables in the current session, not as a general security boundary.
 * **Plans are invalidated only in the current server process** — `PlanCacheRelCallback` is called for each table. Global `ResetPlanCache` and shared invalidation messages are not used. `DISCARD TEMP/ALL` and dependency drops remove entries for deleted tables.
 * **`TRUNCATE` with dependencies is not supported** — the extension handles only explicitly listed tables. Use regular PostgreSQL `TRUNCATE` for inheritance, partitioning, and foreign keys with `CASCADE`.
