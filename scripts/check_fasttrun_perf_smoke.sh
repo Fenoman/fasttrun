@@ -10,6 +10,7 @@ PG_CTL=${PG_CTL:-"$PG_BINDIR/pg_ctl"}
 CREATEDB=${CREATEDB:-"$PG_BINDIR/createdb"}
 BPFTRACE=${BPFTRACE:-bpftrace}
 SUDO=${SUDO:-sudo}
+PG_RUN_AS=${PG_RUN_AS:-}
 PORT=${PGPORT:-55436}
 WORKDIR=${WORKDIR:-$(mktemp -d /tmp/fasttrun-perf.XXXXXX)}
 DBNAME=${DBNAME:-fasttrun_perf}
@@ -20,6 +21,15 @@ FASTTRUN_SO=${FASTTRUN_SO:-"$PG_PKGLIBDIR/fasttrun.so"}
 # не флапает на медленных боксах); жёсткая планка живёт здесь.
 MAX_TRUNC_MS=${MAX_TRUNC_MS:-100}
 
+run_pg()
+{
+	if [ -n "$PG_RUN_AS" ]; then
+		runuser -u "$PG_RUN_AS" -- "$@"
+	else
+		"$@"
+	fi
+}
+
 cleanup()
 {
 	if [ -n "${TRACE_PID:-}" ]; then
@@ -27,7 +37,7 @@ cleanup()
 		wait "$TRACE_PID" >/dev/null 2>&1 || true
 	fi
 	if [ -f "$WORKDIR/data/postmaster.pid" ]; then
-		"$PG_CTL" -D "$WORKDIR/data" -w stop >/dev/null 2>&1 || true
+		run_pg "$PG_CTL" -D "$WORKDIR/data" -w stop >/dev/null 2>&1 || true
 	fi
 	rm -rf "$WORKDIR"
 }
@@ -46,18 +56,24 @@ require_cmd "$INITDB"
 require_cmd "$PG_CTL"
 require_cmd "$CREATEDB"
 require_cmd "$BPFTRACE"
+if [ -n "$PG_RUN_AS" ]; then
+	require_cmd runuser
+fi
 
 if [ ! -f "$FASTTRUN_SO" ]; then
 	echo "missing fasttrun shared library: $FASTTRUN_SO" >&2
 	exit 1
 fi
 
-"$INITDB" -D "$WORKDIR/data" --no-locale -E UTF8 >/dev/null
-"$PG_CTL" -D "$WORKDIR/data" \
-	-o "-k $WORKDIR -p $PORT -c shared_preload_libraries=fasttrun" \
+if [ -n "$PG_RUN_AS" ]; then
+	chown "$PG_RUN_AS" "$WORKDIR"
+fi
+run_pg "$INITDB" -D "$WORKDIR/data" --no-locale -E UTF8 >/dev/null
+run_pg "$PG_CTL" -D "$WORKDIR/data" \
+	-o "-k $WORKDIR -p $PORT -c listen_addresses='' -c shared_preload_libraries=fasttrun" \
 	-l "$WORKDIR/postgres.log" -w start >/dev/null
-"$CREATEDB" -h "$WORKDIR" -p "$PORT" "$DBNAME"
-"$PSQL" -h "$WORKDIR" -p "$PORT" -d "$DBNAME" -X -qAt \
+run_pg "$CREATEDB" -h "$WORKDIR" -p "$PORT" "$DBNAME"
+run_pg "$PSQL" -h "$WORKDIR" -p "$PORT" -d "$DBNAME" -X -qAt \
 	-v ON_ERROR_STOP=1 -c "CREATE EXTENSION fasttrun" >/dev/null
 
 run_trace()
@@ -65,18 +81,55 @@ run_trace()
 	local name=$1
 	local program=$2
 	local sqlfile=$3
+	local workload_map=$4
 	local outfile="$WORKDIR/$name.bpftrace.out"
+	local workload_count
 
-	$SUDO timeout "$TRACE_SECONDS" "$BPFTRACE" -e "$program" \
+	$SUDO timeout "$TRACE_SECONDS" "$BPFTRACE" -e "
+BEGIN { printf(\"ATTACHED_READY\\n\"); }
+$program" \
 		>"$outfile" 2>&1 &
 	TRACE_PID=$!
-	sleep 1
-	"$PSQL" -h "$WORKDIR" -p "$PORT" -d "$DBNAME" -X -qAt \
+	wait_trace_ready "$outfile" "$TRACE_PID" || {
+		cat "$outfile" >&2
+		echo "$name bpftrace did not attach" >&2
+		exit 1
+	}
+	if ! run_pg "$PSQL" -h "$WORKDIR" -p "$PORT" -d "$DBNAME" -X -qAt \
 		-v ON_ERROR_STOP=1 -f "$sqlfile" >"$WORKDIR/$name.psql.out" \
-		2>"$WORKDIR/$name.psql.err"
+		2>"$WORKDIR/$name.psql.err"; then
+		cat "$WORKDIR/$name.psql.out" "$WORKDIR/$name.psql.err" >&2
+		exit 1
+	fi
 	wait "$TRACE_PID" >/dev/null 2>&1 || true
 	TRACE_PID=""
+	workload_count=$(map_count "$workload_map" "$outfile")
+	workload_count=${workload_count:-0}
+	if [ "$workload_count" -le 0 ]; then
+		cat "$outfile" >&2
+		echo "$name expected workload map $workload_map is empty" >&2
+		exit 1
+	fi
 	cat "$outfile"
+}
+
+wait_trace_ready()
+{
+	local outfile=$1
+	local trace_pid=$2
+	local i
+
+	for i in $(seq 1 200); do
+		if grep -q '^ATTACHED_READY$' "$outfile" 2>/dev/null; then
+			kill -0 "$trace_pid" >/dev/null 2>&1
+			return
+		fi
+		if ! kill -0 "$trace_pid" >/dev/null 2>&1; then
+			return 1
+		fi
+		sleep 0.05
+	done
+	return 1
 }
 
 map_count()
@@ -125,9 +178,10 @@ END$$;
 SQL
 
 run_trace fresh_no_stats "
+uprobe:$PG_BINDIR/postgres:standard_planner { @workload = count(); }
 uprobe:$FASTTRUN_SO:fasttrun_planner_hook { @planner = count(); }
-END { print(@planner); }
-" "$WORKDIR/no_fasttrun.sql" >"$WORKDIR/fresh_no_stats.trace"
+END { print(@workload); print(@planner); }
+" "$WORKDIR/no_fasttrun.sql" @workload >"$WORKDIR/fresh_no_stats.trace"
 assert_count "fresh backend planner hook" \
 	"$(map_count @planner "$WORKDIR/fresh_no_stats.trace")" eq 0
 echo "fresh_no_stats passed"
@@ -150,11 +204,12 @@ DROP TABLE ft_perm_smoke;
 SQL
 
 run_trace permanent_after_stats "
+uprobe:$PG_BINDIR/postgres:standard_planner { @workload = count(); }
 uprobe:$FASTTRUN_SO:fasttrun_planner_hook { @planner = count(); }
 uprobe:$FASTTRUN_SO:fasttrun_get_relation_stats_hook { @relstats = count(); }
 uprobe:$FASTTRUN_SO:fasttrun_read_pgstat_counters_for_hook* { @pgstat_hook = count(); }
-END { print(@planner); print(@relstats); print(@pgstat_hook); }
-" "$WORKDIR/permanent_after_stats.sql" >"$WORKDIR/permanent_after_stats.trace"
+END { print(@workload); print(@planner); print(@relstats); print(@pgstat_hook); }
+" "$WORKDIR/permanent_after_stats.sql" @workload >"$WORKDIR/permanent_after_stats.trace"
 assert_count "permanent-query planner hook" \
 	"$(map_count @planner "$WORKDIR/permanent_after_stats.trace")" gt 0
 assert_count "permanent-query relstats hook" \
@@ -188,11 +243,12 @@ END$$;
 SQL
 
 run_trace temp_stats_hit "
+uprobe:$PG_BINDIR/postgres:standard_planner { @workload = count(); }
 uprobe:$FASTTRUN_SO:fasttrun_planner_hook { @planner = count(); }
 uprobe:$FASTTRUN_SO:fasttrun_get_relation_stats_hook { @relstats = count(); }
 uprobe:$FASTTRUN_SO:fasttrun_read_pgstat_counters_for_hook* { @pgstat_hook = count(); }
-END { print(@planner); print(@relstats); print(@pgstat_hook); }
-" "$WORKDIR/temp_stats_hit.sql" >"$WORKDIR/temp_stats_hit.trace"
+END { print(@workload); print(@planner); print(@relstats); print(@pgstat_hook); }
+" "$WORKDIR/temp_stats_hit.sql" @workload >"$WORKDIR/temp_stats_hit.trace"
 assert_count "temp-query planner hook" \
 	"$(map_count @planner "$WORKDIR/temp_stats_hit.trace")" gt 0
 assert_count "temp-query relstats hook" \
@@ -200,6 +256,11 @@ assert_count "temp-query relstats hook" \
 assert_count "temp-query pgstat freshness lookup" \
 	"$(map_count @pgstat_hook "$WORKDIR/temp_stats_hit.trace")" gt 0
 echo "temp_stats_hit passed"
+
+run_pg "$PSQL" -h "$WORKDIR" -p "$PORT" -d "$DBNAME" -X -qAt \
+	-v ON_ERROR_STOP=1 -c \
+	'DROP TABLE IF EXISTS ft_trace_gate; CREATE TABLE ft_trace_gate (go boolean NOT NULL); INSERT INTO ft_trace_gate VALUES (false)' \
+	>/dev/null
 
 cat >"$WORKDIR/no_dml_analyze.sql" <<'SQL'
 CREATE TEMP TABLE ft_noop (a int, b text);
@@ -210,7 +271,13 @@ BEGIN;
 SELECT fasttrun_analyze('ft_noop');
 SELECT pg_backend_pid();
 SELECT 'READY_FOR_TRACE';
-SELECT pg_sleep(2);
+DO $gate$
+BEGIN
+  WHILE NOT (SELECT go FROM ft_trace_gate) LOOP
+    PERFORM pg_sleep(0.05);
+  END LOOP;
+END
+$gate$;
 DO $$
 BEGIN
   FOR i IN 1..200 LOOP
@@ -222,7 +289,7 @@ SELECT pg_sleep(2);
 COMMIT;
 SQL
 
-"$PSQL" -h "$WORKDIR" -p "$PORT" -d "$DBNAME" -X -qAt \
+run_pg "$PSQL" -h "$WORKDIR" -p "$PORT" -d "$DBNAME" -X -qAt \
 	-v ON_ERROR_STOP=1 -f "$WORKDIR/no_dml_analyze.sql" \
 	>"$WORKDIR/no_dml_analyze.psql.out" \
 	2>"$WORKDIR/no_dml_analyze.psql.err" &
@@ -247,13 +314,21 @@ if [ -z "$backend_pid" ]; then
 	exit 1
 fi
 $SUDO timeout "$TRACE_SECONDS" "$BPFTRACE" -e "
-uprobe:$FASTTRUN_SO:fasttrun_analyze /pid == $backend_pid/ { @in_fasttrun[tid] = 1; }
+BEGIN { printf(\"ATTACHED_READY\\n\"); }
+uprobe:$FASTTRUN_SO:fasttrun_analyze /pid == $backend_pid/ { @workload = count(); @in_fasttrun[tid] = 1; }
 uretprobe:$FASTTRUN_SO:fasttrun_analyze /pid == $backend_pid/ { delete(@in_fasttrun[tid]); }
 uprobe:$("$PG_CONFIG" --bindir)/postgres:RelationGetNumberOfBlocksInFork /pid == $backend_pid && @in_fasttrun[tid]/ { @nblocks = count(); }
 uprobe:$("$PG_CONFIG" --bindir)/postgres:smgrnblocks /pid == $backend_pid && @in_fasttrun[tid]/ { @smgr = count(); }
-END { print(@nblocks); print(@smgr); }
+END { print(@workload); print(@nblocks); print(@smgr); }
 " >"$WORKDIR/no_dml_analyze.trace" 2>&1 &
 TRACE_PID=$!
+wait_trace_ready "$WORKDIR/no_dml_analyze.trace" "$TRACE_PID" || {
+	cat "$WORKDIR/no_dml_analyze.trace" >&2
+	echo "no_dml_analyze bpftrace did not attach" >&2
+	exit 1
+}
+run_pg "$PSQL" -h "$WORKDIR" -p "$PORT" -d "$DBNAME" -X -qAt \
+	-v ON_ERROR_STOP=1 -c 'UPDATE ft_trace_gate SET go = true' >/dev/null
 for _ in $(seq 1 200); do
 	if grep -q '^CASE_DONE$' "$WORKDIR/no_dml_analyze.psql.out"; then
 		break
@@ -267,6 +342,8 @@ wait "$psql_pid"
 kill "$TRACE_PID" >/dev/null 2>&1 || true
 wait "$TRACE_PID" >/dev/null 2>&1 || true
 TRACE_PID=""
+assert_count "no-DML traced fasttrun workload" \
+	"$(map_count @workload "$WORKDIR/no_dml_analyze.trace")" gt 0
 assert_count "no-DML RelationGetNumberOfBlocksInFork" \
 	"$(map_count @nblocks "$WORKDIR/no_dml_analyze.trace")" eq 0
 assert_count "no-DML smgrnblocks" \
@@ -296,7 +373,7 @@ BEGIN
     END IF;
 END\$\$;
 SQL
-"$PSQL" -h "$WORKDIR" -p "$PORT" -d "$DBNAME" -X -qAt \
+run_pg "$PSQL" -h "$WORKDIR" -p "$PORT" -d "$DBNAME" -X -qAt \
 	-v ON_ERROR_STOP=1 -f "$WORKDIR/trunc_slo.sql" \
 	>"$WORKDIR/trunc_slo.psql.out" 2>&1 || {
 	cat "$WORKDIR/trunc_slo.psql.out" >&2
