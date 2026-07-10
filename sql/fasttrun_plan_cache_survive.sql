@@ -532,6 +532,128 @@ DROP TABLE t_tc_absent;
 DROP TABLE t_tc_unknown;
 DROP TABLE t_tc_visible;
 
+-- ----------------------------------------------------------------------
+-- 14. DML, изменяющий данные CTE и COPY FROM должны записать таблицу в
+--     журнал даже без вызова функций fasttrun. COMMIT скрывает устаревшую
+--     статистику и один раз сбрасывает подготовленный план, не просматривая
+--     весь кеш.
+-- ----------------------------------------------------------------------
+SET plan_cache_mode = force_generic_plan;
+BEGIN;
+CREATE TEMP TABLE t_commit_flip (id int, grp int);
+INSERT INTO t_commit_flip SELECT g, g FROM generate_series(1, 100000) g;
+SELECT fasttrun_analyze('t_commit_flip');
+PREPARE q_commit_flip(int) AS
+SELECT count(*) FROM t_commit_flip WHERE grp = $1;
+EXECUTE q_commit_flip(1);
+COMMIT;
+
+BEGIN;
+UPDATE t_commit_flip SET grp = 1 WHERE id <= 10000;
+SET client_min_messages = debug1;
+COMMIT;
+RESET client_min_messages;
+
+DO $$
+DECLARE ln text; est int := NULL;
+BEGIN
+  FOR ln IN EXPLAIN EXECUTE q_commit_flip(1) LOOP
+    IF ln ~ 'on t_commit_flip' THEN
+      est := substring(ln FROM 'rows=(\d+)')::int;
+      EXIT;
+    END IF;
+  END LOOP;
+  IF est IS NULL OR est < 100 THEN
+    RAISE EXCEPTION 'COMMIT after DML kept a plan based on stale statistics: est=%', est;
+  END IF;
+END$$;
+SELECT 'dml_commit_flip_replanned' AS marker;
+DEALLOCATE q_commit_flip;
+
+SELECT fasttrun_analyze('t_commit_flip');
+PREPARE q_commit_cte(int) AS
+SELECT count(*) FROM t_commit_flip WHERE id = $1;
+EXECUTE q_commit_cte(20000);
+
+BEGIN;
+SET client_min_messages = debug1;
+WITH changed AS (
+  UPDATE t_commit_flip SET grp = 2 WHERE id BETWEEN 10001 AND 20000
+  RETURNING id
+)
+SELECT count(*) FROM changed;
+COMMIT;
+RESET client_min_messages;
+
+DO $$
+DECLARE ln text; est int := NULL;
+BEGIN
+  FOR ln IN EXPLAIN EXECUTE q_commit_cte(20000) LOOP
+    IF ln ~ 'on t_commit_flip' THEN
+      est := substring(ln FROM 'rows=(\d+)')::int;
+      EXIT;
+    END IF;
+  END LOOP;
+  IF est IS NULL OR est < 100 THEN
+    RAISE EXCEPTION 'modifying CTE kept stale generic plan: est=%', est;
+  END IF;
+END$$;
+SELECT 'modifying_cte_replanned' AS marker;
+DEALLOCATE q_commit_cte;
+
+SET fasttrun.stats_refresh_threshold = 0.001;
+BEGIN;
+CREATE TEMP TABLE t_commit_copy (id int, grp int);
+INSERT INTO t_commit_copy SELECT g, g FROM generate_series(1, 1000) g;
+SELECT fasttrun_analyze('t_commit_copy');
+PREPARE q_commit_copy(int) AS
+SELECT count(*) FROM t_commit_copy WHERE id = $1;
+EXECUTE q_commit_copy(1);
+COMMIT;
+
+BEGIN;
+COPY t_commit_copy (id, grp) FROM STDIN;
+1	1
+1	1
+1	1
+1	1
+1	1
+\.
+SET client_min_messages = debug1;
+COMMIT;
+RESET client_min_messages;
+
+DO $$
+DECLARE ln text; est int := NULL;
+BEGIN
+  FOR ln IN EXPLAIN EXECUTE q_commit_copy(1) LOOP
+    IF ln ~ 'on t_commit_copy' THEN
+      est := substring(ln FROM 'rows=(\d+)')::int;
+      EXIT;
+    END IF;
+  END LOOP;
+  IF est IS NULL OR est < 2 THEN
+    RAISE EXCEPTION 'COPY FROM commit kept stale generic plan: est=%', est;
+  END IF;
+END$$;
+SELECT 'copy_from_replanned' AS marker;
+DEALLOCATE q_commit_copy;
+RESET fasttrun.stats_refresh_threshold;
+
+BEGIN;
+CREATE TEMP TABLE t_commit_on_delete (id int) ON COMMIT DELETE ROWS;
+INSERT INTO t_commit_on_delete SELECT generate_series(1, 1000);
+SELECT fasttrun_analyze('t_commit_on_delete');
+SET client_min_messages = debug1;
+COMMIT;
+RESET client_min_messages;
+SELECT count(*) = 0 AS on_commit_delete_empty FROM t_commit_on_delete;
+
+RESET plan_cache_mode;
+DROP TABLE t_commit_on_delete;
+DROP TABLE t_commit_copy;
+DROP TABLE t_commit_flip;
+
 DROP FUNCTION f_inner();
 DROP TABLE t_rsd_details;
 DROP TABLE t_balance_out;

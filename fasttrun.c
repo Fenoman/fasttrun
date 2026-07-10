@@ -43,6 +43,7 @@
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "optimizer/planner.h"
+#include "parser/parsetree.h"
 #include "pgstat.h"
 #include "utils/pgstat_internal.h"	/* pgstat_fetch_pending_entry */
 #include "storage/buf_internals.h"
@@ -410,6 +411,7 @@ static PlannedStmt *fasttrun_planner_hook(Query *parse,
 										  ParamListInfo boundParams);
 static void fasttrun_ensure_planner_hook(void);
 static void fasttrun_ensure_stats_hooks(void);
+static void fasttrun_executor_start(QueryDesc *queryDesc, int eflags);
 static bool fasttrun_stats_relid_exists(Oid relid);
 static void fasttrun_stats_relid_ref(Oid relid);
 static void fasttrun_stats_relid_unref(Oid relid);
@@ -1543,8 +1545,10 @@ static MemoryContext	fasttrun_stats_mcxt = NULL;
 static get_relation_stats_hook_type prev_get_relation_stats_hook = NULL;
 static get_attavgwidth_hook_type prev_get_attavgwidth_hook = NULL;
 static planner_hook_type prev_planner_hook = NULL;
+static ExecutorStart_hook_type prev_ExecutorStart = NULL;
 static bool				fasttrun_stats_hooks_installed = false;
 static bool				fasttrun_planner_hook_installed = false;
+static bool				fasttrun_executor_hook_installed = false;
 
 static void
 fasttrun_ensure_planner_hook(void)
@@ -1567,7 +1571,40 @@ fasttrun_ensure_stats_hooks(void)
 	get_relation_stats_hook = fasttrun_get_relation_stats_hook;
 	prev_get_attavgwidth_hook = get_attavgwidth_hook;
 	get_attavgwidth_hook = fasttrun_get_attavgwidth_hook;
+	if (!fasttrun_executor_hook_installed)
+	{
+		prev_ExecutorStart = ExecutorStart_hook;
+		ExecutorStart_hook = fasttrun_executor_start;
+		fasttrun_executor_hook_installed = true;
+	}
 	fasttrun_stats_hooks_installed = true;
+}
+
+static void
+fasttrun_executor_start(QueryDesc *queryDesc, int eflags)
+{
+	PlannedStmt *stmt = queryDesc->plannedstmt;
+	ListCell   *lc;
+
+	if (fasttrun_stats_relid_cache != NULL && stmt != NULL &&
+		(stmt->commandType != CMD_SELECT || stmt->hasModifyingCTE))
+	{
+		foreach(lc, stmt->resultRelations)
+		{
+			int			rtindex = lfirst_int(lc);
+			RangeTblEntry *rte = rt_fetch(rtindex, stmt->rtable);
+
+			if (rte->rtekind == RTE_RELATION &&
+				fasttrun_stats_relid_exists(rte->relid))
+				fasttrun_xact_mark_relid(rte->relid, rte->relid,
+									  FASTTRUN_TOUCH_DML);
+		}
+	}
+
+	if (prev_ExecutorStart != NULL)
+		prev_ExecutorStart(queryDesc, eflags);
+	else
+		standard_ExecutorStart(queryDesc, eflags);
 }
 
 static void
@@ -3019,11 +3056,14 @@ fasttrun_stats_entry_neutralize(Oid relid, FasttrunStatsEntry *entry)
  *     (a 20-column temp table used to cost 20 reads here);
  *   - on staleness, turns the entry LOCAL_NEUTRAL and emits no shared
  *     invalidation.  Core pg_statistic stays hidden until an explicit
- *     handoff; the next fasttrun_analyze() issues any needed local plan
- *     invalidation.
+ *     handoff.  When DML makes at least one previously visible column
+ *     neutral, the owning relation gets one backend-local plan invalidation
+ *     after all its columns have been processed.
  *
  * Net effect: column stats stay "fresh-or-hidden" through the planner
- * hook.  No per-COMMIT plan-cache walking.
+ * hook.  COMMIT walks the plan cache at most once per touched owning
+ * relation, and only on an actual visible-to-neutral transition while
+ * storage remains nonempty.  ON COMMIT DELETE ROWS stays at zero walks.
  */
 /* Same reasoning as for fasttrun_cache_commit_xact -- keep the uprobe target. */
 static pg_noinline void
@@ -3051,6 +3091,12 @@ fasttrun_stats_cache_commit_xact(void)
 		BlockNumber	pages_now = 0;
 		bool		have_counters = false;
 		bool		counters_attempted = false;
+		bool		plan_inval_needed = false;
+
+		if ((xentry->flags & (FASTTRUN_TOUCH_DML |
+							 FASTTRUN_TOUCH_STATS |
+							 FASTTRUN_TOUCH_DROPPED)) == 0)
+			continue;
 
 		relentry = (FasttrunStatsRelidEntry *)
 			hash_search(fasttrun_stats_relid_cache, &relid, HASH_FIND, NULL);
@@ -3138,20 +3184,18 @@ fasttrun_stats_cache_commit_xact(void)
 			}
 
 			/*
-			 * Preserve stats across COMMIT while the entry stays within churn
-			 * tolerance (fasttrun_stats_entry_usable); the collected_* reset
-			 * below then keeps it serving in the next xact.  Past the threshold,
-			 * or with pgstat unavailable, the distribution has drifted too far,
-			 * so drop the entry.
-			 *
-			 * No fasttrun_invalidate_local_plan_cache() here: the next
-			 * fasttrun_analyze() that publishes refreshed stats issues its own
-			 * targeted invalidation -- see need_plan_inval inside fasttrun_analyze.
+			 * Preserve statistics across COMMIT while changes stay within the
+			 * allowed threshold.  If counters are unavailable or the distribution
+			 * has changed too much, hide the statistics.  When DML changes visible
+			 * statistics to hidden on a nonempty table, invalidate its plans once
+			 * after the column loop.
 			 */
 			if (!have_counters ||
 				!fasttrun_stats_entry_usable(relid, entry, ins_now, upd_now,
 											 del_now, truncdropped_now, pages_now))
 			{
+				if (entry->was_usable)
+					plan_inval_needed = true;
 				fasttrun_stats_entry_free_undo(entry);
 				fasttrun_stats_relid_unref(key.relid);
 				heap_freetuple(entry->statsTuple);
@@ -3178,6 +3222,16 @@ fasttrun_stats_cache_commit_xact(void)
 		fasttrun_stats_relid_free_undo(relentry);
 		relentry->state_subid = InvalidSubTransactionId;
 		fasttrun_stats_relid_maybe_drop(relid, relentry);
+		/*
+		 * ON COMMIT DELETE ROWS has already truncated local storage before
+		 * this callback.  Keep its old zero-invalidation contract: no rows
+		 * can use the cached plan, while the next explicit refresh owns any
+		 * needed invalidation after refill.  This is the original hot path
+		 * that must not turn N tables into N plan-cache walks per COMMIT.
+		 * Ordinary DELETE keeps heap pages and therefore still invalidates.
+		 */
+		if (plan_inval_needed && pages_now > 0)
+			fasttrun_invalidate_local_plan_cache(xentry->root_relid);
 	}
 
 	/*
@@ -7006,6 +7060,23 @@ fasttrun_handoff_analyze_utility(Node *parsetree)
 	}
 }
 
+static void
+fasttrun_mark_copy_from(Node *parsetree)
+{
+	CopyStmt   *stmt;
+	Oid			relid;
+
+	if (fasttrun_stats_relid_cache == NULL ||
+		parsetree == NULL || !IsA(parsetree, CopyStmt))
+		return;
+	stmt = (CopyStmt *) parsetree;
+	if (!stmt->is_from || stmt->relation == NULL)
+		return;
+	relid = RangeVarGetRelid(stmt->relation, NoLock, true);
+	if (OidIsValid(relid) && fasttrun_stats_relid_exists(relid))
+		fasttrun_xact_mark_relid(relid, relid, FASTTRUN_TOUCH_DML);
+}
+
 /*
  * Dependency-machinery drops (DROP ... CASCADE, DROP OWNED BY, DISCARD)
  * delete relations without a per-table DropStmt, so the utility hook never
@@ -7107,6 +7178,7 @@ fasttrun_utility_hook(PlannedStmt *pstmt,
 		}
 	}
 
+	fasttrun_mark_copy_from(parsetree);
 	fasttrun_evict_utility_caches(parsetree);
 
 	/* Chain to next hook or standard ProcessUtility. */
