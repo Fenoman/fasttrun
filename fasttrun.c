@@ -124,6 +124,30 @@ static bool		fasttrun_use_typanalyze = true;
 static bool		fasttrun_zero_sinval_truncate = true;
 static int		fasttrun_max_analyze_pages = 100000;
 
+#ifdef USE_ASSERT_CHECKING
+static char *fasttrun_test_failpoint = "";
+
+static void
+fasttrun_test_fail(const char *name, int ordinal)
+{
+	char		key[96];
+
+	if (ordinal > 0)
+		snprintf(key, sizeof(key), "%s:%d", name, ordinal);
+	else
+		strlcpy(key, name, sizeof(key));
+	if (fasttrun_test_failpoint[0] != '\0' &&
+		strcmp(fasttrun_test_failpoint, key) == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("fasttrun test failpoint: %s", key)));
+}
+#define FASTTRUN_TEST_FAILPOINT(name, ordinal) \
+	fasttrun_test_fail((name), (ordinal))
+#else
+#define FASTTRUN_TEST_FAILPOINT(name, ordinal) ((void) 0)
+#endif
+
 /*
  * Per-planning freshness cache for column-stats hooks.
  *
@@ -670,17 +694,19 @@ fasttrun_cache_set_partial_scan_anchor(FasttrunAnalyzeCacheEntry *entry,
 static void
 fasttrun_cache_reset(void)
 {
-	if (fasttrun_analyze_cache == NULL)
+	HTAB	   *old_cache = fasttrun_analyze_cache;
+	MemoryContext old_mcxt = fasttrun_analyze_mcxt;
+
+	if (old_cache == NULL && old_mcxt == NULL)
 		return;
 
-	hash_destroy(fasttrun_analyze_cache);
 	fasttrun_analyze_cache = NULL;
+	fasttrun_analyze_mcxt = NULL;
 
-	if (fasttrun_analyze_mcxt != NULL)
-	{
-		MemoryContextDelete(fasttrun_analyze_mcxt);
-		fasttrun_analyze_mcxt = NULL;
-	}
+	if (old_mcxt != NULL)
+		MemoryContextDelete(old_mcxt);
+	else if (old_cache != NULL)
+		hash_destroy(old_cache);
 }
 
 /*
@@ -839,26 +865,39 @@ fasttrun_xact_callback(XactEvent event, void *arg)
 static void
 fasttrun_cache_init(void)
 {
-	HASHCTL ctl;
+	HASHCTL		ctl;
+	MemoryContext volatile new_mcxt = NULL;
+	HTAB	   *new_cache = NULL;
 
 	if (fasttrun_analyze_cache != NULL)
 		return;
 
 	fasttrun_ensure_planner_hook();
 
-	fasttrun_analyze_mcxt = AllocSetContextCreate(TopMemoryContext,
-												  "fasttrun analyze cache",
-												  ALLOCSET_DEFAULT_SIZES);
+	PG_TRY();
+	{
+		new_mcxt = AllocSetContextCreate(TopMemoryContext,
+										 "fasttrun analyze cache",
+										 ALLOCSET_DEFAULT_SIZES);
+		FASTTRUN_TEST_FAILPOINT("after_analyze_context", 0);
 
-	memset(&ctl, 0, sizeof(ctl));
-	ctl.keysize = sizeof(Oid);
-	ctl.entrysize = sizeof(FasttrunAnalyzeCacheEntry);
-	ctl.hcxt = fasttrun_analyze_mcxt;
+		memset(&ctl, 0, sizeof(ctl));
+		ctl.keysize = sizeof(Oid);
+		ctl.entrysize = sizeof(FasttrunAnalyzeCacheEntry);
+		ctl.hcxt = (MemoryContext) new_mcxt;
+		new_cache = hash_create("fasttrun analyze cache", 64, &ctl,
+								HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	}
+	PG_CATCH();
+	{
+		if (new_mcxt != NULL)
+			MemoryContextDelete((MemoryContext) new_mcxt);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 
-	fasttrun_analyze_cache = hash_create("fasttrun analyze cache",
-										 64,
-										 &ctl,
-										 HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	fasttrun_analyze_mcxt = (MemoryContext) new_mcxt;
+	fasttrun_analyze_cache = new_cache;
 }
 
 /* Returns NULL if no entry or cache not yet allocated. */
@@ -1618,7 +1657,10 @@ fasttrun_executor_start(QueryDesc *queryDesc, int eflags)
 static void
 fasttrun_stats_cache_init(void)
 {
-	HASHCTL ctl;
+	HASHCTL		ctl;
+	MemoryContext volatile new_mcxt = NULL;
+	HTAB	   *new_cache = NULL;
+	HTAB	   *new_relid_cache = NULL;
 
 	if (fasttrun_stats_cache != NULL)
 		return;
@@ -1626,46 +1668,64 @@ fasttrun_stats_cache_init(void)
 	fasttrun_ensure_planner_hook();
 	fasttrun_ensure_stats_hooks();
 
-	fasttrun_stats_mcxt = AllocSetContextCreate(TopMemoryContext,
-												"fasttrun stats cache",
-												ALLOCSET_DEFAULT_SIZES);
+	PG_TRY();
+	{
+		new_mcxt = AllocSetContextCreate(TopMemoryContext,
+										 "fasttrun stats cache",
+										 ALLOCSET_DEFAULT_SIZES);
 
-	memset(&ctl, 0, sizeof(ctl));
-	ctl.keysize = sizeof(FasttrunStatsKey);
-	ctl.entrysize = sizeof(FasttrunStatsEntry);
-	ctl.hcxt = fasttrun_stats_mcxt;
+		memset(&ctl, 0, sizeof(ctl));
+		ctl.keysize = sizeof(FasttrunStatsKey);
+		ctl.entrysize = sizeof(FasttrunStatsEntry);
+		ctl.hcxt = (MemoryContext) new_mcxt;
+		new_cache = hash_create("fasttrun stats cache", 64, &ctl,
+								HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+		FASTTRUN_TEST_FAILPOINT("after_stats_cache", 0);
 
-	fasttrun_stats_cache = hash_create("fasttrun stats cache",
-									   64,
-									   &ctl,
-									   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+		memset(&ctl, 0, sizeof(ctl));
+		ctl.keysize = sizeof(Oid);
+		ctl.entrysize = sizeof(FasttrunStatsRelidEntry);
+		ctl.hcxt = (MemoryContext) new_mcxt;
+		new_relid_cache = hash_create("fasttrun stats relid cache", 16,
+									  &ctl,
+									  HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	}
+	PG_CATCH();
+	{
+		if (new_mcxt != NULL)
+			MemoryContextDelete((MemoryContext) new_mcxt);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 
-	memset(&ctl, 0, sizeof(ctl));
-	ctl.keysize = sizeof(Oid);
-	ctl.entrysize = sizeof(FasttrunStatsRelidEntry);
-	ctl.hcxt = fasttrun_stats_mcxt;
-
-	fasttrun_stats_relid_cache = hash_create("fasttrun stats relid cache",
-											 16,
-											 &ctl,
-											 HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	fasttrun_stats_mcxt = (MemoryContext) new_mcxt;
+	fasttrun_stats_cache = new_cache;
+	fasttrun_stats_relid_cache = new_relid_cache;
 }
 
 /* Drop the stats HTAB + its mcxt (frees all cached tuples at once). */
 static void
 fasttrun_stats_cache_reset(void)
 {
-	if (fasttrun_stats_cache == NULL)
+	HTAB	   *old_cache = fasttrun_stats_cache;
+	HTAB	   *old_relid_cache = fasttrun_stats_relid_cache;
+	MemoryContext old_mcxt = fasttrun_stats_mcxt;
+
+	if (old_cache == NULL && old_relid_cache == NULL && old_mcxt == NULL)
 		return;
 
-	hash_destroy(fasttrun_stats_cache);
 	fasttrun_stats_cache = NULL;
 	fasttrun_stats_relid_cache = NULL;
+	fasttrun_stats_mcxt = NULL;
 
-	if (fasttrun_stats_mcxt != NULL)
+	if (old_mcxt != NULL)
+		MemoryContextDelete(old_mcxt);
+	else
 	{
-		MemoryContextDelete(fasttrun_stats_mcxt);
-		fasttrun_stats_mcxt = NULL;
+		if (old_cache != NULL)
+			hash_destroy(old_cache);
+		if (old_relid_cache != NULL)
+			hash_destroy(old_relid_cache);
 	}
 }
 
@@ -8146,19 +8206,31 @@ _PG_init(void)
 							   "to always-active.",
 							   &fasttrun_track_schedule,
 							   "mon-fri 08:00-18:00",
-							   PGC_SUSET,
-							   0,
+								   PGC_SUSET,
+								   0,
+								   NULL,
+								   fasttrun_track_schedule_assign_hook,
+								   NULL);
+
+#ifdef USE_ASSERT_CHECKING
+	DefineCustomStringVariable("fasttrun.test_failpoint",
+							   "Inject deterministic errors in cassert test builds",
 							   NULL,
-							   fasttrun_track_schedule_assign_hook,
-							   NULL);
+							   &fasttrun_test_failpoint,
+							   "",
+							   PGC_SUSET,
+							   GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE,
+							   NULL, NULL, NULL);
+#endif
+	MarkGUCPrefixReserved("fasttrun");
 
-		/* Shared memory tracking -- only when loaded via shared_preload_libraries. */
-		if (process_shared_preload_libraries_in_progress)
-		{
-			prev_shmem_request_hook = shmem_request_hook;
-			shmem_request_hook = fasttrun_shmem_request;
+	/* Shared memory tracking -- only when loaded via shared_preload_libraries. */
+	if (process_shared_preload_libraries_in_progress)
+	{
+		prev_shmem_request_hook = shmem_request_hook;
+		shmem_request_hook = fasttrun_shmem_request;
 
-			prev_shmem_startup_hook = shmem_startup_hook;
-			shmem_startup_hook = fasttrun_shmem_startup;
-		}
+		prev_shmem_startup_hook = shmem_startup_hook;
+		shmem_startup_hook = fasttrun_shmem_startup;
 	}
+}
