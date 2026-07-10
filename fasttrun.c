@@ -7962,6 +7962,11 @@ fasttrun_evict_temp_relid(Oid relid)
 	tp = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
 	if (!HeapTupleIsValid(tp))
 	{
+		/* Mark before mutating so the commit callback reclaims the undo. */
+		fasttrun_xact_mark_relid(relid, relid,
+								FASTTRUN_TOUCH_ANALYZE |
+								FASTTRUN_TOUCH_STATS |
+								FASTTRUN_TOUCH_PLAN_INVALIDATE);
 		fasttrun_cache_mark_evicted(relid);
 		fasttrun_stats_cache_mark_evicted_relid(relid);
 		fasttrun_invalidate_local_plan_cache(relid);
@@ -7982,6 +7987,11 @@ fasttrun_evict_temp_relid(Oid relid)
 	rel = try_relation_open(relid, AccessShareLock);
 	if (rel == NULL)
 	{
+		/* Mark before mutating so the commit callback reclaims the undo. */
+		fasttrun_xact_mark_relid(relid, relid,
+								FASTTRUN_TOUCH_ANALYZE |
+								FASTTRUN_TOUCH_STATS |
+								FASTTRUN_TOUCH_PLAN_INVALIDATE);
 		fasttrun_cache_mark_evicted(relid);
 		fasttrun_stats_cache_mark_evicted_relid(relid);
 		fasttrun_invalidate_local_plan_cache(relid);
