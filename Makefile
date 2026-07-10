@@ -61,7 +61,7 @@ include $(PGXS)
         check-bulk-overhead check-on-commit-drop-leak \
         check-commit-duration check-replace-catalog check-giant-temp \
         check-xact-journal-memory check-cache-init-faults check-fault-matrix \
-        check-tracking-order check-deep-local
+        check-tracking-order check-no-temp-impact check-deep-local
 
 check-parity:
 	PG_CONFIG="$(PG_CONFIG)" scripts/check_fasttrun_analyze_parity.py --profile full
@@ -109,8 +109,12 @@ check-fault-matrix:
 check-tracking-order:
 	PG_CONFIG="$(PG_CONFIG)" scripts/check_fasttrun_tracking_order.sh
 
+check-no-temp-impact:
+	PG_CONFIG="$(PG_CONFIG)" scripts/check_fasttrun_no_temp_impact.sh
+
 check-deep-local: installcheck check-parity check-soak check-perf-smoke \
                   check-hook-chain check-zero-sinval \
                   check-commit-inval-overhead check-bulk-overhead \
                   check-on-commit-drop-leak check-commit-duration \
-                  check-replace-catalog check-giant-temp
+                  check-replace-catalog check-giant-temp \
+                  check-no-temp-impact

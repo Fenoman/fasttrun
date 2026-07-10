@@ -72,6 +72,7 @@ break SIInsertDataEntries
 commands
 silent
 printf "SHARED_INSERT\n"
+printf "SI_SHARED_HIT\n"
 continue
 end
 break SendSharedInvalidMessages
@@ -104,6 +105,14 @@ run_pg "$CREATEDB" -h "$SOCKET_DIR" -p "$PORT" "$DBNAME"
 
 run_pg "$PSQL" -h "$SOCKET_DIR" -p "$PORT" -d "$DBNAME" -XAtq \
 	-v ON_ERROR_STOP=1 -c 'CREATE EXTENSION fasttrun' >/dev/null
+
+run_pg "$PSQL" -h "$SOCKET_DIR" -p "$PORT" -d "$DBNAME" -XAtq \
+	-v ON_ERROR_STOP=1 >/dev/null <<'SQL'
+CREATE TABLE perm_zero_sinval (id int PRIMARY KEY, grp int, payload text);
+INSERT INTO perm_zero_sinval
+SELECT g, g % 100, md5(g::text) FROM generate_series(1,100000) g;
+ANALYZE perm_zero_sinval;
+SQL
 
 run_case()
 {
@@ -302,6 +311,128 @@ SQL
 	fi
 }
 
+run_permanent_case()
+{
+	local name=$1
+	local before_warmup=$2
+	local after_warmup=$3
+	local sqlfile="$WORKDIR/$name.sql"
+	local psqlout="$WORKDIR/$name.psql.out"
+	local psqlerr="$WORKDIR/$name.psql.err"
+	local gdblog="$WORKDIR/$name.gdb.out"
+	local pid=""
+	local psql_pid
+	local gdb_pid
+	local shared_hits
+	local smgr_messages
+	local local_hits
+	local i
+
+	cat >"$sqlfile" <<SQL
+\set ON_ERROR_STOP 1
+SET client_min_messages = warning;
+LOAD 'fasttrun';
+$before_warmup
+SET plan_cache_mode = force_generic_plan;
+PREPARE q_perm(int) AS
+SELECT count(*), min(payload), max(payload)
+FROM perm_zero_sinval
+WHERE grp = \$1;
+\o /dev/null
+EXECUTE q_perm(42);
+\o
+$after_warmup
+SELECT pg_backend_pid();
+SELECT pg_sleep($SLEEP_SECONDS);
+SELECT 'PERM_QUERY_BEGIN';
+EXECUTE q_perm(42);
+SELECT 'PERM_QUERY_DONE';
+SELECT pg_sleep($SLEEP_SECONDS);
+SQL
+
+	run_pg "$PSQL" -h "$SOCKET_DIR" -p "$PORT" -d "$DBNAME" -XAtq \
+		-v ON_ERROR_STOP=1 -f "$sqlfile" >"$psqlout" 2>"$psqlerr" &
+	psql_pid=$!
+
+	for i in $(seq 1 200); do
+		pid=$(grep -E '^[0-9]+$' "$psqlout" | head -1 || true)
+		if [ -n "$pid" ]; then
+			break
+		fi
+		sleep 0.05
+	done
+	if [ -z "$pid" ]; then
+		wait "$psql_pid" || true
+		cat "$psqlout" "$psqlerr" >&2 || true
+		echo "[$name] could not read backend pid" >&2
+		exit 1
+	fi
+
+	"$GDB" -q -nx -batch -x "$WORKDIR/gdb.commands" -p "$pid" \
+		>"$gdblog" 2>&1 &
+	gdb_pid=$!
+	for i in $(seq 1 200); do
+		if grep -q '^ATTACHED_READY$' "$gdblog"; then
+			break
+		fi
+		if ! kill -0 "$gdb_pid" >/dev/null 2>&1; then
+			break
+		fi
+		sleep 0.05
+	done
+	if ! grep -q '^ATTACHED_READY$' "$gdblog"; then
+		kill "$gdb_pid" "$psql_pid" >/dev/null 2>&1 || true
+		wait "$gdb_pid" || true
+		wait "$psql_pid" || true
+		cat "$gdblog" >&2
+		echo "[$name] gdb did not emit ATTACHED_READY" >&2
+		exit 1
+	fi
+
+	for i in $(seq 1 400); do
+		if grep -q '^PERM_QUERY_DONE$' "$psqlout"; then
+			break
+		fi
+		if ! kill -0 "$psql_pid" >/dev/null 2>&1; then
+			break
+		fi
+		sleep 0.05
+	done
+	if ! grep -q '^PERM_QUERY_DONE$' "$psqlout"; then
+		kill "$gdb_pid" >/dev/null 2>&1 || true
+		wait "$gdb_pid" || true
+		wait "$psql_pid" || true
+		cat "$psqlout" "$psqlerr" "$gdblog" >&2 || true
+		echo "[$name] permanent query did not finish" >&2
+		exit 1
+	fi
+
+	kill "$gdb_pid" >/dev/null 2>&1 || true
+	wait "$gdb_pid" || true
+	if ! wait "$psql_pid"; then
+		cat "$psqlout" "$psqlerr" "$gdblog" >&2 || true
+		echo "[$name] psql workload failed" >&2
+		exit 1
+	fi
+
+	if ! grep -Eq '^1000\|[0-9a-f]{32}\|[0-9a-f]{32}$' "$psqlout"; then
+		cat "$psqlout" >&2
+		echo "[$name] permanent query returned an unexpected result" >&2
+		exit 1
+	fi
+	shared_hits=$(grep -c '^SI_SHARED_HIT$' "$gdblog" || true)
+	smgr_messages=$(grep -c '^SMGR_MESSAGE$' "$gdblog" || true)
+	local_hits=$(grep -c '^LOCAL_HIT$' "$gdblog" || true)
+	printf '%-31s si_shared=%s smgr=%s local=%s\n' \
+		"$name" "$shared_hits" "$smgr_messages" "$local_hits"
+	if [ "$shared_hits" -ne 0 ] || [ "$smgr_messages" -ne 0 ] || \
+		[ "$local_hits" -ne 0 ]; then
+		cat "$gdblog" >&2
+		echo "[$name] permanent-only query emitted an invalidation" >&2
+		exit 1
+	fi
+}
+
 truncate_validation=$(cat <<'SQL'
 SELECT format('SELECT ''TOAST_AFTER '' || count(*) FROM %s',
               c.reltoastrelid::regclass)
@@ -322,6 +453,71 @@ FROM pg_class c
 WHERE c.oid = 't_zero_sinval'::regclass \gexec
 SQL
 )
+
+permanent_temp_setup=$(cat <<'SQL'
+CREATE TEMP TABLE ft_perm_state (id int, grp int, payload text);
+INSERT INTO ft_perm_state
+SELECT g, g % 50, md5(g::text) FROM generate_series(1,5000) g;
+ANALYZE ft_perm_state;
+DO $check$
+BEGIN
+  IF (SELECT count(*) FROM pg_statistic
+      WHERE starelid = 'ft_perm_state'::regclass) = 0 THEN
+    RAISE EXCEPTION 'core ANALYZE did not create pg_statistic rows';
+  END IF;
+END
+$check$;
+SQL
+)
+
+permanent_never_post=$(cat <<'SQL'
+DO $check$
+BEGIN
+  IF EXISTS (SELECT FROM pg_backend_memory_contexts
+             WHERE name LIKE 'fasttrun%') THEN
+    RAISE EXCEPTION 'never-initialized state already has fasttrun contexts';
+  END IF;
+END
+$check$;
+SQL
+)
+
+permanent_neutral_post=$(cat <<'SQL'
+SELECT fasttruncate('ft_perm_state');
+DO $check$
+BEGIN
+  IF NOT EXISTS (SELECT FROM pg_backend_memory_contexts
+                 WHERE name = 'fasttrun stats cache') THEN
+    RAISE EXCEPTION 'REL_LOCAL_NEUTRAL state has no stats cache';
+  END IF;
+  IF NOT EXISTS (SELECT FROM pg_backend_memory_contexts
+                 WHERE name = 'fasttrun analyze cache') THEN
+    RAISE EXCEPTION 'neutralized relation has no relstats cache';
+  END IF;
+END
+$check$;
+SQL
+)
+
+permanent_dropped_post=$(cat <<'SQL'
+SELECT fasttruncate('ft_perm_state');
+DROP TABLE ft_perm_state;
+DO $check$
+BEGIN
+  IF EXISTS (SELECT FROM pg_backend_memory_contexts
+             WHERE name LIKE 'fasttrun%') THEN
+    RAISE EXCEPTION 'committed DROP did not remove the last fasttrun context';
+  END IF;
+END
+$check$;
+SQL
+)
+
+run_permanent_case permanent_never_initialized "" "$permanent_never_post"
+run_permanent_case permanent_neutral_live \
+	"$permanent_temp_setup" "$permanent_neutral_post"
+run_permanent_case permanent_dropped_reset \
+	"$permanent_temp_setup" "$permanent_dropped_post"
 
 run_case regular_analyze positive 0 0 0 \
 	"ANALYZE t_zero_sinval;"
