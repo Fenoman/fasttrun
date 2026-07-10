@@ -101,6 +101,7 @@ PG_FUNCTION_INFO_V1(fasttrun_reset_temp_stats);
 #ifdef USE_ASSERT_CHECKING
 PG_FUNCTION_INFO_V1(fasttrun_test_subxact_visits);
 PG_FUNCTION_INFO_V1(fasttrun_test_poison_locator_mismatch);
+PG_FUNCTION_INFO_V1(fasttrun_test_track_set);
 #endif
 Datum	fasttruncate(PG_FUNCTION_ARGS);
 Datum	fasttrun_analyze(PG_FUNCTION_ARGS);
@@ -7146,7 +7147,6 @@ fasttrun_inspect_stats(PG_FUNCTION_ARGS)
  * ================================================================ */
 
 #define FASTTRUN_TRACK_MAX		8192
-#define FASTTRUN_TRACK_TOPN_LIMIT 1024
 #define FASTTRUN_TRACK_FILE		"pg_stat/fasttrun_temp_stats"
 #define FASTTRUN_TRACK_MAGIC	0x46545354	/* "FTST" */
 
@@ -7156,6 +7156,12 @@ typedef struct FasttrunTrackEntry
 	int64			create_count;
 	TimestampTz		last_create;
 } FasttrunTrackEntry;
+
+typedef struct FasttrunTrackSnapshot
+{
+	FasttrunTrackEntry *entries;
+	int			count;
+} FasttrunTrackSnapshot;
 
 static HTAB			   *fasttrun_track_htab = NULL;
 static LWLockId			fasttrun_track_lock;
@@ -8456,6 +8462,122 @@ fasttrun_utility_hook(PlannedStmt *pstmt,
 	list_free(rewrite_relids);
 }
 
+/* Build a bounded immutable snapshot without allocation or sorting under lock. */
+static FasttrunTrackSnapshot
+fasttrun_track_snapshot(int limit)
+{
+	FasttrunTrackSnapshot snapshot;
+	HASH_SEQ_STATUS status;
+	FasttrunTrackEntry *entry;
+	int			capacity;
+	int			worst = 0;
+	bool		bounded;
+
+	/* Tiny top-N stays allocation- and copy-bounded; large readers copy all. */
+	bounded = (limit > 0 && limit <= 32);
+	capacity = bounded ? limit : FASTTRUN_TRACK_MAX;
+	snapshot.entries = (FasttrunTrackEntry *)
+		palloc(sizeof(FasttrunTrackEntry) * capacity);
+	snapshot.count = 0;
+
+	LWLockAcquire(fasttrun_track_lock, LW_SHARED);
+	hash_seq_init(&status, fasttrun_track_htab);
+	while ((entry = (FasttrunTrackEntry *) hash_seq_search(&status)) != NULL)
+	{
+		if (entry->create_count <= 0)
+			continue;
+		if (!bounded)
+		{
+			Assert(snapshot.count < FASTTRUN_TRACK_MAX);
+			snapshot.entries[snapshot.count++] = *entry;
+		}
+		else if (snapshot.count < capacity)
+		{
+			snapshot.entries[snapshot.count] = *entry;
+			if (snapshot.count == 0 ||
+				fasttrun_track_cmp_desc(&snapshot.entries[snapshot.count],
+										&snapshot.entries[worst]) > 0)
+				worst = snapshot.count;
+			snapshot.count++;
+		}
+		else if (fasttrun_track_cmp_desc(entry,
+									  &snapshot.entries[worst]) < 0)
+		{
+			int			i;
+
+			snapshot.entries[worst] = *entry;
+			worst = 0;
+			for (i = 1; i < snapshot.count; i++)
+			{
+				if (fasttrun_track_cmp_desc(&snapshot.entries[i],
+										&snapshot.entries[worst]) > 0)
+					worst = i;
+			}
+		}
+	}
+	LWLockRelease(fasttrun_track_lock);
+	return snapshot;
+}
+
+static void
+fasttrun_track_swap(FasttrunTrackEntry *a, FasttrunTrackEntry *b)
+{
+	FasttrunTrackEntry tmp = *a;
+
+	*a = *b;
+	*b = tmp;
+}
+
+/* Keep the worst selected entry at heap[0]. */
+static void
+fasttrun_track_sift_worst(FasttrunTrackEntry *heap, int count, int root)
+{
+	for (;;)
+	{
+		int			left = root * 2 + 1;
+		int			worst = root;
+
+		if (left < count &&
+			fasttrun_track_cmp_desc(&heap[left], &heap[worst]) > 0)
+			worst = left;
+		if (left + 1 < count &&
+			fasttrun_track_cmp_desc(&heap[left + 1], &heap[worst]) > 0)
+			worst = left + 1;
+		if (worst == root)
+			return;
+		fasttrun_track_swap(&heap[root], &heap[worst]);
+		root = worst;
+	}
+}
+
+/* Exact top-N outside LWLock, then deterministic order of selected rows. */
+static int
+fasttrun_track_select_top(FasttrunTrackEntry *entries, int count, int limit)
+{
+	int			i;
+
+	if (limit <= 0 || limit >= count)
+	{
+		qsort(entries, count, sizeof(FasttrunTrackEntry),
+			  fasttrun_track_cmp_desc);
+		return count;
+	}
+
+	for (i = limit / 2; i-- > 0;)
+		fasttrun_track_sift_worst(entries, limit, i);
+	for (i = limit; i < count; i++)
+	{
+		if (fasttrun_track_cmp_desc(&entries[i], &entries[0]) < 0)
+		{
+			entries[0] = entries[i];
+			fasttrun_track_sift_worst(entries, limit, 0);
+		}
+	}
+	qsort(entries, limit, sizeof(FasttrunTrackEntry),
+		  fasttrun_track_cmp_desc);
+	return limit;
+}
+
 /* SQL: fasttrun_hot_temp_tables(n) -- returns top-N most created temp tables. */
 Datum
 fasttrun_hot_temp_tables(PG_FUNCTION_ARGS)
@@ -8465,16 +8587,10 @@ fasttrun_hot_temp_tables(PG_FUNCTION_ARGS)
 	TupleDesc			tupdesc;
 	Tuplestorestate	   *tupstore;
 	MemoryContext		per_query_cxt, oldcxt;
-	HASH_SEQ_STATUS		status;
-	FasttrunTrackEntry *entry;
+	FasttrunTrackSnapshot snapshot;
 	FasttrunTrackEntry *sorted;
-	int					count = 0;
-	int					alloc = 256;
 	int					output_count;
 	int					i;
-	int					min_idx = 0;
-	bool				min_idx_valid = false;
-	bool				bounded_topn;
 
 	if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo) ||
 		(rsinfo->allowedModes & SFRM_Materialize) == 0)
@@ -8499,68 +8615,9 @@ fasttrun_hot_temp_tables(PG_FUNCTION_ARGS)
 	if (fasttrun_track_htab == NULL)
 		return (Datum) 0;
 
-	bounded_topn = (limit > 0 && limit <= FASTTRUN_TRACK_TOPN_LIMIT);
-	if (bounded_topn)
-		alloc = limit;
-
-	/* Collect entries into a sortable array, or keep only a bounded top-N. */
-	sorted = palloc(sizeof(FasttrunTrackEntry) * alloc);
-
-	LWLockAcquire(fasttrun_track_lock, LW_SHARED);
-	hash_seq_init(&status, fasttrun_track_htab);
-	while ((entry = hash_seq_search(&status)) != NULL)
-	{
-		if (entry->create_count <= 0)
-			continue;
-
-		if (!bounded_topn)
-		{
-			if (count >= alloc)
-			{
-				alloc *= 2;
-				sorted = repalloc(sorted, sizeof(FasttrunTrackEntry) * alloc);
-			}
-			memcpy(&sorted[count++], entry, sizeof(FasttrunTrackEntry));
-		}
-		else if (count < limit)
-		{
-			memcpy(&sorted[count], entry, sizeof(FasttrunTrackEntry));
-			if (!min_idx_valid ||
-				sorted[count].create_count < sorted[min_idx].create_count)
-			{
-				min_idx = count;
-				min_idx_valid = true;
-			}
-			count++;
-		}
-		else
-		{
-			if (entry->create_count > sorted[min_idx].create_count)
-			{
-				int		j;
-
-				memcpy(&sorted[min_idx], entry, sizeof(FasttrunTrackEntry));
-				for (j = 1, min_idx = 0; j < count; j++)
-				{
-					if (sorted[j].create_count < sorted[min_idx].create_count)
-						min_idx = j;
-				}
-			}
-		}
-	}
-	LWLockRelease(fasttrun_track_lock);
-
-	/* Sort by create_count DESC. */
-	qsort(sorted, count, sizeof(FasttrunTrackEntry),
-		  fasttrun_track_cmp_desc);
-
-	/* Emit top-N rows. */
-	if (bounded_topn)
-		output_count = count;
-	else if (limit <= 0 || limit > count)
-		output_count = count;
-	else
-		output_count = limit;
+	snapshot = fasttrun_track_snapshot(limit);
+	sorted = snapshot.entries;
+	output_count = fasttrun_track_select_top(sorted, snapshot.count, limit);
 
 	for (i = 0; i < output_count; i++)
 	{
@@ -8578,16 +8635,18 @@ fasttrun_hot_temp_tables(PG_FUNCTION_ARGS)
 	return (Datum) 0;
 }
 
-/* qsort comparator: descending by create_count. */
+/* Complete deterministic order; explicit branches avoid subtraction overflow. */
 static int
 fasttrun_track_cmp_desc(const void *a, const void *b)
 {
 	const FasttrunTrackEntry *ea = (const FasttrunTrackEntry *) a;
 	const FasttrunTrackEntry *eb = (const FasttrunTrackEntry *) b;
 
-	if (eb->create_count > ea->create_count) return 1;
-	if (eb->create_count < ea->create_count) return -1;
-	return 0;
+	if (ea->create_count != eb->create_count)
+		return (ea->create_count < eb->create_count) ? 1 : -1;
+	if (ea->last_create != eb->last_create)
+		return (ea->last_create < eb->last_create) ? 1 : -1;
+	return strcmp(ea->relname, eb->relname);
 }
 
 /* SQL: fasttrun_prewarm() -- creates top-N temp tables via create_temp_table. */
@@ -8596,74 +8655,16 @@ fasttrun_prewarm(PG_FUNCTION_ARGS)
 {
 	int		limit = fasttrun_prewarm_count;
 	int		created = 0;
-	int		count = 0;
-	int		alloc = 256;
 	int		i;
-	int		min_idx = 0;
-	bool	min_idx_valid = false;
-	bool	bounded_topn;
+	FasttrunTrackSnapshot snapshot;
 	FasttrunTrackEntry *sorted;
-	HASH_SEQ_STATUS		status;
-	FasttrunTrackEntry *entry;
 
 	if (fasttrun_track_htab == NULL)
 		PG_RETURN_INT32(0);
 
-	bounded_topn = (limit > 0 && limit <= FASTTRUN_TRACK_TOPN_LIMIT);
-	if (bounded_topn)
-		alloc = limit;
-
-	sorted = palloc(sizeof(FasttrunTrackEntry) * alloc);
-
-	LWLockAcquire(fasttrun_track_lock, LW_SHARED);
-	hash_seq_init(&status, fasttrun_track_htab);
-	while ((entry = hash_seq_search(&status)) != NULL)
-	{
-		if (entry->create_count <= 0)
-			continue;
-
-		if (!bounded_topn)
-		{
-			if (count >= alloc)
-			{
-				alloc *= 2;
-				sorted = repalloc(sorted, sizeof(FasttrunTrackEntry) * alloc);
-			}
-			memcpy(&sorted[count++], entry, sizeof(FasttrunTrackEntry));
-		}
-		else if (count < limit)
-		{
-			memcpy(&sorted[count], entry, sizeof(FasttrunTrackEntry));
-			if (!min_idx_valid ||
-				sorted[count].create_count < sorted[min_idx].create_count)
-			{
-				min_idx = count;
-				min_idx_valid = true;
-			}
-			count++;
-		}
-		else
-		{
-			if (entry->create_count > sorted[min_idx].create_count)
-			{
-				int		j;
-
-				memcpy(&sorted[min_idx], entry, sizeof(FasttrunTrackEntry));
-				for (j = 1, min_idx = 0; j < count; j++)
-				{
-					if (sorted[j].create_count < sorted[min_idx].create_count)
-						min_idx = j;
-				}
-			}
-		}
-	}
-	LWLockRelease(fasttrun_track_lock);
-
-	qsort(sorted, count, sizeof(FasttrunTrackEntry),
-		  fasttrun_track_cmp_desc);
-
-	if (limit <= 0 || limit > count)
-		limit = count;
+	snapshot = fasttrun_track_snapshot(limit);
+	sorted = snapshot.entries;
+	limit = fasttrun_track_select_top(sorted, snapshot.count, limit);
 
 	{
 		/* Verify dummy schema exists; if not, skip all prewarm. */
@@ -8742,6 +8743,34 @@ fasttrun_reset_temp_stats(PG_FUNCTION_ARGS)
 }
 
 #ifdef USE_ASSERT_CHECKING
+/* Test helper for deterministic tracking-order checks. */
+Datum
+fasttrun_test_track_set(PG_FUNCTION_ARGS)
+{
+	char	   *name = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	char		key[NAMEDATALEN] = {0};
+	int64		count = PG_GETARG_INT64(1);
+	TimestampTz last_create = PG_GETARG_INT64(2);
+	FasttrunTrackEntry *entry;
+	bool		found;
+
+	if (fasttrun_track_htab == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("fasttrun tracking shared memory is unavailable")));
+	strlcpy(key, name, sizeof(key));
+	LWLockAcquire(fasttrun_track_lock, LW_EXCLUSIVE);
+	entry = (FasttrunTrackEntry *)
+		hash_search(fasttrun_track_htab, key, HASH_ENTER, &found);
+	if (!found)
+		memcpy(entry->relname, key, sizeof(entry->relname));
+	entry->create_count = count;
+	entry->last_create = last_create;
+	LWLockRelease(fasttrun_track_lock);
+	pfree(name);
+	PG_RETURN_VOID();
+}
+
 /* Test function available only in cassert builds. */
 Datum
 fasttrun_test_subxact_visits(PG_FUNCTION_ARGS)
