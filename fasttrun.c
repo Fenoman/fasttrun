@@ -2290,21 +2290,16 @@ fasttrun_stats_set_relation_policy(Relation rel,
 	return changed;
 }
 
-/* Catalog probe is allowed only from explicit mutation paths, never hooks. */
+/* Каталог проверяем только при явной смене состояния, не из хуков. */
 static bool
-fasttrun_relation_has_core_stats(Relation rel)
+fasttrun_relid_has_core_stats(Oid relid, int natts)
 {
-	TupleDesc	desc = RelationGetDescr(rel);
-	Oid			relid = RelationGetRelid(rel);
 	int			i;
 
-	for (i = 0; i < desc->natts; i++)
+	for (i = 0; i < natts; i++)
 	{
-		Form_pg_attribute attr = TupleDescAttr(desc, i);
 		HeapTuple	tuple;
 
-		if (attr->attisdropped)
-			continue;
 		tuple = SearchSysCache3(STATRELATTINH,
 								ObjectIdGetDatum(relid),
 								Int16GetDatum(i + 1),
@@ -2315,6 +2310,39 @@ fasttrun_relation_has_core_stats(Relation rel)
 			return true;
 		}
 	}
+	return false;
+}
+
+static bool
+fasttrun_relation_has_core_stats(Relation rel)
+{
+	TupleDesc	desc = RelationGetDescr(rel);
+	List	   *index_oids;
+	ListCell   *lc;
+
+	if (fasttrun_relid_has_core_stats(RelationGetRelid(rel), desc->natts))
+		return true;
+
+	/* Статистика выражений хранится под OID индекса. */
+	index_oids = RelationGetIndexList(rel);
+	foreach(lc, index_oids)
+	{
+		Oid			index_oid = lfirst_oid(lc);
+		HeapTuple	reltuple;
+		int			natts;
+
+		reltuple = SearchSysCache1(RELOID, ObjectIdGetDatum(index_oid));
+		if (!HeapTupleIsValid(reltuple))
+			continue;
+		natts = ((Form_pg_class) GETSTRUCT(reltuple))->relnatts;
+		ReleaseSysCache(reltuple);
+		if (fasttrun_relid_has_core_stats(index_oid, natts))
+		{
+			list_free(index_oids);
+			return true;
+		}
+	}
+	list_free(index_oids);
 	return false;
 }
 

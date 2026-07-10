@@ -963,6 +963,150 @@ SELECT 'dml_abort_inval_ok' AS marker;
 
 COMMIT;
 DROP TABLE t_noop_abort;
+-- ----------------------------------------------------------------------
+-- 16. Ядерная статистика выражения тоже влияет на смену режима.  У обычных
+--     колонок цель сбора = 0, поэтому ANALYZE оставляет единственную строку
+--     pg_statistic под OID индекса выражения.  Подготовленный план сначала
+--     видит частое значение (~9000 строк), затем fasttrun_analyze и
+--     fasttrun_collect_stats без локального сбора скрывают эту статистику.
+--     Сохранённый план обязан перестроиться на стандартную оценку (~50).
+-- ----------------------------------------------------------------------
+SET plan_cache_mode = force_generic_plan;
+SET fasttrun.auto_collect_stats = off;
+SET fasttrun.sample_rows = 0;
+CREATE TEMP TABLE t_expr_policy_analyze (id int, name text);
+ALTER TABLE t_expr_policy_analyze ALTER COLUMN id SET STATISTICS 0;
+ALTER TABLE t_expr_policy_analyze ALTER COLUMN name SET STATISTICS 0;
+INSERT INTO t_expr_policy_analyze
+SELECT g, CASE WHEN g <= 9000 THEN 'dup' ELSE 'v_' || g END
+FROM generate_series(1, 10000) g;
+CREATE INDEX t_expr_policy_analyze_idx ON t_expr_policy_analyze (lower(name));
+ANALYZE t_expr_policy_analyze;
+DO $$
+BEGIN
+  IF EXISTS (SELECT FROM pg_statistic
+             WHERE starelid = 't_expr_policy_analyze'::regclass) OR
+     NOT EXISTS (SELECT FROM pg_statistic
+                 WHERE starelid = 't_expr_policy_analyze_idx'::regclass) THEN
+    RAISE EXCEPTION 'expression-only ANALYZE fixture has wrong catalog stats';
+  END IF;
+END$$;
+PREPARE q_expr_policy_analyze AS
+SELECT count(*) FROM t_expr_policy_analyze WHERE lower(name) = 'dup';
+EXECUTE q_expr_policy_analyze;
+ count 
+-------
+  9000
+(1 row)
+
+DO $$
+DECLARE ln text; est int := NULL;
+BEGIN
+  FOR ln IN EXPLAIN EXECUTE q_expr_policy_analyze LOOP
+    IF ln ~ 'on t_expr_policy_analyze' THEN
+      est := substring(ln FROM 'rows=(\d+)')::int;
+      EXIT;
+    END IF;
+  END LOOP;
+  IF est IS NULL OR est < 8000 THEN
+    RAISE EXCEPTION 'expression-only baseline ignored core stats: est=%', est;
+  END IF;
+END$$;
+SELECT fasttrun_analyze('t_expr_policy_analyze');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+DO $$
+DECLARE ln text; est int := NULL;
+BEGIN
+  FOR ln IN EXPLAIN EXECUTE q_expr_policy_analyze LOOP
+    IF ln ~ 'on t_expr_policy_analyze' THEN
+      est := substring(ln FROM 'rows=(\d+)')::int;
+      EXIT;
+    END IF;
+  END LOOP;
+  IF est IS NULL OR est < 20 OR est > 100 THEN
+    RAISE EXCEPTION 'analyze kept expression-only generic plan: est=%', est;
+  END IF;
+END$$;
+SELECT 'expression_policy_analyze_replanned' AS marker;
+               marker                
+-------------------------------------
+ expression_policy_analyze_replanned
+(1 row)
+
+DEALLOCATE q_expr_policy_analyze;
+DROP TABLE t_expr_policy_analyze;
+CREATE TEMP TABLE t_expr_policy_collect (id int, name text);
+ALTER TABLE t_expr_policy_collect ALTER COLUMN id SET STATISTICS 0;
+ALTER TABLE t_expr_policy_collect ALTER COLUMN name SET STATISTICS 0;
+INSERT INTO t_expr_policy_collect
+SELECT g, CASE WHEN g <= 9000 THEN 'dup' ELSE 'v_' || g END
+FROM generate_series(1, 10000) g;
+CREATE INDEX t_expr_policy_collect_idx ON t_expr_policy_collect (lower(name));
+ANALYZE t_expr_policy_collect;
+DO $$
+BEGIN
+  IF EXISTS (SELECT FROM pg_statistic
+             WHERE starelid = 't_expr_policy_collect'::regclass) OR
+     NOT EXISTS (SELECT FROM pg_statistic
+                 WHERE starelid = 't_expr_policy_collect_idx'::regclass) THEN
+    RAISE EXCEPTION 'expression-only ANALYZE fixture has wrong catalog stats';
+  END IF;
+END$$;
+PREPARE q_expr_policy_collect AS
+SELECT count(*) FROM t_expr_policy_collect WHERE lower(name) = 'dup';
+EXECUTE q_expr_policy_collect;
+ count 
+-------
+  9000
+(1 row)
+
+DO $$
+DECLARE ln text; est int := NULL;
+BEGIN
+  FOR ln IN EXPLAIN EXECUTE q_expr_policy_collect LOOP
+    IF ln ~ 'on t_expr_policy_collect' THEN
+      est := substring(ln FROM 'rows=(\d+)')::int;
+      EXIT;
+    END IF;
+  END LOOP;
+  IF est IS NULL OR est < 8000 THEN
+    RAISE EXCEPTION 'expression-only baseline ignored core stats: est=%', est;
+  END IF;
+END$$;
+SELECT fasttrun_collect_stats('t_expr_policy_collect');
+ fasttrun_collect_stats 
+------------------------
+ 
+(1 row)
+
+DO $$
+DECLARE ln text; est int := NULL;
+BEGIN
+  FOR ln IN EXPLAIN EXECUTE q_expr_policy_collect LOOP
+    IF ln ~ 'on t_expr_policy_collect' THEN
+      est := substring(ln FROM 'rows=(\d+)')::int;
+      EXIT;
+    END IF;
+  END LOOP;
+  IF est IS NULL OR est < 20 OR est > 100 THEN
+    RAISE EXCEPTION 'collect kept expression-only generic plan: est=%', est;
+  END IF;
+END$$;
+SELECT 'expression_policy_collect_replanned' AS marker;
+               marker                
+-------------------------------------
+ expression_policy_collect_replanned
+(1 row)
+
+DEALLOCATE q_expr_policy_collect;
+DROP TABLE t_expr_policy_collect;
+RESET fasttrun.sample_rows;
+RESET fasttrun.auto_collect_stats;
+RESET plan_cache_mode;
 DROP FUNCTION f_inner();
 DROP TABLE t_rsd_details;
 ERROR:  table "t_rsd_details" does not exist
