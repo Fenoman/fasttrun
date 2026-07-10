@@ -2101,6 +2101,24 @@ chain:
 	return false;
 }
 
+static int32
+fasttrun_type_default_width(Oid relid, AttrNumber attnum)
+{
+	HeapTuple	atttuple;
+	Form_pg_attribute attr;
+	int32		width;
+
+	atttuple = SearchSysCache2(ATTNUM,
+							 ObjectIdGetDatum(relid),
+							 Int16GetDatum(attnum));
+	if (!HeapTupleIsValid(atttuple))
+		return 1;
+	attr = (Form_pg_attribute) GETSTRUCT(atttuple);
+	width = get_typavgwidth(attr->atttypid, attr->atttypmod);
+	ReleaseSysCache(atttuple);
+	return Max(width, 1);
+}
+
 /*
  * Companion to fasttrun_get_relation_stats_hook for the planner's
  * separate average-width path (lsyscache.c:get_attavgwidth).
@@ -2112,10 +2130,9 @@ chain:
  * the real sample, which inflates hash-table / sort / spool costing
  * on temp tables with short text columns.
  *
- * Same freshness contract as the relation-stats hook: only return the
- * cached width if the pgstat snapshot still matches.  Returning 0
- * means "no opinion" and lets the planner fall back to its default
- * path (typavgwidth or whatever an outer hook returns).
+ * Same ownership contract as the relation-stats hook.  CORE_ALLOWED chains;
+ * neutral, stale, and zero-width local states return the type default here,
+ * because returning 0 would make lsyscache read stale pg_statistic.stawidth.
  */
 static int32
 fasttrun_get_attavgwidth_hook(Oid relid, AttrNumber attnum)
@@ -2143,24 +2160,31 @@ fasttrun_get_attavgwidth_hook(Oid relid, AttrNumber attnum)
 
 	entry = (FasttrunStatsEntry *) hash_search(fasttrun_stats_cache,
 											   &key, HASH_FIND, NULL);
-	if (entry == NULL ||
-		entry->state != FASTTRUN_COLUMN_LOCAL_CANDIDATE ||
-		entry->statsTuple == NULL)
+	if (entry != NULL && entry->state == FASTTRUN_COLUMN_CORE_ALLOWED)
 		goto chain;
+	if (entry == NULL)
+	{
+		if (relentry->policy == FASTTRUN_REL_LOCAL_NEUTRAL)
+			return fasttrun_type_default_width(relid, attnum);
+		goto chain;
+	}
+	if (entry->state == FASTTRUN_COLUMN_LOCAL_NEUTRAL ||
+		entry->statsTuple == NULL)
+		return fasttrun_type_default_width(relid, attnum);
 
 	if (!fasttrun_read_pgstat_counters_for_hook(relid, &ins_now, &upd_now,
 												&del_now, &truncdropped_now,
 												&pages_now))
-		goto chain;
+		return fasttrun_type_default_width(relid, attnum);
 
 	if (!fasttrun_stats_entry_usable(relid, entry, ins_now, upd_now,
 									 del_now, truncdropped_now, pages_now))
-		goto chain;		/* churn past threshold */
+		return fasttrun_type_default_width(relid, attnum);
 
 	stawidth = ((Form_pg_statistic) GETSTRUCT(entry->statsTuple))->stawidth;
 	if (stawidth > 0)
 		return stawidth;
-	/* fall through to chain on zero / negative width */
+	return fasttrun_type_default_width(relid, attnum);
 
 chain:
 	if (prev_get_attavgwidth_hook)

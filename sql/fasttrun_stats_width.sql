@@ -104,4 +104,56 @@ DROP TABLE t_hs_parity2;
 RESET fasttrun.use_typanalyze;
 RESET fasttrun.sample_rows;
 
+-- ======================================================================
+-- После сброса локальной статистики планировщик не должен читать старую
+-- ширину из pg_statistic. Для текстовой колонки из одних NULL ядро хранит
+-- ноль, но планировщик должен получить положительное значение по типу.
+-- ======================================================================
+CREATE TEMP TABLE t_width_fallback (v text);
+ALTER TABLE t_width_fallback ALTER COLUMN v SET STORAGE PLAIN;
+INSERT INTO t_width_fallback
+SELECT repeat(md5(g::text), 13) FROM generate_series(1, 1000) AS gs(g);
+ANALYZE t_width_fallback;
+
+SELECT avg_width > 300 AS core_width_is_wide
+FROM pg_stats
+WHERE tablename = 't_width_fallback' AND attname = 'v';
+
+SELECT fasttruncate('t_width_fallback');
+INSERT INTO t_width_fallback SELECT NULL FROM generate_series(1, 1000);
+
+SET fasttrun.auto_collect_stats = off;
+SELECT fasttrun_analyze('t_width_fallback');
+DO $$
+DECLARE ln text; plan_width int := NULL;
+BEGIN
+  FOR ln IN EXPLAIN (FORMAT JSON) SELECT DISTINCT v FROM t_width_fallback LOOP
+    plan_width := (ln::jsonb -> 0 -> 'Plan' ->> 'Plan Width')::int;
+  END LOOP;
+  IF plan_width IS NULL OR plan_width <= 0 OR plan_width >= 100 THEN
+    RAISE EXCEPTION 'neutral width escaped to stale core value: %', plan_width;
+  END IF;
+END$$;
+SELECT 'neutral_width_uses_type_default' AS marker;
+RESET fasttrun.auto_collect_stats;
+
+SET fasttrun.use_typanalyze = off;
+SELECT fasttrun_collect_stats('t_width_fallback');
+SELECT stawidth = 0 AS local_text_width_is_core_parity
+FROM fasttrun_inspect_stats('t_width_fallback')
+WHERE staattnum = 1;
+DO $$
+DECLARE ln text; plan_width int := NULL;
+BEGIN
+  FOR ln IN EXPLAIN (FORMAT JSON) SELECT DISTINCT v FROM t_width_fallback LOOP
+    plan_width := (ln::jsonb -> 0 -> 'Plan' ->> 'Plan Width')::int;
+  END LOOP;
+  IF plan_width IS NULL OR plan_width <= 0 OR plan_width >= 100 THEN
+    RAISE EXCEPTION 'zero candidate width escaped to stale core value: %', plan_width;
+  END IF;
+END$$;
+SELECT 'candidate_zero_width_uses_type_default' AS marker;
+RESET fasttrun.use_typanalyze;
+DROP TABLE t_width_fallback;
+
 DROP EXTENSION fasttrun;
