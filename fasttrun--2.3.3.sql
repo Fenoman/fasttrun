@@ -2,8 +2,9 @@
 
 -- ----------------------------------------------------------------------
 -- fasttruncate(text)
--- Очищает временную таблицу через heap_truncate без записи в каталог
--- и без последующего ANALYZE.  Подробности в fasttrun.c.
+-- Очищает локальную временную heap-таблицу напрямую через unlink и
+-- smgrcreate, без записи в каталог и без последующего ANALYZE.
+-- Подробности в fasttrun.c.
 -- ----------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION fasttruncate(text)
 RETURNS void AS 'MODULE_PATHNAME', 'fasttruncate'
