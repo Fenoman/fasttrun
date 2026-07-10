@@ -186,15 +186,12 @@ make installcheck PG_CONFIG=/path/to/pg_config PGPORT=5433
 | `fasttrun_discard` | Эвикция кэшей при `DISCARD TEMP/ALL` и dependency-удалениях (`DROP ... CASCADE`), откат drop'а в savepoint |
 | `fasttrun_zero_sinval_catalog` | Канарейка на «ноль shared sinval»: fasttruncate/analyze/bulk/collect не пишут каталог (relfilenode таблицы и индексов неизменны, `pg_class`/`pg_statistic` не тронуты); позитивный контроль — ядерные TRUNCATE/ANALYZE каталог меняют |
 
-Все тесты проходят на PG 16.13, 17.9 и 18.3.
+Все 13 наборов `pg_regress` проходят на PostgreSQL 16, 17 и 18.
 
-Перед релизом набор гоняется на **cassert-сборках** (`--enable-cassert`) PG 16, 17
-и 18 — обычный installcheck не ловит нарушения инвариантов, которые PostgreSQL
-проверяет только под assert (напр. запрет каталожного доступа в
-`RelationIdGetRelation` на границах транзакции, на котором держатся xact-колбэки).
-Скрипт `scripts/check_cassert_allversions.sh` пересобирает расширение под каждую
-cassert-версию и считает assert-падения (`TRAP`); ожидание — 12/12 тестов и ноль
-`TRAP`. Верифицировано на PG 16/17/18.
+Перед релизом `scripts/check_cassert_allversions.sh` пересобирает расширение
+для PostgreSQL 16, 17 и 18 с включёнными проверками `--enable-cassert`. Для
+каждой версии должны пройти 13 из 13 тестов, не должно быть `TRAP`, а отдельные
+проверки ошибок, порядка сортировки и памяти должны завершиться успешно.
 
 Для отдельной проверки контракта "ноль shared sinval" на Linux есть smoke-тест с `gdb`:
 

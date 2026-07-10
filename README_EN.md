@@ -180,7 +180,12 @@ make installcheck PG_CONFIG=/path/to/pg_config PGPORT=5433
 | `fasttrun_stats_width` | Correct `stawidth` for by-value / varlena / fixed-length by-reference columns |
 | `fasttrun_discard` | Cache eviction on `DISCARD TEMP/ALL` and dependency drops (`DROP ... CASCADE`), drop rollback inside a savepoint |
 
-All tests pass on PG 16.13, 17.9 and 18.3.
+All 13 `pg_regress` tests pass on PostgreSQL 16, 17, and 18.
+
+Before release, `scripts/check_cassert_allversions.sh` rebuilds the extension
+with `--enable-cassert` for all three versions. Each run must pass 13 of 13
+tests with no `TRAP`; the separate fault, ordering, and memory checks must pass
+as well.
 
 For a separate Linux-only check of the "zero shared sinval" contract, run the `gdb` smoke test:
 

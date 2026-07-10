@@ -73,6 +73,22 @@ fi
 # принадлежать root (наследие sudo-прогонов) и ломать pg_regress.
 OUTDIR=${FT_CASSERT_OUTDIR:-$(mktemp -d "${TMPDIR:-/tmp}/ft-cassert.XXXXXX")}
 mkdir -p "$OUTDIR"
+EXPECTED_REGRESS=13
+
+run_isolated_harness()
+{
+	local pgcfg=$1
+	shift
+	if [ -n "${PG_RUN_AS:-}" ]; then
+		if ! command -v runuser >/dev/null 2>&1; then
+			echo "runuser is required for PG_RUN_AS=$PG_RUN_AS" >&2
+			return 127
+		fi
+		runuser -u "$PG_RUN_AS" -- env PG_RUN_AS= PG_CONFIG="$pgcfg" "$@"
+	else
+		env PG_CONFIG="$pgcfg" "$@"
+	fi
+}
 
 overall_rc=0
 
@@ -99,7 +115,11 @@ for t in "${TARGET_ARR[@]}"; do
 	fi
 	warns=$(grep -ci 'warning:' "$OUTDIR/build${ver}.log")
 	echo "  сборка ok, warnings: $warns"
-	make install PG_CONFIG="$pgcfg" >> "$OUTDIR/build${ver}.log" 2>&1
+	if ! make install PG_CONFIG="$pgcfg" >> "$OUTDIR/build${ver}.log" 2>&1; then
+		echo "  не удалось установить расширение (см. $OUTDIR/build${ver}.log)" >&2
+		overall_rc=1
+		continue
+	fi
 
 	# 2. Снять базовую отметку TRAP до прогона.
 	trap_before=0
@@ -125,21 +145,43 @@ for t in "${TARGET_ARR[@]}"; do
 	trap_after=${trap_after//[!0-9]/}; trap_after=${trap_after:-0}
 	trap_delta=$((trap_after - trap_before))
 
-	echo "  тесты: ${passed} ok, ${failed} not ok · TRAP delta: ${trap_delta}"
-	if [ "$check_rc" -ne 0 ] || [ "$failed" -ne 0 ]; then
+	fault_rc=125
+	order_rc=125
+	memory_rc=125
+	if [ "$check_rc" -eq 0 ] && [ "$passed" -eq "$EXPECTED_REGRESS" ] && \
+		[ "$failed" -eq 0 ]; then
+		run_isolated_harness "$pgcfg" scripts/check_fasttrun_fault_matrix.sh \
+			>"$OUTDIR/fault${ver}.log" 2>&1
+		fault_rc=$?
+		run_isolated_harness "$pgcfg" scripts/check_fasttrun_tracking_order.sh \
+			>"$OUTDIR/order${ver}.log" 2>&1
+		order_rc=$?
+		run_isolated_harness "$pgcfg" scripts/check_fasttrun_xact_journal_memory.sh \
+			>"$OUTDIR/memory${ver}.log" 2>&1
+		memory_rc=$?
+	fi
+
+	echo "  тесты: пройдено ${passed}/${EXPECTED_REGRESS}, ошибок ${failed}, новых TRAP ${trap_delta}; дополнительные проверки: ошибки=${fault_rc}, порядок=${order_rc}, память=${memory_rc}"
+	if [ "$check_rc" -ne 0 ] || [ "$passed" -ne "$EXPECTED_REGRESS" ] || \
+		[ "$failed" -ne 0 ]; then
 		echo "  РЕГРЕСС: см. $OUTDIR/rc${ver}/regression.diffs" >&2
 		overall_rc=1
 	fi
+	if [ "$fault_rc" -ne 0 ] || [ "$order_rc" -ne 0 ] || \
+		[ "$memory_rc" -ne 0 ]; then
+		echo "  не прошли проверки ошибок, порядка или памяти; журналы находятся в $OUTDIR" >&2
+		overall_rc=1
+	fi
 	if [ "$trap_delta" -ne 0 ]; then
-		echo "  ASSERT-ПАДЕНИЕ (cassert TRAP): $(grep TRAP "$srvlog" | tail -"$trap_delta")" >&2
+		echo "  падение на Assert: $(grep TRAP "$srvlog" | tail -"$trap_delta")" >&2
 		overall_rc=1
 	fi
 done
 
 echo "========================================================"
 if [ "$overall_rc" -eq 0 ]; then
-	echo "ИТОГ: все cassert-версии зелёные, ноль TRAP."
+	echo "ИТОГ: все версии прошли 13/13 тестов и проверки ошибок, порядка и памяти; новых TRAP нет."
 else
-	echo "ИТОГ: есть регрессы/TRAP -- см. вывод выше и $OUTDIR." >&2
+	echo "ИТОГ: есть ошибки тестов или падения на Assert; см. вывод выше и $OUTDIR." >&2
 fi
 exit "$overall_rc"
