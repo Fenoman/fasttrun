@@ -42,24 +42,26 @@ Safe because temporary tables live in the backend's local buffer pool. Other pro
 At the same time, `fasttruncate` locally invalidates the current backend plan cache. This is needed so PL/pgSQL / SPI does not reuse an old plan after truncate and refill. This step does not send anything to the shared sinval queue.
 
 Besides the table itself, `fasttruncate` handles:
-* **all indexes, the toast table and its index** — the order is
-  load-bearing: every relation is opened first (a failure here leaves
-  the table untouched), then phase 1 drops the storage of all indexes
-  and toast (unlink + `smgrcreate`; the heap still has its data), then
-  the heap itself is emptied — the last destructive step — and only
-  then phase 2 rebuilds the empty structures via `ambuild` (btree
-  metapage, hash, etc.).  No failure state combines an empty heap with
-  an index still carrying old TIDs: before the heap drop the data is
-  intact, after it every index is already empty, and touching an index
-  without a metapage fails with a clear read error instead of silently
-  wrong results (the WARNING says to recreate the table);
+* **all user indexes, the TOAST table, and its indexes** — every relation is
+  opened before any file is changed. If that fails, the data remains intact.
+  The function then clears user indexes, TOAST indexes, the TOAST table, and
+  the main table. Finally, `ambuild` creates empty indexes and the statistics
+  are reset;
 * **`rd_amcache`** — clears the index AM metadata cache;
 * **`smgr_cached_nblocks`** — invalidated after ambuild;
 * **analyze cache** — seeds the baseline for delta math.
 
+An error before the first file change rolls back normally. Once cleanup has
+started, the old files cannot be restored. fasttrun then blocks the table and
+returns SQLSTATE `55000` for SELECT, DML, COPY, planning, and extension
+functions. A successful retry, DROP and recreate, or `DISCARD TEMP/ALL` clears
+the block. A savepoint rollback or full ROLLBACK does not.
+
 Before cleanup, `CheckTableNotInUse` is called — the same check that regular SQL `TRUNCATE` does. If there is an open cursor or an active query on the table, you get a clear SQL error, not a PANIC.
 
-Fallback: `SET fasttrun.zero_sinval_truncate = off` reverts to `heap_truncate_one_rel`. The core path emits several shared smgr/relcache sinval messages per affected relation (heap, each index, toast): on a table with one index that is around ten messages.
+Set `fasttrun.zero_sinval_truncate = off` to use the fallback path. It keeps
+the same order but calls `RelationTruncate` separately for each relation. Each
+completed call emits one shared SMGR message; the default path emits none.
 
 ## How fasttrun_analyze works
 
@@ -105,7 +107,7 @@ A separate commit-boundary backstop: a temp table's pgstat counters reset at eve
 | `fasttrun.max_analyze_pages` | `100000` | Heap-page threshold (~800 MB) above which a cold `fasttrun_analyze` switches from a full scan to block sampling: it reads a bounded random block sample and ESTIMATES reltuples from tuple density (like a regular `ANALYZE`), keeping cost O(sample) instead of O(table) on anomalously giant temp tables. Column stats are collected from the same sample. The threshold covers every analyze scan — cold, delta-refresh after churn and the partial-index rescan, not just the first one. `0` — always do the exact full scan |
 | `fasttrun.stats_refresh_threshold` | `0.2` | DML change ratio threshold governing both stats refresh and freshness tolerance: below it cached column stats stay visible to the planner, past it they are hidden. For freshness the effective threshold scales with column cardinality (`threshold·(1−dratio)`, floored at 5%): near-unique columns are stricter (guarding against a stale skewed estimate), low-cardinality columns keep the full threshold. A visible→hidden flip observed by `fasttrun_analyze` (including in the band between the scaled floor and the refresh threshold) invalidates cached SPI/PREPARE plans — a plan built on the now-hidden distribution does not outlive the flip while new plans already see defaults. `0` — refresh on any DML, visible only on an exact counter match. `1` — auto refresh disabled, freshness tolerates churn up to 100% (subject to the scaling) |
 | `fasttrun.invalidate_threshold` | `0.2` | `relpages`/`reltuples` drift ratio below which `fasttrun_analyze` does NOT invalidate cached SPI/PREPARE plans. Drift is measured cumulatively — against the values published at the last invalidation, not against the previous call: a series of small steps, each below the threshold, still invalidates the plan once the accumulated drift reaches it. Symmetric with `stats_refresh_threshold` — below 20% DML neither refresh nor plan invalidation fires. `0` — invalidate on any drift (the 2.2.0 behaviour). Invalidations triggered by a column-stats refresh, a stats-visibility flip, or an index relstats change always fire, regardless of this threshold |
-| `fasttrun.zero_sinval_truncate` | `on` | Direct `unlink`+`smgrcreate` instead of `smgrtruncate`. `off` — core path with several smgr/relcache sinval messages per affected relation (heap, each index, toast) |
+| `fasttrun.zero_sinval_truncate` | `on` | `on` clears files directly and sends no shared SMGR messages. `off` calls `RelationTruncate` for each relation and sends one message after each successful call |
 
 ## Performance
 
@@ -355,18 +357,18 @@ Statistics are saved to disk (`pg_stat/fasttrun_temp_stats`) on server shutdown 
 ## Limitations
 
 * **Heap AM only** — checked on entry of all functions. For columnar and other exotica — an error.
-* **Does not check foreign keys** — `fasttruncate` doesn't scan `pg_constraint`. By our convention, FKs are not created on temporary tables.
-* **Not transactional** — on ROLLBACK the data is not restored.
+* **Flat temporary heap tables only** — partitioned tables and inheritance parents are rejected before files are changed. Foreign keys are not checked and `TRUNCATE ... CASCADE` is not supported.
+* **Not transactional** — ROLLBACK does not restore files that were already cleared. If cleanup fails midway, the table remains blocked until another `fasttruncate` or DROP.
 * **`track_counts = on` is required for column stats freshness** — without pgstat counters the extension updates only relation-level statistics, emits a WARNING once per backend, and does not return cached column stats to the planner.
 * **Extended statistics** (`CREATE STATISTICS`) — not supported, there is no suitable hook in the core.
 * **Inheritance stats** — not supported. Temporary work tables normally do not use this path.
 * **Sequences** — `fasttruncate` does not reset SERIAL/IDENTITY sequences (same as regular `TRUNCATE` without `RESTART IDENTITY`).
 * **Cache is session-local only** — reused across transactions in one backend, but not across reconnects and never written to catalogs.
-* **Top-level `ROLLBACK` does not do catalog-like undo for `rd_rel`** — savepoint paths are handled locally, but after aborting the whole transaction values may live in relcache until the next `fasttrun_analyze`, `fasttruncate` or reconnect. This matches core behavior: a plain `ANALYZE` also writes `relpages`/`reltuples` in-place and does not roll them back on ROLLBACK — relation-level statistics in PostgreSQL are non-transactional by design.
+* **A full `ROLLBACK` does not restore cleared data** — after a successful `fasttruncate`, the table and its statistics stay empty. After an error, the block remains until repair or DROP.
 * **Expression index statistics** — not collected. Regular btree indexes on table columns use the column statistics, but indexes like `CREATE INDEX ON t ((lower(name)))` do not yet get separate expression statistics.
 * **ACL/RLS/security-barrier semantics of ANALYZE are not reproduced** — the extension is meant for temporary tables in the current session, not as a general security boundary.
 * **Cached plans are invalidated only locally** — `fasttruncate`, `fasttrun_analyze`, `fasttrun_collect_stats`, DDL/TRUNCATE eviction and savepoint rollback reset the current backend plan cache, but do not send shared sinval to other backends. Temp tables dying without a per-table DDL statement are tracked too: `DISCARD TEMP/ALL` drops both caches whole, and dependency drops (`DROP ... CASCADE`, `DROP OWNED BY`) are caught via `object_access_hook` — entries for dead relids do not accumulate in long-lived pooled sessions.
-* **A TRUNCATE that transitively touches other temp tables does not evict their caches** — the utility hook walks only the tables explicitly listed in the command. Children/partitions on a parent `TRUNCATE` and FK-linked tables on `TRUNCATE ... CASCADE` keep their previously cached statistics until the next `fasttrun_analyze`/`fasttruncate` on them. The extension is designed for flat temp tables without FKs.
+* **`TRUNCATE` with dependencies is not supported** — the extension handles only explicitly listed tables. Use regular PostgreSQL `TRUNCATE` for inheritance, partitioning, and foreign keys with `CASCADE`.
 * **Cost of cold-path stats collection** — ~50-150 ms for a 1M rows × 50 columns table. Can be disabled via GUC.
 
 ## Compatibility

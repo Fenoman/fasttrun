@@ -405,4 +405,29 @@ SELECT fasttruncate('t_bloat_idx');
 SELECT pg_relation_size('t_bloat_idx_pkey') < 100000 AS idx_reclaimed;
 DROP TABLE t_bloat_idx;
 
+-- ----------------------------------------------------------------------
+-- 15. fasttruncate не обходит наследование и секции.
+--     Родительская таблица отклоняется до изменения файлов; данные
+--     родителя и потомка остаются целы. Служебные контексты не остаются.
+-- ----------------------------------------------------------------------
+CREATE TEMP TABLE t_inh_parent (id int);
+CREATE TEMP TABLE t_inh_child () INHERITS (t_inh_parent);
+INSERT INTO t_inh_parent VALUES (1);
+INSERT INTO t_inh_child VALUES (2);
+SELECT fasttruncate('t_inh_parent');
+SELECT count(*) = 1 AS parent_intact FROM ONLY t_inh_parent \gset
+\echo parent_intact :parent_intact
+SELECT count(*) = 2 AS hierarchy_intact FROM t_inh_parent \gset
+\echo hierarchy_intact :hierarchy_intact
+DROP TABLE t_inh_parent CASCADE;
+
+CREATE TEMP TABLE t_operation_context (id int primary key);
+INSERT INTO t_operation_context SELECT generate_series(1, 10);
+DO $$ BEGIN PERFORM fasttruncate('t_operation_context'); END $$;
+SELECT count(*) = 0 AS operation_context_gone
+  FROM pg_backend_memory_contexts
+ WHERE name = 'fasttrun operation context' \gset
+\echo operation_context_gone :operation_context_gone
+DROP TABLE t_operation_context;
+
 DROP EXTENSION fasttrun;

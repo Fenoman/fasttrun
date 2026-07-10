@@ -35,6 +35,7 @@
 #include "catalog/pg_class.h"
 #include "catalog/pg_statistic.h"
 #include "catalog/pg_type.h"
+#include "catalog/storage.h"
 #include "commands/defrem.h"
 #include "commands/tablecmds.h"
 #include "commands/vacuum.h"
@@ -99,6 +100,7 @@ PG_FUNCTION_INFO_V1(fasttrun_prewarm);
 PG_FUNCTION_INFO_V1(fasttrun_reset_temp_stats);
 #ifdef USE_ASSERT_CHECKING
 PG_FUNCTION_INFO_V1(fasttrun_test_subxact_visits);
+PG_FUNCTION_INFO_V1(fasttrun_test_poison_locator_mismatch);
 #endif
 Datum	fasttruncate(PG_FUNCTION_ARGS);
 Datum	fasttrun_analyze(PG_FUNCTION_ARGS);
@@ -145,7 +147,8 @@ fasttrun_test_fail(const char *name, int ordinal)
 #define FASTTRUN_TEST_FAILPOINT(name, ordinal) \
 	fasttrun_test_fail((name), (ordinal))
 #else
-#define FASTTRUN_TEST_FAILPOINT(name, ordinal) ((void) 0)
+#define FASTTRUN_TEST_FAILPOINT(name, ordinal) \
+	do { (void) sizeof(name); (void) sizeof(ordinal); } while (0)
 #endif
 
 /*
@@ -572,8 +575,90 @@ typedef struct FasttrunAnalyzeCacheEntry
 static HTAB			   *fasttrun_analyze_cache = NULL;
 static MemoryContext	fasttrun_analyze_mcxt = NULL;
 
+/*
+ * An ERROR after the first storage reset cannot restore old files.  Keep one
+ * operation record until every relation is empty or access to the table has
+ * been blocked.
+ */
+typedef enum FasttrunTruncatePhase
+{
+	FASTTRUN_TRUNCATE_PREPARED,
+	FASTTRUN_TRUNCATE_MUTATED,
+	FASTTRUN_TRUNCATE_COMPLETE,
+	FASTTRUN_TRUNCATE_POISONED
+} FasttrunTruncatePhase;
+
+typedef enum FasttrunTruncateRelKind
+{
+	FASTTRUN_TRUNCATE_USER_INDEX,
+	FASTTRUN_TRUNCATE_TOAST_INDEX,
+	FASTTRUN_TRUNCATE_TOAST_HEAP,
+	FASTTRUN_TRUNCATE_MAIN_HEAP
+} FasttrunTruncateRelKind;
+
+typedef struct FasttrunPoisonEntry FasttrunPoisonEntry;
+
+typedef struct FasttrunTruncateResultSlot
+{
+	Oid			relid;
+	Oid			root_relid;
+	RelFileLocatorBackend rlb;
+	Oid			heap_relid;
+	RelFileLocatorBackend heap_rlb;
+	FasttrunTruncateRelKind kind;
+	FasttrunAnalyzeCacheEntry *analyze_entry;
+	BlockNumber rebuilt_pages;
+	bool		published;
+} FasttrunTruncateResultSlot;
+
+typedef struct FasttrunTruncateOperation
+{
+	Oid			root_relid;
+	RelFileLocatorBackend root_rlb;
+	uint64		generation;
+	FasttrunTruncatePhase phase;
+	int			nuser_indexes;
+	int			ntoast_indexes;
+	int			nslots;
+	int			published_slots;
+	bool		have_pgstat_seed;
+	int64		seed_inserted;
+	int64		seed_updated;
+	int64		seed_deleted;
+	bool		seed_truncdropped;
+	FasttrunPoisonEntry *registry_entry;
+	FasttrunTruncateResultSlot slots[FLEXIBLE_ARRAY_MEMBER];
+} FasttrunTruncateOperation;
+
+struct FasttrunPoisonEntry
+{
+	Oid			root_relid;		/* hash key -- must be first */
+	RelFileLocatorBackend root_rlb;
+	uint64		generation;
+	bool		active;
+	FasttrunTruncateOperation *active_operation;
+	FasttrunTruncateOperation *pending_operation;
+};
+
+typedef struct FasttrunOpenedWorkset
+{
+	List	   *user_indexes;
+	List	   *toast_indexes;
+	Relation	toastrel;
+	Relation   *slot_relations;
+	int			nslots;
+} FasttrunOpenedWorkset;
+
+static MemoryContext fasttrun_operation_mcxt = NULL;
+static HTAB *fasttrun_poison_cache = NULL;
+
 static void fasttrun_xact_callback(XactEvent event, void *arg);
 static void fasttrun_analyze_save_undo(FasttrunAnalyzeCacheEntry *entry);
+static void fasttrun_poison_commit_xact(void);
+static void fasttrun_poison_clear_all(void);
+static void fasttrun_poison_check_relation(Relation rel,
+										   const char *operation,
+										   bool allow_repair);
 
 static bool
 fasttrun_relation_has_same_locator(Relation rel, FasttrunAnalyzeCacheEntry *entry)
@@ -830,6 +915,7 @@ fasttrun_xact_callback(XactEvent event, void *arg)
 	{
 		case XACT_EVENT_COMMIT:
 		case XACT_EVENT_PARALLEL_COMMIT:
+			fasttrun_poison_commit_xact();
 			fasttrun_cache_commit_xact();
 			fasttrun_stats_cache_commit_xact();
 			break;
@@ -850,6 +936,7 @@ fasttrun_xact_callback(XactEvent event, void *arg)
 			break;
 		case XACT_EVENT_PREPARE:
 			/* Prepared xacts cannot retain backend-private temp state. */
+			fasttrun_poison_clear_all();
 			fasttrun_cache_reset();
 			fasttrun_stats_cache_reset();
 			break;
@@ -899,6 +986,269 @@ fasttrun_cache_init(void)
 	fasttrun_analyze_mcxt = (MemoryContext) new_mcxt;
 	fasttrun_analyze_cache = new_cache;
 }
+
+/* Publish the operation registry only after its context and HTAB exist. */
+static void
+fasttrun_operation_init(void)
+{
+	HASHCTL		ctl;
+	MemoryContext volatile new_mcxt = NULL;
+	HTAB	   *new_cache = NULL;
+
+	if (fasttrun_poison_cache != NULL)
+		return;
+
+	/* The planner hook enforces active blocks. */
+	fasttrun_ensure_planner_hook();
+
+	PG_TRY();
+	{
+		new_mcxt = AllocSetContextCreate(TopMemoryContext,
+										 "fasttrun operation context",
+										 ALLOCSET_SMALL_SIZES);
+		memset(&ctl, 0, sizeof(ctl));
+		ctl.keysize = sizeof(Oid);
+		ctl.entrysize = sizeof(FasttrunPoisonEntry);
+		ctl.hcxt = (MemoryContext) new_mcxt;
+		new_cache = hash_create("fasttrun poison cache", 8, &ctl,
+								HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	}
+	PG_CATCH();
+	{
+		if (new_mcxt != NULL)
+			MemoryContextDelete((MemoryContext) new_mcxt);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	fasttrun_operation_mcxt = (MemoryContext) new_mcxt;
+	fasttrun_poison_cache = new_cache;
+}
+
+static void
+fasttrun_operation_reset_if_empty(void)
+{
+	MemoryContext old_mcxt;
+
+	if (fasttrun_poison_cache == NULL ||
+		hash_get_num_entries(fasttrun_poison_cache) != 0)
+		return;
+
+	old_mcxt = fasttrun_operation_mcxt;
+	fasttrun_poison_cache = NULL;
+	fasttrun_operation_mcxt = NULL;
+	MemoryContextDelete(old_mcxt);
+}
+
+static FasttrunPoisonEntry *
+fasttrun_poison_find(Oid root_relid)
+{
+	if (fasttrun_poison_cache == NULL || !OidIsValid(root_relid))
+		return NULL;
+	return (FasttrunPoisonEntry *) hash_search(fasttrun_poison_cache,
+												  &root_relid, HASH_FIND, NULL);
+}
+
+/*
+ * Reserve the registry slot before mutation.  The final pointer assignment
+ * is the publication boundary: errors before it leave no pending operation.
+ */
+static FasttrunPoisonEntry *
+fasttrun_poison_reserve(FasttrunTruncateOperation *operation)
+{
+	FasttrunPoisonEntry *entry;
+	bool		found;
+
+	fasttrun_operation_init();
+	entry = (FasttrunPoisonEntry *) hash_search(fasttrun_poison_cache,
+												   &operation->root_relid,
+												   HASH_ENTER, &found);
+	if (!found)
+	{
+		entry->root_rlb = operation->root_rlb;
+		entry->generation = 0;
+		entry->active = false;
+		entry->active_operation = NULL;
+		entry->pending_operation = NULL;
+	}
+	if (entry->pending_operation != NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("fasttrun: truncate is already pending for relation %u",
+						operation->root_relid)));
+
+	operation->registry_entry = entry;
+	entry->root_rlb = operation->root_rlb;
+	entry->generation = operation->generation;
+	entry->pending_operation = operation;
+	return entry;
+}
+
+/* A preparation error detaches this attempt and preserves an older block. */
+static void
+fasttrun_poison_cancel_pending(FasttrunTruncateOperation *operation)
+{
+	FasttrunPoisonEntry *entry = operation->registry_entry;
+	Oid			root_relid = operation->root_relid;
+
+	if (entry != NULL && entry->pending_operation == operation &&
+		entry->generation == operation->generation)
+		entry->pending_operation = NULL;
+	pfree(operation);
+
+	if (entry != NULL && entry->pending_operation == NULL)
+	{
+		if (entry->active && entry->active_operation != NULL)
+		{
+			entry->root_rlb = entry->active_operation->root_rlb;
+			entry->generation = entry->active_operation->generation;
+		}
+		else
+			(void) hash_search(fasttrun_poison_cache, &root_relid,
+								 HASH_REMOVE, NULL);
+	}
+	fasttrun_operation_reset_if_empty();
+}
+
+/* MUTATED failed: no allocation or catalog access is allowed here. */
+static void
+fasttrun_poison_activate(FasttrunTruncateOperation *operation)
+{
+	FasttrunPoisonEntry *entry = operation->registry_entry;
+	FasttrunTruncateOperation *old_active;
+
+	Assert(entry != NULL);
+	Assert(entry->pending_operation == operation);
+	old_active = entry->active_operation;
+	entry->pending_operation = NULL;
+	entry->active_operation = operation;
+	entry->active = true;
+	entry->root_rlb = operation->root_rlb;
+	entry->generation = operation->generation;
+	operation->phase = FASTTRUN_TRUNCATE_POISONED;
+	if (old_active != NULL && old_active != operation)
+		pfree(old_active);
+}
+
+/* COMPLETE is the only successful repair boundary. */
+static void
+fasttrun_poison_complete(FasttrunTruncateOperation *operation)
+{
+	FasttrunPoisonEntry *entry = operation->registry_entry;
+	FasttrunTruncateOperation *old_active;
+	Oid			root_relid = operation->root_relid;
+
+	Assert(entry != NULL);
+	Assert(entry->pending_operation == operation);
+	old_active = entry->active_operation;
+	entry->pending_operation = NULL;
+	entry->active_operation = NULL;
+	entry->active = false;
+	if (old_active != NULL && old_active != operation)
+		pfree(old_active);
+	pfree(operation);
+	(void) hash_search(fasttrun_poison_cache, &root_relid,
+						 HASH_REMOVE, NULL);
+	fasttrun_operation_reset_if_empty();
+}
+
+static void
+fasttrun_poison_forget_relid(Oid root_relid)
+{
+	FasttrunPoisonEntry *entry = fasttrun_poison_find(root_relid);
+	FasttrunTruncateOperation *active;
+	FasttrunTruncateOperation *pending;
+
+	if (entry == NULL)
+		return;
+	active = entry->active_operation;
+	pending = entry->pending_operation;
+	entry->active_operation = NULL;
+	entry->pending_operation = NULL;
+	entry->active = false;
+	if (active != NULL)
+		pfree(active);
+	if (pending != NULL && pending != active)
+		pfree(pending);
+	(void) hash_search(fasttrun_poison_cache, &root_relid,
+						 HASH_REMOVE, NULL);
+	fasttrun_operation_reset_if_empty();
+}
+
+static void
+fasttrun_poison_clear_all(void)
+{
+	MemoryContext old_mcxt = fasttrun_operation_mcxt;
+
+	if (old_mcxt == NULL)
+		return;
+	fasttrun_poison_cache = NULL;
+	fasttrun_operation_mcxt = NULL;
+	MemoryContextDelete(old_mcxt);
+}
+
+static void
+fasttrun_poison_check_relation(Relation rel, const char *operation,
+								bool allow_repair)
+{
+	Oid			root_relid = RelationGetRelid(rel);
+	FasttrunPoisonEntry *entry = fasttrun_poison_find(root_relid);
+
+	if (entry == NULL || !entry->active)
+		return;
+
+	/* DROP/recreate or a relfilenode replacement retires an old marker. */
+	if (!RelFileLocatorEquals(entry->root_rlb.locator, rel->rd_locator) ||
+		entry->root_rlb.backend != rel->rd_backend)
+	{
+		fasttrun_poison_forget_relid(root_relid);
+		return;
+	}
+	if (allow_repair)
+		return;
+
+	ereport(ERROR,
+			(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+			 errmsg("fasttrun: relation \"%s\" is unavailable after an incomplete truncate",
+					RelationGetRelationName(rel)),
+			 errdetail("The failed %s had already changed table files.",
+					   operation),
+			 errhint("Retry fasttruncate, or DROP and recreate the temporary table.")));
+}
+
+/* DROP is transactional; only COMMIT removes an active block. */
+static void
+fasttrun_poison_commit_xact(void)
+{
+	HASH_SEQ_STATUS status;
+	FasttrunXactRelEntry *xentry;
+
+	if (fasttrun_poison_cache == NULL || fasttrun_xact_frame == NULL)
+		return;
+	hash_seq_init(&status, fasttrun_xact_frame->entries);
+	while ((xentry = (FasttrunXactRelEntry *) hash_seq_search(&status)) != NULL)
+	{
+		if (fasttrun_xact_entry_dropped(xentry) &&
+			fasttrun_poison_find(xentry->relid) != NULL)
+			fasttrun_poison_forget_relid(xentry->relid);
+	}
+}
+
+#ifdef USE_ASSERT_CHECKING
+Datum
+fasttrun_test_poison_locator_mismatch(PG_FUNCTION_ARGS)
+{
+	Oid			relid = PG_GETARG_OID(0);
+	FasttrunPoisonEntry *entry = fasttrun_poison_find(relid);
+
+	if (entry == NULL || !entry->active)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("fasttrun test poison is not active")));
+	entry->root_rlb.locator.relNumber++;
+	PG_RETURN_VOID();
+}
+#endif
 
 /* Returns NULL if no entry or cache not yet allocated. */
 static FasttrunAnalyzeCacheEntry *
@@ -1116,39 +1466,6 @@ fasttrun_cache_mark_evicted(Oid relid)
 	entry->lazy_check_pages = 0;
 }
 
-/* Drop entry by relid.  Called from fasttruncate. */
-static void
-fasttrun_cache_remove(Oid relid)
-{
-	FasttrunAnalyzeCacheEntry *entry;
-
-	if (fasttrun_analyze_cache == NULL)
-		return;
-
-	entry = fasttrun_cache_lookup(relid);
-	if (entry != NULL)
-		fasttrun_analyze_free_undo(entry);
-
-	(void) hash_search(fasttrun_analyze_cache, &relid, HASH_REMOVE, NULL);
-}
-
-static void
-fasttrun_cache_remove_rel_and_indexes(Relation rel)
-{
-	List	   *index_oids;
-	ListCell   *lc;
-
-	if (fasttrun_analyze_cache == NULL)
-		return;
-
-	fasttrun_cache_remove(RelationGetRelid(rel));
-
-	index_oids = RelationGetIndexList(rel);
-	foreach(lc, index_oids)
-		fasttrun_cache_remove(lfirst_oid(lc));
-	list_free(index_oids);
-}
-
 static void
 fasttrun_cache_mark_rel_and_indexes_evicted(Relation rel)
 {
@@ -1164,72 +1481,6 @@ fasttrun_cache_mark_rel_and_indexes_evicted(Relation rel)
 	foreach(lc, index_oids)
 		fasttrun_cache_mark_evicted(lfirst_oid(lc));
 	list_free(index_oids);
-}
-
-/*
- * Seed an analyze-cache entry from scratch right after fasttruncate(),
- * so the very next fasttrun_analyze() on the refilled table can take the
- * delta hot path instead of paying for a full cold scan.
- *
- * Logically the table now has zero rows and zero pages, and the post-
- * truncate pgstat snapshot becomes the new delta-math baseline.  After
- * a subsequent INSERT N, the next fasttrun_analyze() sees:
- *   pages_now > 0 >= cached_pages (=0)               -> delta hit OK
- *   truncdropped_now == cached_truncdropped         -> delta hit OK
- *   delta_ins = ins_now - cached_ins = N            -> exactly the new rows
- *   new_tuples = 0 + N - 0 = N                      -> correct
- *
- * The stats baseline is also seeded with the same snapshot, so that the
- * first post-refill analyze passes the refresh-check threshold (any
- * non-trivial INSERT against a 0-row baseline gives churn ratio >= 1)
- * and refreshes column stats on the refilled data.  The refresh uses the
- * same full reservoir scan as the cold path to keep plan quality aligned
- * with regular ANALYZE.
- *
- * If pgstat is unavailable (track_counts=off) we can't take a snapshot,
- * so we fall back to the old behaviour: drop the cache entry and let
- * the next analyze pay for a real cold scan.
- */
-static void
-fasttrun_cache_seed_after_truncate(Relation rel)
-{
-	Oid			relid = RelationGetRelid(rel);
-	int64		ins_now = 0;
-	int64		upd_now = 0;
-	int64		del_now = 0;
-	bool		truncdropped_now = false;
-	FasttrunAnalyzeCacheEntry *entry;
-
-	/* Drop any prior entry (and its baseline undo chain) first. */
-	fasttrun_cache_remove(relid);
-
-	entry = fasttrun_cache_store_relstats(rel, 0, 0, 0);
-
-	/* fasttruncate just invalidated local plans -- anchor the gate here. */
-	entry->state.last_inval_pages = 0;
-	entry->state.last_inval_tuples = 0;
-	entry->state.last_inval_valid = true;
-
-	if (!fasttrun_read_pgstat_counters(rel, &ins_now, &upd_now, &del_now,
-									   &truncdropped_now))
-		return;	/* no pgstat -> no delta seed; next analyze will cold-scan */
-
-	/* Delta-math state: post-truncate empty table. */
-	fasttrun_cache_store_delta_state(entry, ins_now, upd_now, del_now,
-									 truncdropped_now);
-
-	/*
-	 * Stats baseline: same snapshot.  has_stats_baseline=true so the
-	 * first post-refill analyze enters the refresh-check arm; the
-	 * resulting churn ratio (any INSERT N / max(N,1) = 1) clears the
-	 * default 0.2 threshold and triggers a full reservoir collect.
-	 */
-	entry->state.has_stats_baseline = true;
-	entry->state.stats_baseline_inserted = ins_now;
-	entry->state.stats_baseline_updated = upd_now;
-	entry->state.stats_baseline_deleted = del_now;
-	entry->state.stats_baseline_truncdropped = truncdropped_now;
-	/* The truncate phase owns this replacement; no older state survives. */
 }
 
 /*
@@ -2511,6 +2762,65 @@ fasttrun_reinject_sublink_walker(Node *node, void *context)
 								  context);
 }
 
+static void fasttrun_poison_check_query(Query *query);
+
+static bool
+fasttrun_poison_sublink_walker(Node *node, void *context)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, Query))
+	{
+		fasttrun_poison_check_query((Query *) node);
+		return false;
+	}
+	return expression_tree_walker(node, fasttrun_poison_sublink_walker,
+								  context);
+}
+
+/* Walk only while poison exists; hash misses do not open relations. */
+static void
+fasttrun_poison_check_query(Query *query)
+{
+	ListCell   *lc;
+
+	if (query == NULL || fasttrun_poison_cache == NULL)
+		return;
+	foreach(lc, query->rtable)
+	{
+		RangeTblEntry *rte = (RangeTblEntry *) lfirst(lc);
+
+		if (rte->rtekind == RTE_RELATION && OidIsValid(rte->relid))
+		{
+			FasttrunPoisonEntry *entry = fasttrun_poison_find(rte->relid);
+
+			if (entry != NULL && entry->active)
+			{
+				Relation	rel = RelationIdGetRelation(rte->relid);
+
+				if (RelationIsValid(rel))
+				{
+					fasttrun_poison_check_relation(rel, "query planning", false);
+					RelationClose(rel);
+				}
+			}
+		}
+		else if (rte->rtekind == RTE_SUBQUERY)
+			fasttrun_poison_check_query(rte->subquery);
+	}
+	foreach(lc, query->cteList)
+	{
+		CommonTableExpr *cte = (CommonTableExpr *) lfirst(lc);
+
+		if (IsA(cte->ctequery, Query))
+			fasttrun_poison_check_query((Query *) cte->ctequery);
+	}
+	if (query->hasSubLinks)
+		(void) query_tree_walker(query, fasttrun_poison_sublink_walker, NULL,
+								 QTW_IGNORE_RT_SUBQUERIES |
+								 QTW_IGNORE_CTE_SUBQUERIES);
+}
+
 static PlannedStmt *
 fasttrun_planner_hook(Query *parse, const char *query_string,
 					  int cursorOptions, ParamListInfo boundParams)
@@ -2520,6 +2830,9 @@ fasttrun_planner_hook(Query *parse, const char *query_string,
 	int			saved_freshness_cache_used = fasttrun_freshness_cache_used;
 	int			saved_freshness_cache_next_evict = fasttrun_freshness_cache_next_evict;
 	bool		stats_frame_needed = false;
+
+	if (fasttrun_poison_cache != NULL)
+		fasttrun_poison_check_query(parse);
 
 	if (fasttrun_analyze_cache != NULL)
 	{
@@ -5082,8 +5395,8 @@ fasttrun_unlink_fork_segments(const char *base_path)
 /*
  * Zero-sinval physical truncation of a temp relation.
  *
- * Functionally equivalent to heap_truncate_one_rel(rel) -- empties the
- * heap to zero blocks and discards local buffers -- but does NOT call
+ * Functionally equivalent to RelationTruncate(rel, 0) -- empties one
+ * storage relation to zero blocks and discards local buffers -- but does NOT call
  * smgrtruncate() and therefore never reaches CacheInvalidateSmgr().
  * That removes the last shared-invalidation message that fasttruncate
  * was sending; the path is now literally zero sinval.
@@ -5108,7 +5421,7 @@ fasttrun_unlink_fork_segments(const char *base_path)
  * relpersistence='t' + heap AM.
  */
 static void
-fasttrun_smgr_bypass_truncate(Relation rel)
+fasttrun_smgr_bypass_truncate(Relation rel, bool buffers_already_dropped)
 {
 	SMgrRelation			reln;
 	RelFileLocatorBackend	rlocator;
@@ -5144,8 +5457,9 @@ fasttrun_smgr_bypass_truncate(Relation rel)
 	if (smgrexists(reln, VISIBILITYMAP_FORKNUM))
 		forks[nforks++] = VISIBILITYMAP_FORKNUM;
 
-	/* 2. Drop local buffers of all forks in one pool scan (temp -> local pool). */
-	DropRelationAllLocalBuffers(rlocator.locator);
+	/* 2. Drop local buffers unless already dropped for all opened relations. */
+	if (!buffers_already_dropped)
+		DropRelationAllLocalBuffers(rlocator.locator);
 
 	/*
 	 * 3. Release all cached file descriptors and per-fork state inside the
@@ -5216,38 +5530,400 @@ fasttrun_smgr_bypass_truncate(Relation rel)
  * cache invalidation messages.  The index storage must already be
  * dropped and re-created empty: ambuild requires a zero-block relation.
  */
-static void
-fasttrun_rebuild_one_index(Relation heaprel, Relation indexrel)
+static BlockNumber
+fasttrun_ambuild_empty_index(Relation heaprel, Relation indexrel)
 {
 	IndexInfo  *indexInfo = BuildDummyIndexInfo(indexrel);
+	IndexBuildResult *result;
+	BlockNumber pages;
 
-	if (indexrel->rd_amcache)
+	if (indexrel->rd_amcache != NULL)
 	{
 		pfree(indexrel->rd_amcache);
 		indexrel->rd_amcache = NULL;
 	}
-
-	pfree(indexrel->rd_indam->ambuild(heaprel, indexrel, indexInfo));
-
+	result = indexrel->rd_indam->ambuild(heaprel, indexrel, indexInfo);
+	pfree(result);
+	pfree(indexInfo);
 	RelationGetSmgr(indexrel)->smgr_cached_nblocks[MAIN_FORKNUM] =
 		InvalidBlockNumber;
+	pages = RelationGetNumberOfBlocks(indexrel);
+	return pages;
+}
 
-	indexrel->rd_rel->relpages =
-		RelationGetNumberOfBlocks(indexrel);
-	indexrel->rd_rel->reltuples = 0;
-	indexrel->rd_rel->relallvisible = 0;
-	fasttrun_cache_set_owning_heap(fasttrun_cache_store_relstats(indexrel,
-																 indexrel->rd_rel->relpages,
-																 0, 0),
-								   heaprel);
+static void
+fasttrun_truncate_one_storage(Relation rel, bool zero_sinval,
+								 bool buffers_already_dropped)
+{
+	if (zero_sinval)
+		fasttrun_smgr_bypass_truncate(rel, buffers_already_dropped);
+	else
+		RelationTruncate(rel, 0);
+}
+
+static FasttrunTruncateResultSlot *
+fasttrun_truncate_slot(FasttrunTruncateOperation *operation, Oid relid)
+{
+	int			i;
+
+	for (i = 0; i < operation->nslots; i++)
+	{
+		if (operation->slots[i].relid == relid)
+			return &operation->slots[i];
+	}
+	elog(ERROR, "fasttrun: relation %u was not prepared for truncate", relid);
+	return NULL;
+}
+
+/* Open the complete relation set before any cache or storage side effect. */
+static void
+fasttrun_prepare_truncate_workset(Relation heaprel,
+								  FasttrunOpenedWorkset *opened)
+{
+	List	   *index_oids;
+	ListCell   *lc;
+	Oid			toastrelid;
+	int			i = 0;
+
+	memset(opened, 0, sizeof(*opened));
+	if (heaprel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE ||
+		heaprel->rd_rel->relhassubclass)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("fasttruncate does not support partitioned or inheritance-parent temporary tables"),
+				 errhint("Use core SQL TRUNCATE for inheritance or partition traversal.")));
+
+	CheckTableNotInUse(heaprel, "fasttruncate");
+	index_oids = RelationGetIndexList(heaprel);
+	foreach(lc, index_oids)
+	{
+		Relation	indexrel = index_open(lfirst_oid(lc), AccessExclusiveLock);
+
+		CheckTableNotInUse(indexrel, "fasttruncate");
+		opened->user_indexes = lappend(opened->user_indexes, indexrel);
+	}
+	list_free(index_oids);
+
+	toastrelid = heaprel->rd_rel->reltoastrelid;
+	if (OidIsValid(toastrelid))
+	{
+		opened->toastrel = table_open(toastrelid, AccessExclusiveLock);
+		CheckTableNotInUse(opened->toastrel, "fasttruncate");
+		index_oids = RelationGetIndexList(opened->toastrel);
+		foreach(lc, index_oids)
+		{
+			Relation	indexrel = index_open(lfirst_oid(lc),
+										 AccessExclusiveLock);
+
+			CheckTableNotInUse(indexrel, "fasttruncate");
+			opened->toast_indexes = lappend(opened->toast_indexes, indexrel);
+		}
+		list_free(index_oids);
+	}
+
+	opened->nslots = list_length(opened->user_indexes) +
+		list_length(opened->toast_indexes) +
+		(opened->toastrel != NULL ? 1 : 0) + 1;
+	opened->slot_relations = (Relation *)
+		palloc(sizeof(Relation) * opened->nslots);
+	foreach(lc, opened->user_indexes)
+		opened->slot_relations[i++] = (Relation) lfirst(lc);
+	foreach(lc, opened->toast_indexes)
+		opened->slot_relations[i++] = (Relation) lfirst(lc);
+	if (opened->toastrel != NULL)
+		opened->slot_relations[i++] = opened->toastrel;
+	opened->slot_relations[i++] = heaprel;
+	Assert(i == opened->nslots);
+}
+
+static void
+fasttrun_close_truncate_workset(FasttrunOpenedWorkset *opened)
+{
+	ListCell   *lc;
+
+	foreach(lc, opened->user_indexes)
+		index_close((Relation) lfirst(lc), NoLock);
+	list_free(opened->user_indexes);
+	opened->user_indexes = NIL;
+	foreach(lc, opened->toast_indexes)
+		index_close((Relation) lfirst(lc), NoLock);
+	list_free(opened->toast_indexes);
+	opened->toast_indexes = NIL;
+	if (opened->toastrel != NULL)
+		table_close(opened->toastrel, NoLock);
+	opened->toastrel = NULL;
+	if (opened->slot_relations != NULL)
+		pfree(opened->slot_relations);
+	opened->slot_relations = NULL;
+	opened->nslots = 0;
+}
+
+static FasttrunTruncateOperation *
+fasttrun_allocate_truncate_operation(Relation heaprel,
+									FasttrunOpenedWorkset *opened,
+									uint64 generation)
+{
+	FasttrunTruncateOperation *operation;
+	Size		size;
+	int			i;
+	int			toast_index_end;
+	int			toast_heap_index = -1;
+	RelFileLocatorBackend root_rlb;
+
+	fasttrun_operation_init();
+	size = offsetof(FasttrunTruncateOperation, slots) +
+		(sizeof(FasttrunTruncateResultSlot) * opened->nslots);
+	operation = (FasttrunTruncateOperation *)
+		MemoryContextAllocZero(fasttrun_operation_mcxt, size);
+	root_rlb.locator = heaprel->rd_locator;
+	root_rlb.backend = heaprel->rd_backend;
+	operation->root_relid = RelationGetRelid(heaprel);
+	operation->root_rlb = root_rlb;
+	operation->generation = generation;
+	operation->phase = FASTTRUN_TRUNCATE_PREPARED;
+	operation->nuser_indexes = list_length(opened->user_indexes);
+	operation->ntoast_indexes = list_length(opened->toast_indexes);
+	operation->nslots = opened->nslots;
+	toast_index_end = operation->nuser_indexes + operation->ntoast_indexes;
+	if (opened->toastrel != NULL)
+		toast_heap_index = toast_index_end;
+
+	for (i = 0; i < opened->nslots; i++)
+	{
+		Relation	rel = opened->slot_relations[i];
+		FasttrunTruncateResultSlot *slot = &operation->slots[i];
+
+		slot->relid = RelationGetRelid(rel);
+		slot->root_relid = operation->root_relid;
+		slot->rlb.locator = rel->rd_locator;
+		slot->rlb.backend = rel->rd_backend;
+		if (i < operation->nuser_indexes)
+		{
+			slot->kind = FASTTRUN_TRUNCATE_USER_INDEX;
+			slot->heap_relid = operation->root_relid;
+			slot->heap_rlb = operation->root_rlb;
+		}
+		else if (i < toast_index_end)
+		{
+			slot->kind = FASTTRUN_TRUNCATE_TOAST_INDEX;
+			slot->heap_relid = RelationGetRelid(opened->toastrel);
+			slot->heap_rlb.locator = opened->toastrel->rd_locator;
+			slot->heap_rlb.backend = opened->toastrel->rd_backend;
+		}
+		else if (i == toast_heap_index)
+		{
+			slot->kind = FASTTRUN_TRUNCATE_TOAST_HEAP;
+			slot->heap_relid = slot->relid;
+			slot->heap_rlb = slot->rlb;
+		}
+		else
+		{
+			slot->kind = FASTTRUN_TRUNCATE_MAIN_HEAP;
+			slot->heap_relid = slot->relid;
+			slot->heap_rlb = slot->rlb;
+		}
+	}
+	return operation;
+}
+
+/* Save complete undo and switch every result slot to neutral ownership. */
+static void
+fasttrun_reserve_empty_publication(FasttrunTruncateOperation *operation,
+								   Relation heaprel)
+{
+	int			i;
+
+	for (i = 0; i < operation->nslots; i++)
+	{
+		FasttrunTruncateResultSlot *slot = &operation->slots[i];
+		FasttrunAnalyzeCacheEntry *entry = fasttrun_cache_enter(slot->relid);
+
+		fasttrun_analyze_save_undo(entry);
+		entry->state.has_relstats = false;
+		entry->state.has_delta_state = false;
+		entry->state.has_stats_baseline = false;
+		entry->state.last_inval_valid = false;
+		fasttrun_cache_reset_partial_scan_anchor(entry);
+		entry->lazy_check_subid = InvalidSubTransactionId;
+		entry->lazy_check_pages = 0;
+		slot->analyze_entry = entry;
+		fasttrun_xact_mark_relid(slot->relid, operation->root_relid,
+								FASTTRUN_TOUCH_ANALYZE |
+								FASTTRUN_TOUCH_PLAN_INVALIDATE);
+	}
+	fasttrun_xact_mark_relid(operation->root_relid, operation->root_relid,
+							FASTTRUN_TOUCH_ANALYZE |
+							FASTTRUN_TOUCH_STATS |
+							FASTTRUN_TOUCH_PLAN_INVALIDATE);
+	(void) fasttrun_stats_neutralize_relation(heaprel);
+	operation->have_pgstat_seed = fasttrun_read_pgstat_counters(heaprel,
+													&operation->seed_inserted,
+													&operation->seed_updated,
+													&operation->seed_deleted,
+													&operation->seed_truncdropped);
+	fasttrun_invalidate_local_plan_cache(operation->root_relid);
+}
+
+static void
+fasttrun_execute_truncate_storage(FasttrunTruncateOperation *operation,
+								  Relation heaprel,
+								  FasttrunOpenedWorkset *opened)
+{
+	ListCell   *lc;
+	int			ordinal = 0;
+	int			toast_ordinal = 0;
+
+	fasttrun_xact_mark_truncate(operation->root_relid,
+								operation->root_relid,
+								operation->generation,
+								FASTTRUN_TOUCH_TRUNCATE_MUTATED);
+	operation->phase = FASTTRUN_TRUNCATE_MUTATED;
+
+	foreach(lc, opened->user_indexes)
+	{
+		fasttrun_truncate_one_storage((Relation) lfirst(lc),
+									  fasttrun_zero_sinval_truncate, false);
+		FASTTRUN_TEST_FAILPOINT("after_user_index", ++ordinal);
+	}
+	foreach(lc, opened->toast_indexes)
+	{
+		fasttrun_truncate_one_storage((Relation) lfirst(lc),
+									  fasttrun_zero_sinval_truncate, false);
+		FASTTRUN_TEST_FAILPOINT("after_toast_index", ++toast_ordinal);
+	}
+	if (opened->toastrel != NULL)
+	{
+		fasttrun_truncate_one_storage(opened->toastrel,
+									  fasttrun_zero_sinval_truncate, false);
+		FASTTRUN_TEST_FAILPOINT("after_toast_heap", 0);
+	}
+	fasttrun_truncate_one_storage(heaprel, fasttrun_zero_sinval_truncate,
+								 false);
+	FASTTRUN_TEST_FAILPOINT("after_main_heap", 0);
+}
+
+static void
+fasttrun_rebuild_truncate_indexes(FasttrunTruncateOperation *operation,
+								  Relation heaprel,
+								  FasttrunOpenedWorkset *opened)
+{
+	ListCell   *lc;
+	int			ordinal = 0;
+
+	/* TOAST structures are made usable before user-visible indexes. */
+	foreach(lc, opened->toast_indexes)
+	{
+		Relation	indexrel = (Relation) lfirst(lc);
+		FasttrunTruncateResultSlot *slot;
+
+		slot = fasttrun_truncate_slot(operation, RelationGetRelid(indexrel));
+		slot->rebuilt_pages =
+			fasttrun_ambuild_empty_index(opened->toastrel, indexrel);
+		FASTTRUN_TEST_FAILPOINT("after_ambuild", ++ordinal);
+	}
+	foreach(lc, opened->user_indexes)
+	{
+		Relation	indexrel = (Relation) lfirst(lc);
+		FasttrunTruncateResultSlot *slot;
+
+		slot = fasttrun_truncate_slot(operation, RelationGetRelid(indexrel));
+		slot->rebuilt_pages = fasttrun_ambuild_empty_index(heaprel, indexrel);
+		FASTTRUN_TEST_FAILPOINT("after_ambuild", ++ordinal);
+	}
+}
+
+/* No allocation, hash growth, relcache open or pgstat read past this point. */
+static void
+fasttrun_publish_empty_workset(FasttrunTruncateOperation *operation,
+								FasttrunOpenedWorkset *opened)
+{
+	SubTransactionId subid = GetCurrentSubTransactionId();
+	int			i;
+
+	for (i = 0; i < operation->nslots; i++)
+	{
+		FasttrunTruncateResultSlot *slot = &operation->slots[i];
+		FasttrunAnalyzeCacheEntry *entry = slot->analyze_entry;
+		Relation	rel = opened->slot_relations[i];
+
+		Assert(entry != NULL);
+		entry->state.has_relstats = true;
+		entry->state.cached_locator = slot->rlb.locator;
+		entry->state.cached_pages = slot->rebuilt_pages;
+		entry->state.cached_tuples = 0;
+		entry->state.cached_allvisible = 0;
+		entry->state.probe_rlb = slot->rlb;
+		entry->state.heap_relid = slot->heap_relid;
+		entry->state.heap_rlb = slot->heap_rlb;
+		entry->state.has_delta_state = false;
+		entry->state.has_stats_baseline = false;
+		entry->state.last_inval_pages = 0;
+		entry->state.last_inval_tuples = 0;
+		entry->state.last_inval_valid = false;
+		fasttrun_cache_reset_partial_scan_anchor(entry);
+		entry->state_subid = subid;
+		entry->lazy_check_subid = InvalidSubTransactionId;
+		entry->lazy_check_pages = 0;
+
+		if (slot->kind == FASTTRUN_TRUNCATE_MAIN_HEAP)
+		{
+			entry->state.last_inval_valid = true;
+			if (operation->have_pgstat_seed)
+			{
+				fasttrun_cache_store_delta_state(entry,
+											 operation->seed_inserted,
+											 operation->seed_updated,
+											 operation->seed_deleted,
+											 operation->seed_truncdropped);
+				entry->state.has_stats_baseline = true;
+				entry->state.stats_baseline_inserted = operation->seed_inserted;
+				entry->state.stats_baseline_updated = operation->seed_updated;
+				entry->state.stats_baseline_deleted = operation->seed_deleted;
+				entry->state.stats_baseline_truncdropped =
+					operation->seed_truncdropped;
+			}
+		}
+
+		rel->rd_rel->relpages = slot->rebuilt_pages;
+		rel->rd_rel->reltuples = 0;
+		rel->rd_rel->relallvisible = 0;
+		slot->published = true;
+		operation->published_slots++;
+		FASTTRUN_TEST_FAILPOINT("after_publish", operation->published_slots);
+	}
+}
+
+static void
+fasttrun_clear_partial_publication(FasttrunTruncateOperation *operation)
+{
+	int			i;
+
+	for (i = 0; i < operation->nslots; i++)
+	{
+		FasttrunTruncateResultSlot *slot = &operation->slots[i];
+		FasttrunAnalyzeCacheEntry *entry;
+
+		if (!slot->published)
+			continue;
+		entry = slot->analyze_entry;
+		entry->state.has_relstats = false;
+		entry->state.has_delta_state = false;
+		entry->state.has_stats_baseline = false;
+		entry->state.last_inval_valid = false;
+		fasttrun_cache_reset_partial_scan_anchor(entry);
+		entry->lazy_check_subid = InvalidSubTransactionId;
+		entry->lazy_check_pages = 0;
+		slot->published = false;
+	}
+	operation->published_slots = 0;
 }
 
 /*
  * Zero-sinval truncate of a relation AND all its indexes and toast.
  *
- * The ordering is load-bearing: no reachable failure state may pair an
- * emptied heap with an index still holding old TIDs, because after a
- * refill such an index silently resolves them to unrelated new rows.
+ * The order must not change.  An empty heap must never be paired with an
+ * index that still contains old TIDs, because after a refill those TIDs
+ * could point to unrelated new rows.
  *
  *   1. Open every index, the toast table and its indexes BEFORE any
  *      destructive call.  A failure here leaves the table untouched.
@@ -5260,97 +5936,11 @@ fasttrun_rebuild_one_index(Relation heaprel, Relation indexrel)
  *   4. Phase 2: run every ambuild to recreate the empty index
  *      structures (metapages).
  *
- * Keeping phase 1 apart from phase 2 is equally load-bearing: with ALL
- * index storage gone before the first ambuild, a failure in any ambuild
- * (OOM, disk error) leaves at worst an empty index without a metapage,
- * and any scan of it fails loudly.  Rebuilding index-by-index would
- * leave the indexes past the failure point still carrying old TIDs.
+ * Phase 1 must finish before phase 2 starts.  Once all index storage has
+ * gone, an ambuild failure leaves at worst an empty index without a
+ * metapage, and any scan fails with an error.  Rebuilding each index
+ * immediately would leave later indexes carrying old TIDs after a failure.
  */
-static void
-fasttrun_full_bypass_truncate(Relation rel)
-{
-	List	   *indexes = NIL;
-	List	   *toast_indexes = NIL;
-	Relation	toastrel = NULL;
-	ListCell   *lc;
-	Oid			toastrelid;
-	List	   *index_oids;
-
-	/*
-	 * 1. Open everything before the first destructive call.  An error in
-	 * here propagates with the table fully intact; (sub)transaction abort
-	 * releases the refcounts and locks.
-	 */
-	index_oids = RelationGetIndexList(rel);
-	foreach(lc, index_oids)
-		indexes = lappend(indexes,
-						  index_open(lfirst_oid(lc), AccessExclusiveLock));
-	list_free(index_oids);
-
-	toastrelid = rel->rd_rel->reltoastrelid;
-	if (OidIsValid(toastrelid))
-	{
-		List	   *toast_index_oids;
-
-		toastrel = table_open(toastrelid, AccessExclusiveLock);
-		toast_index_oids = RelationGetIndexList(toastrel);
-		foreach(lc, toast_index_oids)
-			toast_indexes = lappend(toast_indexes,
-									index_open(lfirst_oid(lc),
-											   AccessExclusiveLock));
-		list_free(toast_index_oids);
-	}
-
-	/*
-	 * 2-4. Destructive part.  On failure the table is left with empty
-	 * indexes and possibly an empty heap; every such state errors out
-	 * loudly on access instead of returning stale rows.  The temp table
-	 * is owned exclusively by this backend, so the damage is contained;
-	 * a WARNING tells the user to DROP the table.
-	 */
-	PG_TRY();
-	{
-		/* Phase 1: drop the storage of every index and toast. */
-		foreach(lc, indexes)
-			fasttrun_smgr_bypass_truncate((Relation) lfirst(lc));
-		if (toastrel != NULL)
-		{
-			fasttrun_smgr_bypass_truncate(toastrel);
-			foreach(lc, toast_indexes)
-				fasttrun_smgr_bypass_truncate((Relation) lfirst(lc));
-		}
-
-		/* Heap last: every index is empty by now. */
-		fasttrun_smgr_bypass_truncate(rel);
-
-		/* Phase 2: rebuild the empty index structures. */
-		foreach(lc, indexes)
-			fasttrun_rebuild_one_index(rel, (Relation) lfirst(lc));
-		foreach(lc, toast_indexes)
-			fasttrun_rebuild_one_index(toastrel, (Relation) lfirst(lc));
-	}
-	PG_CATCH();
-	{
-		ereport(WARNING,
-				(errmsg("fasttrun: index rebuild failed for relation \"%s\"",
-						RelationGetRelationName(rel)),
-				 errdetail("Index rebuild did not complete; scans on this "
-						   "table's indexes will fail.  DROP and recreate "
-						   "the temporary table to recover.")));
-		PG_RE_THROW();
-	}
-	PG_END_TRY();
-
-	foreach(lc, indexes)
-		index_close((Relation) lfirst(lc), NoLock);
-	list_free(indexes);
-	foreach(lc, toast_indexes)
-		index_close((Relation) lfirst(lc), NoLock);
-	list_free(toast_indexes);
-	if (toastrel != NULL)
-		table_close(toastrel, NoLock);
-}
-
 /*
  * Invalidate backend-local cached plans for heap relation `relid`.
  * This reaches `PlanCacheRelCallback` through
@@ -5413,12 +6003,14 @@ fasttrun_invalidate_local_plan_cache(Oid relid)
  *     recovery logic of bulk PL/pgSQL routines.
  *   * Verifies the relation lives in a temp namespace; otherwise raises
  *     an error (this prevents accidentally truncating a regular table).
- *   * Cheap empty-check via RelationGetNumberOfBlocks (single smgr
- *     call, no catalog touch); skips the truncate on empty heap.
- *   * If non-empty, calls heap_truncate_one_rel() directly -- bypasses
- *     the heap_truncate(List*) wrapper (avoids a redundant table_open)
- *     AND heap_truncate_check_FKs() (see FK-unsafe warning below).
- *   * Drops any cached fasttrun_analyze entry for this OID.
+ *   * Opens the heap, its indexes, TOAST heap and TOAST indexes before
+ *     changing cache or storage state.  Partition/inheritance traversal
+ *     is deliberately unsupported.
+ *   * Resets indexes before the heap.  The default path emits no shared
+ *     invalidation; the fallback calls RelationTruncate once per relation
+ *     and emits one SMGR message after each successful call.
+ *   * An error before file changes rolls back normally.  After file changes
+ *     start, access stays blocked until fasttruncate is retried successfully.
  *
  * IMPORTANT: this function is FOREIGN-KEY-UNSAFE.  fasttruncate does
  * NOT scan pg_constraint.  If you have FKs involving temp tables, use
@@ -5440,10 +6032,9 @@ fasttrun_invalidate_local_plan_cache(Oid relid)
  * temp tables that are immediately re-filled in the same transaction
  * the catalogue stats would be wrong either way until the next ANALYZE.
  *
- * Warning: this function is NOT transaction-safe.  heap_truncate()
- * physically discards storage and the operation cannot be rolled back
- * cleanly if the surrounding transaction aborts.  Use only on temp
- * tables that the calling code is willing to lose on abort.
+ * Warning: this function is NOT transaction-safe.  Storage reset cannot be
+ * rolled back; after surrounding rollback the table remains physically
+ * empty.  The session-local cache follows that physical truth.
  */
 Datum
 fasttruncate(PG_FUNCTION_ARGS)
@@ -5453,6 +6044,11 @@ fasttruncate(PG_FUNCTION_ARGS)
 	Oid				relOid;
 	Relation		rel;
 	uint64			truncate_generation;
+	FasttrunOpenedWorkset opened;
+	FasttrunTruncateOperation *operation = NULL;
+	FasttrunTruncateOperation *volatile cleanup_operation = NULL;
+	volatile uint64 cleanup_generation = 0;
+	volatile bool cleanup_pending_published = false;
 
 	relvar = fasttrun_make_rangevar(name);
 	relOid = RangeVarGetRelid(relvar, AccessExclusiveLock, true);
@@ -5481,67 +6077,78 @@ fasttruncate(PG_FUNCTION_ARGS)
 			 RelationGetRelationName(rel));
 	}
 
-	/* Same activity check as core TRUNCATE -- rejects open cursors etc. */
-	CheckTableNotInUse(rel, "fasttruncate");
+	/* An active marker permits only this repair path or DROP/recreate. */
+	fasttrun_poison_check_relation(rel, "fasttruncate", true);
+	fasttrun_prepare_truncate_workset(rel, &opened);
 
-	/* Register for per-xact bookkeeping -- callbacks walk this list only. */
-	fasttrun_xact_mark_relid(relOid, relOid,
-							FASTTRUN_TOUCH_ANALYZE |
-							FASTTRUN_TOUCH_STATS |
-							FASTTRUN_TOUCH_PLAN_INVALIDATE);
 	truncate_generation = ++fasttrun_truncate_generation;
 	if (truncate_generation == 0)
 		truncate_generation = ++fasttrun_truncate_generation;
-	fasttrun_xact_mark_truncate(relOid, relOid, truncate_generation,
-								FASTTRUN_TOUCH_TRUNCATE_PREPARED);
 
-	/*
-	 * Evict/invalidate before touching storage.  If index rebuild later
-	 * errors and the caller catches it in a savepoint, old planner stats and
-	 * generic plans must already be gone.
-	 */
-	fasttrun_cache_remove_rel_and_indexes(rel);
-	(void) fasttrun_stats_neutralize_relation(rel);
-	fasttrun_invalidate_local_plan_cache(RelationGetRelid(rel));
-
-	/*
-	 * Skip only when there is nothing to reclaim: an empty heap with no
-	 * indexes and no toast.  A pre-emptied heap (DELETE+VACUUM) can still
-	 * carry bloated index/toast storage that a real TRUNCATE resets, so run
-	 * the truncate for indexed/toasted tables even when the heap is at 0.
-	 * Skip heap_truncate_check_FKs (FK-unsafe).
-	 */
-	if (RelationGetNumberOfBlocks(rel) > 0 ||
-		rel->rd_rel->relhasindex ||
-		OidIsValid(rel->rd_rel->reltoastrelid))
+	PG_TRY();
 	{
+		operation = fasttrun_allocate_truncate_operation(rel, &opened,
+														 truncate_generation);
+		cleanup_operation = operation;
+		cleanup_generation = truncate_generation;
 		fasttrun_xact_mark_truncate(relOid, relOid, truncate_generation,
-								FASTTRUN_TOUCH_TRUNCATE_MUTATED);
-		if (fasttrun_zero_sinval_truncate)
-			fasttrun_full_bypass_truncate(rel);
-		else
-			heap_truncate_one_rel(rel);
+									FASTTRUN_TOUCH_TRUNCATE_PREPARED);
+		(void) fasttrun_poison_reserve(operation);
+		cleanup_pending_published = true;
+		FASTTRUN_TEST_FAILPOINT("after_prepare", 0);
+
+		/* Reserve all memory and rollback state before changing files. */
+		fasttrun_reserve_empty_publication(operation, rel);
+		FASTTRUN_TEST_FAILPOINT("after_phase0", 0);
+
+		fasttrun_execute_truncate_storage(operation, rel, &opened);
+		fasttrun_rebuild_truncate_indexes(operation, rel, &opened);
+		FASTTRUN_TEST_FAILPOINT("before_publish", 0);
+		fasttrun_publish_empty_workset(operation, &opened);
+
+		fasttrun_xact_mark_truncate(relOid, relOid, truncate_generation,
+									FASTTRUN_TOUCH_TRUNCATE_COMPLETE);
+		operation->phase = FASTTRUN_TRUNCATE_COMPLETE;
+		fasttrun_poison_complete(operation);
+		cleanup_operation = NULL;
+		cleanup_generation = 0;
+		cleanup_pending_published = false;
 	}
+	PG_CATCH();
+	{
+		FasttrunTruncateOperation *failed =
+			(FasttrunTruncateOperation *) cleanup_operation;
 
-	/*
-	 * Re-seed (not just evict) the analyze cache so the first post-
-	 * refill fasttrun_analyze() takes the delta hot path.  See header
-	 * comment on fasttrun_cache_seed_after_truncate() for the math.
-	 */
-	fasttrun_cache_seed_after_truncate(rel);
+		if (failed != NULL && failed->generation == cleanup_generation)
+		{
+			if (failed->phase == FASTTRUN_TRUNCATE_PREPARED)
+			{
+				if (cleanup_pending_published)
+					fasttrun_poison_cancel_pending(failed);
+				else
+				{
+					pfree(failed);
+					fasttrun_operation_reset_if_empty();
+				}
+			}
+			else
+			{
+				fasttrun_clear_partial_publication(failed);
+				Assert(cleanup_pending_published);
+				fasttrun_poison_activate(failed);
+			}
+		}
+		else
+			fasttrun_operation_reset_if_empty();
 
-	/*
-	 * Zero out in-memory relpages/reltuples so the planner sees an empty
-	 * table.  pg_class on disk is untouched (no sinval).
-	 * fasttrun_analyze() will publish real stats after the next refill.
-	 */
-	rel->rd_rel->relpages = 0;
-	rel->rd_rel->reltuples = 0;
-	rel->rd_rel->relallvisible = 0;
-	fasttrun_xact_mark_truncate(relOid, relOid, truncate_generation,
-								FASTTRUN_TOUCH_TRUNCATE_COMPLETE);
+		fasttrun_close_truncate_workset(&opened);
+		table_close(rel, NoLock);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 
 	/* Release the AccessExclusiveLock taken by RangeVarGetRelid. */
+	fasttrun_close_truncate_workset(&opened);
 	table_close(rel, AccessExclusiveLock);
 
 	PG_RETURN_VOID();
@@ -6107,6 +6714,7 @@ fasttrun_analyze(PG_FUNCTION_ARGS)
 		elog(ERROR, "fasttrun_analyze: relation \"%s\" is not heap-AM",
 			 RelationGetRelationName(rel));
 	}
+	fasttrun_poison_check_relation(rel, "fasttrun_analyze", false);
 
 	fasttrun_xact_mark_relid(relOid, relOid,
 							FASTTRUN_TOUCH_ANALYZE |
@@ -6188,6 +6796,7 @@ fasttrun_analyze_bulk(PG_FUNCTION_ARGS)
 			elog(ERROR, "fasttrun_analyze_bulk: relation \"%s\" is not heap-AM",
 				 RelationGetRelationName(rel));
 		}
+		fasttrun_poison_check_relation(rel, "fasttrun_analyze_bulk", false);
 
 		fasttrun_xact_mark_relid(relOid, relOid,
 								FASTTRUN_TOUCH_ANALYZE |
@@ -6263,6 +6872,7 @@ fasttrun_relstats(PG_FUNCTION_ARGS)
 		elog(ERROR, "fasttrun_relstats: relation \"%s\" is not heap-AM",
 			 RelationGetRelationName(rel));
 	}
+	fasttrun_poison_check_relation(rel, "fasttrun_relstats", false);
 
 	/*
 	 * Re-inject cached relstats after relcache rebuilds so direct SQL
@@ -6328,8 +6938,12 @@ fasttrun_collect_stats(PG_FUNCTION_ARGS)
 	}
 
 	if (rel->rd_tableam != GetHeapamTableAmRoutine())
+	{
+		table_close(rel, NoLock);
 		elog(ERROR, "fasttrun_collect_stats: relation \"%s\" is not heap-AM",
 			 RelationGetRelationName(rel));
+	}
+	fasttrun_poison_check_relation(rel, "fasttrun_collect_stats", false);
 	relation_policy_changed = fasttrun_stats_set_relation_policy(rel,
 													FASTTRUN_REL_LOCAL_NEUTRAL);
 	planner_fallback_changed = relation_policy_changed &&
@@ -6443,6 +7057,7 @@ fasttrun_inspect_stats(PG_FUNCTION_ARGS)
 	ReturnSetInfo  *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
 	RangeVar	   *relvar;
 	Oid				relOid;
+	Relation		rel;
 	TupleDesc		tupdesc;
 	Tuplestorestate *tupstore;
 	MemoryContext	per_query_cxt;
@@ -6478,12 +7093,19 @@ fasttrun_inspect_stats(PG_FUNCTION_ARGS)
 
 	/* Resolve relation; missing -> empty result. */
 	relvar = fasttrun_make_rangevar(name);
-	relOid = RangeVarGetRelid(relvar, NoLock, true);
+	relOid = RangeVarGetRelid(relvar, AccessShareLock, true);
 	if (!OidIsValid(relOid))
 		return (Datum) 0;
 
-	if (!isTempNamespace(get_rel_namespace(relOid)))
+	rel = relation_open(relOid, NoLock);
+	if (rel->rd_rel->relpersistence != RELPERSISTENCE_TEMP ||
+		!isTempNamespace(RelationGetNamespace(rel)))
+	{
+		relation_close(rel, NoLock);
 		elog(ERROR, "fasttrun_inspect_stats: relation is not a temporary table");
+	}
+	fasttrun_poison_check_relation(rel, "fasttrun_inspect_stats", false);
+	relation_close(rel, AccessShareLock);
 
 	/* Empty cache -> empty result. */
 	if (fasttrun_stats_cache == NULL)
@@ -7028,8 +7650,130 @@ fasttrun_evict_rangevar(RangeVar *rv)
 static void
 fasttrun_evict_all_session_caches(void)
 {
+	fasttrun_poison_clear_all();
 	fasttrun_cache_reset();
 	fasttrun_stats_cache_reset();
+}
+
+static void
+fasttrun_poison_check_relid(Oid relid, const char *operation)
+{
+	Oid			root_relid = relid;
+	FasttrunPoisonEntry *entry;
+	Relation	rel;
+
+	if (fasttrun_poison_cache == NULL || !OidIsValid(relid))
+		return;
+	entry = fasttrun_poison_find(root_relid);
+	if (entry == NULL && get_rel_relkind(relid) == RELKIND_INDEX)
+	{
+		root_relid = IndexGetRelation(relid, true);
+		entry = fasttrun_poison_find(root_relid);
+	}
+	if (entry == NULL || !entry->active)
+		return;
+	rel = try_relation_open(root_relid, AccessShareLock);
+	if (rel == NULL)
+		return;
+	fasttrun_poison_check_relation(rel, operation, false);
+	relation_close(rel, AccessShareLock);
+}
+
+static void
+fasttrun_poison_check_rangevar(RangeVar *rv, const char *operation)
+{
+	Oid			relid;
+
+	if (fasttrun_poison_cache == NULL || rv == NULL)
+		return;
+	relid = RangeVarGetRelid(rv, NoLock, true);
+	fasttrun_poison_check_relid(relid, operation);
+}
+
+static void
+fasttrun_poison_check_any(const char *operation)
+{
+	HASH_SEQ_STATUS status;
+	FasttrunPoisonEntry *entry;
+	Oid			root_relid = InvalidOid;
+
+	if (fasttrun_poison_cache == NULL)
+		return;
+	hash_seq_init(&status, fasttrun_poison_cache);
+	while ((entry = (FasttrunPoisonEntry *) hash_seq_search(&status)) != NULL)
+	{
+		if (entry->active)
+		{
+			root_relid = entry->root_relid;
+			break;
+		}
+	}
+	if (OidIsValid(root_relid))
+		fasttrun_poison_check_relid(root_relid, operation);
+}
+
+/* Reject direct utility access before it can mutate or inspect storage. */
+static void
+fasttrun_poison_check_utility(Node *parsetree)
+{
+	ListCell   *lc;
+
+	if (fasttrun_poison_cache == NULL || parsetree == NULL)
+		return;
+	switch (nodeTag(parsetree))
+	{
+		case T_CopyStmt:
+			fasttrun_poison_check_rangevar(((CopyStmt *) parsetree)->relation,
+										 "COPY");
+			break;
+		case T_TruncateStmt:
+			foreach(lc, ((TruncateStmt *) parsetree)->relations)
+				fasttrun_poison_check_rangevar((RangeVar *) lfirst(lc),
+											 "SQL TRUNCATE");
+			break;
+		case T_VacuumStmt:
+			if (((VacuumStmt *) parsetree)->rels == NIL)
+				fasttrun_poison_check_any("VACUUM/ANALYZE");
+			else
+			{
+				foreach(lc, ((VacuumStmt *) parsetree)->rels)
+				{
+					VacuumRelation *vrel = (VacuumRelation *) lfirst(lc);
+
+					if (OidIsValid(vrel->oid))
+						fasttrun_poison_check_relid(vrel->oid,
+												 "VACUUM/ANALYZE");
+					else
+						fasttrun_poison_check_rangevar(vrel->relation,
+													 "VACUUM/ANALYZE");
+				}
+			}
+			break;
+		case T_ClusterStmt:
+			if (((ClusterStmt *) parsetree)->relation == NULL)
+				fasttrun_poison_check_any("CLUSTER");
+			else
+				fasttrun_poison_check_rangevar(
+					((ClusterStmt *) parsetree)->relation, "CLUSTER");
+			break;
+		case T_AlterTableStmt:
+			fasttrun_poison_check_rangevar(
+				((AlterTableStmt *) parsetree)->relation, "ALTER TABLE");
+			break;
+		case T_IndexStmt:
+			fasttrun_poison_check_rangevar(
+				((IndexStmt *) parsetree)->relation, "CREATE INDEX");
+			break;
+		case T_ReindexStmt:
+			if (((ReindexStmt *) parsetree)->relation == NULL)
+				fasttrun_poison_check_any("REINDEX");
+			else
+				fasttrun_poison_check_rangevar(
+					((ReindexStmt *) parsetree)->relation, "REINDEX");
+			break;
+		default:
+			break;
+	}
 }
 
 typedef struct FasttrunOidSetEntry
@@ -7547,21 +8291,6 @@ fasttrun_evict_utility_caches(Node *parsetree)
 				}
 				break;
 			}
-		case T_DiscardStmt:
-			{
-				DiscardStmt *stmt = (DiscardStmt *) parsetree;
-
-				/*
-				 * DISCARD TEMP/ALL drops every temp table of the session via
-				 * internal dependency deletion -- no per-table DropStmt ever
-				 * reaches this hook.  Every cached relid dies at once, so
-				 * drop both caches whole; they re-arm lazily on the next
-				 * analyze/collect.
-				 */
-				if (stmt->target == DISCARD_ALL || stmt->target == DISCARD_TEMP)
-					fasttrun_evict_all_session_caches();
-				break;
-			}
 		default:
 			break;
 	}
@@ -7603,13 +8332,15 @@ fasttrun_object_access_hook(ObjectAccessType access, Oid classId,
 	if (access != OAT_DROP || classId != RelationRelationId || subId != 0)
 		return;
 
-	if (fasttrun_analyze_cache == NULL && fasttrun_stats_cache == NULL)
+	if (fasttrun_analyze_cache == NULL && fasttrun_stats_cache == NULL &&
+		fasttrun_poison_cache == NULL)
 		return;
 
 	/* Touch only relids we actually track -- keeps the list small on
 	 * mass drops of unrelated relations. */
 	if (fasttrun_cache_lookup(objectId) == NULL &&
-		!fasttrun_stats_relid_exists(objectId))
+		!fasttrun_stats_relid_exists(objectId) &&
+		fasttrun_poison_find(objectId) == NULL)
 		return;
 
 	fasttrun_xact_mark_relid(objectId, objectId, FASTTRUN_TOUCH_DROPPED);
@@ -7629,6 +8360,16 @@ fasttrun_utility_hook(PlannedStmt *pstmt,
 	Node   *parsetree = pstmt->utilityStmt;
 	List   *analyze_targets = NIL;
 	List   *rewrite_relids = NIL;
+	bool	discard_session_state = false;
+
+	fasttrun_poison_check_utility(parsetree);
+	if (IsA(parsetree, DiscardStmt))
+	{
+		DiscardStmt *stmt = (DiscardStmt *) parsetree;
+
+		discard_session_state =
+			(stmt->target == DISCARD_ALL || stmt->target == DISCARD_TEMP);
+	}
 
 	/* Track CREATE TEMP TABLE before execution. */
 	if (fasttrun_track_enabled && fasttrun_track_htab != NULL &&
@@ -7699,6 +8440,10 @@ fasttrun_utility_hook(PlannedStmt *pstmt,
 	else
 		standard_ProcessUtility(pstmt, queryString, readOnlyTree, context,
 								params, queryEnv, dest, qc);
+
+	/* An ERROR above leaves every registry unchanged. */
+	if (discard_session_state)
+		fasttrun_evict_all_session_caches();
 
 	fasttrun_finish_rewrite_handoff(rewrite_relids);
 	fasttrun_finish_analyze_handoff(analyze_targets);
@@ -8102,21 +8847,17 @@ _PG_init(void)
 							 NULL, NULL, NULL);
 
 	DefineCustomBoolVariable("fasttrun.zero_sinval_truncate",
-							 "Bypass smgrtruncate to avoid even the single "
-							 "SMGR sinval message that fasttruncate normally "
-							 "sends",
+							 "Clear local temporary table files without shared "
+							 "SMGR invalidations",
 							 "When on (default), fasttruncate physically "
-							 "unlinks heap fork files and recreates them via "
-							 "smgrcreate (no built-in invalidation), instead "
-							 "of going through heap_truncate_one_rel → "
-							 "smgrtruncate → CacheInvalidateSmgr.  This is "
-							 "the only path that gives literal zero "
-							 "shared-invalidation messages from fasttruncate.  "
-							 "Set to off to fall back on the older "
-							 "heap_truncate_one_rel path (1 SMGR sinval per "
-							 "call) — this is mostly useful as a safety "
-							 "switch if the unlink/smgrcreate dance behaves "
-							 "weirdly on some custom storage backend.",
+							 "clears the temporary table, its indexes, and "
+							 "TOAST relations "
+							 "with unlink and smgrcreate, without calling "
+							 "CacheInvalidateSmgr.  When off, it calls "
+							 "RelationTruncate for each relation; every "
+							 "successful call sends one shared SMGR "
+							 "invalidation.  Both modes rebuild indexes and "
+							 "block access if cleanup is interrupted.",
 							 &fasttrun_zero_sinval_truncate,
 							 true,
 							 PGC_USERSET,
