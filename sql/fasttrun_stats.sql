@@ -1911,4 +1911,58 @@ END$$;
 SELECT 'inherited_estimate_preserved_ok' AS marker;
 DROP TABLE t_inh_stats_parent CASCADE;
 DROP TABLE t_inh_stats_flat;
+
+-- ----------------------------------------------------------------------
+-- 43. Expression-индексы: ядро читает статистику выражения из
+--     pg_statistic по OID индекса (examine_variable/btcostestimate),
+--     мимо column-хуков. После fasttruncate + refill эта каталожная
+--     стата описывает старые данные — для managed-таблицы она должна
+--     скрываться, планировщик берёт дефолтные оценки до ядерного
+--     ANALYZE. Контроль: нетронутая fasttrun'ом таблица читает
+--     expression-стату из каталога как обычно.
+-- ----------------------------------------------------------------------
+CREATE TEMP TABLE t_expr_hidden (id int, name text);
+INSERT INTO t_expr_hidden SELECT g, 'val_' || g FROM generate_series(1, 10000) g;
+CREATE INDEX ON t_expr_hidden (lower(name));
+ANALYZE t_expr_hidden;
+SELECT fasttruncate('t_expr_hidden');
+INSERT INTO t_expr_hidden SELECT g, 'const' FROM generate_series(1, 10000) g;
+SELECT fasttrun_analyze('t_expr_hidden');
+DO $$
+DECLARE ln text; est int := NULL;
+BEGIN
+  FOR ln IN EXPLAIN SELECT * FROM t_expr_hidden WHERE lower(name) = 'const' LOOP
+    IF ln ~ 'on t_expr_hidden' THEN
+      est := substring(ln FROM 'rows=(\d+)')::int;
+      EXIT;
+    END IF;
+  END LOOP;
+  IF est IS NULL OR est < 20 OR est > 500 THEN
+    RAISE EXCEPTION 'stale expression-index stats escaped: est=% (ожидали дефолтную оценку)', est;
+  END IF;
+END$$;
+SELECT 'expression_stats_hidden_ok' AS marker;
+-- Контроль: chain работает — не-managed таблица читает expression-стату.
+CREATE TEMP TABLE t_expr_core (id int, name text);
+INSERT INTO t_expr_core
+  SELECT g, CASE WHEN g <= 9000 THEN 'dup' ELSE 'val_' || g END
+  FROM generate_series(1, 10000) g;
+CREATE INDEX ON t_expr_core (lower(name));
+ANALYZE t_expr_core;
+DO $$
+DECLARE ln text; est int := NULL;
+BEGIN
+  FOR ln IN EXPLAIN SELECT * FROM t_expr_core WHERE lower(name) = 'dup' LOOP
+    IF ln ~ 'on t_expr_core' THEN
+      est := substring(ln FROM 'rows=(\d+)')::int;
+      EXIT;
+    END IF;
+  END LOOP;
+  IF est IS NULL OR est < 5000 THEN
+    RAISE EXCEPTION 'core expression stats unreadable for unmanaged table: est=%', est;
+  END IF;
+END$$;
+SELECT 'expression_stats_core_readable_ok' AS marker;
+DROP TABLE t_expr_hidden;
+DROP TABLE t_expr_core;
 DROP EXTENSION fasttrun;

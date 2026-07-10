@@ -186,6 +186,8 @@ typedef struct FasttrunFreshnessCacheEntry
 	int64		del;
 	bool		truncdropped;
 	BlockNumber	pages;
+	bool		owner_checked;	/* owner_heap is filled in (index relids) */
+	Oid			owner_heap;		/* memoized owning heap of an index */
 } FasttrunFreshnessCacheEntry;
 
 static bool		fasttrun_in_planner = false;
@@ -384,6 +386,9 @@ static bool fasttrun_get_relation_stats_hook(PlannerInfo *root,
 											 AttrNumber attnum,
 											 VariableStatData *vardata);
 static int32 fasttrun_get_attavgwidth_hook(Oid relid, AttrNumber attnum);
+static bool fasttrun_get_index_stats_hook(PlannerInfo *root, Oid indexOid,
+										  AttrNumber indexattnum,
+										  VariableStatData *vardata);
 static PlannedStmt *fasttrun_planner_hook(Query *parse,
 										  const char *query_string,
 										  int cursorOptions,
@@ -1797,6 +1802,7 @@ static HTAB			   *fasttrun_stats_relid_cache = NULL;
 static MemoryContext	fasttrun_stats_mcxt = NULL;
 static get_relation_stats_hook_type prev_get_relation_stats_hook = NULL;
 static get_attavgwidth_hook_type prev_get_attavgwidth_hook = NULL;
+static get_index_stats_hook_type prev_get_index_stats_hook = NULL;
 static planner_hook_type prev_planner_hook = NULL;
 static ExecutorStart_hook_type prev_ExecutorStart = NULL;
 static bool				fasttrun_stats_hooks_installed = false;
@@ -1824,6 +1830,8 @@ fasttrun_ensure_stats_hooks(void)
 	get_relation_stats_hook = fasttrun_get_relation_stats_hook;
 	prev_get_attavgwidth_hook = get_attavgwidth_hook;
 	get_attavgwidth_hook = fasttrun_get_attavgwidth_hook;
+	prev_get_index_stats_hook = get_index_stats_hook;
+	get_index_stats_hook = fasttrun_get_index_stats_hook;
 	if (!fasttrun_executor_hook_installed)
 	{
 		prev_ExecutorStart = ExecutorStart_hook;
@@ -2411,7 +2419,7 @@ fasttrun_stats_entry_usable(Oid relid, const FasttrunStatsEntry *entry,
 
 /*
  * Find or create the freshness-cache slot for a relid.  Planner scope only:
- * callers must check fasttrun_in_planner first.  A new slot starts with both
+ * callers must check fasttrun_in_planner first.  A new slot starts with all
  * memo flags clear.  When the cache is full the slot is claimed round-robin;
  * FIFO is good enough for the planner-scoped lifetime, and an overwritten
  * relid is a miss on its next probe, never a wrong answer.
@@ -2444,6 +2452,8 @@ fasttrun_freshness_cache_slot(Oid relid)
 	slot->locator_checked = false;
 	slot->locator_ok = false;
 	slot->counters_cached = false;
+	slot->owner_checked = false;
+	slot->owner_heap = InvalidOid;
 	return slot;
 }
 
@@ -2648,6 +2658,101 @@ chain:
 	if (prev_get_attavgwidth_hook)
 		return (*prev_get_attavgwidth_hook) (relid, attnum);
 	return 0;
+}
+
+/*
+ * Relid-level ownership gate shared by the planner stats hooks: true when
+ * fasttrun manages the relation, its storage still matches the cached
+ * locator, and the relation policy blocks core pg_statistic rows.  The
+ * same condition under which the column hooks hide core stats.
+ */
+static bool
+fasttrun_stats_relid_blocks_core(Oid relid)
+{
+	FasttrunStatsRelidEntry *relentry;
+
+	if (fasttrun_stats_cache == NULL || fasttrun_stats_relid_cache == NULL)
+		return false;
+	relentry = (FasttrunStatsRelidEntry *)
+		hash_search(fasttrun_stats_relid_cache, &relid, HASH_FIND, NULL);
+	if (relentry == NULL ||
+		!fasttrun_stats_relid_locator_valid(relid, relentry))
+		return false;
+	return relentry->policy == FASTTRUN_REL_LOCAL_NEUTRAL;
+}
+
+/*
+ * Owning heap of an index relid, InvalidOid when unresolvable.  Cheap path
+ * first: the analyze cache links index entries to their heap.  Fallback is
+ * one relcache open -- the hook runs during planning, inside a transaction.
+ * While the planner runs the verdict is memoized per index relid.
+ */
+static Oid
+fasttrun_index_owning_heap(Oid indexOid)
+{
+	FasttrunFreshnessCacheEntry *slot = NULL;
+	FasttrunAnalyzeCacheEntry *aentry;
+	Oid			heap_relid = InvalidOid;
+
+	if (fasttrun_in_planner)
+	{
+		slot = fasttrun_freshness_cache_slot(indexOid);
+		if (slot->owner_checked)
+			return slot->owner_heap;
+	}
+
+	aentry = fasttrun_cache_lookup(indexOid);
+	if (aentry != NULL && OidIsValid(aentry->state.heap_relid) &&
+		aentry->state.heap_relid != indexOid)
+		heap_relid = aentry->state.heap_relid;
+	else
+	{
+		Relation	indexrel = RelationIdGetRelation(indexOid);
+
+		if (RelationIsValid(indexrel))
+		{
+			if (indexrel->rd_index != NULL)
+				heap_relid = indexrel->rd_index->indrelid;
+			RelationClose(indexrel);
+		}
+	}
+
+	if (slot != NULL)
+	{
+		slot->owner_checked = true;
+		slot->owner_heap = heap_relid;
+	}
+	return heap_relid;
+}
+
+/*
+ * Expression indexes keep their stats in pg_statistic under the INDEX oid
+ * (written only by core ANALYZE; the column hooks never see that path).
+ * fasttrun does not refresh those rows, so once the owning heap goes
+ * LOCAL_NEUTRAL they describe data the table no longer has.  Hide them and
+ * let the planner use defaults; unmanaged and CORE_ALLOWED heaps chain.
+ */
+static bool
+fasttrun_get_index_stats_hook(PlannerInfo *root, Oid indexOid,
+							  AttrNumber indexattnum,
+							  VariableStatData *vardata)
+{
+	/* Some core callers do not initialize these output fields. */
+	vardata->statsTuple = NULL;
+	vardata->freefunc = NULL;
+
+	if (fasttrun_stats_cache != NULL && fasttrun_stats_relid_cache != NULL)
+	{
+		Oid			heap_relid = fasttrun_index_owning_heap(indexOid);
+
+		if (OidIsValid(heap_relid) &&
+			fasttrun_stats_relid_blocks_core(heap_relid))
+			return true;	/* stale expression stats hidden, defaults apply */
+	}
+
+	if (prev_get_index_stats_hook)
+		return prev_get_index_stats_hook(root, indexOid, indexattnum, vardata);
+	return false;
 }
 
 /*
