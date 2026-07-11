@@ -22,7 +22,7 @@ CACHE_STATS_FIELDS = (
 )
 FROZEN_SQL_SHA256 = {
     "fasttrun--2.3.4.sql": (
-        "4134aee5d5a67fa100fe14dd504ffef909454ad6511dd284b93f1a9ac8544a36"
+        "2e7d5cd64ba1dc2c2e3bcdaae14fec26c4c91ce0651239e74df364e4504cf1bf"
     ),
 }
 VERSION_PATTERN = r"\d+(?:\.\d+)+"
@@ -298,6 +298,7 @@ def main() -> int:
     scan_paths = [
         *README_PATHS,
         ROOT / "README.fasttrun",
+        *sorted(ROOT.glob("fasttrun--2.3.[0-9].sql")),
     ]
     if install_sql.exists():
         scan_paths.append(install_sql)

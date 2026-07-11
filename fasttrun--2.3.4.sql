@@ -2,8 +2,9 @@
 
 -- ----------------------------------------------------------------------
 -- fasttruncate(text)
--- Очищает временную таблицу через heap_truncate без записи в каталог
--- и без последующего ANALYZE.  Подробности в fasttrun.c.
+-- Очищает локальную временную heap-таблицу напрямую через unlink и
+-- smgrcreate, без записи в каталог и без последующего ANALYZE.
+-- Подробности в fasttrun.c.
 -- ----------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION fasttruncate(text)
 RETURNS void AS 'MODULE_PATHNAME', 'fasttruncate'
@@ -21,14 +22,10 @@ LANGUAGE C STRICT VOLATILE;
 
 -- ----------------------------------------------------------------------
 -- fasttrun_analyze_bulk(VARIADIC text[])
--- Batch variant: эквивалентен N последовательным вызовам fasttrun_analyze
--- для каждого имени.  Плановые invalidations отправляются inline (до
--- мутации rd_rel - это load-bearing ordering), но первая помечает
--- задетые cached SPI/PREPARE планы is_valid=false, и каждая
--- последующая в этом батче short-circuit'ится в core's
--- PlanCacheRelCallback по этому флагу - O(1) на сообщение вместо
--- полного прохода по plan_cache.  Экономия видна когда один backend
--- проходит много temp tables в одной транзакции.
+-- Пакетный вариант: эквивалентен N последовательным вызовам fasttrun_analyze.
+-- Перед изменением rd_rel для каждой таблицы вызывается PlanCacheRelCallback.
+-- Получается N обходов списка сохранённых планов. Уже недействительные планы
+-- быстро пропускаются. Глобальный ResetPlanCache не используется.
 --
 -- Может вызываться двумя путями:
 --   SELECT fasttrun_analyze_bulk('t1','t2','t3');
