@@ -105,6 +105,7 @@ PG_FUNCTION_INFO_V1(fasttrun_test_poison_locator_mismatch);
 PG_FUNCTION_INFO_V1(fasttrun_test_track_set);
 PG_FUNCTION_INFO_V1(fasttrun_test_raw_relpages);
 PG_FUNCTION_INFO_V1(fasttrun_test_relid_undo_depth);
+PG_FUNCTION_INFO_V1(fasttrun_test_evict_missing_relid);
 #endif
 #ifdef USE_ASSERT_CHECKING
 PG_FUNCTION_INFO_V1(fasttrun_test_planner_probe);
@@ -8154,6 +8155,20 @@ fasttrun_shmem_startup(void)
 }
 
 static void
+fasttrun_evict_missing_relid(Oid relid)
+{
+	/* Mark before mutating so the commit callback reclaims the undo. */
+	fasttrun_xact_mark_relid(relid, relid,
+							FASTTRUN_TOUCH_ANALYZE |
+							FASTTRUN_TOUCH_STATS |
+							FASTTRUN_TOUCH_PLAN_INVALIDATE |
+							FASTTRUN_TOUCH_DROPPED);
+	fasttrun_cache_mark_evicted(relid);
+	fasttrun_stats_cache_mark_evicted_relid(relid);
+	fasttrun_invalidate_local_plan_cache(relid);
+}
+
+static void
 fasttrun_evict_temp_relid(Oid relid)
 {
 	Relation	rel;
@@ -8176,14 +8191,7 @@ fasttrun_evict_temp_relid(Oid relid)
 	tp = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
 	if (!HeapTupleIsValid(tp))
 	{
-		/* Mark before mutating so the commit callback reclaims the undo. */
-		fasttrun_xact_mark_relid(relid, relid,
-								FASTTRUN_TOUCH_ANALYZE |
-								FASTTRUN_TOUCH_STATS |
-								FASTTRUN_TOUCH_PLAN_INVALIDATE);
-		fasttrun_cache_mark_evicted(relid);
-		fasttrun_stats_cache_mark_evicted_relid(relid);
-		fasttrun_invalidate_local_plan_cache(relid);
+		fasttrun_evict_missing_relid(relid);
 		return;
 	}
 	relform = (Form_pg_class) GETSTRUCT(tp);
@@ -8201,14 +8209,7 @@ fasttrun_evict_temp_relid(Oid relid)
 	rel = try_relation_open(relid, AccessShareLock);
 	if (rel == NULL)
 	{
-		/* Mark before mutating so the commit callback reclaims the undo. */
-		fasttrun_xact_mark_relid(relid, relid,
-								FASTTRUN_TOUCH_ANALYZE |
-								FASTTRUN_TOUCH_STATS |
-								FASTTRUN_TOUCH_PLAN_INVALIDATE);
-		fasttrun_cache_mark_evicted(relid);
-		fasttrun_stats_cache_mark_evicted_relid(relid);
-		fasttrun_invalidate_local_plan_cache(relid);
+		fasttrun_evict_missing_relid(relid);
 		return;
 	}
 
@@ -9422,6 +9423,14 @@ fasttrun_test_relid_undo_depth(PG_FUNCTION_ARGS)
 	for (saved = entry->undo; saved != NULL; saved = saved->older)
 		depth++;
 	PG_RETURN_INT64(depth);
+}
+
+/* Вызывает защитную cache-miss ветку без гонки с каталогом. */
+Datum
+fasttrun_test_evict_missing_relid(PG_FUNCTION_ARGS)
+{
+	fasttrun_evict_missing_relid(PG_GETARG_OID(0));
+	PG_RETURN_VOID();
 }
 #endif
 

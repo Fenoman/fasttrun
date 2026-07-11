@@ -321,6 +321,70 @@ $case$;
 SELECT 'PUBLICATION_OK policy';
 SQL
 
+cat >"$WORKDIR/miss.sql" <<'SQL'
+\set ON_ERROR_STOP 1
+LOAD 'fasttrun';
+CREATE FUNCTION pg_temp.fasttrun_test_evict_missing_relid(oid)
+RETURNS void
+AS '$libdir/fasttrun', 'fasttrun_test_evict_missing_relid'
+LANGUAGE C STRICT;
+
+CREATE TEMP TABLE ft_miss(id int, payload text);
+INSERT INTO ft_miss
+SELECT g, repeat(md5(g::text), 2)
+FROM generate_series(1, 2000) g;
+SELECT fasttrun_analyze('ft_miss');
+
+DO $case$
+DECLARE
+  cache_row record;
+BEGIN
+  SELECT * INTO cache_row FROM fasttrun_cache_stats();
+  IF cache_row.analyze_tables = 0 OR cache_row.stats_tables = 0 OR
+     cache_row.stats_columns = 0 THEN
+    RAISE EXCEPTION 'missing-path fixture did not seed all caches: analyze %, tables %, columns %',
+      cache_row.analyze_tables, cache_row.stats_tables, cache_row.stats_columns;
+  END IF;
+END
+$case$;
+
+BEGIN;
+SELECT pg_temp.fasttrun_test_evict_missing_relid('ft_miss'::regclass);
+ROLLBACK;
+
+DO $case$
+DECLARE
+  cache_row record;
+BEGIN
+  SELECT * INTO cache_row FROM fasttrun_cache_stats();
+  IF cache_row.analyze_tables = 0 OR cache_row.stats_tables = 0 OR
+     cache_row.stats_columns = 0 THEN
+    RAISE EXCEPTION 'missing-path rollback did not restore caches: analyze %, tables %, columns %',
+      cache_row.analyze_tables, cache_row.stats_tables, cache_row.stats_columns;
+  END IF;
+END
+$case$;
+
+BEGIN;
+SELECT pg_temp.fasttrun_test_evict_missing_relid('ft_miss'::regclass);
+COMMIT;
+
+DO $case$
+DECLARE
+  cache_row record;
+BEGIN
+  SELECT * INTO cache_row FROM fasttrun_cache_stats();
+  IF cache_row.analyze_tables <> 0 OR cache_row.stats_tables <> 0 OR
+     cache_row.stats_columns <> 0 THEN
+    RAISE EXCEPTION 'missing-path commit retained cache rows: analyze %, tables %, columns %',
+      cache_row.analyze_tables, cache_row.stats_tables, cache_row.stats_columns;
+  END IF;
+END
+$case$;
+
+SELECT 'PUBLICATION_OK miss';
+SQL
+
 run_case()
 {
 	local name=$1
@@ -347,8 +411,9 @@ case "$CASE_NAME" in
 		run_case index
 		run_case column
 		run_case policy
+		run_case miss
 		;;
-	reserve|index|column|policy)
+	reserve|index|column|policy|miss)
 		run_case "$CASE_NAME"
 		;;
 	*)
