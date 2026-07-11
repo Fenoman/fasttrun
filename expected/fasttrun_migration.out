@@ -247,8 +247,8 @@ COMMIT;
 ALTER EXTENSION fasttrun UPDATE;
 DO $$
 BEGIN
-    IF (SELECT extversion FROM pg_extension WHERE extname = 'fasttrun') <> '2.3.4' THEN
-        RAISE EXCEPTION 'fasttrun extension was not updated to 2.3.4';
+    IF (SELECT extversion FROM pg_extension WHERE extname = 'fasttrun') <> '2.4.0' THEN
+        RAISE EXCEPTION 'fasttrun extension was not updated to 2.4.0';
     END IF;
 END
 $$;
@@ -271,3 +271,51 @@ SELECT count(*) AS leftover_funcs
               0
 (1 row)
 
+-- ----------------------------------------------------------------------
+-- 8. Прямой путь 2.3.4 -> 2.4.0 добавляет только fasttrun_cache_stats().
+-- ----------------------------------------------------------------------
+\pset format unaligned
+CREATE EXTENSION fasttrun VERSION '2.3.4';
+SELECT to_regprocedure('public.fasttrun_cache_stats()') IS NULL
+       AS cache_stats_absent_before_update;
+cache_stats_absent_before_update
+t
+(1 row)
+ALTER EXTENSION fasttrun UPDATE TO '2.4.0';
+SELECT extname, extversion FROM pg_extension WHERE extname = 'fasttrun';
+extname|extversion
+fasttrun|2.4.0
+(1 row)
+SELECT p.proname,
+       p.prorettype::regtype AS return_type,
+       p.proargnames,
+       ARRAY(SELECT t::regtype::text FROM unnest(p.proallargtypes) AS t)
+         AS all_arg_types,
+       p.proargmodes
+FROM pg_proc p
+JOIN pg_namespace n ON n.oid = p.pronamespace
+WHERE n.nspname = 'public' AND p.proname = 'fasttrun_cache_stats';
+proname|return_type|proargnames|all_arg_types|proargmodes
+fasttrun_cache_stats|record|{analyze_entries,column_stats_relid_entries,column_stats_entries,analyze_bytes,column_stats_bytes,total_bytes}|{bigint,bigint,bigint,bigint,bigint,bigint}|{o,o,o,o,o,o}
+(1 row)
+SELECT p.proname, e.extname AS owner_extension
+FROM pg_proc p
+JOIN pg_namespace n ON n.oid = p.pronamespace
+JOIN pg_depend d ON d.objid = p.oid AND d.deptype = 'e'
+JOIN pg_extension e ON e.oid = d.refobjid
+WHERE n.nspname = 'public' AND p.proname = 'fasttrun_cache_stats';
+proname|owner_extension
+fasttrun_cache_stats|fasttrun
+(1 row)
+SELECT * FROM public.fasttrun_cache_stats();
+analyze_entries|column_stats_relid_entries|column_stats_entries|analyze_bytes|column_stats_bytes|total_bytes
+0|0|0|0|0|0
+(1 row)
+DROP EXTENSION fasttrun;
+SELECT to_regprocedure('public.fasttrun_cache_stats()') IS NULL
+       AS cache_stats_removed_after_drop;
+cache_stats_removed_after_drop
+t
+(1 row)
+\pset format aligned
+-- Конец прямого пути обновления.

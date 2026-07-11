@@ -149,8 +149,8 @@ ALTER EXTENSION fasttrun UPDATE;
 
 DO $$
 BEGIN
-    IF (SELECT extversion FROM pg_extension WHERE extname = 'fasttrun') <> '2.3.4' THEN
-        RAISE EXCEPTION 'fasttrun extension was not updated to 2.3.4';
+    IF (SELECT extversion FROM pg_extension WHERE extname = 'fasttrun') <> '2.4.0' THEN
+        RAISE EXCEPTION 'fasttrun extension was not updated to 2.4.0';
     END IF;
 END
 $$;
@@ -170,3 +170,38 @@ SELECT count(*) AS leftover_funcs
                      'fasttrun_analyze', 'fasttrun_relstats',
                      'fasttrun_collect_stats', 'fasttrun_inspect_stats')
    AND n.nspname = 'public';
+
+-- ----------------------------------------------------------------------
+-- 8. Прямой путь 2.3.4 -> 2.4.0 добавляет только fasttrun_cache_stats().
+-- ----------------------------------------------------------------------
+\pset format unaligned
+CREATE EXTENSION fasttrun VERSION '2.3.4';
+SELECT to_regprocedure('public.fasttrun_cache_stats()') IS NULL
+       AS cache_stats_absent_before_update;
+
+ALTER EXTENSION fasttrun UPDATE TO '2.4.0';
+SELECT extname, extversion FROM pg_extension WHERE extname = 'fasttrun';
+
+SELECT p.proname,
+       p.prorettype::regtype AS return_type,
+       p.proargnames,
+       ARRAY(SELECT t::regtype::text FROM unnest(p.proallargtypes) AS t)
+         AS all_arg_types,
+       p.proargmodes
+FROM pg_proc p
+JOIN pg_namespace n ON n.oid = p.pronamespace
+WHERE n.nspname = 'public' AND p.proname = 'fasttrun_cache_stats';
+
+SELECT p.proname, e.extname AS owner_extension
+FROM pg_proc p
+JOIN pg_namespace n ON n.oid = p.pronamespace
+JOIN pg_depend d ON d.objid = p.oid AND d.deptype = 'e'
+JOIN pg_extension e ON e.oid = d.refobjid
+WHERE n.nspname = 'public' AND p.proname = 'fasttrun_cache_stats';
+
+SELECT * FROM public.fasttrun_cache_stats();
+DROP EXTENSION fasttrun;
+SELECT to_regprocedure('public.fasttrun_cache_stats()') IS NULL
+       AS cache_stats_removed_after_drop;
+\pset format aligned
+-- Конец прямого пути обновления.

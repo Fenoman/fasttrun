@@ -2,9 +2,8 @@
 
 -- ----------------------------------------------------------------------
 -- fasttruncate(text)
--- Очищает локальную временную heap-таблицу напрямую через unlink и
--- smgrcreate, без записи в каталог и без последующего ANALYZE.
--- Подробности в fasttrun.c.
+-- Очищает временную таблицу через heap_truncate без записи в каталог
+-- и без последующего ANALYZE.  Подробности в fasttrun.c.
 -- ----------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION fasttruncate(text)
 RETURNS void AS 'MODULE_PATHNAME', 'fasttruncate'
@@ -22,10 +21,14 @@ LANGUAGE C STRICT VOLATILE;
 
 -- ----------------------------------------------------------------------
 -- fasttrun_analyze_bulk(VARIADIC text[])
--- Пакетный вариант: эквивалентен N последовательным вызовам fasttrun_analyze.
--- Перед изменением rd_rel для каждой таблицы вызывается PlanCacheRelCallback.
--- Получается N обходов списка сохранённых планов. Уже недействительные планы
--- быстро пропускаются. Глобальный ResetPlanCache не используется.
+-- Batch variant: эквивалентен N последовательным вызовам fasttrun_analyze
+-- для каждого имени.  Плановые invalidations отправляются inline (до
+-- мутации rd_rel - это load-bearing ordering), но первая помечает
+-- задетые cached SPI/PREPARE планы is_valid=false, и каждая
+-- последующая в этом батче short-circuit'ится в core's
+-- PlanCacheRelCallback по этому флагу - O(1) на сообщение вместо
+-- полного прохода по plan_cache.  Экономия видна когда один backend
+-- проходит много temp tables в одной транзакции.
 --
 -- Может вызываться двумя путями:
 --   SELECT fasttrun_analyze_bulk('t1','t2','t3');
@@ -73,23 +76,6 @@ CREATE OR REPLACE FUNCTION fasttrun_inspect_stats(rel_name text)
 RETURNS SETOF pg_catalog.pg_statistic
 AS 'MODULE_PATHNAME', 'fasttrun_inspect_stats'
 LANGUAGE C STRICT VOLATILE;
-
--- ----------------------------------------------------------------------
--- fasttrun_cache_stats()
--- Мониторинг ёмкости session-local кэшей: число таблиц в analyze-кэше,
--- число таблиц и колоночных записей в кэше column-статистики и память,
--- занятая подсистемой статистики (хэш-таблицы + кешированные statsTuple,
--- через MemoryContextMemAllocated).  Read-only, без блокировок и без
--- обращений к каталогу; пустые кэши читаются как нули.  Пара к GUC
--- fasttrun.max_stats_memory (мягкий предохранитель памяти кэша).
--- ----------------------------------------------------------------------
-CREATE OR REPLACE FUNCTION fasttrun_cache_stats(
-    OUT analyze_tables int,
-    OUT stats_tables int,
-    OUT stats_columns int,
-    OUT stats_bytes bigint)
-RETURNS record AS 'MODULE_PATHNAME', 'fasttrun_cache_stats'
-LANGUAGE C VOLATILE;
 
 -- Tracking: top-N самых создаваемых temp tables (shared memory)
 CREATE OR REPLACE FUNCTION fasttrun_hot_temp_tables(

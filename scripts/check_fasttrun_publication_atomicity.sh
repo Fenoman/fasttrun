@@ -211,10 +211,12 @@ BEGIN
     RAISE EXCEPTION 'column back-reference failpoint did not fire';
   END IF;
   SELECT * INTO cache_row FROM fasttrun_cache_stats();
-  IF cache_row.analyze_tables <> 0 OR cache_row.stats_tables <> 0 OR
-     cache_row.stats_columns <> 0 THEN
+  IF cache_row.analyze_entries <> 0 OR
+     cache_row.column_stats_relid_entries <> 0 OR
+     cache_row.column_stats_entries <> 0 THEN
     RAISE EXCEPTION 'back-reference failure left cache rows: analyze %, tables %, columns %',
-      cache_row.analyze_tables, cache_row.stats_tables, cache_row.stats_columns;
+      cache_row.analyze_entries, cache_row.column_stats_relid_entries,
+      cache_row.column_stats_entries;
   END IF;
 
   caught := false;
@@ -232,10 +234,12 @@ BEGIN
     RAISE EXCEPTION 'column tuple failpoint did not fire';
   END IF;
   SELECT * INTO cache_row FROM fasttrun_cache_stats();
-  IF cache_row.analyze_tables <> 0 OR cache_row.stats_tables <> 0 OR
-     cache_row.stats_columns <> 0 THEN
+  IF cache_row.analyze_entries <> 0 OR
+     cache_row.column_stats_relid_entries <> 0 OR
+     cache_row.column_stats_entries <> 0 THEN
     RAISE EXCEPTION 'fresh tuple failure left cache rows: analyze %, tables %, columns %',
-      cache_row.analyze_tables, cache_row.stats_tables, cache_row.stats_columns;
+      cache_row.analyze_entries, cache_row.column_stats_relid_entries,
+      cache_row.column_stats_entries;
   END IF;
 
   PERFORM fasttrun_collect_stats('ft_column');
@@ -340,10 +344,12 @@ DECLARE
   cache_row record;
 BEGIN
   SELECT * INTO cache_row FROM fasttrun_cache_stats();
-  IF cache_row.analyze_tables = 0 OR cache_row.stats_tables = 0 OR
-     cache_row.stats_columns = 0 THEN
+  IF cache_row.analyze_entries = 0 OR
+     cache_row.column_stats_relid_entries = 0 OR
+     cache_row.column_stats_entries = 0 THEN
     RAISE EXCEPTION 'missing-path fixture did not seed all caches: analyze %, tables %, columns %',
-      cache_row.analyze_tables, cache_row.stats_tables, cache_row.stats_columns;
+      cache_row.analyze_entries, cache_row.column_stats_relid_entries,
+      cache_row.column_stats_entries;
   END IF;
 END
 $case$;
@@ -357,10 +363,12 @@ DECLARE
   cache_row record;
 BEGIN
   SELECT * INTO cache_row FROM fasttrun_cache_stats();
-  IF cache_row.analyze_tables = 0 OR cache_row.stats_tables = 0 OR
-     cache_row.stats_columns = 0 THEN
+  IF cache_row.analyze_entries = 0 OR
+     cache_row.column_stats_relid_entries = 0 OR
+     cache_row.column_stats_entries = 0 THEN
     RAISE EXCEPTION 'missing-path rollback did not restore caches: analyze %, tables %, columns %',
-      cache_row.analyze_tables, cache_row.stats_tables, cache_row.stats_columns;
+      cache_row.analyze_entries, cache_row.column_stats_relid_entries,
+      cache_row.column_stats_entries;
   END IF;
 END
 $case$;
@@ -374,10 +382,12 @@ DECLARE
   cache_row record;
 BEGIN
   SELECT * INTO cache_row FROM fasttrun_cache_stats();
-  IF cache_row.analyze_tables <> 0 OR cache_row.stats_tables <> 0 OR
-     cache_row.stats_columns <> 0 THEN
+  IF cache_row.analyze_entries <> 0 OR
+     cache_row.column_stats_relid_entries <> 0 OR
+     cache_row.column_stats_entries <> 0 THEN
     RAISE EXCEPTION 'missing-path commit retained cache rows: analyze %, tables %, columns %',
-      cache_row.analyze_tables, cache_row.stats_tables, cache_row.stats_columns;
+      cache_row.analyze_entries, cache_row.column_stats_relid_entries,
+      cache_row.column_stats_entries;
   END IF;
 END
 $case$;

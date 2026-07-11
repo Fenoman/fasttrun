@@ -1975,33 +1975,58 @@ DROP TABLE t_expr_core;
 --     эвикции нет. 0 (default) — без лимита.
 -- ----------------------------------------------------------------------
 DISCARD TEMP;
+\pset format unaligned
 -- Пустые кэши читаются как нули.
 SELECT * FROM fasttrun_cache_stats();
-SET fasttrun.max_stats_memory = '64kB';
+SELECT pg_typeof(analyze_entries) = 'bigint'::regtype AS analyze_entries_bigint,
+       pg_typeof(column_stats_relid_entries) = 'bigint'::regtype AS relid_entries_bigint,
+       pg_typeof(column_stats_entries) = 'bigint'::regtype AS column_entries_bigint,
+       pg_typeof(analyze_bytes) = 'bigint'::regtype AS analyze_bytes_bigint,
+       pg_typeof(column_stats_bytes) = 'bigint'::regtype AS column_bytes_bigint,
+       pg_typeof(total_bytes) = 'bigint'::regtype AS total_bytes_bigint
+FROM fasttrun_cache_stats();
 -- Узкая таблица A: кэш ещё под бюджетом, стата собирается.
 CREATE TEMP TABLE t44_a (id int, name text);
 INSERT INTO t44_a SELECT g, 'val_' || g FROM generate_series(1, 10000) g;
 SELECT fasttrun_analyze('t44_a');
 SELECT count(*) > 0 AS a_stats_cached FROM fasttrun_inspect_stats('t44_a');
-SELECT analyze_tables, stats_tables, stats_columns,
-       stats_bytes > 0 AS stats_bytes_positive
+SELECT analyze_entries, column_stats_relid_entries, column_stats_entries,
+       analyze_bytes > 0 AS analyze_bytes_positive,
+       column_stats_bytes > 0 AS column_bytes_positive,
+       total_bytes = analyze_bytes + column_stats_bytes AS total_is_sum
 FROM fasttrun_cache_stats();
--- Заполнитель с широкими значениями доводит кэш сверх бюджета.
+-- Ровно текущий размер разрешён; первая новая таблица может превысить порог.
+CREATE TEMP TABLE t44_budget AS
+SELECT column_stats_bytes AS bytes FROM fasttrun_cache_stats();
+DO $$
+DECLARE bytes bigint;
+BEGIN
+  SELECT b.bytes INTO bytes FROM t44_budget b;
+  IF bytes <= 0 OR bytes % 1024 <> 0 THEN
+    RAISE EXCEPTION 'column stats bytes are not an exact kB threshold: %', bytes;
+  END IF;
+  PERFORM set_config('fasttrun.max_stats_memory',
+                     (bytes / 1024)::text || 'kB', false);
+END$$;
+-- Заполнитель с широкими значениями выводит кеш статистики сверх бюджета.
 CREATE TEMP TABLE t44_fill (c1 text, c2 text, c3 text, c4 text);
 INSERT INTO t44_fill
   SELECT 'a' || g || repeat('x', 200), 'b' || g || repeat('y', 200),
          'c' || g || repeat('z', 200), 'd' || g || repeat('w', 200)
   FROM generate_series(1, 3000) g;
 SELECT fasttrun_analyze('t44_fill');
-SELECT stats_bytes > 64 * 1024 AS fill_pushed_over_budget
+SELECT count(*) = 4 AS fill_admitted_at_exact_threshold
+FROM fasttrun_inspect_stats('t44_fill');
+SELECT column_stats_bytes > (SELECT bytes FROM t44_budget) AS fill_pushed_over_budget,
+       total_bytes = analyze_bytes + column_stats_bytes AS total_is_sum
 FROM fasttrun_cache_stats();
--- B сверх бюджета: WARNING, column-статы нет, relstats живут.
+-- B сверх бюджета: WARNING, статистики столбцов нет, relstats живут.
 CREATE TEMP TABLE t44_b (id int, name text);
 INSERT INTO t44_b SELECT g, 'val_' || g FROM generate_series(1, 10000) g;
 SELECT fasttrun_analyze('t44_b');
 SELECT count(*) = 0 AS b_stats_absent FROM fasttrun_inspect_stats('t44_b');
 SELECT reltuples::int AS b_reltuples FROM fasttrun_relstats('t44_b');
--- Стата A остаётся видимой: уникальная колонка -> rows=1.
+-- Статистика A остаётся видимой: уникальный столбец -> rows=1.
 DO $$
 DECLARE ln text; est int := NULL;
 BEGIN
@@ -2016,7 +2041,7 @@ BEGIN
   END IF;
 END$$;
 SELECT 'a_stats_still_visible_ok' AS marker;
--- B без column-статы планируется по дефолтной селективности (~0.5%).
+-- B без статистики столбцов планируется по исходной селективности (~0.5%).
 DO $$
 DECLARE ln text; est int := NULL;
 BEGIN
@@ -2036,7 +2061,7 @@ CREATE TEMP TABLE t44_b2 (id int, name text);
 INSERT INTO t44_b2 SELECT g, 'val_' || g FROM generate_series(1, 1000) g;
 SELECT fasttrun_analyze('t44_b2');
 SELECT count(*) = 0 AS b2_stats_absent FROM fasttrun_inspect_stats('t44_b2');
--- Delta-refresh не-managed таблицы в одной транзакции: тоже блокируется,
+-- Обновление приращением таблицы вне управления: тоже блокируется,
 -- тихо (WARNING уже был).
 BEGIN;
 SELECT fasttrun_analyze('t44_b');
@@ -2049,7 +2074,7 @@ FROM fasttrun_inspect_stats('t44_b');
 SELECT fasttrun_collect_stats('t44_b');
 SELECT fasttrun_collect_stats('t44_b');
 SELECT count(*) = 0 AS b_stats_still_absent FROM fasttrun_inspect_stats('t44_b');
--- Managed-таблица A рефрешится сверх порога, бюджет не мешает.
+-- Управляемая таблица A обновляется сверх порога, бюджет не мешает.
 INSERT INTO t44_a SELECT g, 'dup' FROM generate_series(1, 10000) g;
 SELECT fasttrun_analyze('t44_a');
 DO $$
@@ -2072,12 +2097,16 @@ CREATE TEMP TABLE t44_c (id int, name text);
 INSERT INTO t44_c SELECT g, 'val_' || g FROM generate_series(1, 1000) g;
 SELECT fasttrun_analyze('t44_c');
 SELECT count(*) > 0 AS c_stats_cached FROM fasttrun_inspect_stats('t44_c');
-SELECT analyze_tables, stats_tables, stats_columns,
-       stats_bytes > 0 AS stats_bytes_positive
+SELECT analyze_entries, column_stats_relid_entries, column_stats_entries,
+       analyze_bytes > 0 AS analyze_bytes_positive,
+       column_stats_bytes > 0 AS column_bytes_positive,
+       total_bytes = analyze_bytes + column_stats_bytes AS total_is_sum
 FROM fasttrun_cache_stats();
+DROP TABLE t44_budget;
 DROP TABLE t44_a;
 DROP TABLE t44_fill;
 DROP TABLE t44_b;
 DROP TABLE t44_b2;
 DROP TABLE t44_c;
+\pset format aligned
 DROP EXTENSION fasttrun;

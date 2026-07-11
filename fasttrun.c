@@ -2040,6 +2040,13 @@ fasttrun_stats_relid_has_columns(Oid relid)
 	return entry != NULL && entry->attkeys != NIL;
 }
 
+/* Общий счётчик памяти: NULL означает ноль. */
+static Size
+fasttrun_memory_context_bytes(MemoryContext mcxt)
+{
+	return mcxt != NULL ? MemoryContextMemAllocated(mcxt, true) : 0;
+}
+
 /*
  * Soft cap on the column-stats cache: fasttrun.max_stats_memory.
  *
@@ -2059,11 +2066,9 @@ fasttrun_stats_budget_blocks_collect(Relation rel, bool explicit_collect)
 {
 	if (fasttrun_max_stats_memory <= 0)
 		return false;
-	if (fasttrun_stats_mcxt == NULL)
-		return false;
 	if (fasttrun_stats_relid_has_columns(RelationGetRelid(rel)))
 		return false;
-	if (MemoryContextMemAllocated(fasttrun_stats_mcxt, true) <=
+	if (fasttrun_memory_context_bytes(fasttrun_stats_mcxt) <=
 		(Size) fasttrun_max_stats_memory * 1024)
 		return false;
 
@@ -7419,23 +7424,22 @@ fasttrun_relstats(PG_FUNCTION_ARGS)
 /*
  * fasttrun_cache_stats()
  *
- * Capacity monitoring.  Returns the sizes of the session-local caches:
- * relids in the analyze cache, relids and column entries in the
- * column-stats cache, and the memory allocated by the stats subsystem
- * (hash tables + cached statsTuples).  Read-only: no locks, no catalog
- * access; missing caches read as zeroes.
+ * Мониторинг ёмкости: число записей и рекурсивно выделенная память
+ * контекстов analyze и статистики столбцов. Функция не изменяет каталоги
+ * и сама не берёт блокировок; отсутствующий кеш читается как ноль.
  */
 Datum
 fasttrun_cache_stats(PG_FUNCTION_ARGS)
 {
 	TupleDesc	tupdesc;
-	Datum		values[4];
-	bool		nulls[4] = {false, false, false, false};
+	Datum		values[6];
+	bool		nulls[6] = {false, false, false, false, false, false};
 	HeapTuple	tuple;
-	int64		analyze_tables = 0;
-	int64		stats_tables = 0;
-	int64		stats_columns = 0;
-	int64		stats_bytes = 0;
+	int64		analyze_entries = 0;
+	int64		column_stats_relid_entries = 0;
+	int64		column_stats_entries = 0;
+	int64		analyze_bytes;
+	int64		column_stats_bytes;
 
 	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
 		ereport(ERROR,
@@ -7445,19 +7449,22 @@ fasttrun_cache_stats(PG_FUNCTION_ARGS)
 	tupdesc = BlessTupleDesc(tupdesc);
 
 	if (fasttrun_analyze_cache != NULL)
-		analyze_tables = hash_get_num_entries(fasttrun_analyze_cache);
+		analyze_entries = hash_get_num_entries(fasttrun_analyze_cache);
 	if (fasttrun_stats_relid_cache != NULL)
-		stats_tables = hash_get_num_entries(fasttrun_stats_relid_cache);
+		column_stats_relid_entries =
+			hash_get_num_entries(fasttrun_stats_relid_cache);
 	if (fasttrun_stats_cache != NULL)
-		stats_columns = hash_get_num_entries(fasttrun_stats_cache);
-	if (fasttrun_stats_mcxt != NULL)
-		stats_bytes = (int64) MemoryContextMemAllocated(fasttrun_stats_mcxt,
-														true);
+		column_stats_entries = hash_get_num_entries(fasttrun_stats_cache);
+	analyze_bytes = (int64) fasttrun_memory_context_bytes(fasttrun_analyze_mcxt);
+	column_stats_bytes =
+		(int64) fasttrun_memory_context_bytes(fasttrun_stats_mcxt);
 
-	values[0] = Int32GetDatum((int32) analyze_tables);
-	values[1] = Int32GetDatum((int32) stats_tables);
-	values[2] = Int32GetDatum((int32) stats_columns);
-	values[3] = Int64GetDatum(stats_bytes);
+	values[0] = Int64GetDatum(analyze_entries);
+	values[1] = Int64GetDatum(column_stats_relid_entries);
+	values[2] = Int64GetDatum(column_stats_entries);
+	values[3] = Int64GetDatum(analyze_bytes);
+	values[4] = Int64GetDatum(column_stats_bytes);
+	values[5] = Int64GetDatum(analyze_bytes + column_stats_bytes);
 
 	tuple = heap_form_tuple(tupdesc, values, nulls);
 	PG_RETURN_DATUM(HeapTupleGetDatum(tuple));
