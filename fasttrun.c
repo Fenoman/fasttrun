@@ -2203,21 +2203,38 @@ fasttrun_stats_relid_unref(Oid relid)
 static void
 fasttrun_stats_relid_add_key(const FasttrunStatsKey *key)
 {
-	FasttrunStatsRelidEntry *entry;
+	FasttrunStatsRelidEntry *volatile entry = NULL;
 	bool	found;
-	MemoryContext oldcxt;
-	FasttrunStatsKey *kcopy;
+	MemoryContext oldcxt = CurrentMemoryContext;
+	FasttrunStatsKey *volatile kcopy = NULL;
 
 	if (fasttrun_stats_relid_cache == NULL)
 		return;
 
-	entry = fasttrun_stats_relid_enter(key->relid, &found);
+	PG_TRY();
+	{
+		entry = fasttrun_stats_relid_enter(key->relid, &found);
+		FASTTRUN_TEST_FAILPOINT("after_stats_relid_enter", 0);
 
-	oldcxt = MemoryContextSwitchTo(fasttrun_stats_mcxt);
-	kcopy = (FasttrunStatsKey *) palloc(sizeof(*kcopy));
-	*kcopy = *key;
-	entry->attkeys = lappend(entry->attkeys, kcopy);
-	MemoryContextSwitchTo(oldcxt);
+		MemoryContextSwitchTo(fasttrun_stats_mcxt);
+		kcopy = (FasttrunStatsKey *) palloc(sizeof(*kcopy));
+		*((FasttrunStatsKey *) kcopy) = *key;
+		entry->attkeys = lappend(entry->attkeys,
+								   (FasttrunStatsKey *) kcopy);
+		kcopy = NULL;
+		MemoryContextSwitchTo(oldcxt);
+	}
+	PG_CATCH();
+	{
+		MemoryContextSwitchTo(oldcxt);
+		if (kcopy != NULL)
+			pfree((FasttrunStatsKey *) kcopy);
+		if (entry != NULL)
+			fasttrun_stats_relid_maybe_drop(key->relid,
+										 (FasttrunStatsRelidEntry *) entry);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 }
 
 /*
@@ -3597,12 +3614,14 @@ fasttrun_stats_set_column_state(Relation rel, AttrNumber attnum, bool inh,
 {
 	FasttrunStatsKey	key;
 	FasttrunStatsEntry *entry;
+	FasttrunStatsRelidEntry *relentry = NULL;
 	Oid				relid = RelationGetRelid(rel);
 	bool				found;
 	bool				old_candidate;
 	bool				new_candidate;
 	bool				changed;
-	MemoryContext		oldcxt;
+	HeapTuple volatile staged_tuple = NULL;
+	MemoryContext		oldcxt = CurrentMemoryContext;
 	SubTransactionId	cur_subid = GetCurrentSubTransactionId();
 
 	fasttrun_stats_cache_init();
@@ -3613,80 +3632,121 @@ fasttrun_stats_set_column_state(Relation rel, AttrNumber attnum, bool inh,
 	fasttrun_stats_key_init(&key, relid, attnum, inh);
 
 	entry = (FasttrunStatsEntry *) hash_search(fasttrun_stats_cache,
-											   &key, HASH_ENTER, &found);
-	if (!found)
-	{
-		entry->statsTuple = NULL;
-		entry->collected_ins = 0;
-		entry->collected_upd = 0;
-		entry->collected_del = 0;
-		entry->collected_truncdropped = false;
-		entry->collected_pages = 0;
-		entry->was_usable = false;
-		entry->state = FASTTRUN_COLUMN_CORE_ALLOWED;
-		memset(&entry->heap_rlb, 0, sizeof(entry->heap_rlb));
-		entry->heap_rlb_valid = false;
-		entry->state_subid = cur_subid;
-		entry->undo = NULL;
-		fasttrun_stats_relid_add_key(&key);
-	}
+											   &key, HASH_FIND, NULL);
+	found = entry != NULL;
 
-	old_candidate = fasttrun_stats_entry_is_candidate(entry);
+	old_candidate = found && fasttrun_stats_entry_is_candidate(entry);
 	new_candidate = (state == FASTTRUN_COLUMN_LOCAL_CANDIDATE &&
 					 tuple != NULL);
 	changed = !found || entry->state != state ||
 		old_candidate != new_candidate;
 
-	/*
-	 * A state flip or a fresh statsTuple (even same-state: the distribution
-	 * behind it moved) is planner-visible.  Allocation-free: the relid is
-	 * already in the frame from the mark above.
-	 */
-	if (changed || new_candidate)
-		fasttrun_xact_mark_relid(relid, relid,
-								FASTTRUN_TOUCH_PLAN_INVALIDATE);
-
-	if (found && entry->state_subid != cur_subid)
-		fasttrun_stats_entry_save_undo(entry);
-	else if (found && entry->statsTuple != NULL)
+	PG_TRY();
 	{
-		heap_freetuple(entry->statsTuple);
-		entry->statsTuple = NULL;
+		bool	entered;
+
+		if (new_candidate)
+		{
+			MemoryContextSwitchTo(fasttrun_stats_mcxt);
+			FASTTRUN_TEST_FAILPOINT("before_stats_tuple_copy", 0);
+			staged_tuple = heap_copytuple(tuple);
+			MemoryContextSwitchTo(oldcxt);
+		}
+
+		if (!found)
+		{
+			entry = (FasttrunStatsEntry *) hash_search(fasttrun_stats_cache,
+													   &key, HASH_ENTER, &entered);
+			Assert(!entered);
+			entry->statsTuple = NULL;
+			entry->collected_ins = 0;
+			entry->collected_upd = 0;
+			entry->collected_del = 0;
+			entry->collected_truncdropped = false;
+			entry->collected_pages = 0;
+			entry->was_usable = false;
+			entry->state = FASTTRUN_COLUMN_CORE_ALLOWED;
+			memset(&entry->heap_rlb, 0, sizeof(entry->heap_rlb));
+			entry->heap_rlb_valid = false;
+			entry->state_subid = cur_subid;
+			entry->undo = NULL;
+			fasttrun_stats_relid_add_key(&key);
+		}
+
+		/* A state or tuple refresh changes planner-visible statistics. */
+		if (changed || new_candidate)
+			fasttrun_xact_mark_relid(relid, relid,
+									FASTTRUN_TOUCH_PLAN_INVALIDATE);
+
+		if (old_candidate != new_candidate)
+		{
+			relentry = (FasttrunStatsRelidEntry *)
+				hash_search(fasttrun_stats_relid_cache, &relid,
+							HASH_FIND, NULL);
+			if (relentry == NULL)
+				elog(ERROR, "fasttrun stats back-reference is missing");
+		}
+
+		if (found && entry->state_subid != cur_subid)
+			fasttrun_stats_entry_save_undo(entry);
+		else if (found && entry->statsTuple != NULL)
+		{
+			heap_freetuple(entry->statsTuple);
+			entry->statsTuple = NULL;
+		}
+
+		if (old_candidate && !new_candidate)
+		{
+			Assert(relentry->refcount > 0);
+			if (relentry->refcount > 0)
+				relentry->refcount--;
+		}
+		else if (!old_candidate && new_candidate)
+			relentry->refcount++;
+
+		if (new_candidate)
+		{
+			entry->statsTuple = (HeapTuple) staged_tuple;
+			staged_tuple = NULL;
+		}
+		entry->state = state;
+		entry->heap_rlb.locator = rel->rd_locator;
+		entry->heap_rlb.backend = rel->rd_backend;
+		entry->heap_rlb_valid = true;
+		entry->state_subid = cur_subid;
+		entry->was_usable = new_candidate;
+		if (snapshot != NULL)
+		{
+			entry->collected_ins = snapshot->inserted;
+			entry->collected_upd = snapshot->updated;
+			entry->collected_del = snapshot->deleted;
+			entry->collected_truncdropped = snapshot->truncdropped;
+			entry->collected_pages = snapshot->pages;
+		}
+		else
+		{
+			entry->collected_ins = 0;
+			entry->collected_upd = 0;
+			entry->collected_del = 0;
+			entry->collected_truncdropped = false;
+			entry->collected_pages = 0;
+		}
 	}
-
-	if (old_candidate && !new_candidate)
-		fasttrun_stats_relid_unref(relid);
-	else if (!old_candidate && new_candidate)
-		fasttrun_stats_relid_ref(relid);
-
-	if (new_candidate)
+	PG_CATCH();
 	{
-		oldcxt = MemoryContextSwitchTo(fasttrun_stats_mcxt);
-		entry->statsTuple = heap_copytuple(tuple);
 		MemoryContextSwitchTo(oldcxt);
+		if (staged_tuple != NULL)
+			heap_freetuple((HeapTuple) staged_tuple);
+		if (!found)
+		{
+			(void) hash_search(fasttrun_stats_cache, &key,
+							   HASH_REMOVE, NULL);
+			fasttrun_stats_relid_drop_key(&key);
+		}
+		PG_RE_THROW();
 	}
-	entry->state = state;
-	entry->heap_rlb.locator = rel->rd_locator;
-	entry->heap_rlb.backend = rel->rd_backend;
-	entry->heap_rlb_valid = true;
-	entry->state_subid = cur_subid;
-	entry->was_usable = new_candidate;
-	if (snapshot != NULL)
-	{
-		entry->collected_ins = snapshot->inserted;
-		entry->collected_upd = snapshot->updated;
-		entry->collected_del = snapshot->deleted;
-		entry->collected_truncdropped = snapshot->truncdropped;
-		entry->collected_pages = snapshot->pages;
-	}
-	else
-	{
-		entry->collected_ins = 0;
-		entry->collected_upd = 0;
-		entry->collected_del = 0;
-		entry->collected_truncdropped = false;
-		entry->collected_pages = 0;
-	}
+	PG_END_TRY();
+
 	return changed;
 }
 

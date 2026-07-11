@@ -176,6 +176,104 @@ $case$;
 SELECT 'PUBLICATION_OK index';
 SQL
 
+cat >"$WORKDIR/column.sql" <<'SQL'
+\set ON_ERROR_STOP 1
+LOAD 'fasttrun';
+CREATE TEMP TABLE ft_column(id int, grp int, payload text);
+INSERT INTO ft_column
+SELECT g, g % 29, repeat(md5(g::text), 3)
+FROM generate_series(1, 3000) g;
+
+DO $case$
+DECLARE
+  cache_row record;
+  before_count bigint;
+  after_count bigint;
+  before_width bigint;
+  after_width bigint;
+  before_distinct double precision;
+  after_distinct double precision;
+  before_nullfrac double precision;
+  after_nullfrac double precision;
+  caught boolean := false;
+BEGIN
+  PERFORM set_config('fasttrun.test_failpoint', 'after_stats_relid_enter', false);
+  BEGIN
+    PERFORM fasttrun_collect_stats('ft_column');
+  EXCEPTION WHEN SQLSTATE '55000' THEN
+    IF SQLERRM <> 'fasttrun test failpoint: after_stats_relid_enter' THEN
+      RAISE;
+    END IF;
+    caught := true;
+  END;
+  PERFORM set_config('fasttrun.test_failpoint', '', false);
+  IF NOT caught THEN
+    RAISE EXCEPTION 'column back-reference failpoint did not fire';
+  END IF;
+  SELECT * INTO cache_row FROM fasttrun_cache_stats();
+  IF cache_row.analyze_tables <> 0 OR cache_row.stats_tables <> 0 OR
+     cache_row.stats_columns <> 0 THEN
+    RAISE EXCEPTION 'back-reference failure left cache rows: analyze %, tables %, columns %',
+      cache_row.analyze_tables, cache_row.stats_tables, cache_row.stats_columns;
+  END IF;
+
+  caught := false;
+  PERFORM set_config('fasttrun.test_failpoint', 'before_stats_tuple_copy', false);
+  BEGIN
+    PERFORM fasttrun_collect_stats('ft_column');
+  EXCEPTION WHEN SQLSTATE '55000' THEN
+    IF SQLERRM <> 'fasttrun test failpoint: before_stats_tuple_copy' THEN
+      RAISE;
+    END IF;
+    caught := true;
+  END;
+  PERFORM set_config('fasttrun.test_failpoint', '', false);
+  IF NOT caught THEN
+    RAISE EXCEPTION 'column tuple failpoint did not fire';
+  END IF;
+  SELECT * INTO cache_row FROM fasttrun_cache_stats();
+  IF cache_row.analyze_tables <> 0 OR cache_row.stats_tables <> 0 OR
+     cache_row.stats_columns <> 0 THEN
+    RAISE EXCEPTION 'fresh tuple failure left cache rows: analyze %, tables %, columns %',
+      cache_row.analyze_tables, cache_row.stats_tables, cache_row.stats_columns;
+  END IF;
+
+  PERFORM fasttrun_collect_stats('ft_column');
+  SELECT count(*), sum(stawidth), sum(stadistinct), sum(stanullfrac)
+    INTO before_count, before_width, before_distinct, before_nullfrac
+  FROM fasttrun_inspect_stats('ft_column');
+  IF before_count = 0 THEN
+    RAISE EXCEPTION 'column retry did not publish statistics';
+  END IF;
+
+  caught := false;
+  PERFORM set_config('fasttrun.test_failpoint', 'before_stats_tuple_copy', false);
+  BEGIN
+    PERFORM fasttrun_collect_stats('ft_column');
+  EXCEPTION WHEN SQLSTATE '55000' THEN
+    IF SQLERRM <> 'fasttrun test failpoint: before_stats_tuple_copy' THEN
+      RAISE;
+    END IF;
+    caught := true;
+  END;
+  PERFORM set_config('fasttrun.test_failpoint', '', false);
+  IF NOT caught THEN
+    RAISE EXCEPTION 'column overwrite failpoint did not fire';
+  END IF;
+  SELECT count(*), sum(stawidth), sum(stadistinct), sum(stanullfrac)
+    INTO after_count, after_width, after_distinct, after_nullfrac
+  FROM fasttrun_inspect_stats('ft_column');
+  IF after_count <> before_count OR after_width <> before_width OR
+     after_distinct IS DISTINCT FROM before_distinct OR
+     after_nullfrac IS DISTINCT FROM before_nullfrac THEN
+    RAISE EXCEPTION 'column overwrite failure changed old statistics';
+  END IF;
+END
+$case$;
+
+SELECT 'PUBLICATION_OK column';
+SQL
+
 run_case()
 {
 	local name=$1
@@ -200,8 +298,9 @@ case "$CASE_NAME" in
 	all)
 		run_case reserve
 		run_case index
+		run_case column
 		;;
-	reserve|index)
+	reserve|index|column)
 		run_case "$CASE_NAME"
 		;;
 	*)
