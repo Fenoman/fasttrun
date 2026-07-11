@@ -67,7 +67,7 @@ endif
         check-commit-duration check-replace-catalog check-giant-temp \
         check-xact-journal-memory check-cache-init-faults check-fault-matrix \
         check-tracking-order check-no-temp-impact check-planner-probes \
-        check-publication-atomicity \
+        check-publication-atomicity check-tracking-persistence \
         check-docs check-deep-local
 
 check-parity:
@@ -125,6 +125,9 @@ check-planner-probes:
 check-publication-atomicity:
 	PG_CONFIG="$(PG_CONFIG)" scripts/check_fasttrun_publication_atomicity.sh
 
+check-tracking-persistence:
+	PG_CONFIG="$(PG_CONFIG)" scripts/check_fasttrun_tracking_persistence.sh
+
 check-docs:
 	python3 scripts/check_docs_consistency.py
 
@@ -133,4 +136,4 @@ check-deep-local: installcheck check-parity check-soak check-perf-smoke \
                   check-commit-inval-overhead check-bulk-overhead \
                   check-on-commit-drop-leak check-commit-duration \
                   check-replace-catalog check-giant-temp \
-                  check-no-temp-impact check-docs
+                  check-no-temp-impact check-tracking-persistence check-docs

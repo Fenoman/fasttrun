@@ -139,7 +139,29 @@ static int		fasttrun_max_stats_memory = 0;	/* KB, 0 = no cap */
 
 #ifdef USE_ASSERT_CHECKING
 static char *fasttrun_test_failpoint = "";
+#endif
 
+/* Без аллокаций: shutdown callback не имеет права бросать ERROR. */
+static bool
+fasttrun_test_failpoint_matches(const char *name, int ordinal)
+{
+#ifdef USE_ASSERT_CHECKING
+	char		key[96];
+
+	if (ordinal > 0)
+		snprintf(key, sizeof(key), "%s:%d", name, ordinal);
+	else
+		strlcpy(key, name, sizeof(key));
+	return fasttrun_test_failpoint[0] != '\0' &&
+		strcmp(fasttrun_test_failpoint, key) == 0;
+#else
+	(void) name;
+	(void) ordinal;
+	return false;
+#endif
+}
+
+#ifdef USE_ASSERT_CHECKING
 static void
 fasttrun_test_fail(const char *name, int ordinal)
 {
@@ -149,8 +171,7 @@ fasttrun_test_fail(const char *name, int ordinal)
 		snprintf(key, sizeof(key), "%s:%d", name, ordinal);
 	else
 		strlcpy(key, name, sizeof(key));
-	if (fasttrun_test_failpoint[0] != '\0' &&
-		strcmp(fasttrun_test_failpoint, key) == 0)
+	if (fasttrun_test_failpoint_matches(name, ordinal))
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("fasttrun test failpoint: %s", key)));
@@ -7999,11 +8020,16 @@ fasttrun_shmem_request(void)
 static void
 fasttrun_track_save(int code, Datum arg)
 {
-	FILE			   *f;
+	FILE			   *f = NULL;
 	HASH_SEQ_STATUS		status;
 	FasttrunTrackEntry *entry;
 	int32				magic = FASTTRUN_TRACK_MAGIC;
 	int32				count = 0;
+	const char		   *phase = "track_save_open";
+	int					save_errno = 0;
+	bool				lock_held = false;
+	bool				scan_active = false;
+	bool				first_positive = true;
 
 	/* Don't try to dump during a crash: shared state may be inconsistent. */
 	if (code)
@@ -8017,57 +8043,92 @@ fasttrun_track_save(int code, Datum arg)
 		goto error;
 
 	LWLockAcquire(fasttrun_track_lock, LW_SHARED);
+	lock_held = true;
 
 	/* magic + count placeholder; count is rewritten below */
+	phase = "track_save_header";
 	if (fwrite(&magic, sizeof(magic), 1, f) != 1 ||
 		fwrite(&count, sizeof(count), 1, f) != 1)
-	{
-		LWLockRelease(fasttrun_track_lock);
 		goto error;
-	}
 
 	hash_seq_init(&status, fasttrun_track_htab);
+	scan_active = true;
 	while ((entry = hash_seq_search(&status)) != NULL)
 	{
 		if (entry->create_count > 0)
 		{
-			if (fwrite(entry, sizeof(FasttrunTrackEntry), 1, f) != 1)
+			phase = "track_save_write";
+			if (first_positive &&
+				fasttrun_test_failpoint_matches("track_save_write", 0))
 			{
-				hash_seq_term(&status);
-				LWLockRelease(fasttrun_track_lock);
+				errno = ENOSPC;
 				goto error;
 			}
+			first_positive = false;
+			if (fwrite(entry, sizeof(FasttrunTrackEntry), 1, f) != 1)
+				goto error;
 			count++;
 		}
 	}
+	scan_active = false;
 
 	LWLockRelease(fasttrun_track_lock);
+	lock_held = false;
 
 	/* rewrite count over the placeholder */
+	phase = "track_save_count";
 	if (fseek(f, sizeof(magic), SEEK_SET) != 0 ||
 		fwrite(&count, sizeof(count), 1, f) != 1)
 		goto error;
 
+	phase = "track_save_close";
 	if (FreeFile(f))
 	{
 		f = NULL;
 		goto error;
 	}
 	f = NULL;
+	if (fasttrun_test_failpoint_matches("track_save_close", 0))
+	{
+		errno = EIO;
+		goto error;
+	}
+
+	phase = "track_save_pre_rename";
+	if (fasttrun_test_failpoint_matches("track_save_pre_rename", 0))
+	{
+		errno = EIO;
+		goto error;
+	}
 
 	/* atomic replace: the old file stays intact if anything above failed */
-	(void) durable_rename(FASTTRUN_TRACK_FILE ".tmp",
-						  FASTTRUN_TRACK_FILE, LOG);
+	phase = "track_save_rename";
+	if (durable_rename(FASTTRUN_TRACK_FILE ".tmp",
+						   FASTTRUN_TRACK_FILE, LOG) != 0)
+	{
+		/* durable_rename не сохраняет errno после возврата. */
+		errno = EIO;
+		goto error;
+	}
 	return;
 
 error:
+	save_errno = errno != 0 ? errno : EIO;
+	if (scan_active)
+		hash_seq_term(&status);
+	if (lock_held)
+		LWLockRelease(fasttrun_track_lock);
+	if (f != NULL)
+	{
+		(void) FreeFile(f);
+		f = NULL;
+	}
+	errno = save_errno;
 	ereport(LOG,
 			(errcode_for_file_access(),
-			 errmsg("fasttrun: could not write file \"%s\": %m",
-					FASTTRUN_TRACK_FILE ".tmp")));
-	if (f)
-		FreeFile(f);
-	unlink(FASTTRUN_TRACK_FILE ".tmp");
+			 errmsg("fasttrun: could not save tracking statistics at phase %s: %m",
+					phase)));
+	(void) unlink(FASTTRUN_TRACK_FILE ".tmp");
 }
 
 /* Load tracking stats from disk. Called at shmem startup. */
