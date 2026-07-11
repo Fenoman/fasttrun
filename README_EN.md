@@ -120,6 +120,14 @@ rows and uses a safe type-based value for column width. With
 statistics and hides column statistics. Collect statistics again after
 enabling the counters.
 
+The hiding is covered in the reverse direction too: if a plan was built while
+column stats were hidden by the freshness gate after DML (the planner saw
+defaults), rolling that DML back — `ROLLBACK` or `ROLLBACK TO SAVEPOINT` —
+invalidates such plans locally: the stats are visible again, and the
+defaults-based plan is stale. The dependency is recorded only when the planner
+actually consults the hidden stats during planning; with `track_counts = off`
+it never arises.
+
 Regular `ANALYZE` gives statistics ownership back to PostgreSQL. A full call
 removes local statistics for every column; `ANALYZE table (col1, ...)` removes
 them only for the listed columns. Plain `VACUUM` changes nothing. A table
@@ -315,7 +323,7 @@ PERFORM fasttruncate('temp_xxx');
 
 In a typical PL/pgSQL calculation, one backend works with 10-30 temporary tables, each going through this cycle many times. With a pooler (pg_doorman, odyssey) the backend lives long and serves hundreds of clients in a row — temporary tables accumulate and get reused. `fasttruncate` resets data and statistics so the next client doesn't inherit anything from the previous one.
 
-Statistics memory is split between the analyze cache and the column-stats cache. `fasttrun_cache_stats()` reports `analyze_entries`, `column_stats_relid_entries`, `column_stats_entries`, `analyze_bytes`, `column_stats_bytes`, and `total_bytes`; byte counts include child contexts and the total is the sum of both parts. One copied `pg_statistic` row (MCV + histogram at `default_statistics_target = 100`) typically takes 1-3 KB, so hundreds of temporary tables per backend can consume tens of MB per connection. `fasttrun.max_stats_memory` compares only `column_stats_bytes` before first admission: equality is allowed and may overshoot once, after which new tables remain without column stats. Already managed tables keep refreshing; there is no eviction or LRU. Recycling pooler connections releases both caches.
+Statistics memory is split between the analyze cache and the column-stats cache. `fasttrun_cache_stats()` reports `analyze_entries`, `column_stats_relid_entries`, `column_stats_entries`, `analyze_bytes`, `column_stats_bytes`, and `total_bytes`; byte counts include child contexts and the total is the sum of both parts. One copied `pg_statistic` row (MCV + histogram at `default_statistics_target = 100`) typically takes 1-3 KB, so hundreds of temporary tables per backend can consume tens of MB per connection. `fasttrun.max_stats_memory` compares only `column_stats_bytes` before first admission: equality is allowed and may overshoot once, after which new tables remain without column stats. Already managed tables keep refreshing; there is no eviction or LRU. Recycling pooler connections releases both caches. With a densely packed pool, factor this per-backend memory into the pool's RAM budget — allow for tens of MB per server connection.
 
 ## Hot table prewarming
 

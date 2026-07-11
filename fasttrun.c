@@ -141,7 +141,7 @@ static int		fasttrun_max_stats_memory = 0;	/* KB, 0 = no cap */
 static char *fasttrun_test_failpoint = "";
 #endif
 
-/* Без аллокаций: shutdown callback не имеет права бросать ERROR. */
+/* No allocations: a shutdown callback must not throw ERROR. */
 static bool
 fasttrun_test_failpoint_matches(const char *name, int ordinal)
 {
@@ -370,7 +370,7 @@ fasttrun_xact_mark_relid(Oid relid, Oid root_relid, uint32 flags)
 	return entry;
 }
 
-/* План увидел статистику, скрытую DML этих уровней. */
+/* The plan saw statistics hidden by DML at these levels. */
 static void
 fasttrun_xact_mark_dml_plan_dependency(Oid relid)
 {
@@ -2040,7 +2040,7 @@ fasttrun_stats_relid_has_columns(Oid relid)
 	return entry != NULL && entry->attkeys != NIL;
 }
 
-/* Общий счётчик памяти: NULL означает ноль. */
+/* Common memory counter: NULL reads as zero. */
 static Size
 fasttrun_memory_context_bytes(MemoryContext mcxt)
 {
@@ -2386,7 +2386,7 @@ fasttrun_stats_set_relation_policy(Relation rel,
 	return changed;
 }
 
-/* Каталог проверяем только при явной смене состояния, не из хуков. */
+/* Probe the catalog only on an explicit state change, never from hooks. */
 static bool
 fasttrun_relid_has_core_stats(Oid relid, int natts)
 {
@@ -2419,7 +2419,7 @@ fasttrun_relation_has_core_stats(Relation rel)
 	if (fasttrun_relid_has_core_stats(RelationGetRelid(rel), desc->natts))
 		return true;
 
-	/* Статистика выражений хранится под OID индекса. */
+	/* Expression statistics are stored under the index OID. */
 	index_oids = RelationGetIndexList(rel);
 	foreach(lc, index_oids)
 	{
@@ -3195,7 +3195,7 @@ fasttrun_restore_planner_frame(bool saved_in_planner,
 	fasttrun_in_planner = saved_in_planner;
 	if (saved_in_planner)
 	{
-		/* Вложенный планировщик перезаписал массив: внешний кэш перечитается. */
+		/* A nested planner overwrote the array: the outer cache re-reads. */
 		fasttrun_freshness_cache_used = 0;
 		fasttrun_freshness_cache_next_evict = 0;
 	}
@@ -3250,7 +3250,7 @@ fasttrun_planner_hook(Query *parse, const char *query_string,
 									boundParams);
 		}
 
-		/* Вложенный немаршрутизируемый запрос не наследует внешний фрейм. */
+		/* A nested non-routable query does not inherit the outer frame. */
 		fasttrun_in_planner = false;
 		PG_TRY();
 		{
@@ -7424,9 +7424,9 @@ fasttrun_relstats(PG_FUNCTION_ARGS)
 /*
  * fasttrun_cache_stats()
  *
- * Мониторинг ёмкости: число записей и рекурсивно выделенная память
- * контекстов analyze и статистики столбцов. Функция не изменяет каталоги
- * и сама не берёт блокировок; отсутствующий кеш читается как ноль.
+ * Capacity monitoring: entry counts and recursively allocated memory of
+ * the analyze and column-stats contexts.  The function does not modify
+ * catalogs and takes no locks itself; a missing cache reads as zero.
  */
 Datum
 fasttrun_cache_stats(PG_FUNCTION_ARGS)
@@ -8113,7 +8113,7 @@ fasttrun_track_save(int code, Datum arg)
 	if (durable_rename(FASTTRUN_TRACK_FILE ".tmp",
 						   FASTTRUN_TRACK_FILE, LOG) != 0)
 	{
-		/* durable_rename не сохраняет errno после возврата. */
+		/* durable_rename does not preserve errno on return. */
 		errno = EIO;
 		goto error;
 	}
@@ -8637,7 +8637,7 @@ fasttrun_prepare_relstats_handoff(Relation rel)
 	fasttrun_cache_mark_rel_and_indexes_evicted(rel);
 }
 
-/* Сохраняем relation-state до смены locator при rewrite. */
+/* Capture relation state before a rewrite changes the locator. */
 static void
 fasttrun_stats_arm_rewrite_undo(Relation rel)
 {
@@ -9459,7 +9459,7 @@ fasttrun_test_subxact_visits(PG_FUNCTION_ARGS)
 	PG_RETURN_INT64((int64) prior);
 }
 
-/* Читает rd_rel без подстановки из локального кеша. */
+/* Reads rd_rel without substitution from the local cache. */
 Datum
 fasttrun_test_raw_relpages(PG_FUNCTION_ARGS)
 {
@@ -9473,7 +9473,7 @@ fasttrun_test_raw_relpages(PG_FUNCTION_ARGS)
 	PG_RETURN_INT32(pages);
 }
 
-/* Возвращает глубину relation-policy undo для теста атомарности. */
+/* Returns the relation-policy undo depth for the atomicity test. */
 Datum
 fasttrun_test_relid_undo_depth(PG_FUNCTION_ARGS)
 {
@@ -9493,7 +9493,7 @@ fasttrun_test_relid_undo_depth(PG_FUNCTION_ARGS)
 	PG_RETURN_INT64(depth);
 }
 
-/* Вызывает защитную cache-miss ветку без гонки с каталогом. */
+/* Exercises the defensive cache-miss branch without racing the catalog. */
 Datum
 fasttrun_test_evict_missing_relid(PG_FUNCTION_ARGS)
 {
@@ -9503,7 +9503,7 @@ fasttrun_test_evict_missing_relid(PG_FUNCTION_ARGS)
 #endif
 
 #ifdef USE_ASSERT_CHECKING
-/* Счётчики проверок планировщика; true возвращает и сбрасывает. */
+/* Planner probe counters; true returns and resets them. */
 Datum
 fasttrun_test_planner_probe(PG_FUNCTION_ARGS)
 {
@@ -9527,7 +9527,7 @@ fasttrun_test_planner_probe(PG_FUNCTION_ARGS)
 									  8, true, TYPALIGN_DOUBLE));
 }
 
-/* Прямой вызов хука ширины вне планировщика. */
+/* Direct call of the width hook outside the planner. */
 Datum
 fasttrun_test_call_attavgwidth(PG_FUNCTION_ARGS)
 {
