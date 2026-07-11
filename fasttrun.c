@@ -104,6 +104,7 @@ PG_FUNCTION_INFO_V1(fasttrun_test_subxact_visits);
 PG_FUNCTION_INFO_V1(fasttrun_test_poison_locator_mismatch);
 PG_FUNCTION_INFO_V1(fasttrun_test_track_set);
 PG_FUNCTION_INFO_V1(fasttrun_test_raw_relpages);
+PG_FUNCTION_INFO_V1(fasttrun_test_relid_undo_depth);
 #endif
 #ifdef USE_ASSERT_CHECKING
 PG_FUNCTION_INFO_V1(fasttrun_test_planner_probe);
@@ -2326,24 +2327,31 @@ fasttrun_stats_set_relation_policy(Relation rel,
 	if (entry != NULL && entry->heap_rlb_valid &&
 		!fasttrun_rlb_equals(entry->heap_rlb, rlb) &&
 		entry->state_subid != cur_subid)
+	{
 		fasttrun_stats_forget_relid(relid);
-	entry = fasttrun_stats_relid_enter(relid, &found);
-	changed = !found || entry->policy != policy ||
+		entry = NULL;
+	}
+	changed = entry == NULL || entry->policy != policy ||
 		!entry->heap_rlb_valid || !fasttrun_rlb_equals(entry->heap_rlb, rlb);
+	if (!changed)
+		return false;
 
 	/*
-	 * A policy flip is planner-visible; a same-value overwrite is pure
-	 * subxact bookkeeping and must not cost a plan invalidation on abort.
-	 * Mark before mutating so a mid-operation error stays conservative.
+	 * Mark before inserting or mutating so a mid-operation error stays
+	 * conservative and rollback can find every published state.
 	 */
 	fasttrun_xact_mark_relid(relid, relid,
 							FASTTRUN_TOUCH_STATS |
-							(changed ? FASTTRUN_TOUCH_PLAN_INVALIDATE : 0));
+							FASTTRUN_TOUCH_PLAN_INVALIDATE);
 
-	if (found)
+	if (entry != NULL)
 		fasttrun_stats_relid_save_undo(entry);
 	else
+	{
+		entry = fasttrun_stats_relid_enter(relid, &found);
+		Assert(!found);
 		entry->state_subid = cur_subid;
+	}
 
 	entry->policy = policy;
 	entry->heap_rlb = rlb;
@@ -8560,6 +8568,23 @@ fasttrun_prepare_relstats_handoff(Relation rel)
 	fasttrun_cache_mark_rel_and_indexes_evicted(rel);
 }
 
+/* Сохраняем relation-state до смены locator при rewrite. */
+static void
+fasttrun_stats_arm_rewrite_undo(Relation rel)
+{
+	Oid			relid = RelationGetRelid(rel);
+	FasttrunStatsRelidEntry *entry;
+
+	if (fasttrun_stats_relid_cache == NULL)
+		return;
+	entry = (FasttrunStatsRelidEntry *)
+		hash_search(fasttrun_stats_relid_cache, &relid, HASH_FIND, NULL);
+	if (entry == NULL || entry->state_subid == GetCurrentSubTransactionId())
+		return;
+	fasttrun_xact_mark_relid(relid, relid, FASTTRUN_TOUCH_STATS);
+	fasttrun_stats_relid_save_undo(entry);
+}
+
 static void
 fasttrun_prepare_relation_handoff(Relation rel, Bitmapset *attnums,
 								  bool do_analyze, bool do_rewrite,
@@ -8572,7 +8597,10 @@ fasttrun_prepare_relation_handoff(Relation rel, Bitmapset *attnums,
 	Assert(rewrite_relids != NULL);
 
 	if (do_rewrite)
+	{
+		fasttrun_stats_arm_rewrite_undo(rel);
 		(void) fasttrun_stats_neutralize_relation(rel);
+	}
 	else if (do_analyze)
 		fasttrun_stats_neutralize_target(rel, attnums);
 	fasttrun_prepare_relstats_handoff(rel);
@@ -9374,6 +9402,26 @@ fasttrun_test_raw_relpages(PG_FUNCTION_ARGS)
 	pages = rel->rd_rel->relpages;
 	relation_close(rel, AccessShareLock);
 	PG_RETURN_INT32(pages);
+}
+
+/* Возвращает глубину relation-policy undo для теста атомарности. */
+Datum
+fasttrun_test_relid_undo_depth(PG_FUNCTION_ARGS)
+{
+	Oid			relid = PG_GETARG_OID(0);
+	FasttrunStatsRelidEntry *entry;
+	FasttrunStatsRelidSavedState *saved;
+	int64		depth = 0;
+
+	if (fasttrun_stats_relid_cache == NULL)
+		PG_RETURN_INT64(0);
+	entry = (FasttrunStatsRelidEntry *)
+		hash_search(fasttrun_stats_relid_cache, &relid, HASH_FIND, NULL);
+	if (entry == NULL)
+		PG_RETURN_INT64(0);
+	for (saved = entry->undo; saved != NULL; saved = saved->older)
+		depth++;
+	PG_RETURN_INT64(depth);
 }
 #endif
 

@@ -274,6 +274,53 @@ $case$;
 SELECT 'PUBLICATION_OK column';
 SQL
 
+cat >"$WORKDIR/policy.sql" <<'SQL'
+\set ON_ERROR_STOP 1
+LOAD 'fasttrun';
+CREATE FUNCTION pg_temp.fasttrun_test_relid_undo_depth(oid)
+RETURNS bigint
+AS '$libdir/fasttrun', 'fasttrun_test_relid_undo_depth'
+LANGUAGE C STRICT;
+
+SET fasttrun.auto_collect_stats = off;
+SET fasttrun.sample_rows = 0;
+CREATE TEMP TABLE ft_policy(id int);
+INSERT INTO ft_policy SELECT generate_series(1, 1000);
+SELECT fasttrun_analyze('ft_policy');
+
+DO $case$
+BEGIN
+  IF pg_temp.fasttrun_test_relid_undo_depth('ft_policy'::regclass) <> 0 THEN
+    RAISE EXCEPTION 'policy fixture retained undo state';
+  END IF;
+END
+$case$;
+
+BEGIN;
+SELECT fasttrun_analyze('ft_policy');
+DO $case$
+DECLARE
+  depth bigint;
+BEGIN
+  depth := pg_temp.fasttrun_test_relid_undo_depth('ft_policy'::regclass);
+  IF depth <> 0 THEN
+    RAISE EXCEPTION 'unchanged relation policy created undo state: depth %', depth;
+  END IF;
+END
+$case$;
+ROLLBACK;
+
+DO $case$
+BEGIN
+  IF pg_temp.fasttrun_test_relid_undo_depth('ft_policy'::regclass) <> 0 THEN
+    RAISE EXCEPTION 'policy rollback retained undo state';
+  END IF;
+END
+$case$;
+
+SELECT 'PUBLICATION_OK policy';
+SQL
+
 run_case()
 {
 	local name=$1
@@ -299,8 +346,9 @@ case "$CASE_NAME" in
 		run_case reserve
 		run_case index
 		run_case column
+		run_case policy
 		;;
-	reserve|index|column)
+	reserve|index|column|policy)
 		run_case "$CASE_NAME"
 		;;
 	*)
