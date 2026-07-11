@@ -67,6 +67,7 @@ endif
         check-commit-duration check-replace-catalog check-giant-temp \
         check-xact-journal-memory check-cache-init-faults check-fault-matrix \
         check-tracking-order check-no-temp-impact check-planner-probes \
+        check-publication-atomicity \
         check-docs check-deep-local
 
 check-parity:
@@ -120,6 +121,9 @@ check-no-temp-impact:
 
 check-planner-probes:
 	PG_CONFIG="$(PG_CONFIG)" scripts/check_fasttrun_planner_probes.sh all
+
+check-publication-atomicity:
+	PG_CONFIG="$(PG_CONFIG)" scripts/check_fasttrun_publication_atomicity.sh
 
 check-docs:
 	python3 scripts/check_docs_consistency.py

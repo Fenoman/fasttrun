@@ -149,6 +149,7 @@ for t in "${TARGET_ARR[@]}"; do
 	order_rc=125
 	memory_rc=125
 	planner_rc=125
+	publication_rc=125
 	if [ "$check_rc" -eq 0 ] && [ "$passed" -eq "$EXPECTED_REGRESS" ] && \
 		[ "$failed" -eq 0 ]; then
 		run_isolated_harness "$pgcfg" scripts/check_fasttrun_fault_matrix.sh \
@@ -163,16 +164,20 @@ for t in "${TARGET_ARR[@]}"; do
 		run_isolated_harness "$pgcfg" scripts/check_fasttrun_planner_probes.sh all \
 			>"$OUTDIR/planner${ver}.log" 2>&1
 		planner_rc=$?
+		run_isolated_harness "$pgcfg" scripts/check_fasttrun_publication_atomicity.sh \
+			>"$OUTDIR/publication${ver}.log" 2>&1
+		publication_rc=$?
 	fi
 
-	echo "  тесты: пройдено ${passed}/${EXPECTED_REGRESS}, ошибок ${failed}, новых TRAP ${trap_delta}; дополнительные проверки: ошибки=${fault_rc}, порядок=${order_rc}, память=${memory_rc}, планировщик=${planner_rc}"
+	echo "  тесты: пройдено ${passed}/${EXPECTED_REGRESS}, ошибок ${failed}, новых TRAP ${trap_delta}; дополнительные проверки: ошибки=${fault_rc}, порядок=${order_rc}, память=${memory_rc}, планировщик=${planner_rc}, публикация=${publication_rc}"
 	if [ "$check_rc" -ne 0 ] || [ "$passed" -ne "$EXPECTED_REGRESS" ] || \
 		[ "$failed" -ne 0 ]; then
 		echo "  РЕГРЕСС: см. $OUTDIR/rc${ver}/regression.diffs" >&2
 		overall_rc=1
 	fi
 	if [ "$fault_rc" -ne 0 ] || [ "$order_rc" -ne 0 ] || \
-		[ "$memory_rc" -ne 0 ] || [ "$planner_rc" -ne 0 ]; then
+		[ "$memory_rc" -ne 0 ] || [ "$planner_rc" -ne 0 ] || \
+		[ "$publication_rc" -ne 0 ]; then
 		echo "  не прошли дополнительные проверки; журналы находятся в $OUTDIR" >&2
 		overall_rc=1
 	fi

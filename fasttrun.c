@@ -103,6 +103,7 @@ PG_FUNCTION_INFO_V1(fasttrun_reset_temp_stats);
 PG_FUNCTION_INFO_V1(fasttrun_test_subxact_visits);
 PG_FUNCTION_INFO_V1(fasttrun_test_poison_locator_mismatch);
 PG_FUNCTION_INFO_V1(fasttrun_test_track_set);
+PG_FUNCTION_INFO_V1(fasttrun_test_raw_relpages);
 #endif
 #ifdef USE_ASSERT_CHECKING
 PG_FUNCTION_INFO_V1(fasttrun_test_planner_probe);
@@ -1322,8 +1323,6 @@ fasttrun_cache_store_relstats(Relation rel, BlockNumber pages, int64 tuples,
 {
 	FasttrunAnalyzeCacheEntry *entry;
 
-	entry = fasttrun_cache_enter(RelationGetRelid(rel));
-
 	/*
 	 * Register this relid so the xact-end callback walks it.  Index entries
 	 * land here too (via fasttrun_update_index_relstats and
@@ -1334,9 +1333,10 @@ fasttrun_cache_store_relstats(Relation rel, BlockNumber pages, int64 tuples,
 	 * mid-operation error keeps the abort path conservative.
 	 */
 	fasttrun_xact_mark_relid(RelationGetRelid(rel), RelationGetRelid(rel),
-							FASTTRUN_TOUCH_ANALYZE |
-							FASTTRUN_TOUCH_PLAN_INVALIDATE);
+								FASTTRUN_TOUCH_ANALYZE |
+								FASTTRUN_TOUCH_PLAN_INVALIDATE);
 
+	entry = fasttrun_cache_enter(RelationGetRelid(rel));
 	fasttrun_analyze_save_undo(entry);
 
 	entry->state.has_relstats = true;
@@ -1362,15 +1362,16 @@ fasttrun_cache_set_owning_heap(FasttrunAnalyzeCacheEntry *entry,
 							   Relation heaprel)
 {
 	uint32		flags = FASTTRUN_TOUCH_ANALYZE;
+	Oid			root_relid = RelationGetRelid(heaprel);
 
-	entry->state.heap_relid = RelationGetRelid(heaprel);
-	entry->state.heap_rlb.locator = heaprel->rd_locator;
-	entry->state.heap_rlb.backend = heaprel->rd_backend;
 	/* TOAST has no user plan of its own; its main heap already owns the plan. */
 	if (heaprel->rd_rel->relkind != RELKIND_TOASTVALUE)
 		flags |= FASTTRUN_TOUCH_PLAN_INVALIDATE;
-	fasttrun_xact_mark_relid(entry->relid, entry->state.heap_relid,
-							flags);
+	fasttrun_xact_mark_relid(entry->relid, root_relid, flags);
+
+	entry->state.heap_relid = root_relid;
+	entry->state.heap_rlb.locator = heaprel->rd_locator;
+	entry->state.heap_rlb.backend = heaprel->rd_backend;
 }
 
 static void
@@ -5104,14 +5105,15 @@ fasttrun_update_index_relstats(Relation rel, List *index_rels,
 			 indexrel->rd_rel->reltuples != (float4) index_tuples))
 			changed = true;
 
+		fasttrun_cache_set_owning_heap(fasttrun_cache_store_relstats(indexrel,
+														 index_pages,
+														 index_tuples,
+														 0),
+										   rel);
+		FASTTRUN_TEST_FAILPOINT("index_publication_boundary", 0);
 		indexrel->rd_rel->relpages = index_pages;
 		indexrel->rd_rel->reltuples = (float4) index_tuples;
 		indexrel->rd_rel->relallvisible = 0;
-		fasttrun_cache_set_owning_heap(fasttrun_cache_store_relstats(indexrel,
-																	 index_pages,
-																	 index_tuples,
-																	 0),
-									   rel);
 	}
 
 	if (opened != NIL)
@@ -6127,10 +6129,19 @@ fasttrun_reserve_empty_publication(FasttrunTruncateOperation *operation,
 {
 	int			i;
 
+	fasttrun_xact_mark_relid(operation->root_relid, operation->root_relid,
+								FASTTRUN_TOUCH_ANALYZE |
+								FASTTRUN_TOUCH_STATS |
+								FASTTRUN_TOUCH_PLAN_INVALIDATE);
 	for (i = 0; i < operation->nslots; i++)
 	{
 		FasttrunTruncateResultSlot *slot = &operation->slots[i];
-		FasttrunAnalyzeCacheEntry *entry = fasttrun_cache_enter(slot->relid);
+		FasttrunAnalyzeCacheEntry *entry;
+
+		fasttrun_xact_mark_relid(slot->relid, operation->root_relid,
+								FASTTRUN_TOUCH_ANALYZE |
+								FASTTRUN_TOUCH_PLAN_INVALIDATE);
+		entry = fasttrun_cache_enter(slot->relid);
 
 		fasttrun_analyze_save_undo(entry);
 		entry->state.has_relstats = false;
@@ -6141,14 +6152,8 @@ fasttrun_reserve_empty_publication(FasttrunTruncateOperation *operation,
 		entry->lazy_check_subid = InvalidSubTransactionId;
 		entry->lazy_check_pages = 0;
 		slot->analyze_entry = entry;
-		fasttrun_xact_mark_relid(slot->relid, operation->root_relid,
-								FASTTRUN_TOUCH_ANALYZE |
-								FASTTRUN_TOUCH_PLAN_INVALIDATE);
+		FASTTRUN_TEST_FAILPOINT("reserve_after_state", i + 1);
 	}
-	fasttrun_xact_mark_relid(operation->root_relid, operation->root_relid,
-							FASTTRUN_TOUCH_ANALYZE |
-							FASTTRUN_TOUCH_STATS |
-							FASTTRUN_TOUCH_PLAN_INVALIDATE);
 	(void) fasttrun_stats_neutralize_relation(heaprel);
 	operation->have_pgstat_seed = fasttrun_read_pgstat_counters(heaprel,
 													&operation->seed_inserted,
@@ -9295,6 +9300,20 @@ fasttrun_test_subxact_visits(PG_FUNCTION_ARGS)
 	if (reset)
 		fasttrun_test_subxact_visited = 0;
 	PG_RETURN_INT64((int64) prior);
+}
+
+/* Читает rd_rel без подстановки из локального кеша. */
+Datum
+fasttrun_test_raw_relpages(PG_FUNCTION_ARGS)
+{
+	Oid			relid = PG_GETARG_OID(0);
+	Relation	rel;
+	int32		pages;
+
+	rel = relation_open(relid, AccessShareLock);
+	pages = rel->rd_rel->relpages;
+	relation_close(rel, AccessShareLock);
+	PG_RETURN_INT32(pages);
 }
 #endif
 
