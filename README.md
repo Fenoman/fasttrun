@@ -26,7 +26,7 @@
 | `fasttrun_collect_stats(text)` | Явный сбор статистики колонок. В 99% случаев достаточно `fasttrun_analyze` — он делает то же самое автоматически при первом проходе. Эта функция нужна только если автосбор отключён (`auto_collect_stats=off`) или хочется принудительно пересобрать статистику | **нет** |
 | `fasttrun_relstats(text)` | Возвращает текущие `relpages/reltuples` из памяти процесса | **нет** |
 | `fasttrun_inspect_stats(text)` | Возвращает кешированные statsTuple в формате `pg_statistic` (для отладки) | **нет** |
-| `fasttrun_cache_stats()` | Мониторинг ёмкости: число таблиц в analyze-кэше, число таблиц и колоночных записей в кэше column-статистики, память подсистемы статистики в байтах. Read-only, без блокировок и каталога; пустые кэши читаются как нули | **нет** |
+| `fasttrun_cache_stats()` | Мониторинг ёмкости: шесть полей `bigint` — `analyze_entries`, `column_stats_relid_entries`, `column_stats_entries`, `analyze_bytes`, `column_stats_bytes`, `total_bytes`. Первые три считают записи, следующие два показывают рекурсивно выделенную память соответствующих контекстов, `total_bytes` равен их сумме. Функция не изменяет каталоги и сама не берёт блокировок; отсутствующие кеши читаются как нули | **нет** |
 | `fasttrun_hot_temp_tables(n)` | Top-N самых создаваемых temp tables (требует `shared_preload_libraries`) | **нет** |
 | `fasttrun_prewarm()` | Создаёт top-N горячих temp tables через `create_temp_table` | **нет** |
 | `fasttrun_reset_temp_stats()` | Сбрасывает счётчики создания temp tables | **нет** |
@@ -145,7 +145,7 @@ Partial-индексы: их `reltuples` пересэмплируется при
 | `fasttrun.stats_refresh_threshold` | `0.2` | Порог доли изменений: и пересбор статистики, и freshness-толерантность (ниже порога cached column stats видимы планировщику, выше — скрываются). Для freshness эффективный порог масштабируется по кардинальности колонки (`threshold·(1−dratio)`, пол 5%): near-unique колонки строже (защита от stale skewed estimate), low-card — полный порог. Флип видимости visible→hidden, замеченный `fasttrun_analyze` (в т.ч. в полосе между масштабированным полом и порогом пересбора), инвалидирует cached SPI/PREPARE планы — план на спрятанной стате не живёт дольше флипа, когда новые планы уже видят дефолты. `0` — пересбор при любом DML, видимость только при точном совпадении счётчиков. `1` — автопересбор отключён, freshness терпит churn до 100% (с учётом масштабирования) |
 | `fasttrun.invalidate_threshold` | `0.2` | Порог доли изменений `relpages`/`reltuples` ниже которого `fasttrun_analyze` НЕ инвалидирует cached SPI/PREPARE планы. Drift меряется кумулятивно — от значений на момент последней инвалидации, а не от предыдущего вызова: серия мелких шагов, каждый ниже порога, всё равно инвалидирует план, когда суммарный дрейф достигнет порога. Симметрично `stats_refresh_threshold` — при <20% DML ни refresh, ни plan invalidation. `0` — инвалидировать на любой drift (как было в 2.2.0). Инвалидации от пересбора column stats, смены их видимости и изменения index relstats срабатывают всегда, независимо от этого порога |
 | `fasttrun.zero_sinval_truncate` | `on` | `on` очищает файлы напрямую и не отправляет общих SMGR-сообщений. `off` вызывает `RelationTruncate` для каждого отношения и отправляет по одному сообщению после успешного вызова |
-| `fasttrun.max_stats_memory` | `0` | Мягкий предохранитель памяти кэша column-статистики (в КБ; `0` — без лимита, текущее поведение). Когда кэш уже занимает больше лимита, статистика колонок для таблиц, у которых её ещё нет, не собирается — такая таблица работает как при `auto_collect_stats = off`: relation-level relstats продолжают работать, планировщик берёт дефолтную селективность. Авто-путь предупреждает `WARNING` один раз на бэкенд, явный `fasttrun_collect_stats` — `NOTICE` на каждый вызов. Таблицы с уже собранной статистикой продолжают refresh без проверки бюджета; эвикции живой статистики нет. Текущий размер кэша показывает `fasttrun_cache_stats()` |
+| `fasttrun.max_stats_memory` | `0` | Мягкий предохранитель памяти кеша статистики столбцов (в КБ; `0` — без лимита). Перед первым сбором для новой таблицы с лимитом сравнивается только `column_stats_bytes`: размер, равный лимиту, ещё разрешён, поэтому первая новая таблица может превысить порог; следующие новые таблицы блокируются, когда текущий размер уже больше лимита. `analyze_bytes` в бюджет не входит. Такая таблица работает как при `auto_collect_stats = off`: relation-level relstats продолжают работать, планировщик берёт исходную селективность. Автосбор выдаёт `WARNING` один раз на бэкенд, явный `fasttrun_collect_stats` — `NOTICE` на каждый вызов. Таблицы с уже собранной статистикой обновляются без проверки бюджета; вытеснения и LRU нет. Текущие размеры показывает `fasttrun_cache_stats()` |
 
 ## Производительность
 
@@ -190,9 +190,10 @@ make install PG_CONFIG=/path/to/pg_config
 CREATE EXTENSION fasttrun;
 ```
 
-По умолчанию будет установлена версия `2.3.4`.
+По умолчанию будет установлена версия `2.4.0`.
 
-Поддерживается обновление со старых версий `2.0` / `2.1` / `2.1.1` / `2.1.2` / `2.2.0`:
+Поддерживается обновление со старых версий `2.0` / `2.1` / `2.1.1` /
+`2.1.2` / `2.2.0` / `2.3.0` / `2.3.1` / `2.3.2` / `2.3.3` / `2.3.4`:
 ```sql
 ALTER EXTENSION fasttrun UPDATE;
 ```
@@ -213,7 +214,7 @@ make installcheck PG_CONFIG=/path/to/pg_config PGPORT=5433
 | `fasttrun_analyze` | Дельта-математика, откат к savepoint, TRUNCATE внутри транзакции |
 | `fasttrun_migration` | Путь обновления 2.0 -> latest, включая обратную совместимость с `fasttruncate_c` |
 | `fasttrun_bench` | Синтетический бенчмарк на 1M строк x 50 колонок |
-| `fasttrun_stats` | Хук статистики: EXPLAIN до/после, автосбор, sample_rows=0/-1, refresh threshold, DDL/TRUNCATE eviction, partial-index relstats |
+| `fasttrun_stats` | Хук статистики: EXPLAIN до/после, автосбор, sample_rows=0/-1, refresh threshold, DDL/TRUNCATE eviction, partial-index relstats, шесть полей `fasttrun_cache_stats()` и допуск первого сбора ровно на пороге памяти |
 | `fasttrun_tracking` | Трекинг часто создаваемых temp tables и prewarm; есть expected для режима с `shared_preload_libraries` и без него |
 | `fasttrun_relstats_survive` | Сохранение relstats через relcache rebuild и `COMMIT` в рамках backend'а, включая таблицы, видимые только из SubLink-подзапросов |
 | `fasttrun_plan_cache_survive` | Локальный сброс кэша планов SPI/PL/pgSQL после fasttruncate, analyze, collect_stats и savepoint rollback |
@@ -226,7 +227,8 @@ make installcheck PG_CONFIG=/path/to/pg_config PGPORT=5433
 Перед релизом `scripts/check_cassert_allversions.sh` пересобирает расширение
 для PostgreSQL 16, 17 и 18 с включёнными проверками `--enable-cassert`. Для
 каждой версии должны пройти 13 из 13 тестов, не должно быть `TRAP`, а отдельные
-проверки ошибок, порядка сортировки и памяти должны завершиться успешно.
+проверки ошибок, порядка сортировки, памяти, планировщика, публикации и
+сохранения tracking-файла должны завершиться успешно.
 
 Для отдельной проверки контракта "ноль shared sinval" на Linux есть smoke-тест с `gdb`:
 
@@ -252,6 +254,7 @@ make check-zero-sinval PG_CONFIG=/path/to/pg_config
 make check-fault-matrix PG_CONFIG=/path/to/pg_config
 make check-xact-journal-memory PG_CONFIG=/path/to/pg_config
 make check-no-temp-impact PG_CONFIG=/path/to/pg_config
+make check-tracking-persistence PG_CONFIG=/path/to/pg_config
 make check-docs
 ```
 
@@ -279,6 +282,7 @@ make check-docs
 | `check-xact-journal-memory` | Проверяет журналы транзакций и подтранзакций, состояние очистки и память |
 | `check-no-temp-impact` | Сравнивает планы, результаты, повторное планирование, память и время планирования запросов к обычным таблицам |
 | `check-giant-temp` | Проверяет таблицу размером 1M x 50 и ограничение выборки по блокам |
+| `check-tracking-persistence` | Запускает `scripts/check_fasttrun_tracking_persistence.sh`: штатный save/restart/load создаёт настоящую таблицу через `LIKE dummy_tmp.*` на release и cassert; три отказа записи, закрытия и переименования проверяются на cassert |
 | `check-cassert_allversions.sh` | Запускает все проверки на PostgreSQL 16, 17 и 18 со включёнными проверочными утверждениями |
 | `check-docs` | Сверяет документацию с метаданными проекта |
 | `check-replace-catalog` | Проверяет, что скрипт замены не меняет строки и комментарии SQL |
@@ -320,7 +324,7 @@ PERFORM fasttruncate('temp_xxx');
 
 В типичном PL/pgSQL-расчёте один бэкенд работает с 10-30 временными таблицами, каждая из которых проходит через этот цикл многократно. При работе с пулером (pg_doorman, odyssey) бэкенд живёт долго и обслуживает сотни клиентов подряд — временные таблицы накапливаются и переиспользуются. `fasttruncate` сбрасывает данные и статистику, чтобы следующий клиент не унаследовал чужое.
 
-Память под кэш статистики: кэш column stats — это per-backend копия строк `pg_statistic`. Колонка с собранной статистикой (MCV + histogram при `default_statistics_target = 100`) занимает примерно 1-3 КБ; оценка объёма — таблиц × колонок × ~2 КБ. При профиле «сотни temp-таблиц на бэкенд через пулер» это десятки МБ на каждое серверное соединение — учитывайте при расчёте RAM под пул. Периодический ресайкл соединений пулера ограничивает рост. Фактический размер кэшей виден через `fasttrun_cache_stats()` (число таблиц, колоночных записей и байты), а мягкий предохранитель `fasttrun.max_stats_memory` ограничивает рост: сверх бюджета новые таблицы остаются без column-статы, таблицы с уже собранной статистикой продолжают refresh, эвикции нет.
+Память под статистику хранится отдельно для analyze-кеша и кеша статистики столбцов. `fasttrun_cache_stats()` показывает их как `analyze_entries`, `column_stats_relid_entries`, `column_stats_entries`, `analyze_bytes`, `column_stats_bytes`, `total_bytes`; байты включают дочерние контексты, а итог равен сумме двух частей. Копия `pg_statistic` для одного столбца (MCV + histogram при `default_statistics_target = 100`) занимает примерно 1-3 КБ; при сотнях временных таблиц на бэкенд это десятки МБ на соединение. `fasttrun.max_stats_memory` сравнивает только `column_stats_bytes` перед первым сбором: равенство порогу разрешено и может дать однократное превышение, после чего новые таблицы остаются без статистики столбцов. Уже управляемые таблицы продолжают обновляться; вытеснения и LRU нет. Периодический ресайкл соединений освобождает оба кеша.
 
 ## Прогрев горячих таблиц
 
@@ -461,11 +465,12 @@ fasttrun.track_schedule = ''
 ```
 fasttrun.c                    # основной C-код
 fasttrun.control              # метаданные расширения
+fasttrun--2.4.0.sql           # текущая версия (10 функций)
+fasttrun--2.3.4.sql           # замороженная предыдущая версия (9 функций)
 fasttrun--2.3.0.sql           # старая версия
 fasttrun--2.3.1.sql           # предыдущая версия
 fasttrun--2.3.2.sql           # предыдущая версия
 fasttrun--2.3.3.sql           # предыдущая версия
-fasttrun--2.3.4.sql           # текущая версия (9 функций)
 fasttrun--2.2.0.sql           # старая версия
 fasttrun--2.0.sql             # старая базовая версия
 fasttrun--2.0--2.1.sql        # миграция 2.0 -> 2.1
@@ -477,8 +482,10 @@ fasttrun--2.3.0--2.3.1.sql    # миграция 2.3.0 -> 2.3.1 (только C-
 fasttrun--2.3.1--2.3.2.sql    # миграция 2.3.1 -> 2.3.2 (только C-фиксы, без изменений SQL)
 fasttrun--2.3.2--2.3.3.sql    # миграция 2.3.2 -> 2.3.3 (только C-фиксы, без изменений SQL)
 fasttrun--2.3.3--2.3.4.sql    # миграция 2.3.3 -> 2.3.4 (только C-фиксы, без изменений SQL)
+fasttrun--2.3.4--2.4.0.sql    # миграция 2.3.4 -> 2.4.0 (новая телеметрия кешей)
 Makefile                      # PGXS
 examples/                     # примеры (create_temp_table)
+scripts/check_fasttrun_tracking_persistence.sh  # штатное и отказоустойчивое сохранение tracking-файла
 sql/                          # 13 наборов pg_regress
 expected/                     # ожидаемый вывод
 ```

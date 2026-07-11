@@ -24,7 +24,7 @@ This fasttrun fork tries to solve both problems:
 | `fasttrun_collect_stats(text)` | Explicit column statistics collection. In 99% of cases `fasttrun_analyze` is enough — it does the same automatically on the first pass. This function is needed only if auto-collection is disabled (`auto_collect_stats=off`) or you want to force a rebuild | **no** |
 | `fasttrun_relstats(text)` | Returns current `relpages/reltuples` from process memory | **no** |
 | `fasttrun_inspect_stats(text)` | Returns cached statsTuple in `pg_statistic` format (for debugging) | **no** |
-| `fasttrun_cache_stats()` | Capacity monitoring: number of tables in the analyze cache, number of tables and column entries in the column-stats cache, and the stats subsystem memory in bytes. Read-only, no locks, no catalog access; empty caches read as zeroes | **no** |
+| `fasttrun_cache_stats()` | Capacity monitoring with six `bigint` fields: `analyze_entries`, `column_stats_relid_entries`, `column_stats_entries`, `analyze_bytes`, `column_stats_bytes`, `total_bytes`. The first three count entries, the next two report recursively allocated bytes in each context, and `total_bytes` is their sum. The function does not modify catalogs or take locks itself; missing caches read as zeroes | **no** |
 | `fasttrun_hot_temp_tables(n)` | Top-N most frequently created temp tables (requires `shared_preload_libraries`) | **no** |
 | `fasttrun_prewarm()` | Creates top-N hot temp tables via `create_temp_table` | **no** |
 | `fasttrun_reset_temp_stats()` | Resets temp table creation counters | **no** |
@@ -138,7 +138,7 @@ A separate commit-boundary backstop: a temp table's pgstat counters reset at eve
 | `fasttrun.stats_refresh_threshold` | `0.2` | DML change ratio threshold governing both stats refresh and freshness tolerance: below it cached column stats stay visible to the planner, past it they are hidden. For freshness the effective threshold scales with column cardinality (`threshold·(1−dratio)`, floored at 5%): near-unique columns are stricter (guarding against a stale skewed estimate), low-cardinality columns keep the full threshold. A visible→hidden flip observed by `fasttrun_analyze` (including in the band between the scaled floor and the refresh threshold) invalidates cached SPI/PREPARE plans — a plan built on the now-hidden distribution does not outlive the flip while new plans already see defaults. `0` — refresh on any DML, visible only on an exact counter match. `1` — auto refresh disabled, freshness tolerates churn up to 100% (subject to the scaling) |
 | `fasttrun.invalidate_threshold` | `0.2` | `relpages`/`reltuples` drift ratio below which `fasttrun_analyze` does NOT invalidate cached SPI/PREPARE plans. Drift is measured cumulatively — against the values published at the last invalidation, not against the previous call: a series of small steps, each below the threshold, still invalidates the plan once the accumulated drift reaches it. Symmetric with `stats_refresh_threshold` — below 20% DML neither refresh nor plan invalidation fires. `0` — invalidate on any drift (the 2.2.0 behaviour). Invalidations triggered by a column-stats refresh, a stats-visibility flip, or an index relstats change always fire, regardless of this threshold |
 | `fasttrun.zero_sinval_truncate` | `on` | `on` clears files directly and sends no shared SMGR messages. `off` calls `RelationTruncate` for each relation and sends one message after each successful call |
-| `fasttrun.max_stats_memory` | `0` | Soft memory cap for the column-stats cache (in KB; `0` = no cap, the current behaviour). Once the cache already holds more than the cap, column statistics are not collected for tables that have none cached yet — such a table behaves as with `auto_collect_stats = off`: relation-level relstats keep working, the planner falls back to default selectivity. The auto-collect path warns with a `WARNING` once per backend; an explicit `fasttrun_collect_stats` call gets a `NOTICE` every time. Tables that already hold cached statistics keep refreshing without the budget check; live statistics are never evicted. `fasttrun_cache_stats()` reports the current cache size |
+| `fasttrun.max_stats_memory` | `0` | Soft memory guard for the column-stats cache (in KB; `0` = unlimited). Before the first collection for a new table, only `column_stats_bytes` is compared with the limit. Equality is admitted, so that first table may overshoot; later new tables are blocked once the current size is already above the limit. `analyze_bytes` is not part of this budget. A blocked table behaves as with `auto_collect_stats = off`: relation-level relstats keep working and the planner uses default selectivity. Auto-collection warns once per backend; explicit `fasttrun_collect_stats` emits a `NOTICE` on every call. Tables with existing statistics keep refreshing; there is no eviction or LRU. `fasttrun_cache_stats()` reports the current sizes |
 
 ## Performance
 
@@ -183,9 +183,10 @@ make install PG_CONFIG=/path/to/pg_config
 CREATE EXTENSION fasttrun;
 ```
 
-By default, this installs version `2.3.4`.
+By default, this installs version `2.4.0`.
 
-Upgrade from older versions `2.0` / `2.1` / `2.1.1` / `2.1.2` / `2.2.0` is supported:
+Upgrade from older versions `2.0` / `2.1` / `2.1.1` / `2.1.2` / `2.2.0` /
+`2.3.0` / `2.3.1` / `2.3.2` / `2.3.3` / `2.3.4` is supported:
 ```sql
 ALTER EXTENSION fasttrun UPDATE;
 ```
@@ -206,7 +207,7 @@ make installcheck PG_CONFIG=/path/to/pg_config PGPORT=5433
 | `fasttrun_analyze` | Delta math, savepoint rollback, TRUNCATE inside a transaction |
 | `fasttrun_migration` | Upgrade path 2.0 -> latest, including backward compatibility with `fasttruncate_c` |
 | `fasttrun_bench` | Synthetic benchmark on 1M rows x 50 columns |
-| `fasttrun_stats` | Statistics hook: EXPLAIN before/after, auto-collection, sample_rows=0/-1, refresh threshold, DDL/TRUNCATE eviction, partial-index relstats |
+| `fasttrun_stats` | Statistics hook: EXPLAIN before/after, auto-collection, sample_rows=0/-1, refresh threshold, DDL/TRUNCATE eviction, partial-index relstats, all six `fasttrun_cache_stats()` fields, and first admission exactly at the memory threshold |
 | `fasttrun_tracking` | Tracking frequently created temp tables and prewarm; has expected output for both `shared_preload_libraries` and non-preload modes |
 | `fasttrun_relstats_survive` | relstats survive relcache rebuilds and `COMMIT` inside one backend, including tables referenced only from SubLink subqueries |
 | `fasttrun_plan_cache_survive` | Backend-local SPI/PL/pgSQL plan cache invalidation after fasttruncate, analyze, collect_stats and savepoint rollback |
@@ -218,8 +219,8 @@ All 13 `pg_regress` tests pass on PostgreSQL 16, 17, and 18.
 
 Before release, `scripts/check_cassert_allversions.sh` rebuilds the extension
 with `--enable-cassert` for all three versions. Each run must pass 13 of 13
-tests with no `TRAP`; the separate fault, ordering, and memory checks must pass
-as well.
+tests with no `TRAP`; the separate fault, ordering, memory, planner,
+publication, and tracking-file persistence checks must pass as well.
 
 For a separate Linux-only check of the "zero shared sinval" contract, run the `gdb` smoke test:
 
@@ -245,6 +246,7 @@ make check-zero-sinval PG_CONFIG=/path/to/pg_config
 make check-fault-matrix PG_CONFIG=/path/to/pg_config
 make check-xact-journal-memory PG_CONFIG=/path/to/pg_config
 make check-no-temp-impact PG_CONFIG=/path/to/pg_config
+make check-tracking-persistence PG_CONFIG=/path/to/pg_config
 make check-docs
 ```
 
@@ -271,6 +273,7 @@ Other checks:
 | `check-xact-journal-memory` | Checks transaction and subtransaction journals, cleanup state, and memory |
 | `check-no-temp-impact` | Compares plans, results, replans, memory, and planning time for permanent-table queries |
 | `check-giant-temp` | Checks the 1M x 50 table and the block-sampling limit |
+| `check-tracking-persistence` | Runs `scripts/check_fasttrun_tracking_persistence.sh`: a real table created with `LIKE dummy_tmp.*` exercises clean save/restart/load in release and cassert builds; write, close, and pre-rename failures run on cassert builds |
 | `check_cassert_allversions.sh` | Runs all checks on PostgreSQL 16, 17, and 18 with assertions enabled |
 | `check-docs` | Checks documentation against project metadata |
 | `check-replace-catalog` | Checks that the replacement script does not change SQL strings or comments |
@@ -312,7 +315,7 @@ PERFORM fasttruncate('temp_xxx');
 
 In a typical PL/pgSQL calculation, one backend works with 10-30 temporary tables, each going through this cycle many times. With a pooler (pg_doorman, odyssey) the backend lives long and serves hundreds of clients in a row — temporary tables accumulate and get reused. `fasttruncate` resets data and statistics so the next client doesn't inherit anything from the previous one.
 
-Statistics cache memory: the column-stats cache is a per-backend copy of `pg_statistic` rows. A column with collected statistics (MCV + histogram at `default_statistics_target = 100`) takes roughly 1-3 KB; estimate the footprint as tables × columns × ~2 KB. With a "hundreds of temp tables per backend behind a pooler" profile this adds up to tens of MB per server connection — account for it when sizing the pool's RAM. Periodic pooler connection recycling bounds the growth. The actual cache sizes are visible through `fasttrun_cache_stats()` (table counts, column entries, and bytes), and the soft cap `fasttrun.max_stats_memory` bounds the growth: over the budget, new tables are left without column stats while tables with already-collected statistics keep refreshing; nothing is evicted.
+Statistics memory is split between the analyze cache and the column-stats cache. `fasttrun_cache_stats()` reports `analyze_entries`, `column_stats_relid_entries`, `column_stats_entries`, `analyze_bytes`, `column_stats_bytes`, and `total_bytes`; byte counts include child contexts and the total is the sum of both parts. One copied `pg_statistic` row (MCV + histogram at `default_statistics_target = 100`) typically takes 1-3 KB, so hundreds of temporary tables per backend can consume tens of MB per connection. `fasttrun.max_stats_memory` compares only `column_stats_bytes` before first admission: equality is allowed and may overshoot once, after which new tables remain without column stats. Already managed tables keep refreshing; there is no eviction or LRU. Recycling pooler connections releases both caches.
 
 ## Hot table prewarming
 
@@ -452,11 +455,12 @@ Single source file, version differences handled via `#if PG_VERSION_NUM`.
 ```
 fasttrun.c                    # main C code
 fasttrun.control              # extension metadata
+fasttrun--2.4.0.sql           # current version (10 functions)
+fasttrun--2.3.4.sql           # frozen previous version (9 functions)
 fasttrun--2.3.0.sql           # older version
 fasttrun--2.3.1.sql           # previous version
 fasttrun--2.3.2.sql           # previous version
 fasttrun--2.3.3.sql           # previous version
-fasttrun--2.3.4.sql           # current version (9 functions)
 fasttrun--2.2.0.sql           # older version
 fasttrun--2.0.sql             # old base version
 fasttrun--2.0--2.1.sql        # migration 2.0 -> 2.1
@@ -468,8 +472,10 @@ fasttrun--2.3.0--2.3.1.sql    # migration 2.3.0 -> 2.3.1 (C-side fixes only, no 
 fasttrun--2.3.1--2.3.2.sql    # migration 2.3.1 -> 2.3.2 (C-side fixes only, no SQL changes)
 fasttrun--2.3.2--2.3.3.sql    # migration 2.3.2 -> 2.3.3 (C-side fixes only, no SQL changes)
 fasttrun--2.3.3--2.3.4.sql    # migration 2.3.3 -> 2.3.4 (C-side fixes only, no SQL changes)
+fasttrun--2.3.4--2.4.0.sql    # migration 2.3.4 -> 2.4.0 (cache telemetry)
 Makefile                      # PGXS
 examples/                     # examples (create_temp_table)
+scripts/check_fasttrun_tracking_persistence.sh  # clean and fault-safe tracking-file persistence
 sql/                          # 13 pg_regress tests
 expected/                     # expected output
 ```
