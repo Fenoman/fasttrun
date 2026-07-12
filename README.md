@@ -235,8 +235,29 @@ make installcheck PG_CONFIG=/path/to/pg_config PGPORT=5433
 Перед релизом `scripts/check_cassert_allversions.sh` пересобирает расширение
 для PostgreSQL 16, 17 и 18 с включёнными проверками `--enable-cassert`. Для
 каждой версии должны пройти 13 из 13 тестов, не должно быть `TRAP`, а отдельные
-проверки ошибок, порядка сортировки, памяти, планировщика, публикации и
-сохранения tracking-файла должны завершиться успешно.
+проверки 50 сценариев на 25 точках отказа с BRIN, инициализации кешей,
+порядка сортировки, памяти, планировщика, публикации и сохранения tracking-файла
+должны завершиться успешно. Короткая проверка BRIN выполняет на каждой версии
+96 обычных
+`EXPLAIN` со скрытой статистикой и ещё 48 принудительных проверок BRIN-пути
+через `scripts/check_fasttrun_brin_stress.sh`.
+Целевые серверы должны быть запущены без `fasttrun` в
+`shared_preload_libraries`: скрипт сначала устанавливает свежую сборку, после
+чего новый серверный процесс загружает именно её. До начала тестов проверяются
+версия сервера, `debug_assertions` и совпадение каталогов библиотек и SQL-файлов
+у живого сервера и переданного `pg_config`.
+
+Перед релизом и в ночном прогоне вместо короткой проверки запускается полный
+набор:
+
+```bash
+FT_CASSERT_TARGETS="16:/path/pg16/bin/pg_config:port:log,..." \
+  scripts/check_fasttrun_prerelease.sh
+```
+
+Он использует тот же сценарий BRIN, но выполняет на каждой версии 1000 обычных
+`EXPLAIN` со скрытой статистикой и 200 принудительных проверок BRIN-пути.
+Отдельной копии SQL для полного режима нет.
 
 Для отдельной проверки контракта "ноль shared sinval" на Linux есть smoke-тест с `gdb`:
 
@@ -260,9 +281,11 @@ make check-perf-smoke PG_CONFIG=/path/to/pg_config
 make check-hook-chain PG_CONFIG=/path/to/pg_config
 make check-zero-sinval PG_CONFIG=/path/to/pg_config
 make check-fault-matrix PG_CONFIG=/path/to/pg_config
+make check-brin-stress PG_CONFIG=/path/to/cassert/pg_config
 make check-xact-journal-memory PG_CONFIG=/path/to/pg_config
 make check-no-temp-impact PG_CONFIG=/path/to/pg_config
 make check-tracking-persistence PG_CONFIG=/path/to/pg_config
+make check-required-suite
 make check-docs
 ```
 
@@ -287,6 +310,9 @@ make check-docs
 | `check-hook-chain` | Проверяет оба порядка вызова хуков встроенным тестовым модулем; установленное стороннее расширение используется при наличии |
 | `check-zero-sinval` | Через `gdb` проверяет отсутствие общих сообщений инвалидации |
 | `check-fault-matrix` | Имитирует ошибки на каждом шаге очистки файлов и проверяет восстановление |
+| `check-brin-stress` | Запускает BRIN smoke в режимах default/full и zero-sinval on/off на cassert-сборке |
+| `check-required-suite` | Проверяет состав обязательного cassert и pre-release набора |
+| `check-prerelease` | Запускает полный обязательный cassert-набор PG16/17/18 с тяжёлой BRIN-матрицей |
 | `check-xact-journal-memory` | Проверяет журналы транзакций и подтранзакций, состояние очистки и память |
 | `check-no-temp-impact` | Сравнивает планы, результаты, повторное планирование, память и время планирования запросов к обычным таблицам |
 | `check-giant-temp` | Проверяет таблицу размером 1M x 50 и ограничение выборки по блокам |

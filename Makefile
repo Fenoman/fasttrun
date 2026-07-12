@@ -56,9 +56,12 @@ REGRESS = fasttrun_basic \
 
 PG_CONFIG ?= pg_config
 
-# Документация сверяется только с метаданными репозитория: эта цель должна
-# работать и без установленного PostgreSQL development toolchain.
-ifneq ($(MAKECMDGOALS),check-docs)
+# Статические проверки и pre-release driver сами не используют PGXS.
+NO_PGXS_GOALS = check-docs check-required-suite check-prerelease
+ifeq ($(strip $(MAKECMDGOALS)),)
+PGXS := $(shell $(PG_CONFIG) --pgxs)
+include $(PGXS)
+else ifneq ($(strip $(filter-out $(NO_PGXS_GOALS),$(MAKECMDGOALS))),)
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
 endif
@@ -70,6 +73,7 @@ endif
         check-xact-journal-memory check-cache-init-faults check-fault-matrix \
         check-tracking-order check-no-temp-impact check-planner-probes \
         check-publication-atomicity check-tracking-persistence \
+        check-brin-stress check-required-suite check-prerelease \
         check-docs check-deep-local
 
 check-parity:
@@ -112,6 +116,9 @@ check-xact-journal-memory:
 check-cache-init-faults:
 	PG_CONFIG="$(PG_CONFIG)" scripts/check_fasttrun_cache_init_faults.sh
 
+check-brin-stress:
+	PG_CONFIG="$(PG_CONFIG)" scripts/check_fasttrun_brin_stress.sh
+
 check-fault-matrix:
 	PG_CONFIG="$(PG_CONFIG)" scripts/check_fasttrun_fault_matrix.sh
 
@@ -133,9 +140,16 @@ check-tracking-persistence:
 check-docs:
 	python3 scripts/check_docs_consistency.py
 
+check-required-suite:
+	python3 scripts/check_required_suite.py
+
+check-prerelease:
+	scripts/check_fasttrun_prerelease.sh
+
 check-deep-local: installcheck check-parity check-soak check-perf-smoke \
                   check-hook-chain check-zero-sinval \
                   check-commit-inval-overhead check-bulk-overhead \
                   check-on-commit-drop-leak check-commit-duration \
                   check-replace-catalog check-giant-temp \
-                  check-no-temp-impact check-tracking-persistence check-docs
+                  check-no-temp-impact check-tracking-persistence \
+                  check-required-suite check-docs

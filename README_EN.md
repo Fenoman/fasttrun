@@ -227,8 +227,26 @@ All 13 `pg_regress` tests pass on PostgreSQL 16, 17, and 18.
 
 Before release, `scripts/check_cassert_allversions.sh` rebuilds the extension
 with `--enable-cassert` for all three versions. Each run must pass 13 of 13
-tests with no `TRAP`; the separate fault, ordering, memory, planner,
-publication, and tracking-file persistence checks must pass as well.
+tests with no `TRAP`; the 50 cases across 25 BRIN-aware failpoints, cache-init,
+four-mode BRIN smoke, ordering, memory, planner, publication, and tracking-file
+persistence checks must pass as well. On each version, the smoke profile runs
+96 regular `EXPLAIN` calls with hidden statistics plus 48 forced BRIN-path
+canaries through `scripts/check_fasttrun_brin_stress.sh`.
+The target servers must run without `fasttrun` in `shared_preload_libraries`:
+the script installs the fresh build first, then a new backend loads that build.
+Before testing, it verifies the live server version, `debug_assertions`, and
+that the server and supplied `pg_config` use the same library and SQL paths.
+
+Before a release and in nightly, run the full profile instead:
+
+```bash
+FT_CASSERT_TARGETS="16:/path/pg16/bin/pg_config:port:log,..." \
+  scripts/check_fasttrun_prerelease.sh
+```
+
+It reuses the same BRIN harness and runs 1,000 regular `EXPLAIN` calls with
+hidden statistics plus 200 forced BRIN-path canaries per version. There is no
+separate SQL copy for the full profile.
 
 For a separate Linux-only check of the "zero shared sinval" contract, run the `gdb` smoke test:
 
@@ -252,9 +270,11 @@ make check-perf-smoke PG_CONFIG=/path/to/pg_config
 make check-hook-chain PG_CONFIG=/path/to/pg_config
 make check-zero-sinval PG_CONFIG=/path/to/pg_config
 make check-fault-matrix PG_CONFIG=/path/to/pg_config
+make check-brin-stress PG_CONFIG=/path/to/cassert/pg_config
 make check-xact-journal-memory PG_CONFIG=/path/to/pg_config
 make check-no-temp-impact PG_CONFIG=/path/to/pg_config
 make check-tracking-persistence PG_CONFIG=/path/to/pg_config
+make check-required-suite
 make check-docs
 ```
 
@@ -278,6 +298,9 @@ Other checks:
 | `check-hook-chain` | Tests both hook orders with the bundled test module; an installed third-party extension is used when available |
 | `check-zero-sinval` | Uses `gdb` to check that no shared invalidation messages are sent |
 | `check-fault-matrix` | Simulates an error at each file-cleanup step and checks recovery |
+| `check-brin-stress` | Runs BRIN smoke in default/full and zero-sinval on/off modes on a cassert build |
+| `check-required-suite` | Checks the mandatory cassert and pre-release suite wiring |
+| `check-prerelease` | Runs the full mandatory PG16/17/18 cassert suite with the heavy BRIN matrix |
 | `check-xact-journal-memory` | Checks transaction and subtransaction journals, cleanup state, and memory |
 | `check-no-temp-impact` | Compares plans, results, replans, memory, and planning time for permanent-table queries |
 | `check-giant-temp` | Checks the 1M x 50 table and the block-sampling limit |

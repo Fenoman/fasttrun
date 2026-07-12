@@ -67,16 +67,20 @@ SET fasttrun.zero_sinval_truncate = :mode;
 CREATE TEMP TABLE ft_fault (
   id int PRIMARY KEY,
   grp int,
+  brin_key int,
   payload text
-);
+) WITH (fillfactor = 10);
 CREATE INDEX ft_fault_grp_idx ON ft_fault (grp);
+CREATE INDEX ft_fault_brin_idx ON ft_fault USING brin (brin_key)
+  WITH (pages_per_range = 1);
 ALTER TABLE ft_fault ALTER COLUMN payload SET STORAGE EXTERNAL;
 INSERT INTO ft_fault
-SELECT g, g % 31,
+SELECT g, g % 31, g,
        string_agg(md5((g * 1000 + s)::text), '')
 FROM generate_series(1, 200) g
 CROSS JOIN LATERAL generate_series(1, 450) s
 GROUP BY g;
+SELECT 1 / (brin_summarize_new_values('ft_fault_brin_idx') > 0)::int;
 CREATE TEMP TABLE ft_expected AS
 SELECT count(*) AS rows,
        md5(string_agg(md5(payload), '' ORDER BY id)) AS checksum
@@ -118,6 +122,9 @@ DECLARE
   toast_oid oid;
   toast_chunks bigint;
   context_count bigint;
+  plan_line text;
+  brin_used boolean;
+  summarized_ranges int;
 BEGIN
   SELECT failpoint, phase INTO point, test_phase FROM ft_case_meta;
   SELECT rows, checksum INTO before_rows, before_checksum FROM ft_expected;
@@ -144,8 +151,19 @@ BEGIN
       RAISE EXCEPTION '% changed heap/TOAST before mutation', point;
     END IF;
     IF (SELECT count(*) FROM ft_fault WHERE id = 73) <> 1 OR
-       (SELECT count(*) FROM ft_fault WHERE grp = 11) = 0 THEN
+       (SELECT count(*) FROM ft_fault WHERE grp = 11) = 0 OR
+       (SELECT count(*) FROM ft_fault WHERE brin_key BETWEEN 5 AND 10) <> 6 THEN
       RAISE EXCEPTION '% damaged a forced index path', point;
+    END IF;
+    brin_used := false;
+    FOR plan_line IN EXPLAIN (COSTS OFF)
+      SELECT * FROM ft_fault WHERE brin_key BETWEEN 5 AND 10
+    LOOP
+      brin_used := brin_used OR
+        position('ft_fault_brin_idx' IN plan_line) > 0;
+    END LOOP;
+    IF NOT brin_used THEN
+      RAISE EXCEPTION '% did not use BRIN before mutation', point;
     END IF;
     IF (SELECT count(*) FROM fasttrun_inspect_stats('ft_fault')) = 0 OR
        (SELECT reltuples FROM fasttrun_relstats('ft_fault')) <= 0 THEN
@@ -154,7 +172,8 @@ BEGIN
   ELSE
     PERFORM pg_temp.expect_poison('SELECT count(*) FROM ft_fault');
     PERFORM pg_temp.expect_poison('EXECUTE ft_prepared(11)');
-    PERFORM pg_temp.expect_poison('INSERT INTO ft_fault VALUES (999, 1, ''x'')');
+    PERFORM pg_temp.expect_poison(
+      'INSERT INTO ft_fault VALUES (999, 1, 999, ''x'')');
     PERFORM pg_temp.expect_poison('UPDATE ft_fault SET grp = 1 WHERE id = 1');
     PERFORM pg_temp.expect_poison('DELETE FROM ft_fault WHERE id = 1');
     PERFORM pg_temp.expect_poison('COPY ft_fault TO ''/dev/null''');
@@ -191,17 +210,34 @@ BEGIN
     END IF;
 
     INSERT INTO ft_fault
-    SELECT 1000 + g, g % 31,
+    SELECT 1000 + g, g % 31, 1000 + g,
            string_agg(md5((900000 + g * 1000 + s)::text), '')
     FROM generate_series(1, 20) g
     CROSS JOIN LATERAL generate_series(1, 120) s
     GROUP BY g;
+    SELECT brin_summarize_new_values('ft_fault_brin_idx')
+      INTO summarized_ranges;
+    IF summarized_ranges <= 0 THEN
+      RAISE EXCEPTION '% repair summarized no BRIN ranges', point;
+    END IF;
     PERFORM set_config('enable_seqscan', 'off', true);
     IF (SELECT count(*) FROM ft_fault) <> 20 OR
        (SELECT min(id) FROM ft_fault) <> 1001 OR
        (SELECT count(*) FROM ft_fault WHERE id = 1007) <> 1 OR
-       (SELECT count(*) FROM ft_fault WHERE grp = 7) = 0 THEN
+       (SELECT count(*) FROM ft_fault WHERE grp = 7) = 0 OR
+       (SELECT count(*) FROM ft_fault
+         WHERE brin_key BETWEEN 1005 AND 1010) <> 6 THEN
       RAISE EXCEPTION '% repair/refill returned stale or missing rows', point;
+    END IF;
+    brin_used := false;
+    FOR plan_line IN EXPLAIN (COSTS OFF)
+      SELECT * FROM ft_fault WHERE brin_key BETWEEN 1005 AND 1010
+    LOOP
+      brin_used := brin_used OR
+        position('ft_fault_brin_idx' IN plan_line) > 0;
+    END LOOP;
+    IF NOT brin_used THEN
+      RAISE EXCEPTION '% did not use BRIN after repair', point;
     END IF;
   END IF;
 
@@ -226,6 +262,8 @@ SELECT 'BOUNDARY_MEMORY_2 ' || coalesce(sum(total_bytes), 0) || ' ' ||
 FROM pg_backend_memory_contexts WHERE name LIKE 'fasttrun%';
 SELECT 'BOUNDARY_OK ' || :'mode' || ' ' || :'failpoint';
 SQL
+
+boundary_count=0
 
 run_boundary_case()
 {
@@ -255,30 +293,53 @@ run_boundary_case()
 		exit 1
 	fi
 	echo "boundary passed: mode=$mode failpoint=$failpoint"
+	boundary_count=$((boundary_count + 1))
 }
 
 early_failpoints=(
 	after_prepare
 	after_phase0
+	reserve_after_state:1
+	reserve_after_state:2
+	reserve_after_state:3
+	reserve_after_state:4
+	reserve_after_state:5
+	reserve_after_state:6
 )
 post_failpoints=(
 	after_user_index:1
 	after_user_index:2
+	after_user_index:3
 	after_toast_index:1
 	after_toast_heap
 	after_main_heap
 	after_ambuild:1
 	after_ambuild:2
 	after_ambuild:3
+	after_ambuild:4
 	before_publish
 	after_publish:1
 	after_publish:2
 	after_publish:3
 	after_publish:4
 	after_publish:5
+	after_publish:6
 )
+modes=(
+	on
+	off
+)
+EXPECTED_BOUNDARY_CASES=50
+failpoint_count=$((${#early_failpoints[@]} + ${#post_failpoints[@]}))
+expected_boundary_count=$((
+	${#modes[@]} * (${#early_failpoints[@]} + ${#post_failpoints[@]})
+))
+if [ "$expected_boundary_count" -ne "$EXPECTED_BOUNDARY_CASES" ]; then
+	echo "FAIL: fault matrix defines $expected_boundary_count cases, expected $EXPECTED_BOUNDARY_CASES" >&2
+	exit 1
+fi
 
-for mode in on off; do
+for mode in "${modes[@]}"; do
 	for failpoint in "${early_failpoints[@]}"; do
 		run_boundary_case "$mode" "$failpoint" early
 	done
@@ -286,6 +347,11 @@ for mode in on off; do
 		run_boundary_case "$mode" "$failpoint" post
 	done
 done
+
+if [ "$boundary_count" -ne "$EXPECTED_BOUNDARY_CASES" ]; then
+	echo "FAIL: expected $EXPECTED_BOUNDARY_CASES boundary cases, got $boundary_count" >&2
+	exit 1
+fi
 
 cat >"$WORKDIR/lifecycle.sql" <<'SQL'
 \set ON_ERROR_STOP 1
@@ -547,10 +613,12 @@ for target in TEMP ALL; do
 	echo "discard passed: target=$target"
 done
 
-if grep -Eq 'TRAP|Assertion|PANIC|server process .* was terminated' "$LOG"; then
-	grep -E 'TRAP|Assertion|PANIC|server process .* was terminated' "$LOG" >&2
+if grep -Eq 'TRAP|Assertion|FailedAssertion|PANIC|terminated by signal|server process .* was terminated|Segmentation fault|Abort trap' \
+	"$LOG"; then
+	grep -E 'TRAP|Assertion|FailedAssertion|PANIC|terminated by signal|server process .* was terminated|Segmentation fault|Abort trap' \
+		"$LOG" >&2
 	echo "FAIL: fault matrix caused an assertion or server exit" >&2
 	exit 1
 fi
 
-echo "truncate fault matrix passed: 32 boundaries plus lifecycle, zero unexpected exits"
+echo "truncate fault matrix passed: $boundary_count cases across $failpoint_count failpoints plus lifecycle, zero unexpected exits"
