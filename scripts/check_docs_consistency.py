@@ -11,6 +11,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent.parent
+EXTENSION_SQL_DIR = ROOT / "extension"
 README_PATHS = (ROOT / "README.md", ROOT / "README_EN.md")
 CACHE_STATS_FIELDS = (
     "analyze_entries",
@@ -92,6 +93,16 @@ def main() -> int:
     control = read(ROOT / "fasttrun.control")
     code = read(ROOT / "fasttrun.c")
 
+    root_extension_sql = sorted(ROOT.glob("fasttrun--*.sql"))
+    require(errors, EXTENSION_SQL_DIR.is_dir(),
+            "нет каталога extension с SQL расширения")
+    require(
+        errors,
+        not root_extension_sql,
+        "versioned SQL должны находиться в extension, а не в корне: "
+        + ", ".join(path.name for path in root_extension_sql),
+    )
+
     version_match = re.search(
         r"^default_version\s*=\s*'([^']+)'", control, re.MULTILINE
     )
@@ -111,9 +122,11 @@ def main() -> int:
     require(errors, bool(data), "Makefile: DATA не найден")
     require(errors, len(data) == len(set(data)),
             "Makefile: DATA содержит дубликаты")
-    data_set = set(data)
+    data_set = {Path(item).as_posix() for item in data}
     repository_sql = {
-        path.name for path in ROOT.glob("fasttrun--*.sql") if path.is_file()
+        path.relative_to(ROOT).as_posix()
+        for path in EXTENSION_SQL_DIR.glob("fasttrun--*.sql")
+        if path.is_file()
     }
     missing_from_data = sorted(repository_sql - data_set)
     extra_in_data = sorted(data_set - repository_sql)
@@ -132,7 +145,8 @@ def main() -> int:
     install_versions: dict[str, str] = {}
     upgrade_edges: list[tuple[str, str, str]] = []
     unknown_sql: list[str] = []
-    for filename in sorted(data_set):
+    for data_path in sorted(data_set):
+        filename = Path(data_path).name
         install_match = INSTALL_SQL_RE.fullmatch(filename)
         if install_match:
             install_versions[install_match.group("version")] = filename
@@ -175,7 +189,7 @@ def main() -> int:
             )
 
     for filename, expected_sha in FROZEN_SQL_SHA256.items():
-        path = ROOT / filename
+        path = EXTENSION_SQL_DIR / filename
         require(errors, path.exists(), f"нет замороженного SQL {filename}")
         if path.exists():
             actual_sha = hashlib.sha256(path.read_bytes()).hexdigest()
@@ -185,7 +199,7 @@ def main() -> int:
                 f"{filename}: изменён замороженный SQL, SHA256 {actual_sha}",
             )
 
-    install_sql = ROOT / f"fasttrun--{version}.sql"
+    install_sql = EXTENSION_SQL_DIR / f"fasttrun--{version}.sql"
     require(errors, install_sql.exists(),
             f"нет install SQL для default_version {version}")
     install_content = ""
@@ -236,6 +250,17 @@ def main() -> int:
     for path in README_PATHS:
         content = read(path)
         label = path.name
+        require(
+            errors,
+            re.search(r"^extension/\s+#", content, re.MULTILINE) is not None,
+            f"{label}: каталог extension не описан в файловой структуре",
+        )
+        require(
+            errors,
+            re.search(r"^fasttrun--[^\s]+\.sql\s+#", content, re.MULTILINE)
+            is None,
+            f"{label}: versioned SQL ошибочно показаны в корне",
+        )
         for pg_version in ("PostgreSQL 16", "PostgreSQL 17", "PostgreSQL 18"):
             require(errors, pg_version in content,
                     f"{label}: отсутствует {pg_version}")
@@ -298,7 +323,7 @@ def main() -> int:
     scan_paths = [
         *README_PATHS,
         ROOT / "README.fasttrun",
-        *sorted(ROOT.glob("fasttrun--2.3.[0-9].sql")),
+        *sorted(EXTENSION_SQL_DIR.glob("fasttrun--2.3.[0-9].sql")),
     ]
     if install_sql.exists():
         scan_paths.append(install_sql)
