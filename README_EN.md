@@ -123,7 +123,7 @@ FROM pg_extension
 WHERE extname = 'fasttrun';
 ```
 
-The default version is `2.4.0`.
+The default version is `2.4.1`.
 
 Instead of a plain `CREATE EXTENSION`, you can install the extension into a
 dedicated schema. Untrusted roles must not be allowed to create objects in the
@@ -765,7 +765,7 @@ connections cannot continue after this event.
 ## Upgrading and removing
 
 Upgrades are supported from versions `2.0`, `2.1`, `2.1.1`, `2.1.2`, `2.2.0`,
-`2.3.0`, `2.3.1`, `2.3.2`, `2.3.3`, and `2.3.4`.
+`2.3.0`, `2.3.1`, `2.3.2`, `2.3.3`, `2.3.4`, and `2.4.0`.
 
 Treat a C-library upgrade as maintenance on the server processes. Install the
 new build and SQL files on every cluster node.
@@ -787,7 +787,7 @@ After startup or after opening a new connection, run the following in every
 database as the extension owner or a superuser:
 
 ```sql
-ALTER EXTENSION fasttrun UPDATE TO '2.4.0';
+ALTER EXTENSION fasttrun UPDATE TO '2.4.1';
 ```
 
 With physical replication, install the files on standby nodes too, but run
@@ -796,6 +796,11 @@ standbys through normal replication.
 
 This is important for an upgrade from 2.3.4 to 2.4.0: the SQL migration adds a
 function that does not exist in the old C library.
+
+Version 2.4.1 fixes memory leaks after rolling back temporary-table creation
+and speeds up repeated truncation of an already empty table. The upgrade
+from 2.4.0 to 2.4.1 leaves SQL objects unchanged; the fixes require the new
+C library.
 
 When moving to a new PostgreSQL major version with `pg_upgrade`, build and
 install fasttrun against the new `pg_config` in advance. The extension's catalog

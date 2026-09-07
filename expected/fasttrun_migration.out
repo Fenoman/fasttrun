@@ -247,8 +247,8 @@ COMMIT;
 ALTER EXTENSION fasttrun UPDATE;
 DO $$
 BEGIN
-    IF (SELECT extversion FROM pg_extension WHERE extname = 'fasttrun') <> '2.4.0' THEN
-        RAISE EXCEPTION 'fasttrun extension was not updated to 2.4.0';
+    IF (SELECT extversion FROM pg_extension WHERE extname = 'fasttrun') <> '2.4.1' THEN
+        RAISE EXCEPTION 'fasttrun extension was not updated to 2.4.1';
     END IF;
 END
 $$;
@@ -310,6 +310,23 @@ fasttrun_cache_stats|fasttrun
 SELECT * FROM public.fasttrun_cache_stats();
 analyze_entries|column_stats_relid_entries|column_stats_entries|analyze_bytes|column_stats_bytes|total_bytes
 0|0|0|0|0|0
+(1 row)
+-- ----------------------------------------------------------------------
+-- 9. Пустая миграция 2.4.0 -> 2.4.1 сохраняет OID функции.
+-- ----------------------------------------------------------------------
+DO $$
+DECLARE
+    cache_stats_oid oid := 'public.fasttrun_cache_stats()'::regprocedure;
+BEGIN
+    ALTER EXTENSION fasttrun UPDATE TO '2.4.1';
+    IF 'public.fasttrun_cache_stats()'::regprocedure::oid <> cache_stats_oid THEN
+        RAISE EXCEPTION 'fasttrun_cache_stats OID changed during patch upgrade';
+    END IF;
+END
+$$;
+SELECT extname, extversion FROM pg_extension WHERE extname = 'fasttrun';
+extname|extversion
+fasttrun|2.4.1
 (1 row)
 DROP EXTENSION fasttrun;
 SELECT to_regprocedure('public.fasttrun_cache_stats()') IS NULL
