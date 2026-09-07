@@ -298,6 +298,14 @@ FETCH 1 FROM c_busy;
 SELECT fasttruncate('t_busy');
 ROLLBACK;
 
+-- Быстрый выход для пустой таблицы тоже обязан проверять активный курсор.
+BEGIN;
+CREATE TEMP TABLE t_busy (v int);
+SELECT fasttruncate('t_busy');
+DECLARE c_busy NO SCROLL CURSOR FOR SELECT * FROM t_busy;
+SELECT fasttruncate('t_busy');
+ROLLBACK;
+
 -- ----------------------------------------------------------------------
 -- 11. Контракт "только heap": все публичные API должны чисто
 --     отказывать на partitioned temp table через ERROR, а не заходить

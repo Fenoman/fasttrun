@@ -4,7 +4,8 @@
 #   * отдельная строка подтверждает подключение gdb;
 #   * SMGR-сообщения считаются внутри SendSharedInvalidMessages;
 #   * SIInsertDataEntries подтверждает, что счётчик общих сообщений работает;
-#   * локальный сброс планов должен сработать для каждой операции fasttrun.
+#   * локальный сброс планов срабатывает при изменении статистики;
+#   * повторная очистка пустой таблицы не отправляет никаких инвалидаций.
 #
 set -euo pipefail
 export LC_ALL=C LANG=C
@@ -122,6 +123,7 @@ run_case()
 	local require_local=$4
 	local validate_truncate=$5
 	local workload=$6
+	local preparation=${7:-}
 	local sqlfile="$WORKDIR/$name.sql"
 	local psqlout="$WORKDIR/$name.psql.out"
 	local psqlerr="$WORKDIR/$name.psql.err"
@@ -173,6 +175,7 @@ WHERE c.oid = 't_zero_sinval'::regclass \gexec
 SELECT 'BEFORE_CHECKSUM ' ||
        md5(string_agg(md5(payload), '' ORDER BY id))
 FROM t_zero_sinval;
+$preparation
 SELECT pg_backend_pid();
 SELECT pg_sleep($SLEEP_SECONDS);
 $workload
@@ -293,6 +296,11 @@ SQL
 	if [ "$require_local" -eq 1 ] && [ "$local_hits" -le 0 ]; then
 		cat "$gdblog" >&2
 		echo "[$name] локальный сброс планов не сработал" >&2
+		exit 1
+	fi
+	if [ "$require_local" -eq -1 ] && [ "$local_hits" -ne 0 ]; then
+		cat "$gdblog" >&2
+		echo "[$name] повторная очистка вызвала локальную инвалидацию" >&2
 		exit 1
 	fi
 
@@ -529,6 +537,12 @@ run_case fasttruncate_default zero 0 1 1 \
 	"SELECT fasttruncate('t_zero_sinval'); $truncate_validation"
 run_case fasttruncate_fallback any fixture 1 1 \
 	"SET fasttrun.zero_sinval_truncate = off; SELECT fasttruncate('t_zero_sinval'); $truncate_validation"
+run_case fasttruncate_empty_default zero 0 -1 1 \
+	"SELECT fasttruncate('t_zero_sinval'); $truncate_validation" \
+	"SELECT fasttruncate('t_zero_sinval');"
+run_case fasttruncate_empty_fallback zero 0 -1 1 \
+	"SELECT fasttruncate('t_zero_sinval'); $truncate_validation" \
+	"SET fasttrun.zero_sinval_truncate = off; SELECT fasttruncate('t_zero_sinval');"
 
 debug_assertions=$(run_pg "$PSQL" -h "$SOCKET_DIR" -p "$PORT" -d "$DBNAME" \
 	-XAtq -c 'SHOW debug_assertions')

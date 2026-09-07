@@ -6180,6 +6180,101 @@ fasttrun_prepare_truncate_workset(Relation heaprel,
 	Assert(i == opened->nslots);
 }
 
+/* Skip file changes only for a fully published empty state, after in-use checks. */
+static bool
+fasttrun_try_empty_truncate(Relation heaprel, FasttrunOpenedWorkset *opened)
+{
+	Oid			relid = RelationGetRelid(heaprel);
+	FasttrunAnalyzeCacheEntry *heapentry = fasttrun_cache_lookup(relid);
+	FasttrunStatsRelidEntry *relentry;
+	ListCell   *lc;
+	int			nuser_indexes = list_length(opened->user_indexes);
+	int			ntoast_indexes = list_length(opened->toast_indexes);
+	int			i;
+	int64		ins, upd, del;
+	bool		truncdropped;
+	bool		have_counters;
+
+	/* A physically empty heap can still need repair after a failed rebuild. */
+	if (fasttrun_poison_find(relid) != NULL || heapentry == NULL ||
+		!fasttrun_relation_has_same_locator(heaprel, heapentry) ||
+		heapentry->state.cached_pages != 0 ||
+		heapentry->state.cached_tuples != 0 ||
+		!heapentry->state.last_inval_valid ||
+		heapentry->state.last_inval_pages != 0 ||
+		heapentry->state.last_inval_tuples != 0 ||
+		RelationGetNumberOfBlocks(heaprel) != 0)
+		return false;
+
+	/* Keep the delta seed valid for a later refill in this transaction. */
+	have_counters = fasttrun_read_pgstat_counters(heaprel, &ins, &upd, &del,
+													 &truncdropped);
+	if (heapentry->state.has_delta_state &&
+		(!have_counters ||
+			ins != heapentry->state.cached_inserted ||
+			upd != heapentry->state.cached_updated ||
+			del != heapentry->state.cached_deleted ||
+			truncdropped != heapentry->state.cached_truncdropped))
+		return false;
+
+	if (fasttrun_stats_relid_cache == NULL)
+		return false;
+	relentry = (FasttrunStatsRelidEntry *)
+		hash_search(fasttrun_stats_relid_cache, &relid, HASH_FIND, NULL);
+	if (relentry == NULL || relentry->policy != FASTTRUN_REL_LOCAL_NEUTRAL ||
+		!relentry->heap_rlb_valid ||
+		!RelFileLocatorEquals(relentry->heap_rlb.locator, heaprel->rd_locator) ||
+		relentry->heap_rlb.backend != heaprel->rd_backend)
+		return false;
+
+	/* Partial core ANALYZE can leave CORE_ALLOWED column overrides. */
+	foreach(lc, relentry->attkeys)
+	{
+		FasttrunStatsEntry *entry = (FasttrunStatsEntry *)
+			hash_search(fasttrun_stats_cache, lfirst(lc), HASH_FIND, NULL);
+
+		if (entry == NULL || entry->state != FASTTRUN_COLUMN_LOCAL_NEUTRAL ||
+			entry->statsTuple != NULL)
+			return false;
+	}
+
+	for (i = 0; i < opened->nslots; i++)
+	{
+		Relation	rel = opened->slot_relations[i];
+		Relation	owner = i < nuser_indexes ? heaprel :
+			(i < nuser_indexes + ntoast_indexes ? opened->toastrel : rel);
+		FasttrunAnalyzeCacheEntry *entry = fasttrun_cache_lookup(RelationGetRelid(rel));
+
+		if (entry == NULL || !fasttrun_relation_has_same_locator(rel, entry) ||
+			entry->state.probe_rlb.backend != rel->rd_backend ||
+			entry->state.heap_relid != RelationGetRelid(owner) ||
+			!RelFileLocatorEquals(entry->state.heap_rlb.locator, owner->rd_locator) ||
+			entry->state.heap_rlb.backend != owner->rd_backend ||
+			entry->state.cached_tuples != 0 || entry->state.cached_allvisible != 0 ||
+			(owner == rel && entry->state.cached_pages != 0) ||
+			rel->rd_rel->relpages != entry->state.cached_pages ||
+			rel->rd_rel->reltuples != 0 || rel->rd_rel->relallvisible != 0 ||
+			RelationGetNumberOfBlocks(rel) != entry->state.cached_pages)
+			return false;
+	}
+
+	/* COMMIT clears delta anchors. Reseed without changing planner-visible stats. */
+	if (have_counters &&
+		(!heapentry->state.has_delta_state ||
+		 !heapentry->state.has_stats_baseline ||
+		 heapentry->state.stats_baseline_inserted != ins ||
+		 heapentry->state.stats_baseline_updated != upd ||
+		 heapentry->state.stats_baseline_deleted != del ||
+		 heapentry->state.stats_baseline_truncdropped != truncdropped))
+	{
+		fasttrun_xact_mark_relid(relid, relid, FASTTRUN_TOUCH_ANALYZE);
+		fasttrun_analyze_save_undo(heapentry);
+		fasttrun_cache_store_delta_state(heapentry, ins, upd, del, truncdropped);
+		fasttrun_cache_set_stats_baseline(relid, ins, upd, del, truncdropped);
+	}
+	return true;
+}
+
 static void
 fasttrun_close_truncate_workset(FasttrunOpenedWorkset *opened)
 {
@@ -6632,6 +6727,12 @@ fasttruncate(PG_FUNCTION_ARGS)
 	/* An active marker permits only this repair path or DROP/recreate. */
 	fasttrun_poison_check_relation(rel, "fasttruncate", true);
 	fasttrun_prepare_truncate_workset(rel, &opened);
+	if (fasttrun_try_empty_truncate(rel, &opened))
+	{
+		fasttrun_close_truncate_workset(&opened);
+		table_close(rel, AccessExclusiveLock);
+		PG_RETURN_VOID();
+	}
 
 	truncate_generation = ++fasttrun_truncate_generation;
 	if (truncate_generation == 0)

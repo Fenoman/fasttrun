@@ -425,6 +425,124 @@ BEGIN
 END
 $fn$;
 
+-- Повторная очистка согласованной пустой таблицы не входит в полный путь.
+CREATE FUNCTION pg_temp.truncate_probe(boolean)
+RETURNS bigint[] AS '$libdir/fasttrun', 'fasttrun_test_planner_probe'
+LANGUAGE C STRICT;
+CREATE TEMP TABLE ft_empty(id int PRIMARY KEY, payload text);
+BEGIN;
+INSERT INTO ft_empty SELECT g, repeat('x', 100) FROM generate_series(1, 100) g;
+SELECT fasttrun_analyze('ft_empty');
+SELECT fasttruncate('ft_empty');
+SELECT pg_temp.truncate_probe(true);
+SET fasttrun.test_failpoint = 'after_prepare';
+SELECT fasttruncate('ft_empty');
+SAVEPOINT empty_child;
+SELECT fasttruncate('ft_empty');
+ROLLBACK TO SAVEPOINT empty_child;
+SELECT fasttruncate('ft_empty');
+COMMIT;
+SELECT fasttruncate('ft_empty');
+BEGIN;
+SELECT fasttruncate('ft_empty');
+ROLLBACK;
+RESET fasttrun.test_failpoint;
+SELECT 1 / ((pg_temp.truncate_probe(false))[4] = 0)::int;
+SELECT 1 / (count(*) = 0)::int FROM ft_empty;
+SELECT 1 / (reltuples = 0)::int FROM fasttrun_relstats('ft_empty');
+SELECT pg_temp.assert_operation_context_zero('empty repeat');
+
+-- Кеш с нулём строк не разрешает пропустить очистку после вставки.
+INSERT INTO ft_empty VALUES (1001, 'refill');
+SELECT pg_temp.inject('ft_empty', 'after_prepare');
+SELECT 1 / (count(*) = 1)::int FROM ft_empty;
+SELECT fasttruncate('ft_empty');
+INSERT INTO ft_empty VALUES (2001, 'next refill');
+SELECT fasttrun_analyze('ft_empty');
+SELECT 1 / (reltuples = 1)::int FROM fasttrun_relstats('ft_empty');
+SET enable_seqscan = off;
+SELECT 1 / (count(*) = 0)::int FROM ft_empty WHERE id = 1001;
+SELECT 1 / (count(*) = 1)::int FROM ft_empty WHERE id = 2001;
+RESET enable_seqscan;
+
+-- DELETE оставляет физические страницы даже при нуле видимых строк.
+DELETE FROM ft_empty;
+SELECT fasttrun_analyze('ft_empty');
+SELECT 1 / (pg_relation_size('ft_empty') > 0)::int;
+SELECT pg_temp.inject('ft_empty', 'after_prepare');
+SELECT fasttruncate('ft_empty');
+SELECT 1 / (pg_relation_size('ft_empty') = 0)::int;
+
+-- Откат вставки тоже оставляет страницы, хотя прежняя статистика пуста.
+BEGIN;
+SAVEPOINT empty_child;
+INSERT INTO ft_empty VALUES (3001, 'aborted refill');
+ROLLBACK TO SAVEPOINT empty_child;
+SELECT pg_temp.inject('ft_empty', 'after_prepare');
+SELECT fasttruncate('ft_empty');
+COMMIT;
+SELECT 1 / (pg_relation_size('ft_empty') = 0)::int;
+
+-- Новый индекс и передача статистики ядру требуют согласования состояния.
+CREATE INDEX ft_empty_payload_idx ON ft_empty(payload);
+SELECT pg_temp.inject('ft_empty', 'after_prepare');
+SELECT fasttruncate('ft_empty');
+ANALYZE ft_empty(payload);
+SELECT pg_temp.inject('ft_empty', 'after_prepare');
+SELECT fasttruncate('ft_empty');
+
+-- Без счётчиков остаётся обязательная проверка физического размера.
+SET track_counts = off;
+SELECT fasttruncate('ft_empty');
+SET fasttrun.test_failpoint = 'after_prepare';
+SELECT fasttruncate('ft_empty');
+RESET fasttrun.test_failpoint;
+INSERT INTO ft_empty VALUES (4001, 'untracked refill');
+SELECT pg_temp.inject('ft_empty', 'after_prepare');
+SELECT fasttruncate('ft_empty');
+RESET track_counts;
+SELECT 1 / (count(*) = 0)::int FROM ft_empty;
+DROP TABLE ft_empty;
+
+-- После COMMIT быстрый путь должен заново задать базу счётчиков для refill.
+CREATE TEMP TABLE ft_empty_delta(id int);
+SELECT fasttruncate('ft_empty_delta');
+BEGIN;
+SET LOCAL fasttrun.auto_collect_stats = off;
+SET LOCAL fasttrun.sample_rows = 0;
+SELECT fasttruncate('ft_empty_delta');
+INSERT INTO ft_empty_delta SELECT generate_series(1, 1000);
+DO $delta$
+DECLARE before_scan bigint;
+BEGIN
+  before_scan := pg_stat_get_xact_tuples_returned('ft_empty_delta'::regclass);
+  PERFORM fasttrun_analyze('ft_empty_delta');
+  IF pg_stat_get_xact_tuples_returned('ft_empty_delta'::regclass) <> before_scan THEN
+    RAISE EXCEPTION 'empty truncate lost delta seed: unexpected heap scan';
+  END IF;
+END
+$delta$;
+SELECT 1 / (reltuples = 1000)::int FROM fasttrun_relstats('ft_empty_delta');
+COMMIT;
+DROP TABLE ft_empty_delta;
+
+-- Ленивое обнаружение пустого heap не подтверждает свежесть сохранённых планов.
+CREATE TEMP TABLE ft_empty_core(id int) ON COMMIT DELETE ROWS;
+BEGIN;
+SET LOCAL fasttrun.auto_collect_stats = off;
+SET LOCAL fasttrun.sample_rows = 0;
+INSERT INTO ft_empty_core SELECT generate_series(1, 100);
+SELECT fasttrun_analyze('ft_empty_core');
+PREPARE ft_empty_plan AS SELECT * FROM ft_empty_core;
+EXPLAIN (COSTS OFF) EXECUTE ft_empty_plan;
+COMMIT;
+SELECT 1 / (reltuples = 0)::int FROM fasttrun_relstats('ft_empty_core');
+SELECT pg_temp.truncate_probe(true);
+SELECT fasttruncate('ft_empty_core');
+SELECT 1 / ((pg_temp.truncate_probe(false))[4] = 1)::int;
+DEALLOCATE ft_empty_plan;
+DROP TABLE ft_empty_core;
+
 /* A block created after file changes must survive a transaction rollback. */
 SELECT pg_temp.make_fixture('ft_abort');
 BEGIN;

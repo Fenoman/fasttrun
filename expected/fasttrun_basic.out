@@ -604,6 +604,19 @@ FETCH 1 FROM c_busy;
 SELECT fasttruncate('t_busy');
 ERROR:  cannot fasttruncate "t_busy" because it is being used by active queries in this session
 ROLLBACK;
+-- Быстрый выход для пустой таблицы тоже обязан проверять активный курсор.
+BEGIN;
+CREATE TEMP TABLE t_busy (v int);
+SELECT fasttruncate('t_busy');
+ fasttruncate 
+--------------
+ 
+(1 row)
+
+DECLARE c_busy NO SCROLL CURSOR FOR SELECT * FROM t_busy;
+SELECT fasttruncate('t_busy');
+ERROR:  cannot fasttruncate "t_busy" because it is being used by active queries in this session
+ROLLBACK;
 -- ----------------------------------------------------------------------
 -- 11. Контракт "только heap": все публичные API должны чисто
 --     отказывать на partitioned temp table через ERROR, а не заходить
