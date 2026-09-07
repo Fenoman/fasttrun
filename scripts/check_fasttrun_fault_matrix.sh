@@ -436,6 +436,105 @@ SELECT 1 / (count(*) = 0)::int FROM ft_abort;
 SELECT pg_temp.assert_operation_context_zero('top-abort repair');
 DROP TABLE ft_abort;
 
+/* Aborted table births must release incomplete operations, including when
+ * the first operation ran in an independently aborted descendant. */
+DO $births$
+BEGIN
+  FOR i IN 1..100 LOOP
+    BEGIN
+      CREATE TEMP TABLE ft_birth_error(id int PRIMARY KEY);
+      INSERT INTO ft_birth_error VALUES (1);
+      PERFORM set_config('fasttrun.test_failpoint', 'after_main_heap', true);
+      PERFORM fasttruncate('ft_birth_error');
+      RAISE EXCEPTION 'after_main_heap did not fire';
+    EXCEPTION WHEN SQLSTATE '55000' THEN
+      IF SQLERRM <> 'fasttrun test failpoint: after_main_heap' THEN
+        RAISE;
+      END IF;
+    END;
+    IF to_regclass('pg_temp.ft_birth_error') IS NOT NULL THEN
+      RAISE EXCEPTION 'aborted table birth survived';
+    END IF;
+  END LOOP;
+END
+$births$;
+SELECT pg_temp.assert_operation_context_zero('aborted table births');
+
+BEGIN;
+SAVEPOINT birth_parent;
+CREATE TEMP TABLE ft_birth_ancestor(id int PRIMARY KEY);
+INSERT INTO ft_birth_ancestor VALUES (1);
+SAVEPOINT birth_middle;
+SELECT pg_temp.inject('ft_birth_ancestor', 'after_main_heap');
+ROLLBACK TO SAVEPOINT birth_middle;
+SELECT pg_temp.expect_poison('SELECT count(*) FROM ft_birth_ancestor');
+ROLLBACK TO SAVEPOINT birth_parent;
+SELECT pg_temp.assert_operation_context_zero('aborted ancestor birth');
+COMMIT;
+
+BEGIN;
+SAVEPOINT birth_parent;
+SAVEPOINT birth_child;
+CREATE TEMP TABLE ft_birth_released(id int PRIMARY KEY);
+SELECT pg_temp.inject('ft_birth_released', 'after_main_heap');
+RELEASE SAVEPOINT birth_child;
+ROLLBACK TO SAVEPOINT birth_parent;
+SELECT pg_temp.assert_operation_context_zero('released child birth');
+COMMIT;
+
+BEGIN;
+CREATE TEMP TABLE ft_birth_top(id int PRIMARY KEY);
+SELECT pg_temp.inject('ft_birth_top', 'after_main_heap');
+ROLLBACK;
+SELECT pg_temp.assert_operation_context_zero('aborted top birth');
+
+/* A committed table birth must not be mistaken for a later aborted one. */
+BEGIN;
+CREATE TEMP TABLE ft_birth_committed(id int PRIMARY KEY);
+SELECT pg_temp.inject('ft_birth_committed', 'after_main_heap');
+COMMIT;
+BEGIN;
+SELECT 1;
+ROLLBACK;
+SELECT pg_temp.expect_poison('SELECT count(*) FROM ft_birth_committed');
+SELECT fasttruncate('ft_birth_committed');
+DROP TABLE ft_birth_committed;
+SELECT pg_temp.assert_operation_context_zero('committed birth repair');
+
+/* A born index belongs to an older heap; abort must keep the heap blocked. */
+CREATE TEMP TABLE ft_birth_index_owner(id int PRIMARY KEY, grp int);
+INSERT INTO ft_birth_index_owner VALUES (1, 1);
+DO $born_index$
+BEGIN
+  BEGIN
+    CREATE INDEX ft_birth_new_idx ON ft_birth_index_owner(grp);
+    PERFORM set_config('fasttrun.test_failpoint', 'after_main_heap', true);
+    PERFORM fasttruncate('ft_birth_index_owner');
+    RAISE EXCEPTION 'after_main_heap did not fire';
+  EXCEPTION WHEN SQLSTATE '55000' THEN
+    IF SQLERRM <> 'fasttrun test failpoint: after_main_heap' THEN
+      RAISE;
+    END IF;
+  END;
+END
+$born_index$;
+SELECT pg_temp.expect_poison('SELECT count(*) FROM ft_birth_index_owner');
+SELECT fasttruncate('ft_birth_index_owner');
+SELECT pg_temp.assert_operation_context_zero('born index owner repair');
+DROP TABLE ft_birth_index_owner;
+
+/* Removing a dead birth must not clear another relation's active block. */
+CREATE TEMP TABLE ft_birth_old(id int PRIMARY KEY);
+SELECT pg_temp.inject('ft_birth_old', 'after_main_heap');
+BEGIN;
+CREATE TEMP TABLE ft_birth_new(id int PRIMARY KEY);
+SELECT pg_temp.inject('ft_birth_new', 'after_main_heap');
+ROLLBACK;
+SELECT pg_temp.expect_poison('SELECT count(*) FROM ft_birth_old');
+SELECT fasttruncate('ft_birth_old');
+SELECT pg_temp.assert_operation_context_zero('mixed registry repair');
+DROP TABLE ft_birth_old;
+
 /* An unrelated prepared transaction must not remove a physical block. */
 SELECT pg_temp.make_fixture('ft_prepare_poison');
 SELECT pg_temp.inject('ft_prepare_poison', 'after_main_heap');

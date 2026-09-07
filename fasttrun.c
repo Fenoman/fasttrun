@@ -259,7 +259,9 @@ typedef enum FasttrunTouchFlags
 	/* Planner-visible mutation: abort must invalidate local cached plans. */
 	FASTTRUN_TOUCH_PLAN_INVALIDATE = 1 << 4,
 	/* Column-stats entries were written: subxact end must walk attkeys. */
-	FASTTRUN_TOUCH_COLSTATS = 1 << 5
+	FASTTRUN_TOUCH_COLSTATS = 1 << 5,
+	/* Recorded at the relation's birth level, not its first cache mutation. */
+	FASTTRUN_TOUCH_CREATED = 1 << 6
 } FasttrunTouchFlags;
 
 typedef struct FasttrunXactRelEntry
@@ -281,16 +283,19 @@ static FasttrunXactFrame *fasttrun_xact_frame = NULL;
 static uint64 fasttrun_truncate_generation = 0;
 
 static FasttrunXactFrame *
-fasttrun_xact_frame_for_current(bool create)
+fasttrun_xact_frame_for_subid(SubTransactionId subid, bool create)
 {
-	SubTransactionId subid = GetCurrentSubTransactionId();
+	FasttrunXactFrame **link = &fasttrun_xact_frame;
 	FasttrunXactFrame *volatile new_frame = NULL;
 	MemoryContext volatile new_mcxt = NULL;
 	MemoryContext oldcxt;
 	HASHCTL		ctl;
 
-	if (fasttrun_xact_frame != NULL && fasttrun_xact_frame->subid == subid)
-		return fasttrun_xact_frame;
+	/* Active ancestors have smaller IDs; core rejects subid wraparound. */
+	while (*link != NULL && (*link)->subid > subid)
+		link = &(*link)->parent;
+	if (*link != NULL && (*link)->subid == subid)
+		return *link;
 	if (!create)
 		return NULL;
 
@@ -303,7 +308,7 @@ fasttrun_xact_frame_for_current(bool create)
 		new_frame = (FasttrunXactFrame *) palloc0(sizeof(*new_frame));
 		new_frame->subid = subid;
 		new_frame->mcxt = (MemoryContext) new_mcxt;
-		new_frame->parent = fasttrun_xact_frame;
+		new_frame->parent = *link;
 
 		memset(&ctl, 0, sizeof(ctl));
 		ctl.keysize = sizeof(Oid);
@@ -323,8 +328,37 @@ fasttrun_xact_frame_for_current(bool create)
 	}
 	PG_END_TRY();
 
-	fasttrun_xact_frame = (FasttrunXactFrame *) new_frame;
-	return fasttrun_xact_frame;
+	*link = (FasttrunXactFrame *) new_frame;
+	return *link;
+}
+
+static FasttrunXactFrame *
+fasttrun_xact_frame_for_current(bool create)
+{
+	return fasttrun_xact_frame_for_subid(GetCurrentSubTransactionId(), create);
+}
+
+/* A descendant can abort its first use while the table's birth stays live. */
+static void
+fasttrun_xact_mark_created_relation(Relation rel)
+{
+	FasttrunXactFrame *frame;
+	FasttrunXactRelEntry *entry;
+	Oid			relid = RelationGetRelid(rel);
+	bool		found;
+
+	if (rel->rd_createSubid == InvalidSubTransactionId)
+		return;
+
+	frame = fasttrun_xact_frame_for_subid(rel->rd_createSubid, true);
+	entry = (FasttrunXactRelEntry *)
+		hash_search(frame->entries, &relid, HASH_ENTER, &found);
+	if (!found)
+	{
+		entry->root_relid = relid;
+		entry->flags = 0;
+	}
+	entry->flags |= FASTTRUN_TOUCH_CREATED;
 }
 
 static FasttrunXactRelEntry *
@@ -1345,6 +1379,8 @@ fasttrun_cache_store_relstats(Relation rel, BlockNumber pages, int64 tuples,
 							  BlockNumber allvisible)
 {
 	FasttrunAnalyzeCacheEntry *entry;
+
+	fasttrun_xact_mark_created_relation(rel);
 
 	/*
 	 * Register this relid so the xact-end callback walks it.  Index entries
@@ -4422,6 +4458,23 @@ fasttrun_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 		fasttrun_test_subxact_visited++;
 #endif
 
+		/* Abort removes a newly created relation without an OAT_DROP hook.
+		 * Its still-present empty files must not override this lifetime. */
+		if (event == SUBXACT_EVENT_ABORT_SUB &&
+			(xentry->flags & FASTTRUN_TOUCH_CREATED) != 0)
+		{
+			aentry = fasttrun_cache_lookup(relid);
+			if (aentry != NULL)
+			{
+				fasttrun_analyze_free_undo(aentry);
+				(void) hash_search(fasttrun_analyze_cache, &relid,
+								   HASH_REMOVE, NULL);
+			}
+			fasttrun_stats_forget_relid(relid);
+			fasttrun_poison_forget_relid(relid);
+			goto finish_entry;
+		}
+
 		/*
 		 * Walk the column-stats entries only when this frame actually wrote
 		 * some (COLSTATS).  A relid touched only through the relstats path
@@ -6160,6 +6213,11 @@ fasttrun_allocate_truncate_operation(Relation heaprel,
 	int			toast_index_end;
 	int			toast_heap_index = -1;
 	RelFileLocatorBackend root_rlb;
+
+	/* Journal every birth before allocating an operation not yet owned by
+	 * the caller's error cleanup.  No catalog access is needed on abort. */
+	for (i = 0; i < opened->nslots; i++)
+		fasttrun_xact_mark_created_relation(opened->slot_relations[i]);
 
 	fasttrun_operation_init();
 	size = offsetof(FasttrunTruncateOperation, slots) +

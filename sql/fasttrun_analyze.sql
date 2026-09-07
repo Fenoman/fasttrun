@@ -493,4 +493,87 @@ DROP TABLE t_an_oncommit;
 -- Очистка
 DROP TABLE t_an;
 DROP TABLE t_an_persist;
+
+-- 20. Откат CREATE не должен оставлять в кеше записи об исчезнувшей пустой таблице.
+CREATE FUNCTION pg_temp.assert_birth_cache_empty() RETURNS void
+LANGUAGE plpgsql AS $$
+DECLARE s record;
+BEGIN
+  SELECT * INTO s FROM fasttrun_cache_stats();
+  IF s.analyze_entries <> 0 OR s.column_stats_entries <> 0 OR
+     s.column_stats_relid_entries <> 0 THEN
+    RAISE EXCEPTION 'aborted CREATE left cache entries: %', row_to_json(s);
+  END IF;
+END
+$$;
+
+BEGIN;
+DO $$
+BEGIN
+  FOR i IN 1..100 LOOP
+    BEGIN
+      CREATE TEMP TABLE t_birth_empty(id int PRIMARY KEY, payload text);
+      PERFORM fasttrun_analyze('t_birth_empty');
+      RAISE EXCEPTION USING ERRCODE = 'ZX001', MESSAGE = 'abort new table';
+    EXCEPTION WHEN SQLSTATE 'ZX001' THEN
+      NULL;
+    END;
+  END LOOP;
+END
+$$;
+SELECT pg_temp.assert_birth_cache_empty();
+COMMIT;
+SELECT pg_temp.assert_birth_cache_empty();
+
+-- RELEASE передаёт родителю изменения кеша и сведения о создании таблицы.
+BEGIN;
+SAVEPOINT birth_parent;
+SAVEPOINT birth_child;
+CREATE TEMP TABLE t_birth_released(id int PRIMARY KEY);
+SELECT fasttrun_analyze('t_birth_released');
+RELEASE SAVEPOINT birth_child;
+ROLLBACK TO SAVEPOINT birth_parent;
+SELECT pg_temp.assert_birth_cache_empty();
+COMMIT;
+
+-- Первое обращение может быть в дочерней подтранзакции, которая откатывается независимо от CREATE.
+BEGIN;
+SAVEPOINT birth_parent;
+CREATE TEMP TABLE t_birth_ancestor(id int PRIMARY KEY);
+INSERT INTO t_birth_ancestor SELECT generate_series(1, 100);
+SAVEPOINT birth_child;
+SELECT fasttruncate('t_birth_ancestor');
+ROLLBACK TO SAVEPOINT birth_child;
+SELECT count(*) = 0 AS birth_ancestor_still_empty FROM t_birth_ancestor;
+SELECT reltuples = 0 AS birth_ancestor_stats_empty
+  FROM fasttrun_relstats('t_birth_ancestor');
+ROLLBACK TO SAVEPOINT birth_parent;
+SELECT pg_temp.assert_birth_cache_empty();
+COMMIT;
+
+-- Таблица создана в основной транзакции, а fasttrun вызывается только в дочерней.
+BEGIN;
+CREATE TEMP TABLE t_birth_top(id int PRIMARY KEY);
+SAVEPOINT birth_child;
+SELECT fasttrun_analyze('t_birth_top');
+ROLLBACK TO SAVEPOINT birth_child;
+ROLLBACK;
+SELECT pg_temp.assert_birth_cache_empty();
+
+-- Для существующей таблицы откат должен сохранять результат необратимой очистки.
+CREATE TEMP TABLE t_birth_existing(id int PRIMARY KEY);
+INSERT INTO t_birth_existing SELECT generate_series(1, 100);
+SELECT fasttrun_analyze('t_birth_existing');
+BEGIN;
+SAVEPOINT birth_child;
+SELECT fasttruncate('t_birth_existing');
+ROLLBACK TO SAVEPOINT birth_child;
+SELECT count(*) = 0 AS birth_existing_still_empty FROM t_birth_existing;
+SELECT reltuples = 0 AS birth_existing_stats_empty
+  FROM fasttrun_relstats('t_birth_existing');
+ROLLBACK;
+SELECT reltuples = 0 AS birth_existing_top_abort_empty
+  FROM fasttrun_relstats('t_birth_existing');
+DROP TABLE t_birth_existing;
+SELECT pg_temp.assert_birth_cache_empty();
 DROP EXTENSION fasttrun;
