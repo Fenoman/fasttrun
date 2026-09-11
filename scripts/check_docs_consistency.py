@@ -296,8 +296,12 @@ def main() -> int:
                 f"{label}: persistence-harness не документирован")
         require(
             errors,
-            re.search(r"(?:13/13|13\s+(?:из|of)\s+13)", content) is not None,
-            f"{label}: cassert-итог 13/13 не документирован",
+            re.search(
+                rf"(?:{len(regress)}/{len(regress)}"
+                rf"|{len(regress)}\s+(?:из|of)\s+{len(regress)})",
+                content,
+            ) is not None,
+            f"{label}: cassert-итог {len(regress)}/{len(regress)} не документирован",
         )
 
     legacy = read(ROOT / "README.fasttrun")

@@ -147,10 +147,20 @@ COMMIT;
 -- ----------------------------------------------------------------------
 ALTER EXTENSION fasttrun UPDATE;
 
+/* Номер последней версии берётся из control-файла, а не пишется здесь: иначе
+   каждый подъём версии ломает этот набор на ровном месте. */
 DO $$
+DECLARE
+    v_latest text;
+    v_now    text;
 BEGIN
-    IF (SELECT extversion FROM pg_extension WHERE extname = 'fasttrun') <> '2.4.1' THEN
-        RAISE EXCEPTION 'fasttrun extension was not updated to 2.4.1';
+    SELECT default_version INTO v_latest
+      FROM pg_available_extensions WHERE name = 'fasttrun';
+    SELECT extversion INTO v_now
+      FROM pg_extension WHERE extname = 'fasttrun';
+    IF v_now <> v_latest THEN
+        RAISE EXCEPTION 'fasttrun extension was not updated to %, got %',
+                        v_latest, v_now;
     END IF;
 END
 $$;
@@ -202,19 +212,24 @@ WHERE n.nspname = 'public' AND p.proname = 'fasttrun_cache_stats';
 SELECT * FROM public.fasttrun_cache_stats();
 
 -- ----------------------------------------------------------------------
--- 9. Пустая миграция 2.4.0 -> 2.4.1 сохраняет OID функции.
+-- 9. Пустая миграция до последней версии сохраняет OID функции.
 -- ----------------------------------------------------------------------
 DO $$
 DECLARE
     cache_stats_oid oid := 'public.fasttrun_cache_stats()'::regprocedure;
+    v_latest text;
 BEGIN
-    ALTER EXTENSION fasttrun UPDATE TO '2.4.1';
+    SELECT default_version INTO v_latest
+      FROM pg_available_extensions WHERE name = 'fasttrun';
+    EXECUTE format('ALTER EXTENSION fasttrun UPDATE TO %L', v_latest);
     IF 'public.fasttrun_cache_stats()'::regprocedure::oid <> cache_stats_oid THEN
         RAISE EXCEPTION 'fasttrun_cache_stats OID changed during patch upgrade';
     END IF;
 END
 $$;
-SELECT extname, extversion FROM pg_extension WHERE extname = 'fasttrun';
+SELECT extname, extversion = (SELECT default_version FROM pg_available_extensions
+                              WHERE name = 'fasttrun') AS at_latest
+  FROM pg_extension WHERE extname = 'fasttrun';
 
 DROP EXTENSION fasttrun;
 SELECT to_regprocedure('public.fasttrun_cache_stats()') IS NULL

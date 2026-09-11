@@ -15,6 +15,13 @@
 --   3. nested UPDATE обновляет все строки после refill.
 --
 
+/*
+ * Поколоночный учёт UPDATE работает только при предзагруженной библиотеке,
+ * а этот набор проверяет именно его влияние на сохранённые планы.
+ */
+ALTER DATABASE :DBNAME SET session_preload_libraries = 'fasttrun';
+\connect -
+
 CREATE EXTENSION fasttrun;
 
 CREATE TEMP TABLE t_balance_out
@@ -571,14 +578,36 @@ SELECT 'dml_commit_flip_replanned' AS marker;
 DEALLOCATE q_commit_flip;
 
 SELECT fasttrun_analyze('t_commit_flip');
+-- CTE ниже пишет в id, поэтому запрос по id обязан перепланироваться, а соседний
+-- запрос по grp проверяет обратное: колонку, которой UPDATE не касался,
+-- статистики лишать не за что.
 PREPARE q_commit_cte(int) AS
 SELECT count(*) FROM t_commit_flip WHERE id = $1;
+PREPARE q_commit_cte_untouched(int) AS
+SELECT count(*) FROM t_commit_flip WHERE grp = $1;
 EXECUTE q_commit_cte(20000);
+EXECUTE q_commit_cte_untouched(3);
+-- Исходная оценка обязана быть маленькой: иначе проверка «перепланировалось»
+-- ниже прошла бы и при изначально отсутствующей статистике id.
+DO $$
+DECLARE ln text; est int := NULL;
+BEGIN
+  FOR ln IN EXPLAIN EXECUTE q_commit_cte(20000) LOOP
+    IF ln ~ 'on t_commit_flip' THEN
+      est := substring(ln FROM 'rows=(\d+)')::int;
+      EXIT;
+    END IF;
+  END LOOP;
+  IF est IS NULL OR est > 10 THEN
+    RAISE EXCEPTION 'baseline estimate for id was already large: est=%', est;
+  END IF;
+END$$;
+SELECT 'modifying_cte_baseline_small' AS marker;
 
 BEGIN;
 SET client_min_messages = debug1;
 WITH changed AS (
-  UPDATE t_commit_flip SET grp = 2 WHERE id BETWEEN 10001 AND 20000
+  UPDATE t_commit_flip SET id = id + 1000000 WHERE id BETWEEN 10001 AND 20000
   RETURNING id
 )
 SELECT count(*) FROM changed;
@@ -599,7 +628,28 @@ BEGIN
   END IF;
 END$$;
 SELECT 'modifying_cte_replanned' AS marker;
+DO $$
+DECLARE ln text; est int := NULL;
+BEGIN
+  FOR ln IN EXPLAIN EXECUTE q_commit_cte_untouched(3) LOOP
+    IF ln ~ 'on t_commit_flip' THEN
+      est := substring(ln FROM 'rows=(\d+)')::int;
+      EXIT;
+    END IF;
+  END LOOP;
+  IF est IS NULL OR est > 100 THEN
+    RAISE EXCEPTION 'column the UPDATE never wrote lost its statistics: est=%', est;
+  END IF;
+END$$;
+/*
+ * Проверка говорит о сохранённом плане, а не о маске: план здесь берётся из
+ * кэша, и оценка держится независимо от поколоночного учёта. Что учёт
+ * действительно сохраняет неназванную колонку, доказывают §46f и §46p набора
+ * fasttrun_stats -- они краснеют при выключенном учёте, эта не краснеет.
+ */
+SELECT 'modifying_cte_untouched_column_kept' AS marker;
 DEALLOCATE q_commit_cte;
+DEALLOCATE q_commit_cte_untouched;
 
 SET fasttrun.stats_refresh_threshold = 0.001;
 BEGIN;
@@ -1052,3 +1102,4 @@ DROP TABLE t_analyze_freshness_plan;
 DROP TABLE t_savepoint_cached_plan;
 DROP TABLE t_collect_cached_plan;
 DROP EXTENSION fasttrun;
+ALTER DATABASE :DBNAME RESET session_preload_libraries;

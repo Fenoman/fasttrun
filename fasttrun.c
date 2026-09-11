@@ -23,6 +23,7 @@
 #include "access/heapam.h"
 #include "access/htup_details.h"
 #include "access/relation.h"
+#include "access/sysattr.h"
 #include "access/table.h"
 #include "access/tableam.h"
 #include "access/visibilitymap.h"
@@ -44,6 +45,7 @@
 #include "executor/executor.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
+#include "parser/parse_relation.h"
 #include "nodes/nodeFuncs.h"
 #include "optimizer/planner.h"
 #include "parser/parsetree.h"
@@ -67,6 +69,7 @@
 #include "utils/relcache.h"
 #include "utils/sampling.h"
 #include "utils/selfuncs.h"
+#include "utils/portal.h"
 #include "utils/snapmgr.h"
 #include "utils/sortsupport.h"
 #include "utils/syscache.h"
@@ -82,6 +85,7 @@
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
 #include "executor/spi.h"
+#include "tcop/pquery.h"
 #include "tcop/utility.h"
 
 
@@ -216,6 +220,11 @@ typedef struct FasttrunFreshnessCacheEntry
 	int64		upd;
 	int64		del;
 	bool		truncdropped;
+	bool		wide_writers;	/* relation can change a column no statement
+								 * named: row triggers, stored generated cols */
+	bool		upd_cached;		/* upd holds a real reading, not the zero a
+								 * caller that passed upd = NULL left behind;
+								 * placed here to reuse existing padding */
 	BlockNumber	pages;
 	bool		owner_checked;	/* owner_heap is filled in (index relids) */
 	Oid			owner_heap;		/* memoized owning heap of an index */
@@ -280,7 +289,44 @@ typedef struct FasttrunXactFrame
 } FasttrunXactFrame;
 
 static FasttrunXactFrame *fasttrun_xact_frame = NULL;
+
+/*
+ * Frames released by a finished subtransaction are kept here for reuse instead
+ * of being deleted.  A frame costs a memory context plus a hash table, and a
+ * PL/pgSQL EXCEPTION block opens a subtransaction on every pass of its loop, so
+ * without the pool a loop over a tracked relation built and tore that pair down
+ * once per pass.  Frame contexts are children of TopTransactionContext, so at
+ * the end of the top transaction the list only has to be cleared: the memory
+ * goes away with the parent.
+ *
+ * A frame that grew wide is not pooled: dynahash never shrinks, so keeping it
+ * would hold the enlarged table until the top transaction ends, while the old
+ * behaviour returned it at the end of the subtransaction.
+ */
+#define FASTTRUN_XACT_FRAME_POOL_MAX 4
+#define FASTTRUN_XACT_FRAME_POOL_ENTRIES_MAX 32
+
+/* Set on a pooled frame's context; a live frame carries no identifier. */
+#define FASTTRUN_XACT_FRAME_POOLED_IDENT "pooled"
+
+static FasttrunXactFrame *fasttrun_xact_frame_pool = NULL;
+static int	fasttrun_xact_frame_pool_used = 0;
+
 static uint64 fasttrun_truncate_generation = 0;
+
+#ifdef USE_ASSERT_CHECKING
+/* The counter and the list must not drift apart. */
+static int
+fasttrun_xact_frame_pool_length(void)
+{
+	FasttrunXactFrame *frame;
+	int			n = 0;
+
+	for (frame = fasttrun_xact_frame_pool; frame != NULL; frame = frame->parent)
+		n++;
+	return n;
+}
+#endif
 
 static FasttrunXactFrame *
 fasttrun_xact_frame_for_subid(SubTransactionId subid, bool create)
@@ -298,6 +344,20 @@ fasttrun_xact_frame_for_subid(SubTransactionId subid, bool create)
 		return *link;
 	if (!create)
 		return NULL;
+
+	if (fasttrun_xact_frame_pool != NULL)
+	{
+		FasttrunXactFrame *reused = fasttrun_xact_frame_pool;
+
+		Assert(fasttrun_xact_frame_pool_length() == fasttrun_xact_frame_pool_used);
+		fasttrun_xact_frame_pool = reused->parent;
+		fasttrun_xact_frame_pool_used--;
+		MemoryContextSetIdentifier(reused->mcxt, NULL);
+		reused->subid = subid;
+		reused->parent = *link;
+		*link = reused;
+		return *link;
+	}
 
 	new_mcxt = AllocSetContextCreate(TopTransactionContext,
 									 "fasttrun xact frame",
@@ -330,6 +390,44 @@ fasttrun_xact_frame_for_subid(SubTransactionId subid, bool create)
 
 	*link = (FasttrunXactFrame *) new_frame;
 	return *link;
+}
+
+/*
+ * Release the frame of a finished subtransaction.  Its entries are cleared and
+ * the empty frame, context and hash table included, goes to the pool.  A frame
+ * that is too wide, or one arriving at a full pool, is deleted as before.
+ */
+static void
+fasttrun_xact_frame_release(FasttrunXactFrame *frame)
+{
+	HASH_SEQ_STATUS status;
+	FasttrunXactRelEntry *xentry;
+
+	if (fasttrun_xact_frame_pool_used >= FASTTRUN_XACT_FRAME_POOL_MAX ||
+		hash_get_num_entries(frame->entries) >
+		FASTTRUN_XACT_FRAME_POOL_ENTRIES_MAX)
+	{
+		MemoryContextDelete(frame->mcxt);
+		return;
+	}
+
+	/* Deleting the just-returned entry during a seq scan is allowed. */
+	hash_seq_init(&status, frame->entries);
+	while ((xentry = (FasttrunXactRelEntry *) hash_seq_search(&status)) != NULL)
+		(void) hash_search(frame->entries, &xentry->relid, HASH_REMOVE, NULL);
+
+	/*
+	 * A pooled frame keeps the context name, so mark it instead: the memory
+	 * check tells a live frame from a pooled one by this identifier, and can
+	 * still demand zero live frames after a rollback.
+	 */
+	MemoryContextSetIdentifier(frame->mcxt,
+							   FASTTRUN_XACT_FRAME_POOLED_IDENT);
+	frame->subid = InvalidSubTransactionId;
+	frame->parent = fasttrun_xact_frame_pool;
+	fasttrun_xact_frame_pool = frame;
+	fasttrun_xact_frame_pool_used++;
+	Assert(fasttrun_xact_frame_pool_length() == fasttrun_xact_frame_pool_used);
 }
 
 static FasttrunXactFrame *
@@ -482,7 +580,7 @@ static FasttrunCollectResult fasttrun_collect_and_store(Relation rel,
 static bool fasttrun_read_pgstat_counters(Relation rel,
 										  int64 *ins, int64 *upd, int64 *del,
 										  bool *truncdropped);
-static bool fasttrun_read_pgstat_counters_for_hook(Oid relid,
+static bool fasttrun_read_pgstat_counters_for_hook(Oid relid, bool *wide_writers,
 												   int64 *ins, int64 *upd,
 												   int64 *del,
 												   bool *truncdropped,
@@ -504,6 +602,26 @@ static void fasttrun_ensure_planner_hook(void);
 static void fasttrun_ensure_stats_hooks(void);
 static void fasttrun_executor_start(QueryDesc *queryDesc, int eflags);
 static bool fasttrun_stats_relid_exists(Oid relid);
+/* Defined with the session-local stats cache further down. */
+struct FasttrunStatsRelidEntry;
+struct FasttrunStatsEntry;
+
+static void fasttrun_stats_note_update_target(Oid relid,
+											  RTEPermissionInfo *perminfo);
+static void fasttrun_stats_update_in_flight(Oid relid, int delta);
+static bool fasttrun_stats_relid_in_flight(Oid relid);
+static bool fasttrun_stats_relation_written_now(Relation rel);
+static void fasttrun_stats_forget_in_flight(void);
+static void fasttrun_stats_in_flight_subxact_end(SubTransactionId mySubid,
+									 SubTransactionId parentSubid,
+									 bool aborted);
+static void fasttrun_stats_note_wide_writer_ddl(RangeVar *rv);
+static void fasttrun_executor_end(QueryDesc *queryDesc);
+static void fasttrun_executor_walk_targets(PlannedStmt *stmt, bool starting);
+static bool fasttrun_stats_column_was_updated(struct FasttrunStatsRelidEntry *relentry,
+											  const struct FasttrunStatsEntry *entry);
+static void fasttrun_stats_begin_collect_period(Relation rel);
+static bool fasttrun_relation_has_wide_writers(Relation rel);
 static void fasttrun_stats_relid_ref(Oid relid);
 static void fasttrun_stats_relid_unref(Oid relid);
 static bool fasttrun_manages_relid(Oid relid);
@@ -981,6 +1099,7 @@ fasttrun_xact_callback(XactEvent event, void *arg)
 			fasttrun_poison_commit_xact();
 			fasttrun_cache_commit_xact();
 			fasttrun_stats_cache_commit_xact();
+			fasttrun_stats_forget_in_flight();
 			break;
 		case XACT_EVENT_ABORT:
 		case XACT_EVENT_PARALLEL_ABORT:
@@ -996,11 +1115,13 @@ fasttrun_xact_callback(XactEvent event, void *arg)
 									  frame->subid,
 									  InvalidSubTransactionId, NULL);
 			}
+			fasttrun_stats_forget_in_flight();
 			break;
 		case XACT_EVENT_PREPARE:
 			/* Prepared xacts cannot retain backend-private temp statistics. */
 			fasttrun_cache_reset();
 			fasttrun_stats_cache_reset();
+			fasttrun_stats_forget_in_flight();
 			break;
 		default:
 			return;
@@ -1008,6 +1129,8 @@ fasttrun_xact_callback(XactEvent event, void *arg)
 
 	/* Frame contexts are children of TopTransactionContext. */
 	fasttrun_xact_frame = NULL;
+	fasttrun_xact_frame_pool = NULL;
+	fasttrun_xact_frame_pool_used = 0;
 }
 
 /* Lazily allocate the analyze HTAB and its dedicated mcxt. */
@@ -1834,6 +1957,8 @@ typedef struct FasttrunStatsSavedState
 	bool				collected_truncdropped;
 	BlockNumber			collected_pages;
 	bool				was_usable;
+	uint64				collect_seq;
+	bool				unsafe;
 	FasttrunColumnStatsState state;
 	RelFileLocatorBackend heap_rlb;
 	bool				heap_rlb_valid;
@@ -1855,6 +1980,12 @@ typedef struct FasttrunStatsEntry
 	bool				was_usable;		/* entry passed the freshness check at
 										 * the last analyze/publish; drives the
 										 * visible->hidden flip detection */
+	uint64				collect_seq;	/* collect period this sample belongs to;
+										 * the per-column UPDATE mask describes
+										 * the relation's current period only */
+	bool				unsafe;		/* taken while the relation was being
+									 * written: the scan and the counters
+									 * beside it describe different moments */
 	FasttrunColumnStatsState state;
 	RelFileLocatorBackend heap_rlb;
 	bool				heap_rlb_valid;
@@ -1893,8 +2024,18 @@ typedef struct FasttrunStatsRelidEntry
 	Oid			relid;		/* hash key -- must be first */
 	int			refcount;	/* visible statsTuple entries for this relid */
 	List	   *attkeys;	/* List of FasttrunStatsKey *, owns palloc'd keys */
+	Bitmapset  *updated_cols;	/* attnums named by an UPDATE since the last
+								 * collect, in RTEPermissionInfo.updatedCols
+								 * offset form; lives in fasttrun_stats_mcxt */
+	uint64		collect_seq;	/* current collect period; a column sample from
+								 * an older period is not covered by the mask */
 	RelFileLocatorBackend heap_rlb;	/* heap storage identity for the commit-time size probe */
 	bool		heap_rlb_valid;
+	bool		updated_cols_exact;	/* the mask can be taken as the full set of
+									 * what an UPDATE changed on this relation;
+									 * placed here to reuse existing padding */
+	bool		period_unsafe;	/* samples of the current period were taken
+								 * while a statement was writing the relation */
 	FasttrunRelStatsPolicy policy;
 	SubTransactionId state_subid;
 	FasttrunStatsRelidSavedState *undo;
@@ -1913,6 +2054,7 @@ static get_relation_stats_hook_type prev_get_relation_stats_hook = NULL;
 static get_attavgwidth_hook_type prev_get_attavgwidth_hook = NULL;
 static get_index_stats_hook_type prev_get_index_stats_hook = NULL;
 static planner_hook_type prev_planner_hook = NULL;
+static ExecutorEnd_hook_type prev_ExecutorEnd = NULL;
 static ExecutorStart_hook_type prev_ExecutorStart = NULL;
 static bool				fasttrun_stats_hooks_installed = false;
 static bool				fasttrun_planner_hook_installed = false;
@@ -1941,40 +2083,98 @@ fasttrun_ensure_stats_hooks(void)
 	get_attavgwidth_hook = fasttrun_get_attavgwidth_hook;
 	prev_get_index_stats_hook = get_index_stats_hook;
 	get_index_stats_hook = fasttrun_get_index_stats_hook;
-	if (!fasttrun_executor_hook_installed)
-	{
-		prev_ExecutorStart = ExecutorStart_hook;
-		ExecutorStart_hook = fasttrun_executor_start;
-		fasttrun_executor_hook_installed = true;
-	}
 	fasttrun_stats_hooks_installed = true;
+}
+
+/*
+ * The library was loaded on its first use rather than preloaded, so statements
+ * that had already started were never offered to the hook.  Which relations
+ * they write, and whether they write at all, cannot be recovered afterwards, so
+ * the per-column account does not run in such a backend at all: wear from an
+ * UPDATE goes back to counting for every column, exactly as before the account
+ * existed.  Put fasttrun in session_preload_libraries to get it.
+ */
+static bool fasttrun_lazy_loaded = false;
+static bool fasttrun_lazy_loaded_warned = false;
+
+
+static void
+fasttrun_executor_walk_targets(PlannedStmt *stmt, bool starting)
+{
+	ListCell   *lc;
+
+	if (stmt == NULL ||
+		(stmt->commandType == CMD_SELECT && !stmt->hasModifyingCTE))
+		return;
+
+	foreach(lc, stmt->resultRelations)
+	{
+		int			rtindex = lfirst_int(lc);
+		RangeTblEntry *rte = rt_fetch(rtindex, stmt->rtable);
+		RTEPermissionInfo *perminfo = NULL;
+		bool		writes_columns;
+
+		if (rte->rtekind != RTE_RELATION)
+			continue;
+
+		/* PG16 moved updatedCols out of RangeTblEntry. */
+		if (rte->perminfoindex > 0)
+			perminfo = getRTEPermissionInfo(stmt->permInfos, rte);
+
+		/*
+		 * An INSERT or DELETE target names no columns, so it leaves the mask
+		 * alone -- it still enters the registry below, because its rows are
+		 * just as invisible to a scan on the same command's snapshot.  A
+		 * target with no permission information hides which it is: treat it as
+		 * naming columns, so a collect running underneath stays conservative.
+		 */
+		writes_columns = (perminfo == NULL ||
+						  !bms_is_empty(perminfo->updatedCols));
+
+		/*
+		 * Every DML target enters the registry, INSERT and DELETE included:
+		 * their rows are invisible to a scan running on the same command's
+		 * snapshot just as an UPDATE's are.  The registry is kept even for a
+		 * relation fasttrun does not manage yet, because its first collect may
+		 * happen from inside this very statement.
+		 */
+		fasttrun_stats_update_in_flight(rte->relid, starting ? 1 : -1);
+
+		if (starting && fasttrun_stats_relid_exists(rte->relid))
+		{
+			/*
+			 * Every DML statement marks the relation, INSERT and DELETE
+			 * included: the commit walk decides from this mark whether the
+			 * relation needs a freshness re-check.
+			 */
+			fasttrun_xact_mark_relid(rte->relid, rte->relid,
+								  FASTTRUN_TOUCH_DML);
+			if (writes_columns)
+				fasttrun_stats_note_update_target(rte->relid, perminfo);
+		}
+	}
 }
 
 static void
 fasttrun_executor_start(QueryDesc *queryDesc, int eflags)
 {
-	PlannedStmt *stmt = queryDesc->plannedstmt;
-	ListCell   *lc;
-
-	if (fasttrun_stats_relid_cache != NULL && stmt != NULL &&
-		(stmt->commandType != CMD_SELECT || stmt->hasModifyingCTE))
-	{
-		foreach(lc, stmt->resultRelations)
-		{
-			int			rtindex = lfirst_int(lc);
-			RangeTblEntry *rte = rt_fetch(rtindex, stmt->rtable);
-
-			if (rte->rtekind == RTE_RELATION &&
-				fasttrun_stats_relid_exists(rte->relid))
-				fasttrun_xact_mark_relid(rte->relid, rte->relid,
-									  FASTTRUN_TOUCH_DML);
-		}
-	}
+	fasttrun_executor_walk_targets(queryDesc->plannedstmt, true);
 
 	if (prev_ExecutorStart != NULL)
 		prev_ExecutorStart(queryDesc, eflags);
 	else
 		standard_ExecutorStart(queryDesc, eflags);
+}
+
+static void
+fasttrun_executor_end(QueryDesc *queryDesc)
+{
+	fasttrun_executor_walk_targets(queryDesc->plannedstmt, false);
+
+	if (prev_ExecutorEnd != NULL)
+		prev_ExecutorEnd(queryDesc);
+	else
+		standard_ExecutorEnd(queryDesc);
 }
 
 static void
@@ -2128,6 +2328,10 @@ fasttrun_stats_relid_init(FasttrunStatsRelidEntry *entry)
 {
 	entry->refcount = 0;
 	entry->attkeys = NIL;
+	entry->updated_cols = NULL;
+	entry->updated_cols_exact = false;
+	entry->period_unsafe = false;
+	entry->collect_seq = 0;
 	memset(&entry->heap_rlb, 0, sizeof(entry->heap_rlb));
 	entry->heap_rlb_valid = false;
 	entry->policy = FASTTRUN_REL_CORE_ALLOWED;
@@ -2145,6 +2349,348 @@ fasttrun_stats_relid_enter(Oid relid, bool *found)
 	if (!*found)
 		fasttrun_stats_relid_init(entry);
 	return entry;
+}
+
+/*
+ * Record the columns a statement names as UPDATE targets.  pgstat reports
+ * tuples_updated per relation, so without this the churn of a single-column
+ * UPDATE ages the statistics of every column -- and an UPDATE that only
+ * enriches a helper column would blind the planner on the join keys it never
+ * touched.  Members are kept in RTEPermissionInfo.updatedCols offset form.
+ *
+ * A target without permission information (an inheritance child reached
+ * through its parent) hides which columns the statement writes, so the mask
+ * stops being a full account and the relation falls back to relation-wide
+ * churn until the next collect.
+ */
+static void
+fasttrun_stats_note_update_target(Oid relid, RTEPermissionInfo *perminfo)
+{
+	FasttrunStatsRelidEntry *entry;
+	MemoryContext oldcxt;
+
+	if (fasttrun_stats_relid_cache == NULL || fasttrun_stats_mcxt == NULL)
+		return;
+
+	/* INSERT and DELETE targets name no columns -- leave before the lookup. */
+	if (perminfo != NULL && bms_is_empty(perminfo->updatedCols))
+		return;
+
+	entry = (FasttrunStatsRelidEntry *)
+		hash_search(fasttrun_stats_relid_cache, &relid, HASH_FIND, NULL);
+	if (entry == NULL)
+		return;
+
+	if (perminfo == NULL)
+	{
+		entry->updated_cols_exact = false;
+		return;
+	}
+
+	oldcxt = MemoryContextSwitchTo(fasttrun_stats_mcxt);
+	entry->updated_cols = bms_add_members(entry->updated_cols,
+										  perminfo->updatedCols);
+	MemoryContextSwitchTo(oldcxt);
+}
+
+/*
+ * Registry of UPDATE statements that have started and not finished.
+ *
+ * It has to live outside the stats cache: the very first collect of a relation
+ * happens while no cache entry exists yet, and that collect still must not take
+ * the column mask as a full account if an UPDATE is running underneath it.
+ * Nesting is shallow -- a statement reaches here only through a subquery or a
+ * modifying CTE -- so a short array beats a hash.  Overflow is answered
+ * conservatively rather than grown.
+ */
+#define FASTTRUN_IN_FLIGHT_SLOTS	16
+
+typedef struct FasttrunInFlightSlot
+{
+	Oid			relid;
+	int			depth;
+	SubTransactionId subid;		/* subtransaction the statement started in */
+} FasttrunInFlightSlot;
+
+static FasttrunInFlightSlot fasttrun_in_flight[FASTTRUN_IN_FLIGHT_SLOTS];
+static int	fasttrun_in_flight_used = 0;
+
+/*
+ * The registry ran out of slots, so it does not hold the whole truth for this
+ * transaction.  Every relation is then answered as written.
+ */
+static bool fasttrun_in_flight_incomplete = false;
+
+
+static void
+fasttrun_stats_update_in_flight(Oid relid, int delta)
+{
+	SubTransactionId subid = GetCurrentSubTransactionId();
+	int			i;
+	int			fallback = -1;
+
+	/*
+	 * One slot per (relation, subtransaction).  Keeping the subtransaction in
+	 * the key is what lets a nested statement that raised an error be dropped
+	 * on its own, without touching the outer statement writing the same
+	 * relation.  A statement normally starts and ends in the same
+	 * subtransaction; the fallback covers the case where its subtransaction
+	 * committed while it was still running.
+	 */
+	for (i = 0; i < fasttrun_in_flight_used; i++)
+	{
+		if (fasttrun_in_flight[i].relid != relid)
+			continue;
+		if (fasttrun_in_flight[i].subid != subid)
+		{
+			if (fallback < 0)
+				fallback = i;
+			continue;
+		}
+		fasttrun_in_flight[i].depth += delta;
+		if (fasttrun_in_flight[i].depth <= 0)
+			fasttrun_in_flight[i] = fasttrun_in_flight[--fasttrun_in_flight_used];
+		return;
+	}
+
+	if (delta <= 0)
+	{
+		if (fallback < 0)
+			return;				/* end of a statement whose start overflowed */
+		fasttrun_in_flight[fallback].depth += delta;
+		if (fasttrun_in_flight[fallback].depth <= 0)
+			fasttrun_in_flight[fallback] =
+				fasttrun_in_flight[--fasttrun_in_flight_used];
+		return;
+	}
+
+	if (fasttrun_in_flight_used >= FASTTRUN_IN_FLIGHT_SLOTS)
+	{
+		fasttrun_in_flight_incomplete = true;
+		return;
+	}
+
+	fasttrun_in_flight[fasttrun_in_flight_used].relid = relid;
+	fasttrun_in_flight[fasttrun_in_flight_used].depth = 1;
+	fasttrun_in_flight[fasttrun_in_flight_used].subid = subid;
+	fasttrun_in_flight_used++;
+}
+
+static bool
+fasttrun_stats_relid_in_flight(Oid relid)
+{
+	int			i;
+
+	if (fasttrun_in_flight_incomplete)
+		return true;
+
+	for (i = 0; i < fasttrun_in_flight_used; i++)
+	{
+		if (fasttrun_in_flight[i].relid == relid)
+			return true;
+	}
+	return false;
+}
+
+/*
+ * True when this relation's data and the counters beside it describe different
+ * moments, so a sample taken now cannot be compared with anything later.
+ *
+ * Two ways that happens:
+ *
+ *   * a statement writing the relation is running.  The registry knows every
+ *     statement whose start was observed, nested ones included, and every DML
+ *     target of it -- which is every statement at all, because the per-column
+ *     account only runs in a backend that preloaded the library;
+ *   * a write already finished under a snapshot older than it.  The scan then
+ *     runs on that older snapshot and does not see rows the counters count:
+ *     an inner function's UPDATE, or an earlier command of this transaction
+ *     when the current statement kept the old snapshot.
+ */
+static bool
+fasttrun_stats_relation_written_now(Relation rel)
+{
+	int64		ins = 0;
+	int64		upd = 0;
+	int64		del = 0;
+	bool		truncdropped = false;
+
+	if (fasttrun_stats_relid_in_flight(RelationGetRelid(rel)))
+		return true;
+
+	/*
+	 * Writes of this transaction that the scan's snapshot cannot show.  Both
+	 * halves are needed: without the counters an unrelated statement moving
+	 * the command id would forbid a perfectly good sample, and without the
+	 * snapshot age an ordinary collect after a finished write of this relation
+	 * would be forbidden although the scan sees every row of it.
+	 */
+	return (ActiveSnapshotSet() &&
+			GetActiveSnapshot()->curcid < GetCurrentCommandId(false) &&
+			fasttrun_read_pgstat_counters(rel, &ins, &upd, &del, &truncdropped) &&
+			(ins != 0 || upd != 0 || del != 0 || truncdropped));
+}
+
+/* Nothing is in flight once the top-level transaction is over. */
+static void
+fasttrun_stats_forget_in_flight(void)
+{
+	fasttrun_in_flight_used = 0;
+	fasttrun_in_flight_incomplete = false;
+}
+
+/*
+ * A subtransaction ending takes its statements with it.  On abort that is the
+ * statement caught by a PL/pgSQL EXCEPTION block: it never reaches the end
+ * hook, so without this its entry would hold every later collect of that
+ * relation at the conservative answer for the rest of the transaction.  On
+ * commit the entry moves to the parent, which is the subtransaction that owns
+ * it from then on.  Statements started outside the ending subtransaction and
+ * still running keep their entries.
+ *
+ * Entries are per (relation, subtransaction), so a nested statement on a
+ * relation an outer statement is already writing is dropped on its own.
+ */
+static void
+fasttrun_stats_in_flight_subxact_end(SubTransactionId mySubid,
+									 SubTransactionId parentSubid,
+									 bool aborted)
+{
+	int			i = 0;
+
+	while (i < fasttrun_in_flight_used)
+	{
+		if (fasttrun_in_flight[i].subid != mySubid)
+		{
+			i++;
+			continue;
+		}
+		if (!aborted)
+		{
+			fasttrun_in_flight[i].subid = parentSubid;
+			i++;
+			continue;
+		}
+		fasttrun_in_flight[i] = fasttrun_in_flight[--fasttrun_in_flight_used];
+	}
+}
+
+/*
+ * DDL that can add a writer working outside a statement's target list must take
+ * trust away from the column mask before the next UPDATE runs -- after COMMIT
+ * the counters are gone and the evidence with them.  CREATE TRIGGER is the one
+ * such statement that does not already go through eviction; ALTER TABLE does,
+ * which is stronger.  The planner-path re-read stays as a second line.
+ */
+static void
+fasttrun_stats_note_wide_writer_ddl(RangeVar *rv)
+{
+	Oid			relid;
+	FasttrunStatsRelidEntry *entry;
+
+	if (fasttrun_stats_relid_cache == NULL || rv == NULL)
+		return;
+
+	relid = RangeVarGetRelid(rv, NoLock, true);
+	if (!OidIsValid(relid))
+		return;
+
+	entry = (FasttrunStatsRelidEntry *)
+		hash_search(fasttrun_stats_relid_cache, &relid, HASH_FIND, NULL);
+	if (entry != NULL)
+		entry->updated_cols_exact = false;
+}
+
+/*
+ * True when an UPDATE may have written this column since its sample was taken.
+ * Answers conservatively -- an over-reported column merely loses its statistics
+ * -- whenever the mask cannot account for the change:
+ *
+ *   * the relation can change columns a statement does not name;
+ *   * the sample predates the current collect period, so the mask, which was
+ *     cleared at that collect, says nothing about it.  This covers a sample
+ *     restored by savepoint rollback and a column the collect skipped;
+ *   * the mask is empty while the counters say an UPDATE happened, so the
+ *     write did not reach the executor hook.  A write that mixes with an
+ *     already recorded UPDATE is not detected -- see the direct table AM
+ *     boundary in CLAUDE.md.
+ */
+static bool
+fasttrun_stats_column_was_updated(FasttrunStatsRelidEntry *relentry,
+								  const FasttrunStatsEntry *entry)
+{
+	if (relentry == NULL || !relentry->updated_cols_exact)
+		return true;
+
+	if (entry->collect_seq != relentry->collect_seq)
+		return true;
+
+	if (relentry->updated_cols == NULL)
+		return true;
+
+	/* A whole-row reference names every column. */
+	if (bms_is_member(0 - FirstLowInvalidHeapAttributeNumber,
+					  relentry->updated_cols))
+		return true;
+
+	return bms_is_member(entry->key.attnum - FirstLowInvalidHeapAttributeNumber,
+						 relentry->updated_cols);
+}
+
+/*
+ * Open a new collect period: the fresh samples about to be stored carry the new
+ * sequence, and the mask starts empty.  Samples left behind by an earlier period
+ * -- one the collect skipped, or one a savepoint rollback restores later -- keep
+ * their old sequence and stay outside the mask's account.
+ *
+ * A trigger may write columns the statement does not name, and a stored generated
+ * column is recomputed outside the target list; on such a relation the mask is not
+ * a full account.  That check is re-read here and again whenever a plan asks
+ * for this relation's statistics, so a trigger created between two collects is
+ * covered.
+ *
+ * An UPDATE of this relation that has started and not finished is the other way
+ * the mask misses a write: the samples about to be taken describe rows the
+ * statement will still overwrite, and the columns it names were just cleared.
+ */
+static void
+fasttrun_stats_begin_collect_period(Relation rel)
+{
+	FasttrunStatsRelidEntry *entry;
+	bool		found;
+	bool		wide;
+
+	if (fasttrun_stats_relid_cache == NULL)
+		return;
+
+	entry = fasttrun_stats_relid_enter(RelationGetRelid(rel), &found);
+	entry->collect_seq++;
+
+	/*
+	 * The mask accounts for the new period only when nothing can write outside
+	 * it: no UPDATE statement is running underneath this collect (one would
+	 * write rows after the sample is taken and never return to the hook), and
+	 * the relation cannot change a column no statement names.  A mask left by
+	 * an UPDATE that already finished says nothing about the new period and is
+	 * simply dropped.
+	 */
+	if (fasttrun_lazy_loaded && !fasttrun_lazy_loaded_warned)
+	{
+		fasttrun_lazy_loaded_warned = true;
+		ereport(LOG,
+				(errmsg("fasttrun: per-column UPDATE accounting is off in this session"),
+				 errdetail("The library was loaded on first use, so statements that had already started were never seen."),
+				 errhint("Add fasttrun to session_preload_libraries or shared_preload_libraries.")));
+	}
+
+	wide = fasttrun_relation_has_wide_writers(rel);
+	entry->period_unsafe = fasttrun_stats_relation_written_now(rel);
+	entry->updated_cols_exact = !fasttrun_lazy_loaded &&
+		!entry->period_unsafe && !wide;
+
+
+	bms_free(entry->updated_cols);
+	entry->updated_cols = NULL;
 }
 
 static void
@@ -2190,8 +2736,12 @@ fasttrun_stats_relid_maybe_drop(Oid relid,
 		entry->policy == FASTTRUN_REL_CORE_ALLOWED &&
 		entry->state_subid == InvalidSubTransactionId &&
 		entry->undo == NULL)
+	{
+		bms_free(entry->updated_cols);
+		entry->updated_cols = NULL;
 		(void) hash_search(fasttrun_stats_relid_cache, &relid,
 						   HASH_REMOVE, NULL);
+	}
 }
 
 /*
@@ -2529,12 +3079,14 @@ typedef struct FasttrunUsableBaseline
  * carried over from previous columns of the same relid).
  */
 static bool
-fasttrun_stats_entry_usable_ext(Oid relid, const FasttrunStatsEntry *entry,
+fasttrun_stats_entry_usable_ext(Oid relid, FasttrunStatsRelidEntry *relentry,
+								const FasttrunStatsEntry *entry,
 								int64 ins_now, int64 upd_now, int64 del_now,
 								bool truncdropped_now, BlockNumber pages_now,
 								FasttrunUsableBaseline *rel_baseline)
 {
 	int64		churn;
+	int64		upd_delta;
 	double		baseline;
 	double		threshold;
 	double		floor_threshold;
@@ -2543,6 +3095,30 @@ fasttrun_stats_entry_usable_ext(Oid relid, const FasttrunStatsEntry *entry,
 
 	if (truncdropped_now != entry->collected_truncdropped)
 		return false;
+
+	/*
+	 * A sample taken while the relation was being written describes the
+	 * command snapshot its scan started from, while the counters stored beside
+	 * it already include those writes.  Nothing about them can be compared, so
+	 * it stays out of use for good; only a fresh sample replaces it.  The mark
+	 * belongs to the sample, not to the relation's current period: a period
+	 * ends, and the sample can outlive it through a savepoint rollback or a
+	 * collect that skipped its column.
+	 */
+	if (entry->unsafe)
+		return false;
+
+	/*
+	 * pgstat counts tuples_updated per relation, not per column, so a single
+	 * UPDATE that rewrote one helper column would age the statistics of every
+	 * column of the table.  Charge this column only for UPDATEs that named it
+	 * in their target list; inserts and deletes still count for all of them,
+	 * since they change the row count every distribution rests on.
+	 */
+	upd_delta = upd_now - entry->collected_upd;
+	if (upd_delta != 0 &&
+		!fasttrun_stats_column_was_updated(relentry, entry))
+		upd_delta = 0;
 
 	if (ins_now == entry->collected_ins &&
 		upd_now == entry->collected_upd &&
@@ -2587,6 +3163,17 @@ fasttrun_stats_entry_usable_ext(Oid relid, const FasttrunStatsEntry *entry,
 		return true;			/* no DML and size stable -- exactly fresh */
 	}
 
+	/*
+	 * Only UPDATEs of other columns since collect.  Such a rewrite also grows
+	 * the page count, which the cross-commit anchor above would read as a
+	 * refill -- but here the counters name the cause, so there is nothing to
+	 * guess and this column's sample still describes the data.
+	 */
+	if (ins_now == entry->collected_ins &&
+		del_now == entry->collected_del &&
+		upd_delta == 0)
+		return true;
+
 	if (!rel_baseline->resolved)
 	{
 		FasttrunAnalyzeCacheEntry *aentry = fasttrun_cache_lookup(relid);
@@ -2601,7 +3188,7 @@ fasttrun_stats_entry_usable_ext(Oid relid, const FasttrunStatsEntry *entry,
 		return false;
 
 	churn = (ins_now - entry->collected_ins)
-		+ (upd_now - entry->collected_upd)
+		+ upd_delta
 		+ (del_now - entry->collected_del);
 	if (churn < 0)
 		churn = -churn;
@@ -2628,14 +3215,15 @@ fasttrun_stats_entry_usable_ext(Oid relid, const FasttrunStatsEntry *entry,
 
 /* Single-column convenience wrapper: resolves the baseline itself. */
 static bool
-fasttrun_stats_entry_usable(Oid relid, const FasttrunStatsEntry *entry,
+fasttrun_stats_entry_usable(Oid relid, FasttrunStatsRelidEntry *relentry,
+							const FasttrunStatsEntry *entry,
 							int64 ins_now, int64 upd_now, int64 del_now,
 							bool truncdropped_now, BlockNumber pages_now)
 {
 	FasttrunUsableBaseline rel_baseline = {0};
 
-	return fasttrun_stats_entry_usable_ext(relid, entry, ins_now, upd_now,
-										   del_now, truncdropped_now,
+	return fasttrun_stats_entry_usable_ext(relid, relentry, entry, ins_now,
+										   upd_now, del_now, truncdropped_now,
 										   pages_now, &rel_baseline);
 }
 
@@ -2674,6 +3262,7 @@ fasttrun_freshness_cache_slot(Oid relid)
 	slot->locator_checked = false;
 	slot->locator_ok = false;
 	slot->counters_cached = false;
+	slot->upd_cached = false;
 	slot->owner_checked = false;
 	slot->owner_heap = InvalidOid;
 	return slot;
@@ -2744,6 +3333,7 @@ fasttrun_get_relation_stats_hook(PlannerInfo *root, RangeTblEntry *rte,
 	int64			del_now = 0;
 	bool			truncdropped_now = false;
 	BlockNumber		pages_now = 0;
+	bool			wide_writers = false;
 
 	/* Some core callers do not initialize these output fields. */
 	vardata->statsTuple = NULL;
@@ -2774,12 +3364,21 @@ fasttrun_get_relation_stats_hook(PlannerInfo *root, RangeTblEntry *rte,
 		return true;
 
 	/* Freshness check: tolerate DML churn up to stats_refresh_threshold. */
-	if (!fasttrun_read_pgstat_counters_for_hook(rte->relid, &ins_now, &upd_now,
+	if (!fasttrun_read_pgstat_counters_for_hook(rte->relid, &wide_writers,
+											   &ins_now, &upd_now,
 												&del_now, &truncdropped_now,
 												&pages_now))
 		return true;
 
-	if (!fasttrun_stats_entry_usable(rte->relid, entry, ins_now, upd_now,
+	/*
+	 * Re-read per plan: a trigger or a stored generated column created after
+	 * the last collect makes the UPDATE mask an incomplete account.  The flag
+	 * only ever clears here and is re-established by the next collect.
+	 */
+	if (wide_writers)
+		relentry->updated_cols_exact = false;
+
+	if (!fasttrun_stats_entry_usable(rte->relid, relentry, entry, ins_now, upd_now,
 									 del_now, truncdropped_now, pages_now))
 	{
 		fasttrun_xact_mark_dml_plan_dependency(rte->relid);
@@ -2841,6 +3440,7 @@ fasttrun_get_attavgwidth_hook(Oid relid, AttrNumber attnum)
 	int64				del_now = 0;
 	bool				truncdropped_now = false;
 	BlockNumber			pages_now = 0;
+	bool				wide_writers = false;
 	int32				stawidth;
 
 	if (fasttrun_stats_cache == NULL || fasttrun_stats_relid_cache == NULL)
@@ -2868,12 +3468,16 @@ fasttrun_get_attavgwidth_hook(Oid relid, AttrNumber attnum)
 		entry->statsTuple == NULL)
 		return fasttrun_type_default_width(relid, attnum);
 
-	if (!fasttrun_read_pgstat_counters_for_hook(relid, &ins_now, &upd_now,
+	if (!fasttrun_read_pgstat_counters_for_hook(relid, &wide_writers,
+											   &ins_now, &upd_now,
 												&del_now, &truncdropped_now,
 												&pages_now))
 		return fasttrun_type_default_width(relid, attnum);
 
-	if (!fasttrun_stats_entry_usable(relid, entry, ins_now, upd_now,
+	if (wide_writers)
+		relentry->updated_cols_exact = false;
+
+	if (!fasttrun_stats_entry_usable(relid, relentry, entry, ins_now, upd_now,
 									 del_now, truncdropped_now, pages_now))
 	{
 		fasttrun_xact_mark_dml_plan_dependency(relid);
@@ -3459,8 +4063,23 @@ fasttrun_stats_relid_nblocks_at_commit(const FasttrunStatsRelidEntry *relentry)
 	return smgrnblocks(reln, MAIN_FORKNUM);
 }
 
+/*
+ * Can this relation change a column that the statement did not name?  A BEFORE
+ * ROW trigger may assign to any field of NEW, and a stored generated column is
+ * recomputed outside the target list.  Either makes the per-statement UPDATE
+ * mask an incomplete account of what changed.
+ */
 static bool
-fasttrun_read_pgstat_counters_for_hook(Oid relid,
+fasttrun_relation_has_wide_writers(Relation rel)
+{
+	TupleDesc	tupdesc = RelationGetDescr(rel);
+
+	return rel->rd_rel->relhastriggers ||
+		(tupdesc->constr != NULL && tupdesc->constr->has_generated_stored);
+}
+
+static bool
+fasttrun_read_pgstat_counters_for_hook(Oid relid, bool *wide_writers,
 									   int64 *ins, int64 *upd, int64 *del,
 									   bool *truncdropped, BlockNumber *pages)
 {
@@ -3469,12 +4088,14 @@ fasttrun_read_pgstat_counters_for_hook(Oid relid,
 	bool	have;
 
 	*pages = 0;
+	*wide_writers = false;
 
 	if (fasttrun_in_planner)
 	{
 		slot = fasttrun_freshness_cache_slot(relid);
-		if (slot->counters_cached)
+		if (slot->counters_cached && (upd == NULL || slot->upd_cached))
 		{
+			*wide_writers = slot->wide_writers;
 			*ins = slot->ins;
 			if (upd != NULL)
 				*upd = slot->upd;
@@ -3509,15 +4130,23 @@ fasttrun_read_pgstat_counters_for_hook(Oid relid,
 		 */
 		if (RELKIND_HAS_STORAGE(rel->rd_rel->relkind))
 			*pages = RelationGetNumberOfBlocks(rel);
+		/*
+		 * Re-read in the relation open the freshness path already pays for: a
+		 * trigger created after the last collect must not leave the UPDATE
+		 * mask trusted.
+		 */
+		*wide_writers = fasttrun_relation_has_wide_writers(rel);
 		RelationClose(rel);
 	}
 
 	if (slot != NULL)
 	{
 		slot->counters_cached = true;
+		slot->wide_writers = *wide_writers;
 		slot->have = have;
 		slot->ins = *ins;
 		slot->upd = (upd != NULL) ? *upd : 0;
+		slot->upd_cached = (upd != NULL);
 		slot->del = *del;
 		slot->truncdropped = *truncdropped;
 		slot->pages = *pages;
@@ -3667,6 +4296,8 @@ fasttrun_stats_entry_save_undo(FasttrunStatsEntry *entry)
 	saved->collected_truncdropped = entry->collected_truncdropped;
 	saved->collected_pages = entry->collected_pages;
 	saved->was_usable = entry->was_usable;
+	saved->collect_seq = entry->collect_seq;
+	saved->unsafe = entry->unsafe;
 	saved->state = entry->state;
 	saved->heap_rlb = entry->heap_rlb;
 	saved->heap_rlb_valid = entry->heap_rlb_valid;
@@ -3749,7 +4380,7 @@ fasttrun_stats_set_column_state(Relation rel, AttrNumber attnum, bool inh,
 			fasttrun_xact_mark_relid(relid, relid,
 									FASTTRUN_TOUCH_PLAN_INVALIDATE);
 
-		if (old_candidate != new_candidate)
+		if (old_candidate || new_candidate)
 		{
 			relentry = (FasttrunStatsRelidEntry *)
 				hash_search(fasttrun_stats_relid_cache, &relid,
@@ -3786,6 +4417,16 @@ fasttrun_stats_set_column_state(Relation rel, AttrNumber attnum, bool inh,
 		entry->heap_rlb_valid = true;
 		entry->state_subid = cur_subid;
 		entry->was_usable = new_candidate;
+		/*
+		 * Stamp the sample with the relation's current collect period.  A
+		 * non-candidate carries no sample and is never asked, so leaving its
+		 * old stamp alone is harmless.
+		 */
+		if (relentry != NULL)
+		{
+			entry->collect_seq = relentry->collect_seq;
+			entry->unsafe = relentry->period_unsafe;
+		}
 		if (snapshot != NULL)
 		{
 			entry->collected_ins = snapshot->inserted;
@@ -3880,6 +4521,8 @@ fasttrun_stats_forget_relid(Oid relid)
 			heap_freetuple(entry->statsTuple);
 		(void) hash_search(fasttrun_stats_cache, key, HASH_REMOVE, NULL);
 	}
+	bms_free(relentry->updated_cols);
+	relentry->updated_cols = NULL;
 	list_free_deep(relentry->attkeys);
 	fasttrun_stats_relid_free_undo(relentry);
 	(void) hash_search(fasttrun_stats_relid_cache, &relid, HASH_REMOVE, NULL);
@@ -4012,6 +4655,8 @@ fasttrun_stats_cache_commit_xact(void)
 					heap_freetuple(entry->statsTuple);
 				(void) hash_search(fasttrun_stats_cache, &key, HASH_REMOVE, NULL);
 			}
+			bms_free(relentry->updated_cols);
+			relentry->updated_cols = NULL;
 			list_free_deep(relentry->attkeys);
 			fasttrun_stats_relid_free_undo(relentry);
 			(void) hash_search(fasttrun_stats_relid_cache, &relid,
@@ -4097,7 +4742,7 @@ fasttrun_stats_cache_commit_xact(void)
 			 * without one smgrnblocks probe per analyzed relation.
 			 */
 			if (!have_counters ||
-				!fasttrun_stats_entry_usable(relid, entry, ins_now, upd_now,
+				!fasttrun_stats_entry_usable(relid, relentry, entry, ins_now, upd_now,
 										 del_now, truncdropped_now,
 										 entry->collected_pages))
 			{
@@ -4380,7 +5025,7 @@ fasttrun_stats_note_visibility(Oid relid, bool have_counters,
 
 		/* The planner hook hides stats when pgstat is unavailable too. */
 		usable_now = have_counters &&
-			fasttrun_stats_entry_usable_ext(relid, entry, ins_now, upd_now,
+			fasttrun_stats_entry_usable_ext(relid, relentry, entry, ins_now, upd_now,
 											del_now, truncdropped_now,
 											pages_now, &rel_baseline);
 		if (entry->was_usable && !usable_now)
@@ -4429,6 +5074,10 @@ fasttrun_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 
 	if (event != SUBXACT_EVENT_ABORT_SUB && event != SUBXACT_EVENT_COMMIT_SUB)
 		return;
+
+	if (fasttrun_in_flight_used > 0)
+		fasttrun_stats_in_flight_subxact_end(mySubid, parentSubid,
+										 event == SUBXACT_EVENT_ABORT_SUB);
 
 	/*
 	 * Hot-path shortcut.  When no fasttrun cache mutation happened anywhere
@@ -4534,6 +5183,8 @@ fasttrun_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 							sentry->collected_truncdropped = popped->collected_truncdropped;
 							sentry->collected_pages = popped->collected_pages;
 							sentry->was_usable = popped->was_usable;
+							sentry->collect_seq = popped->collect_seq;
+							sentry->unsafe = popped->unsafe;
 							sentry->state = popped->state;
 							sentry->heap_rlb = popped->heap_rlb;
 							sentry->heap_rlb_valid = popped->heap_rlb_valid;
@@ -4753,7 +5404,7 @@ fasttrun_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 			fasttrun_stats_cache_reset();
 
 		fasttrun_xact_frame = frame->parent;
-		MemoryContextDelete(frame->mcxt);
+		fasttrun_xact_frame_release(frame);
 	}
 	else if (frame->parent == NULL || frame->parent->subid != parentSubid)
 	{
@@ -4772,7 +5423,7 @@ fasttrun_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 		while ((xentry = (FasttrunXactRelEntry *) hash_seq_search(&status)) != NULL)
 			fasttrun_xact_merge_entry(parent, xentry);
 		fasttrun_xact_frame = parent;
-		MemoryContextDelete(frame->mcxt);
+		fasttrun_xact_frame_release(frame);
 	}
 }
 
@@ -5329,6 +5980,8 @@ fasttrun_collect_and_store(Relation rel, HeapTuple *sample, int sample_count,
 
 	if (sample_count <= 0)
 		return result;
+
+	fasttrun_stats_begin_collect_period(rel);
 
 	/*
 	 * Physical block count at collect time: the freshness check anchors to it
@@ -9104,6 +9757,10 @@ fasttrun_evict_utility_caches(Node *parsetree)
 				fasttrun_evict_rangevar(stmt->relation);
 				break;
 			}
+		case T_CreateTrigStmt:
+			fasttrun_stats_note_wide_writer_ddl(
+				((CreateTrigStmt *) parsetree)->relation);
+			break;
 		case T_TruncateStmt:
 			{
 				TruncateStmt *stmt = (TruncateStmt *) parsetree;
@@ -9142,21 +9799,30 @@ fasttrun_evict_utility_caches(Node *parsetree)
 	}
 }
 
-static void
+/*
+ * COPY ... FROM writes rows without going through the executor, so nothing else
+ * records it.  Return its target so the caller can count it as a running writer
+ * for the duration: a collect called from a COPY expression scans on the same
+ * command's snapshot and cannot see the rows the counters already hold.
+ */
+static Oid
 fasttrun_mark_copy_from(Node *parsetree)
 {
 	CopyStmt   *stmt;
 	Oid			relid;
 
-	if (fasttrun_stats_relid_cache == NULL ||
-		parsetree == NULL || !IsA(parsetree, CopyStmt))
-		return;
+	if (parsetree == NULL || !IsA(parsetree, CopyStmt))
+		return InvalidOid;
 	stmt = (CopyStmt *) parsetree;
 	if (!stmt->is_from || stmt->relation == NULL)
-		return;
+		return InvalidOid;
 	relid = RangeVarGetRelid(stmt->relation, NoLock, true);
-	if (OidIsValid(relid) && fasttrun_stats_relid_exists(relid))
+	if (!OidIsValid(relid))
+		return InvalidOid;
+	if (fasttrun_stats_relid_cache != NULL &&
+		fasttrun_stats_relid_exists(relid))
 		fasttrun_xact_mark_relid(relid, relid, FASTTRUN_TOUCH_DML);
+	return relid;
 }
 
 /*
@@ -9207,6 +9873,7 @@ fasttrun_utility_hook(PlannedStmt *pstmt,
 	List   *analyze_targets = NIL;
 	List   *rewrite_relids = NIL;
 	bool	discard_session_state = false;
+	Oid		copy_relid = InvalidOid;
 
 	fasttrun_poison_check_utility(parsetree);
 	if (IsA(parsetree, DiscardStmt))
@@ -9274,7 +9941,9 @@ fasttrun_utility_hook(PlannedStmt *pstmt,
 		}
 	}
 
-	fasttrun_mark_copy_from(parsetree);
+	copy_relid = fasttrun_mark_copy_from(parsetree);
+	if (OidIsValid(copy_relid))
+		fasttrun_stats_update_in_flight(copy_relid, 1);
 	fasttrun_prepare_utility_handoff(parsetree, &analyze_targets,
 									 &rewrite_relids);
 	fasttrun_evict_utility_caches(parsetree);
@@ -9286,6 +9955,9 @@ fasttrun_utility_hook(PlannedStmt *pstmt,
 	else
 		standard_ProcessUtility(pstmt, queryString, readOnlyTree, context,
 								params, queryEnv, dest, qc);
+
+	if (OidIsValid(copy_relid))
+		fasttrun_stats_update_in_flight(copy_relid, -1);
 
 	/* An ERROR above leaves every registry unchanged. */
 	if (discard_session_state)
@@ -9863,6 +10535,37 @@ _PG_init(void)
 	 */
 	RegisterXactCallback(fasttrun_xact_callback, NULL);
 	RegisterSubXactCallback(fasttrun_subxact_callback, NULL);
+
+	/*
+	 * The executor hooks go in here, not with the lazily installed stats
+	 * hooks.  A statement's start is the only moment its target list can be
+	 * read, and the first collect of a backend can happen from inside a
+	 * running UPDATE -- by then a lazily installed hook has already missed
+	 * that start.  The hook itself leaves a plain SELECT after one branch.
+	 *
+	 * A library loaded on first use is already too late for the statements
+	 * running above it, and nothing recovers them afterwards, so that backend
+	 * does without the per-column account entirely.
+	 */
+	prev_ExecutorStart = ExecutorStart_hook;
+	ExecutorStart_hook = fasttrun_executor_start;
+	prev_ExecutorEnd = ExecutorEnd_hook;
+	ExecutorEnd_hook = fasttrun_executor_end;
+	fasttrun_executor_hook_installed = true;
+
+	/*
+	 * Preloading runs before the session executes anything, so neither a portal
+	 * nor a snapshot is set yet -- measured for shared_preload_libraries and
+	 * for session_preload_libraries alike, even though the latter does run
+	 * inside the startup transaction.  What matters is the writer that could
+	 * be running above us: to write it needs a snapshot, and the paths that
+	 * reach the executor without a portal set one before they get there -- a
+	 * login event trigger, a logical replication apply worker, a fastpath
+	 * function call.  So either mark here means something may already be
+	 * running and its start was missed; only the absence of both is taken as
+	 * proof of an early load.
+	 */
+	fasttrun_lazy_loaded = (ActiveSnapshotSet() || ActivePortal != NULL);
 
 	/*
 	 * Planner/stats hooks are installed lazily on first use of the local

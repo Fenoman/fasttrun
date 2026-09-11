@@ -2,10 +2,20 @@
 -- fasttrun_stats — статистика по колонкам, локальная для сессии
 -- (через get_relation_stats_hook), без записи в pg_statistic.
 --
--- ВАЖНО: статистика живёт только в пределах одной транзакции (callback
--- границы транзакции чистит хэш-таблицу на commit/abort), поэтому все
--- секции, где нужно наблюдать действие кэша, обёрнуты в BEGIN/COMMIT.
+-- ВАЖНО: собранная статистика переживает commit и живёт до конца сеанса.
+-- Транзакционный callback на commit снимает только привязку к счётчикам
+-- транзакции, а на abort откатывает изменения этой транзакции. В BEGIN/COMMIT
+-- обёрнуты те секции, где важна граница транзакции сама по себе.
 --
+
+/*
+ * Поколоночный учёт UPDATE работает только там, где библиотека предзагружена:
+ * иначе операторы, начавшиеся до её загрузки, остались невидимыми, и учёт
+ * выключается на весь сеанс. Набор поднимает предзагрузку для своей базы и
+ * переподключается, а в конце возвращает всё как было.
+ */
+ALTER DATABASE :DBNAME SET session_preload_libraries = 'fasttrun';
+\connect -
 
 CREATE EXTENSION fasttrun;
 
@@ -2108,5 +2118,730 @@ DROP TABLE t44_fill;
 DROP TABLE t44_b;
 DROP TABLE t44_b2;
 DROP TABLE t44_c;
+-- ----------------------------------------------------------------------
+-- 45. UPDATE непричастной колонки не гасит статистику остальных.
+--     pgstat считает tuples_updated по отношению целиком, поэтому без учёта
+--     реально записанных колонок обогащающий UPDATE ослеплял планировщик на
+--     ключах соединения, которых он не касался.
+-- ----------------------------------------------------------------------
+CREATE TEMP TABLE t_col_churn (id int, grp int, note text);
+INSERT INTO t_col_churn SELECT g, g % 100, 'x' FROM generate_series(1, 100000) g;
+BEGIN;
+SELECT fasttrun_collect_stats('t_col_churn');
+UPDATE t_col_churn SET note = 'y';          -- вся таблица, но колонка id не тронута
+DO $$
+DECLARE ln text; est int := NULL;
+BEGIN
+  FOR ln IN EXPLAIN SELECT * FROM t_col_churn WHERE id = 1 LOOP
+    IF ln ~ 'on t_col_churn' THEN
+      est := substring(ln FROM 'rows=(\d+)')::int;
+      EXIT;
+    END IF;
+  END LOOP;
+  IF est IS NULL OR est > 10 THEN
+    RAISE EXCEPTION 'UPDATE of another column hid the statistics of id: est=%', est;
+  END IF;
+END$$;
+SELECT 'untouched_column_stats_kept' AS marker;
+UPDATE t_col_churn SET id = 1;              -- теперь пишем именно в id
+DO $$
+DECLARE ln text; est int := NULL;
+BEGIN
+  FOR ln IN EXPLAIN SELECT * FROM t_col_churn WHERE id = 1 LOOP
+    IF ln ~ 'on t_col_churn' THEN
+      est := substring(ln FROM 'rows=(\d+)')::int;
+      EXIT;
+    END IF;
+  END LOOP;
+  IF est IS NULL OR est < 100 THEN
+    RAISE EXCEPTION 'UPDATE of id kept its own statistics: est=%', est;
+  END IF;
+END$$;
+SELECT 'touched_column_stats_hidden' AS marker;
+COMMIT;
+DROP TABLE t_col_churn;
+
+-- ----------------------------------------------------------------------
+-- 46. Маска UPDATE достоверна не всегда, и там где она недостоверна,
+--     статистика обязана прятаться, как до появления поколоночного учёта.
+--     Общий помощник: оценка строк из EXPLAIN.
+-- ----------------------------------------------------------------------
+CREATE FUNCTION ft_rows_est(q text, pat text) RETURNS int LANGUAGE plpgsql AS $ft$
+DECLARE ln text; est int := NULL;
+BEGIN
+  FOR ln IN EXECUTE 'EXPLAIN ' || q LOOP
+    IF ln ~ pat THEN est := substring(ln FROM 'rows=(\d+)')::int; EXIT; END IF;
+  END LOOP;
+  RETURN est;
+END$ft$;
+
+-- 46a. Откат savepoint возвращает образец прошлого периода сбора. Маска была
+--      очищена тем пересбором и о старом образце ничего не знает.
+CREATE TEMP TABLE t_seq_rollback (id int, note text);
+INSERT INTO t_seq_rollback SELECT g, 'x' FROM generate_series(1, 100000) g;
+SELECT fasttrun_collect_stats('t_seq_rollback');
+BEGIN;
+UPDATE t_seq_rollback SET id = 1;
+SAVEPOINT s;
+SELECT fasttrun_collect_stats('t_seq_rollback');
+ROLLBACK TO s;
+UPDATE t_seq_rollback SET note = 'y';
+SELECT ft_rows_est('SELECT * FROM t_seq_rollback WHERE id = 1', 'on t_seq_rollback')
+       >= 100 AS rollback_sample_not_trusted;
+COMMIT;
+DROP TABLE t_seq_rollback;
+
+-- 46b. То же через RELEASE вложенного savepoint и откат внешнего.
+CREATE TEMP TABLE t_seq_release (id int, note text);
+INSERT INTO t_seq_release SELECT g, 'x' FROM generate_series(1, 100000) g;
+SELECT fasttrun_collect_stats('t_seq_release');
+BEGIN;
+-- Повреждающий UPDATE ВНЕ отката: после ROLLBACK TO данные остаются
+-- испорченными, а восстановленный образец описывает прежнюю уникальность.
+UPDATE t_seq_release SET id = 1;
+SAVEPOINT outer_sp;
+SAVEPOINT inner_sp;
+SELECT fasttrun_collect_stats('t_seq_release');
+RELEASE inner_sp;
+ROLLBACK TO outer_sp;
+UPDATE t_seq_release SET note = 'y';
+SELECT ft_rows_est('SELECT * FROM t_seq_release WHERE id = 1', 'on t_seq_release')
+       >= 100 AS release_then_rollback_not_trusted;
+COMMIT;
+DROP TABLE t_seq_release;
+
+-- 46c. BEFORE UPDATE пишет в колонку, которой нет в списке SET.
+CREATE TEMP TABLE t_seq_trigger (id int, note text);
+INSERT INTO t_seq_trigger SELECT g, 'x' FROM generate_series(1, 100000) g;
+CREATE FUNCTION t_seq_trigger_fn() RETURNS trigger LANGUAGE plpgsql AS $tf$
+BEGIN NEW.id := 1; RETURN NEW; END $tf$;
+CREATE TRIGGER t_seq_trigger_bu BEFORE UPDATE ON t_seq_trigger
+  FOR EACH ROW EXECUTE FUNCTION t_seq_trigger_fn();
+SELECT fasttrun_collect_stats('t_seq_trigger');
+UPDATE t_seq_trigger SET note = 'y';
+SELECT ft_rows_est('SELECT * FROM t_seq_trigger WHERE id = 1', 'on t_seq_trigger')
+       >= 100 AS before_trigger_not_trusted;
+DROP TABLE t_seq_trigger;
+DROP FUNCTION t_seq_trigger_fn();
+
+-- 46d. Stored generated column пересчитывается вне списка SET.
+CREATE TEMP TABLE t_seq_generated (src int, note text,
+                                   gen int GENERATED ALWAYS AS (src) STORED);
+INSERT INTO t_seq_generated (src, note) SELECT g, 'x' FROM generate_series(1, 100000) g;
+SELECT fasttrun_collect_stats('t_seq_generated');
+-- до UPDATE gen уникальна, оценка обязана быть маленькой
+SELECT ft_rows_est('SELECT * FROM t_seq_generated WHERE gen = 1', 'on t_seq_generated')
+       <= 10 AS generated_column_unique_before;
+UPDATE t_seq_generated SET src = 1;
+-- gen пересчиталась вне списка SET: все 100 000 строк стали одинаковыми
+SELECT ft_rows_est('SELECT * FROM t_seq_generated WHERE gen = 1', 'on t_seq_generated')
+       >= 100 AS generated_column_not_trusted;
+DROP TABLE t_seq_generated;
+
+-- 46e. UPDATE наследника через родителя: у child RTE нет своей permission
+--      information, поэтому какие колонки пишутся — неизвестно. Первый UPDATE
+--      специально оставляет непустую маску, чтобы она не сошла за доказательство.
+CREATE TEMP TABLE t_seq_parent (id int, note text);
+CREATE TEMP TABLE t_seq_child () INHERITS (t_seq_parent);
+INSERT INTO t_seq_child SELECT g, 'x' FROM generate_series(1, 100000) g;
+SELECT fasttrun_collect_stats('t_seq_child');
+UPDATE ONLY t_seq_child SET note = 'y' WHERE false;
+UPDATE t_seq_parent SET id = 1;
+SELECT ft_rows_est('SELECT * FROM t_seq_child WHERE id = 1', 'on t_seq_child')
+       >= 100 AS inherited_update_not_trusted;
+DROP TABLE t_seq_child;
+DROP TABLE t_seq_parent;
+
+-- 46f. Та же связка, что в 45, но с analyze-baseline: проверяется не только
+--      ветка скрытия, но и пороговая арифметика.
+CREATE TEMP TABLE t_seq_analyze (id int, grp int, note text);
+INSERT INTO t_seq_analyze SELECT g, g % 100, 'x' FROM generate_series(1, 100000) g;
+SELECT fasttrun_analyze('t_seq_analyze');
+UPDATE t_seq_analyze SET note = 'y';
+SELECT ft_rows_est('SELECT * FROM t_seq_analyze WHERE id = 1', 'on t_seq_analyze')
+       <= 10 AS untouched_column_kept_with_baseline;
+UPDATE t_seq_analyze SET id = 1;
+SELECT ft_rows_est('SELECT * FROM t_seq_analyze WHERE id = 1', 'on t_seq_analyze')
+       >= 100 AS touched_column_hidden_with_baseline;
+DROP TABLE t_seq_analyze;
+
+-- 46g. Триггер, созданный ПОСЛЕ пересбора: на момент сбора отношение выглядело
+--      безопасным, поэтому флаг достоверности перечитывается на каждом плане.
+CREATE TEMP TABLE t_seq_late_trigger (id int, note text);
+INSERT INTO t_seq_late_trigger SELECT g, 'x' FROM generate_series(1, 100000) g;
+SELECT fasttrun_collect_stats('t_seq_late_trigger');
+CREATE FUNCTION t_seq_late_trigger_fn() RETURNS trigger LANGUAGE plpgsql AS $lt$
+BEGIN NEW.id := 1; RETURN NEW; END $lt$;
+CREATE TRIGGER t_seq_late_trigger_bu BEFORE UPDATE ON t_seq_late_trigger
+  FOR EACH ROW EXECUTE FUNCTION t_seq_late_trigger_fn();
+UPDATE t_seq_late_trigger SET note = 'y';
+SELECT ft_rows_est('SELECT * FROM t_seq_late_trigger WHERE id = 1', 'on t_seq_late_trigger')
+       >= 100 AS late_trigger_not_trusted;
+DROP TABLE t_seq_late_trigger;
+DROP FUNCTION t_seq_late_trigger_fn();
+
+-- 46h. Пересбор из выражения уже начатого UPDATE: маска, оставленная этим же
+--      оператором, снимается, а дописывать строки он будет уже после выборки.
+CREATE TEMP TABLE t_seq_active (id int, note text);
+INSERT INTO t_seq_active SELECT g, 'x' FROM generate_series(1, 100000) g;
+SELECT fasttrun_collect_stats('t_seq_active');
+BEGIN;
+UPDATE t_seq_active SET id = (SELECT 1 FROM fasttrun_collect_stats('t_seq_active'));
+UPDATE t_seq_active SET note = 'y' WHERE false;
+SELECT ft_rows_est('SELECT * FROM t_seq_active WHERE id = 1', 'on t_seq_active')
+       >= 100 AS collect_inside_update_not_trusted;
+ROLLBACK;
+DROP TABLE t_seq_active;
+
+-- 46i. Позитивная проверка клейма: повторный пересбор без DML между ними
+--      переклеймляет все образцы, и UPDATE соседней колонки их не гасит.
+CREATE TEMP TABLE t_seq_recollect (id int, note text);
+INSERT INTO t_seq_recollect SELECT g, 'x' FROM generate_series(1, 100000) g;
+SELECT fasttrun_collect_stats('t_seq_recollect');
+SELECT fasttrun_collect_stats('t_seq_recollect');
+UPDATE t_seq_recollect SET note = 'y';
+SELECT ft_rows_est('SELECT * FROM t_seq_recollect WHERE id = 1', 'on t_seq_recollect')
+       <= 10 AS recollected_sample_still_trusted;
+DROP TABLE t_seq_recollect;
+
+-- 46j. Пересбор, пропускающий ранее собранную колонку: json берёт только
+--      полный сборщик, облегчённому нужен btree-компаратор.
+CREATE TEMP TABLE t_seq_skip (id int, j json);
+INSERT INTO t_seq_skip SELECT g, '{"a":1}'::json FROM generate_series(1, 100000) g;
+BEGIN;
+SET LOCAL fasttrun.use_typanalyze = on;
+SELECT fasttrun_collect_stats('t_seq_skip');
+UPDATE t_seq_skip SET j = NULL;
+SET LOCAL fasttrun.use_typanalyze = off;
+SELECT fasttrun_collect_stats('t_seq_skip');
+UPDATE t_seq_skip SET id = id;
+SELECT ft_rows_est('SELECT * FROM t_seq_skip WHERE j IS NULL', 'on t_seq_skip')
+       >= 100 AS skipped_column_not_trusted;
+COMMIT;
+DROP TABLE t_seq_skip;
+
+-- 46k. Пороговая арифметика: у почти уникальной колонки допуск 5%, поэтому
+--      UPDATE на 2% статистику сохраняет, а накопленный сверх порога — гасит.
+CREATE TEMP TABLE t_seq_threshold (id int, note text);
+INSERT INTO t_seq_threshold SELECT g, 'x' FROM generate_series(1, 100000) g;
+SELECT fasttrun_analyze('t_seq_threshold');
+UPDATE t_seq_threshold SET id = id WHERE id <= 2000;
+SELECT ft_rows_est('SELECT * FROM t_seq_threshold WHERE id = 1', 'on t_seq_threshold')
+       <= 10 AS below_threshold_kept;
+UPDATE t_seq_threshold SET id = id WHERE id <= 30000;
+SELECT ft_rows_est('SELECT * FROM t_seq_threshold WHERE id = 1', 'on t_seq_threshold')
+       >= 100 AS above_threshold_hidden;
+DROP TABLE t_seq_threshold;
+
+-- 46l. Два пересбора внутри одного действующего UPDATE. Каждый снимает маску,
+--      оставленную этим же оператором, а строки он допишет уже после выборки.
+CREATE TEMP TABLE t_seq_two_collects (id int, note text);
+INSERT INTO t_seq_two_collects SELECT g, 'x' FROM generate_series(1, 100000) g;
+SELECT fasttrun_collect_stats('t_seq_two_collects');
+BEGIN;
+UPDATE t_seq_two_collects SET id = (SELECT 1 FROM fasttrun_collect_stats('t_seq_two_collects'))
+  WHERE (SELECT true FROM fasttrun_collect_stats('t_seq_two_collects'));
+UPDATE t_seq_two_collects SET note = 'y' WHERE false;
+SELECT ft_rows_est('SELECT * FROM t_seq_two_collects WHERE id = 1', 'on t_seq_two_collects')
+       >= 100 AS two_collects_inside_update_not_trusted;
+ROLLBACK;
+DROP TABLE t_seq_two_collects;
+
+-- 46m. Первый пересбор отношения, за которым расширение ещё не следит, изнутри
+--      действующего UPDATE. Учёт начатых операторов ведётся и для таких
+--      отношений, иначе самый первый образец сходит за достоверный.
+CREATE TEMP TABLE t_seq_first_collect (id int, note text);
+INSERT INTO t_seq_first_collect SELECT g, 'x' FROM generate_series(1, 100000) g;
+BEGIN;
+UPDATE t_seq_first_collect SET id = (SELECT 1 FROM fasttrun_collect_stats('t_seq_first_collect'));
+UPDATE t_seq_first_collect SET note = 'y' WHERE false;
+SELECT ft_rows_est('SELECT * FROM t_seq_first_collect WHERE id = 1', 'on t_seq_first_collect')
+       >= 100 AS first_collect_inside_update_not_trusted;
+ROLLBACK;
+DROP TABLE t_seq_first_collect;
+
+-- 46n. Пересбор наследника изнутри UPDATE через родителя: цель оператора —
+--      таблица-наследник, и её начатый UPDATE обязан считаться так же.
+CREATE TEMP TABLE t_seq_inh_parent (id int, note text);
+CREATE TEMP TABLE t_seq_inh_child () INHERITS (t_seq_inh_parent);
+INSERT INTO t_seq_inh_child SELECT g, 'x' FROM generate_series(1, 100000) g;
+SELECT fasttrun_collect_stats('t_seq_inh_child');
+BEGIN;
+UPDATE t_seq_inh_parent SET id = (SELECT 1 FROM fasttrun_collect_stats('t_seq_inh_child'));
+UPDATE ONLY t_seq_inh_child SET note = 'y' WHERE false;
+SELECT ft_rows_est('SELECT * FROM t_seq_inh_child WHERE id = 1', 'on t_seq_inh_child')
+       >= 100 AS collect_inside_inherited_update_not_trusted;
+ROLLBACK;
+DROP TABLE t_seq_inh_child;
+DROP TABLE t_seq_inh_parent;
+
+-- 46o. Поздний триггер и завершённая транзакция. Признак снимает сам оператор
+--      CREATE TRIGGER, заблаговременно: после COMMIT счётчиков уже нет, и
+--      доказать по ним ничего нельзя.
+CREATE TEMP TABLE t_seq_commit_trigger (id int, note text);
+INSERT INTO t_seq_commit_trigger SELECT g, 'x' FROM generate_series(1, 100000) g;
+SELECT fasttrun_analyze('t_seq_commit_trigger');
+CREATE FUNCTION t_seq_commit_trigger_fn() RETURNS trigger LANGUAGE plpgsql AS $ct$
+BEGIN NEW.id := 1; RETURN NEW; END $ct$;
+CREATE TRIGGER t_seq_commit_trigger_bu BEFORE UPDATE ON t_seq_commit_trigger
+  FOR EACH ROW EXECUTE FUNCTION t_seq_commit_trigger_fn();
+BEGIN;
+UPDATE t_seq_commit_trigger SET note = 'y';
+COMMIT;
+SELECT ft_rows_est('SELECT * FROM t_seq_commit_trigger WHERE id = 1', 'on t_seq_commit_trigger')
+       >= 100 AS late_trigger_after_commit_not_trusted;
+DROP TABLE t_seq_commit_trigger;
+DROP FUNCTION t_seq_commit_trigger_fn();
+
+-- 46p. Рабочий цикл целиком, три раза подряд: учёт начатых операторов не должен
+--      отбирать выигрыш у обычной последовательности «очистка — набор — анализ —
+--      UPDATE служебной колонки — запрос по ключу».
+CREATE TEMP TABLE t_seq_cycle (id int, grp int, f_units int, note text);
+DO $cy$
+DECLARE i int; est int;
+BEGIN
+  FOR i IN 1..3 LOOP
+    PERFORM fasttruncate('t_seq_cycle');
+    INSERT INTO t_seq_cycle SELECT g, g % 100, 0, repeat('x', 40)
+      FROM generate_series(1, 100000) g;
+    PERFORM fasttrun_analyze('t_seq_cycle');
+    UPDATE t_seq_cycle SET f_units = 7;
+    est := ft_rows_est('SELECT * FROM t_seq_cycle WHERE id = 1', 'on t_seq_cycle');
+    IF est > 10 THEN
+      RAISE EXCEPTION 'цикл %: оценка % вместо единиц', i, est;
+    END IF;
+  END LOOP;
+  RAISE NOTICE 'work cycle estimate survived three rounds';
+END$cy$;
+DROP TABLE t_seq_cycle;
+
+-- 46q. Маска столбцов лежит в собственном контексте расширения и переживает
+--      транзакцию. Отношение, покидающее кэш, обязано её освобождать: иначе
+--      каждый рабочий цикл оставляет за собой битовую карту, а у длинного
+--      сеанса таких циклов много. Вторая собранная таблица держит контекст,
+--      чтобы измерялся рост, а не создание контекста заново.
+CREATE TEMP TABLE t_seq_mask_anchor (id int);
+INSERT INTO t_seq_mask_anchor SELECT g FROM generate_series(1, 1000) g;
+SELECT fasttrun_collect_stats('t_seq_mask_anchor') IS NOT NULL AS mask_anchor_collected;
+SELECT 'CREATE TEMP TABLE t_seq_mask_wide (' || string_agg(format('c%s int', i), ', ') || ')'
+  FROM generate_series(1, 1600) i \gexec
+INSERT INTO t_seq_mask_wide (c1, c1600) SELECT g, g FROM generate_series(1, 10) g;
+-- один прогревающий цикл: дальше размер контекста уже установившийся
+SELECT fasttrun_collect_stats('t_seq_mask_wide') IS NOT NULL AS mask_wide_collected;
+UPDATE t_seq_mask_wide SET c1600 = 1 WHERE false;
+ANALYZE t_seq_mask_wide;
+SELECT sum(used_bytes) AS mask_bytes_before FROM pg_backend_memory_contexts
+ WHERE name = 'fasttrun stats cache' \gset
+/* отношение покидает кэш только на COMMIT: до него передача ядру лишь меняет
+   правило, а запись остаётся на месте, и маску снял бы очередной пересбор */
+CREATE PROCEDURE t_seq_mask_cycles(n int) LANGUAGE plpgsql AS $mk$
+DECLARE i int;
+BEGIN
+  FOR i IN 1..n LOOP
+    PERFORM fasttrun_collect_stats('t_seq_mask_wide');
+    UPDATE t_seq_mask_wide SET c1600 = 1 WHERE false;
+    ANALYZE t_seq_mask_wide;
+    COMMIT;
+  END LOOP;
+END$mk$;
+CALL t_seq_mask_cycles(128);
+-- потерянная маска колонки 1600 весит 264 байта, 128 циклов дали бы 33 КиБ
+SELECT sum(used_bytes) - :mask_bytes_before < 8192 AS mask_freed_when_relation_leaves_cache
+  FROM pg_backend_memory_contexts WHERE name = 'fasttrun stats cache';
+DROP PROCEDURE t_seq_mask_cycles(int);
+DROP TABLE t_seq_mask_wide;
+DROP TABLE t_seq_mask_anchor;
+
+-- 46r. Порог у почти уникальной колонки — ровно 5% строк, и доля считается
+--      накопленно от последнего пересбора, а не по одному оператору.
+--      Счётчики привязаны к транзакции, поэтому накопление живёт внутри неё.
+CREATE TEMP TABLE t_seq_edge (id int, note text);
+INSERT INTO t_seq_edge SELECT g, 'x' FROM generate_series(1, 100000) g;
+SELECT fasttrun_analyze('t_seq_edge');
+BEGIN;
+UPDATE t_seq_edge SET id = id WHERE id <= 4900;
+SELECT ft_rows_est('SELECT * FROM t_seq_edge WHERE id = 1', 'on t_seq_edge')
+       <= 10 AS just_below_threshold_kept;
+UPDATE t_seq_edge SET id = id WHERE id > 4900 AND id <= 5000;
+SELECT ft_rows_est('SELECT * FROM t_seq_edge WHERE id = 1', 'on t_seq_edge')
+       >= 100 AS exactly_at_threshold_hidden;
+UPDATE t_seq_edge SET id = id WHERE id > 5000 AND id <= 5100;
+SELECT ft_rows_est('SELECT * FROM t_seq_edge WHERE id = 1', 'on t_seq_edge')
+       >= 100 AS just_above_threshold_hidden;
+COMMIT;
+DROP TABLE t_seq_edge;
+
+-- 46s. INSERT ... ON CONFLICT DO UPDATE — отдельный вход в учёт колонок:
+--      названная в DO UPDATE гаснет, соседняя обязана уцелеть.
+CREATE TEMP TABLE t_seq_upsert (id int PRIMARY KEY, grp int, note text);
+INSERT INTO t_seq_upsert SELECT g, g % 10, 'x' FROM generate_series(1, 100000) g;
+SELECT fasttrun_analyze('t_seq_upsert');
+INSERT INTO t_seq_upsert SELECT g, 1, 'z' FROM generate_series(1, 100000) g
+  ON CONFLICT (id) DO UPDATE SET grp = excluded.grp;
+SELECT ft_rows_est('SELECT * FROM t_seq_upsert WHERE grp = 1', 'on t_seq_upsert')
+       <= 2000 AS upsert_named_column_hidden;
+SELECT ft_rows_est('SELECT * FROM t_seq_upsert WHERE note = ''x''', 'on t_seq_upsert')
+       >= 100000 AS upsert_other_column_kept;
+DROP TABLE t_seq_upsert;
+
+-- 46t. MERGE ... WHEN MATCHED THEN UPDATE — такой же отдельный вход.
+CREATE TEMP TABLE t_seq_merge (id int, grp int, note text);
+INSERT INTO t_seq_merge SELECT g, g % 10, 'x' FROM generate_series(1, 100000) g;
+SELECT fasttrun_analyze('t_seq_merge');
+CREATE TEMP TABLE t_seq_merge_src (id int);
+INSERT INTO t_seq_merge_src SELECT g FROM generate_series(1, 100000) g;
+SELECT ft_rows_est('SELECT * FROM t_seq_merge WHERE grp = 1', 'on t_seq_merge')
+       >= 5000 AS merge_named_column_before;
+MERGE INTO t_seq_merge USING t_seq_merge_src s ON t_seq_merge.id = s.id
+  WHEN MATCHED THEN UPDATE SET grp = 1;
+SELECT ft_rows_est('SELECT * FROM t_seq_merge WHERE grp = 1', 'on t_seq_merge')
+       <= 2000 AS merge_named_column_hidden;
+DROP TABLE t_seq_merge;
+DROP TABLE t_seq_merge_src;
+
+-- 46u. Доверие к списку колонок снимается и в планировщике. Откат убирает сам
+--      триггер, но доверие не возвращает: потеря идёт в безопасную сторону и
+--      держится только до следующего пересбора.
+CREATE TEMP TABLE t_seq_plan_clear (id int, note text);
+INSERT INTO t_seq_plan_clear SELECT g, 'x' FROM generate_series(1, 100000) g;
+SELECT fasttrun_collect_stats('t_seq_plan_clear');
+CREATE FUNCTION t_seq_plan_clear_fn() RETURNS trigger LANGUAGE plpgsql AS $pc$
+BEGIN NEW.id := 1; RETURN NEW; END $pc$;
+BEGIN;
+SAVEPOINT sp;
+CREATE TRIGGER t_seq_plan_clear_bu BEFORE UPDATE ON t_seq_plan_clear
+  FOR EACH ROW EXECUTE FUNCTION t_seq_plan_clear_fn();
+SELECT ft_rows_est('SELECT * FROM t_seq_plan_clear WHERE id = 1', 'on t_seq_plan_clear')
+       <= 10 AS trigger_alone_hides_nothing;
+ROLLBACK TO sp;
+UPDATE t_seq_plan_clear SET note = 'y';
+SELECT ft_rows_est('SELECT * FROM t_seq_plan_clear WHERE id = 1', 'on t_seq_plan_clear')
+       >= 100 AS planner_clearing_survives_rollback;
+SELECT fasttrun_collect_stats('t_seq_plan_clear');
+UPDATE t_seq_plan_clear SET note = 'z';
+SELECT ft_rows_est('SELECT * FROM t_seq_plan_clear WHERE id = 1', 'on t_seq_plan_clear')
+       <= 10 AS recollect_restores_exact_mask;
+COMMIT;
+DROP TABLE t_seq_plan_clear;
+DROP FUNCTION t_seq_plan_clear_fn();
+
+-- 46v. Оператор, упавший внутри блока EXCEPTION, до конечного хука не доходит.
+--      Его запись обязана уйти вместе с подтранзакцией, иначе все дальнейшие
+--      пересборы этого отношения до конца транзакции идут по осторожному пути.
+CREATE TEMP TABLE t_seq_failed_stmt (id int, note text);
+INSERT INTO t_seq_failed_stmt SELECT g, 'x' FROM generate_series(1, 100000) g;
+BEGIN;
+DO $fs$
+BEGIN
+  /* делитель зависит от строки, поэтому ошибка происходит уже в исполнении:
+     свёртка констант сняла бы оператор до старта и проверять было бы нечего */
+  UPDATE t_seq_failed_stmt SET id = 1 / (id - id);
+EXCEPTION WHEN division_by_zero THEN NULL;
+END$fs$;
+SELECT fasttrun_collect_stats('t_seq_failed_stmt');
+UPDATE t_seq_failed_stmt SET note = 'y';
+SELECT ft_rows_est('SELECT * FROM t_seq_failed_stmt WHERE id = 1', 'on t_seq_failed_stmt')
+       <= 10 AS failed_statement_leaves_no_trace;
+COMMIT;
+DROP TABLE t_seq_failed_stmt;
+
+-- 46w. Обратная сторона: подтранзакция, отменённая внутри действующего UPDATE,
+--      не должна уносить запись самого этого UPDATE.
+CREATE TEMP TABLE t_seq_nested_abort (id int, note text);
+INSERT INTO t_seq_nested_abort SELECT g, 'x' FROM generate_series(1, 100000) g;
+SELECT fasttrun_collect_stats('t_seq_nested_abort');
+CREATE FUNCTION t_seq_nested_abort_fn(t text) RETURNS int LANGUAGE plpgsql AS $na$
+BEGIN
+  BEGIN
+    PERFORM 1 / 0;
+  EXCEPTION WHEN division_by_zero THEN NULL;
+  END;
+  PERFORM fasttrun_collect_stats(t);
+  RETURN 1;
+END$na$;
+BEGIN;
+UPDATE t_seq_nested_abort SET id = (SELECT t_seq_nested_abort_fn('t_seq_nested_abort'));
+UPDATE t_seq_nested_abort SET note = 'y' WHERE false;
+SELECT ft_rows_est('SELECT * FROM t_seq_nested_abort WHERE id = 1', 'on t_seq_nested_abort')
+       >= 100 AS nested_abort_keeps_outer_statement;
+ROLLBACK;
+DROP TABLE t_seq_nested_abort;
+DROP FUNCTION t_seq_nested_abort_fn(text);
+
+-- 46x. Пересбор из выходной части запроса, у которого modifying CTE уже
+--      переписал таблицу. Скан идёт по снимку начала команды и новых версий не
+--      видит, а счётчики рядом уже включают эти записи, поэтому сравнивать
+--      образец не с чем: он не отдаётся до следующего чистого пересбора.
+CREATE TEMP TABLE t_seq_cte (id int, note int);
+INSERT INTO t_seq_cte SELECT g, 0 FROM generate_series(1, 100000) g;
+SELECT fasttrun_collect_stats('t_seq_cte');
+BEGIN;
+WITH u AS (UPDATE t_seq_cte SET id = 1 RETURNING id)
+SELECT count(*) > 0 AS cte_rewrote_everything,
+       fasttrun_collect_stats('t_seq_cte') IS NOT DISTINCT FROM NULL AS cte_collect_ran
+  FROM u;
+SELECT ft_rows_est('SELECT * FROM t_seq_cte WHERE id = 1', 'on t_seq_cte')
+       >= 100 AS collect_under_modifying_cte_not_served;
+ROLLBACK;
+DROP TABLE t_seq_cte;
+
+-- 46y. Обратная сторона учёта по подтранзакциям: вложенный UPDATE того же
+--      отношения упал и был перехвачен, внешний завершился штатно. Записи о
+--      начатых операторах не остаётся, поэтому следующий пересбор снова точен.
+CREATE TEMP TABLE t_seq_nested_err (id int, note int);
+INSERT INTO t_seq_nested_err SELECT g, 0 FROM generate_series(1, 100000) g;
+SELECT fasttrun_collect_stats('t_seq_nested_err');
+CREATE FUNCTION t_seq_nested_err_fn() RETURNS int LANGUAGE plpgsql AS $ne$
+BEGIN
+  BEGIN
+    UPDATE t_seq_nested_err SET note = 1 / (id - id);
+  EXCEPTION WHEN division_by_zero THEN NULL;
+  END;
+  RETURN 7;
+END$ne$;
+BEGIN;
+UPDATE t_seq_nested_err SET note = (SELECT t_seq_nested_err_fn());
+SELECT fasttrun_collect_stats('t_seq_nested_err');
+UPDATE t_seq_nested_err SET note = 8;
+SELECT ft_rows_est('SELECT * FROM t_seq_nested_err WHERE id = 1', 'on t_seq_nested_err')
+       <= 10 AS nested_error_leaves_no_residue;
+COMMIT;
+DROP TABLE t_seq_nested_err;
+DROP FUNCTION t_seq_nested_err_fn();
+
+-- 46z. Реестр начатых операторов конечен. Оператор, у которого целей больше,
+--      чем слотов, переводит весь реестр в осторожный ответ до конца
+--      транзакции, а её граница возвращает обычную работу.
+CREATE TEMP TABLE t_seq_overflow (id int, note int);
+INSERT INTO t_seq_overflow SELECT g, 0 FROM generate_series(1, 100000) g;
+SELECT fasttrun_collect_stats('t_seq_overflow');
+CREATE TEMP TABLE t_seq_many_parent (id int);
+DO $ov$
+DECLARE i int;
+BEGIN
+  FOR i IN 1..20 LOOP
+    EXECUTE format('CREATE TEMP TABLE t_seq_many_c%s () INHERITS (t_seq_many_parent)', i);
+  END LOOP;
+END$ov$;
+BEGIN;
+UPDATE t_seq_many_parent SET id = 1;
+SELECT fasttrun_collect_stats('t_seq_overflow');
+UPDATE t_seq_overflow SET note = 1;
+SELECT ft_rows_est('SELECT * FROM t_seq_overflow WHERE id = 1', 'on t_seq_overflow')
+       >= 100 AS overflow_forces_conservative;
+COMMIT;
+SELECT fasttrun_collect_stats('t_seq_overflow');
+UPDATE t_seq_overflow SET note = 2;
+SELECT ft_rows_est('SELECT * FROM t_seq_overflow WHERE id = 1', 'on t_seq_overflow')
+       <= 10 AS overflow_cleared_at_xact_end;
+DO $ov$
+DECLARE i int;
+BEGIN
+  FOR i IN 1..20 LOOP
+    EXECUTE format('DROP TABLE t_seq_many_c%s', i);
+  END LOOP;
+END$ov$;
+DROP TABLE t_seq_many_parent;
+DROP TABLE t_seq_overflow;
+
+-- 46aa. MERGE: колонка, которую не называет ни одна ветка, обязана уцелеть.
+CREATE TEMP TABLE t_seq_merge_keep (id int, grp int, note text);
+INSERT INTO t_seq_merge_keep SELECT g, g % 10, 'x' FROM generate_series(1, 100000) g;
+SELECT fasttrun_analyze('t_seq_merge_keep');
+CREATE TEMP TABLE t_seq_merge_keep_src (id int);
+INSERT INTO t_seq_merge_keep_src SELECT g FROM generate_series(1, 100000) g;
+MERGE INTO t_seq_merge_keep USING t_seq_merge_keep_src s ON t_seq_merge_keep.id = s.id
+  WHEN MATCHED THEN UPDATE SET grp = 1;
+SELECT ft_rows_est('SELECT * FROM t_seq_merge_keep WHERE id = 1', 'on t_seq_merge_keep')
+       <= 10 AS merge_untouched_column_kept;
+DROP TABLE t_seq_merge_keep;
+DROP TABLE t_seq_merge_keep_src;
+
+-- 46ab. Учёт по колонкам решает «называли или нет», а не «сколько строк по
+--       этой колонке». Пока колонку не называли, чужие UPDATE её не старят;
+--       как только назвали хоть раз, ей засчитывается весь оборот таблицы за
+--       период, включая соседние UPDATE. Граница грубая и в безопасную сторону.
+CREATE TEMP TABLE t_seq_edge_mix (id int, note text);
+INSERT INTO t_seq_edge_mix SELECT g, 'x' FROM generate_series(1, 100000) g;
+SELECT fasttrun_analyze('t_seq_edge_mix');
+BEGIN;
+UPDATE t_seq_edge_mix SET note = 'y';
+SELECT ft_rows_est('SELECT * FROM t_seq_edge_mix WHERE id = 1', 'on t_seq_edge_mix')
+       <= 10 AS big_neighbour_update_alone_kept;
+UPDATE t_seq_edge_mix SET id = id WHERE id <= 100;
+SELECT ft_rows_est('SELECT * FROM t_seq_edge_mix WHERE id = 1', 'on t_seq_edge_mix')
+       >= 100 AS own_tiny_update_charges_whole_period;
+COMMIT;
+SELECT fasttrun_analyze('t_seq_edge_mix');
+UPDATE t_seq_edge_mix SET id = id WHERE id <= 100;
+SELECT ft_rows_est('SELECT * FROM t_seq_edge_mix WHERE id = 1', 'on t_seq_edge_mix')
+       <= 10 AS own_tiny_update_alone_kept;
+DROP TABLE t_seq_edge_mix;
+
+-- 46ac. Запрет принадлежит образцу, а не периоду сбора. Откат savepoint
+--       возвращает образец прошлого периода вместе с его запретом; сам UPDATE
+--       остался вне отката, поэтому данные так и остались переписанными.
+CREATE TEMP TABLE t_seq_undo (id int, note int);
+INSERT INTO t_seq_undo SELECT g, 0 FROM generate_series(1, 100000) g;
+BEGIN;
+/* Запрещённый образец: пересбор идёт из выходной части запроса, чей CTE уже
+   переписал таблицу. Счётчики рядом с образцом включают эти записи, поэтому
+   позже сравнивать будет не с чем -- разница оборота окажется нулевой. */
+WITH w AS (UPDATE t_seq_undo SET id = 1 RETURNING id)
+SELECT count(*) > 0 AS cte_rewrote, fasttrun_collect_stats('t_seq_undo') FROM w;
+/* Чистый пересбор внутри savepoint: писателя нет, период новый и безопасный. */
+SAVEPOINT s;
+SELECT fasttrun_collect_stats('t_seq_undo');
+/* Откат возвращает запрещённый образец прошлого периода. Пометка периода тут
+   уже снята, и удержать образец может только его собственная. */
+ROLLBACK TO s;
+SELECT ft_rows_est('SELECT * FROM t_seq_undo WHERE id = 1', 'on t_seq_undo')
+       >= 100 AS restored_unsafe_sample_stays_forbidden;
+ROLLBACK;
+DROP TABLE t_seq_undo;
+
+-- 46ad. Тот же запрет переживает пересбор, который эту колонку пропустил:
+--       облегчённому сборщику нужен btree-компаратор, а json его не имеет.
+CREATE TEMP TABLE t_seq_skip_unsafe (id int, j json);
+INSERT INTO t_seq_skip_unsafe SELECT g, '{"a":1}'::json FROM generate_series(1, 100000) g;
+BEGIN;
+/* Запрещённый образец json снимается тем же способом -- изнутри запроса, чей
+   CTE уже обнулил колонку. */
+SET LOCAL fasttrun.use_typanalyze = on;
+WITH w AS (UPDATE t_seq_skip_unsafe SET j = NULL RETURNING id)
+SELECT count(*) > 0 AS cte_nulled_json, fasttrun_collect_stats('t_seq_skip_unsafe')
+  FROM w;
+/* Облегчённому сборщику нужен btree-компаратор, а у json его нет: новый период
+   эту колонку пропускает, и запрещённый образец остаётся на месте. */
+SET LOCAL fasttrun.use_typanalyze = off;
+SELECT fasttrun_collect_stats('t_seq_skip_unsafe');
+SELECT ft_rows_est('SELECT * FROM t_seq_skip_unsafe WHERE j IS NULL', 'on t_seq_skip_unsafe')
+       >= 100 AS skipped_unsafe_sample_stays_forbidden;
+ROLLBACK;
+DROP TABLE t_seq_skip_unsafe;
+
+-- 46ae. INSERT и DELETE из modifying CTE меняют таблицу так же незаметно для
+--       выборки, идущей по снимку начала команды, поэтому в учёт начатых
+--       операторов входят все цели DML, а не только пишущие колонки.
+CREATE TEMP TABLE t_seq_cte_ins (id int);
+INSERT INTO t_seq_cte_ins SELECT g FROM generate_series(1, 100000) g;
+SELECT fasttrun_collect_stats('t_seq_cte_ins');
+BEGIN;
+WITH w AS (INSERT INTO t_seq_cte_ins SELECT 1 FROM generate_series(1, 100000) RETURNING id)
+SELECT count(*) > 0 AS cte_inserted, fasttrun_collect_stats('t_seq_cte_ins') FROM w;
+SELECT ft_rows_est('SELECT * FROM t_seq_cte_ins WHERE id = 1', 'on t_seq_cte_ins')
+       >= 100 AS collect_under_modifying_insert_not_served;
+ROLLBACK;
+DROP TABLE t_seq_cte_ins;
+
+CREATE TEMP TABLE t_seq_cte_del (id int);
+INSERT INTO t_seq_cte_del SELECT g FROM generate_series(1, 100000) g;
+SELECT fasttrun_collect_stats('t_seq_cte_del');
+BEGIN;
+WITH w AS (DELETE FROM t_seq_cte_del WHERE id > 1 RETURNING id)
+SELECT count(*) > 0 AS cte_deleted, fasttrun_collect_stats('t_seq_cte_del') FROM w;
+SELECT ft_rows_est('SELECT * FROM t_seq_cte_del WHERE id > 1', 'on t_seq_cte_del')
+       >= 30000 AS collect_under_modifying_delete_not_served;
+ROLLBACK;
+DROP TABLE t_seq_cte_del;
+
+-- 46af. Писатель может успеть завершиться, а выборка всё равно останется на
+--       прежнем снимке: UPDATE внутри функции закончился, реестр пуст, но
+--       внешний снимок его строк не видит. Ловится по возрасту снимка.
+CREATE TEMP TABLE t_seq_spi (id int, note int);
+INSERT INTO t_seq_spi SELECT g, 0 FROM generate_series(1, 100000) g;
+SELECT fasttrun_collect_stats('t_seq_spi');
+CREATE FUNCTION t_seq_spi_fn() RETURNS int LANGUAGE plpgsql AS $sf$
+BEGIN
+  UPDATE t_seq_spi SET id = 1;
+  RETURN 1;
+END$sf$;
+BEGIN;
+WITH w AS MATERIALIZED (SELECT t_seq_spi_fn() AS n)
+SELECT fasttrun_collect_stats('t_seq_spi') FROM w WHERE n = 1;
+SELECT ft_rows_est('SELECT * FROM t_seq_spi WHERE id = 1', 'on t_seq_spi')
+       >= 100 AS collect_after_finished_writer_not_served;
+ROLLBACK;
+DROP TABLE t_seq_spi;
+DROP FUNCTION t_seq_spi_fn();
+
+-- 46ag. Обратная сторона: обычный первый анализ в той же транзакции, где
+--       таблицу создали и наполнили, писателем не считается. Оператор INSERT
+--       завершён, снимок анализа взят после него, и статистика обязана жить.
+BEGIN;
+CREATE TEMP TABLE t_seq_plain_first (id int, note int);
+INSERT INTO t_seq_plain_first SELECT g, 0 FROM generate_series(1, 100000) g;
+SELECT fasttrun_analyze('t_seq_plain_first');
+SELECT ft_rows_est('SELECT * FROM t_seq_plain_first WHERE id = 1', 'on t_seq_plain_first')
+       <= 10 AS first_analyze_in_same_xact_kept;
+UPDATE t_seq_plain_first SET note = 7;
+SELECT ft_rows_est('SELECT * FROM t_seq_plain_first WHERE id = 1', 'on t_seq_plain_first')
+       <= 10 AS first_analyze_survives_neighbour_update;
+COMMIT;
+DROP TABLE t_seq_plain_first;
+
+-- 46ah. COPY пишет строки мимо исполнителя, поэтому его цель отмечается как
+--       идущий писатель отдельно: выборка внутри выражения COPY идёт по снимку
+--       той же команды и уже вставленных строк не видит, а счётчики их держат.
+CREATE TEMP TABLE t_seq_copy (id int);
+INSERT INTO t_seq_copy SELECT generate_series(1, 100000);
+SELECT fasttrun_analyze('t_seq_copy');
+BEGIN;
+COPY t_seq_copy FROM STDIN
+  WHERE CASE WHEN id = 2 THEN fasttrun_collect_stats('t_seq_copy') IS NULL
+             ELSE true END;
+1
+1
+1
+1
+1
+1
+1
+1
+1
+1
+1
+1
+1
+1
+1
+1
+1
+1
+1
+1
+2
+\.
+SELECT ft_rows_est('SELECT * FROM t_seq_copy WHERE id = 1', 'on t_seq_copy')
+       >= 100 AS collect_inside_copy_not_served;
+ROLLBACK;
+DROP TABLE t_seq_copy;
+
+-- 46ai. Обратная сторона: посторонний оператор, сдвинувший номер команды, не
+--       имеет права гасить статистику таблицы, которую никто не трогал.
+CREATE TEMP TABLE t_seq_untouched (id int);
+CREATE TEMP TABLE t_seq_other (n int);
+INSERT INTO t_seq_untouched SELECT generate_series(1, 100000);
+SELECT fasttrun_analyze('t_seq_untouched');
+CREATE FUNCTION t_seq_other_noop() RETURNS int LANGUAGE plpgsql AS $on$
+BEGIN
+  UPDATE t_seq_other SET n = n WHERE false;
+  RETURN 1;
+END$on$;
+BEGIN;
+WITH w AS MATERIALIZED (SELECT t_seq_other_noop() AS n)
+SELECT fasttrun_collect_stats('t_seq_untouched') FROM w WHERE n = 1;
+SELECT ft_rows_est('SELECT * FROM t_seq_untouched WHERE id = 1', 'on t_seq_untouched')
+       <= 10 AS foreign_writer_keeps_untouched_relation;
+COMMIT;
+SELECT ft_rows_est('SELECT * FROM t_seq_untouched WHERE id = 1', 'on t_seq_untouched')
+       <= 10 AS foreign_writer_keeps_after_commit;
+DROP TABLE t_seq_untouched;
+DROP TABLE t_seq_other;
+DROP FUNCTION t_seq_other_noop();
+
+DROP FUNCTION ft_rows_est(text, text);
+
 \pset format aligned
 DROP EXTENSION fasttrun;
+ALTER DATABASE :DBNAME RESET session_preload_libraries;

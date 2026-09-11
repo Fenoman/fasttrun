@@ -361,6 +361,21 @@ def main() -> int:
         require(errors, os.access(prerelease_path, os.X_OK),
                 "scripts/check_fasttrun_prerelease.sh: файл не исполняемый")
 
+    # Обязательный прогон сверяет число пройденных наборов с числом в
+    # Makefile. Хранить его отдельным числом нельзя: добавленный набор тогда
+    # превращает зелёный прогон в «регрессию».
+    cassert = ROOT / "scripts" / "check_cassert_allversions.sh"
+    if cassert.exists():
+        body = cassert.read_text(encoding="utf-8")
+        require(errors,
+                re.search(r"^EXPECTED_REGRESS=\d+\s*$", body, re.MULTILINE) is None,
+                "check_cassert_allversions.sh: EXPECTED_REGRESS задан числом, "
+                "а должен выводиться из Makefile")
+        require(errors,
+                re.search(r"\b\d+/\d+ тестов", body) is None,
+                "check_cassert_allversions.sh: число тестов вшито в текст итога, "
+                "а должно подставляться из EXPECTED_REGRESS")
+
     if errors:
         for error in errors:
             print(error, file=sys.stderr)

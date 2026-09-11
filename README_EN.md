@@ -123,7 +123,7 @@ FROM pg_extension
 WHERE extname = 'fasttrun';
 ```
 
-The default version is `2.4.1`.
+The default version is `2.5.0`.
 
 Instead of a plain `CREATE EXTENSION`, you can install the extension into a
 dedicated schema. Untrusted roles must not be allowed to create objects in the
@@ -444,12 +444,50 @@ can differ. Collection is more expensive than with the default settings.
 `SET LOCAL` prevents the modified parameters from leaking to the next pooler
 client.
 
+`UPDATE` is accounted for per column. pgstat counts changed rows per relation,
+so updating a single helper column used to age the statistics of every other
+column. Wear from an `UPDATE` now applies only to the columns named in `SET`;
+`INSERT` and `DELETE` still apply to all of them.
+
+The account requires a preload: a statement's target list is visible only at its
+start, and the hooks are installed when the library loads.
+
+```
+session_preload_libraries = 'fasttrun'
+```
+
+Without the preload the per-column account is off entirely, wear again applies to
+every column, and the server log gets one line about it per session. The old
+behaviour is **not** restored in full: a sample taken while the relation was
+being written is not served to the planner in either mode until a fresh one
+replaces it. There is nothing to compare it with -- the scan runs on its own
+command's snapshot, while the counters stored beside it already include those
+writes.
+
+For a given relation the account is off until the next collect whenever the
+column list cannot be trusted: the relation has triggers or a stored generated
+column, an `UPDATE` reached an inheritance child through its parent, or the
+column's statistics are older than the last collect.
+
+The list comes from the statement's targets, not from the values it actually
+changed: an `UPDATE` that matched no row still marks its columns, and from then
+on the relation's whole turnover for that period is charged to them.
+
+The price: a bulk `UPDATE` spoils the physical order of rows, so for the
+untouched columns the correlation can end up overstated -- index access looks
+cheaper for them than it is. The number of distinct values, the NULL fraction
+and the MCV list stay correct.
+
 After a small amount of DML, cached statistics can remain visible, just as they
 do between regular runs of `ANALYZE`. When
 `fasttrun.stats_refresh_threshold` is reached, the statistics are rebuilt if
 automatic collection is enabled, `sample_rows` is not zero, and the memory
-limit permits collection. Otherwise, fasttrun hides stale statistics so that
-the planner does not use a distribution known to be outdated.
+limit permits collection. Otherwise, fasttrun hides the statistics so that the
+planner does not use a distribution known to be outdated. This is not a full
+guarantee: the change ratio is measured against the transaction's counters, so
+several sub-threshold transactions in a row can rewrite the relation between
+them without hiding anything. Across a commit only a change in physical size is
+noticed.
 
 `track_counts=on` is required for column-statistics freshness checks and the
 fast delta path. With `off`, fasttrun still updates the table-size estimate by
@@ -787,7 +825,7 @@ After startup or after opening a new connection, run the following in every
 database as the extension owner or a superuser:
 
 ```sql
-ALTER EXTENSION fasttrun UPDATE TO '2.4.1';
+ALTER EXTENSION fasttrun UPDATE TO '2.5.0';
 ```
 
 With physical replication, install the files on standby nodes too, but run
@@ -796,6 +834,21 @@ standbys through normal replication.
 
 This is important for an upgrade from 2.3.4 to 2.4.0: the SQL migration adds a
 function that does not exist in the old C library.
+
+Version 2.5.0 adds per-column accounting of statistics wear: an `UPDATE` of a
+helper column no longer devalues the statistics of the join keys. The 2.4.1 to
+2.5.0 upgrade leaves SQL objects unchanged but **requires a configuration
+change**:
+
+```
+session_preload_libraries = 'fasttrun'
+```
+
+Without that line the extension behaves as before, over the whole relation, and
+writes one line about it to the server log per session. A statement's column
+list is visible only at its start, and the hooks are installed when the library
+loads: if it loads on first use, the statements already running cannot be
+recovered.
 
 Version 2.4.1 fixes memory leaks after rolling back temporary-table creation
 and speeds up repeated truncation of an already empty table. The upgrade
@@ -862,6 +915,12 @@ preload is already disabled, stop PostgreSQL and remove the file manually.
 - Local plans are invalidated only in the current backend. A global
   `ResetPlanCache` is not called.
 - The main functions treat a missing table as an allowed case and do nothing.
+- Once per-column `UPDATE` accounting has been dropped for a relation, only the
+  next collect brings it back: if a trigger was created inside a savepoint and
+  the savepoint was rolled back, the account for that relation stays suspended.
+- A write that bypasses the executor -- a direct heap/table AM API call from
+  another extension -- never reaches the column list. No core path does that to
+  a temporary table.
 - fasttrun is not a security boundary between connection-pooler clients.
 
 ## Performance
@@ -887,6 +946,14 @@ The synthetic test is in
 [sql/fasttrun_bench.sql](sql/fasttrun_bench.sql). Use real plans and load tests
 for your own system.
 
+To compare two builds against each other there is
+[scripts/bench_percolumn.sh](scripts/bench_percolumn.sh): it swaps in two
+pre-built libraries in turn and runs
+[scripts/bench_percolumn.sql](scripts/bench_percolumn.sql) in alternating
+series, collecting the measurements into `scripts/raw.csv`. The alternation
+matters: on single runs machine noise easily passes for a difference between
+builds that is not there.
+
 Example of the observed effect on one production cluster:
 
 ![CPU before fasttrun](docs/images/prod-cpu-before.png)
@@ -908,7 +975,7 @@ Basic suite:
 make installcheck PG_CONFIG=/path/to/pg_config
 ```
 
-It contains 13 `pg_regress` suites. The expected result is 13/13 on supported
+It contains 14 `pg_regress` suites. The expected result is 14/14 on supported
 PostgreSQL 16, PostgreSQL 17, and PostgreSQL 18 installations.
 
 Extended local suite:
@@ -916,6 +983,16 @@ Extended local suite:
 ```bash
 make check-deep-local PG_CONFIG=/path/to/pg_config
 ```
+
+The `check-perf-smoke` target in that suite times `fasttruncate` with a
+wall clock, so it depends on machine speed. It takes two measurements with
+separate limits: a narrow table (1M rows, two columns, one index) at 100 ms and
+a wide one (1M rows, 50 columns, four indexes, TOAST, 637 MB) at 500 ms. Both
+come from the `MAX_TRUNC_MS` and `MAX_TRUNC_WIDE_MS` environment variables. The
+wide limit is provisional -- it is set with room for slow storage and should be
+re-derived from a measurement on your own machine; the script prints both
+medians. The target needs Linux, `bpftrace` and `sudo`, so it does not run on
+macOS.
 
 It does not replace the full mandatory pre-release run. Releases and nightly
 jobs use:
@@ -925,7 +1002,7 @@ FT_CASSERT_TARGETS="16:/path/pg16/bin/pg_config:port:log,..." \
   scripts/check_fasttrun_prerelease.sh
 ```
 
-The mandatory suite includes cassert builds of PostgreSQL 16/17/18, 13/13
+The mandatory suite includes cassert builds of PostgreSQL 16/17/18, 14/14
 `pg_regress`, BRIN stress, cache-initialization faults, the fault matrix, and
 checks of memory, planning, and local invalidations.
 
@@ -980,9 +1057,9 @@ this contract.
 
 | PostgreSQL | Builds | Basic tests |
 |---|---|---|
-| PostgreSQL 16 | yes | 13/13 |
-| PostgreSQL 17 | yes | 13/13 |
-| PostgreSQL 18 | yes | 13/13 |
+| PostgreSQL 16 | yes | 14/14 |
+| PostgreSQL 17 | yes | 14/14 |
+| PostgreSQL 18 | yes | 14/14 |
 
 ## File layout
 
@@ -993,6 +1070,6 @@ extension/                    # installation and upgrade SQL files
 Makefile                      # PGXS build
 examples/                     # integration examples
 scripts/                      # checks and pre-release runner
-sql/                          # 13 pg_regress suites
+sql/                          # 14 pg_regress suites
 expected/                     # expected pg_regress output
 ```

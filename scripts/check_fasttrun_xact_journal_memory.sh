@@ -112,7 +112,10 @@ $visits$;
 SELECT 'VISITS ' || pg_temp.fasttrun_test_subxact_visits(false);
 SELECT 'VISIT_FRAMES ' || count(*)
 FROM pg_backend_memory_contexts
-WHERE name = 'fasttrun xact frame';
+WHERE name = 'fasttrun xact frame' AND ident IS NULL;
+SELECT 'VISIT_POOL ' || count(*)
+FROM pg_backend_memory_contexts
+WHERE name = 'fasttrun xact frame' AND ident = 'pooled';
 COMMIT;
 
 /* Вложенные уровни одной таблицы восстанавливают согласованное состояние. */
@@ -147,7 +150,8 @@ SELECT 'NESTED_ROWS ' || count(*) FROM ft_same_relid;
 SELECT 'NESTED_ORIGINAL ' || count(*)
 FROM ft_same_relid WHERE id = 1 AND payload = 'original';
 SELECT 'NESTED_FRAMES ' || count(*)
-FROM pg_backend_memory_contexts WHERE name = 'fasttrun xact frame';
+FROM pg_backend_memory_contexts
+WHERE name = 'fasttrun xact frame' AND ident IS NULL;
 DROP TABLE ft_same_relid;
 
 BEGIN;
@@ -177,7 +181,10 @@ FROM pg_backend_memory_contexts
 WHERE name LIKE 'fasttrun%';
 SELECT 'FINAL_FRAMES ' || count(*)
 FROM pg_backend_memory_contexts
-WHERE name = 'fasttrun xact frame';
+WHERE name = 'fasttrun xact frame' AND ident IS NULL;
+SELECT 'FINAL_POOL ' || count(*)
+FROM pg_backend_memory_contexts
+WHERE name = 'fasttrun xact frame' AND ident = 'pooled';
 SELECT 'FINAL_CONTEXT ' || name || ' ' || used_bytes
 FROM pg_backend_memory_contexts
 WHERE name LIKE 'fasttrun%'
@@ -299,6 +306,7 @@ warm_total=$(value WARM_TOTAL)
 warm_contexts=$(value WARM_CONTEXTS)
 visits=$(value VISITS)
 visit_frames=$(value VISIT_FRAMES)
+visit_pool=$(value VISIT_POOL)
 nest_rows=$(value NESTED_ROWS)
 nest_original=$(value NESTED_ORIGINAL)
 nest_frames=$(value NESTED_FRAMES)
@@ -306,6 +314,7 @@ final_used=$(value FINAL_USED)
 final_total=$(value FINAL_TOTAL)
 final_contexts=$(value FINAL_CONTEXTS)
 final_frames=$(value FINAL_FRAMES)
+final_pool=$(value FINAL_POOL)
 truncate_warm_used=$(value TRUNCATE_WARM_USED)
 truncate_final_used=$(value TRUNCATE_FINAL_USED)
 poison_final_used=$(value POISON_FINAL_USED)
@@ -347,6 +356,15 @@ if [ "$visit_frames" -ne 0 ] || [ "$final_frames" -ne 0 ]; then
 	echo "FAIL: остались уровни транзакции: при обходе=$visit_frames, в конце=$final_frames" >&2
 	exit 1
 fi
+# Отработавший уровень отдаёт кадр в пул для повторного использования. Кадр в
+# пуле помечен, поэтому от живого он отличим, и здесь проверяется только то,
+# что пул не растёт по числу уровней.
+FRAME_POOL_MAX=${FRAME_POOL_MAX:-4}
+if [ "${visit_pool:-0}" -gt "$FRAME_POOL_MAX" ] || \
+	[ "${final_pool:-0}" -gt "$FRAME_POOL_MAX" ]; then
+	echo "FAIL: пул кадров вырос: при обходе=${visit_pool:-0}, в конце=${final_pool:-0}, предел=$FRAME_POOL_MAX" >&2
+	exit 1
+fi
 if [ "$nest_rows" -ne 1 ] || [ "$nest_original" -ne 1 ] || \
 	[ "$nest_frames" -ne 0 ]; then
 	echo "FAIL: неверный откат вложенных уровней одной таблицы: строк=$nest_rows исходных=$nest_original уровней=$nest_frames" >&2
@@ -381,4 +399,4 @@ if grep -Eq 'TRAP|Assertion|PANIC|server process .* was terminated' "$LOG"; then
 	exit 1
 fi
 
-echo "проверка памяти журнала транзакций прошла: обходы=$visits рост=$growth рост_очистки=$truncate_growth активных_уровней=0"
+echo "проверка памяти журнала транзакций прошла: обходы=$visits рост=$growth рост_очистки=$truncate_growth живых_уровней=0 кадров_в_пуле=${final_pool:-0}"

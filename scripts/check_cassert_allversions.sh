@@ -85,7 +85,12 @@ esac
 # принадлежать root (наследие sudo-прогонов) и ломать pg_regress.
 OUTDIR=${FT_CASSERT_OUTDIR:-$(mktemp -d "${TMPDIR:-/tmp}/ft-cassert.XXXXXX")}
 mkdir -p "$OUTDIR"
-EXPECTED_REGRESS=13
+# Число наборов берётся из Makefile, а не хранится числом: иначе добавленный
+# набор превращает успешный прогон в «регрессию» на ровном месте.
+# Путь строится от REPO_ROOT, а не от $0: скрипт уже перешёл в корень, и
+# относительный $0 после этого указывает мимо репозитория.
+EXPECTED_REGRESS=$(awk '/^REGRESS[ \t]*=/,/[^\\]$/' "$REPO_ROOT/Makefile" \
+	| tr -d '\\' | sed 's/^REGRESS[ \t]*=//' | tr -s ' \t\n' '\n' | grep -c .)
 EXPECTED_MAJORS="16 17 18 "
 
 IFS=',' read -r -a TARGET_ARR <<< "$TARGETS"
@@ -415,7 +420,7 @@ done
 
 echo "========================================================"
 if [ "$overall_rc" -eq 0 ]; then
-	echo "ИТОГ: все версии прошли 13/13 тестов и дополнительные проверки; новых TRAP нет."
+	echo "ИТОГ: все версии прошли ${EXPECTED_REGRESS}/${EXPECTED_REGRESS} тестов и дополнительные проверки; новых TRAP нет."
 else
 	echo "ИТОГ: есть ошибки тестов или падения на Assert; см. вывод выше и $OUTDIR." >&2
 fi

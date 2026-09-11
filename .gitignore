@@ -28,3 +28,6 @@ isolation.out
 *.save
 *.bak
 *.orig
+# Выход замера bench_percolumn.sh
+scripts/raw.csv
+scripts/table.md

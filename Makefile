@@ -27,6 +27,7 @@ DATA = extension/fasttrun--2.0.sql \
        extension/fasttrun--2.3.4.sql \
        extension/fasttrun--2.4.0.sql \
        extension/fasttrun--2.4.1.sql \
+       extension/fasttrun--2.5.0.sql \
        extension/fasttrun--2.0--2.1.sql \
        extension/fasttrun--2.1--2.1.1.sql \
        extension/fasttrun--2.1.1--2.1.2.sql \
@@ -38,6 +39,7 @@ DATA = extension/fasttrun--2.0.sql \
        extension/fasttrun--2.3.3--2.3.4.sql \
        extension/fasttrun--2.3.4--2.4.0.sql \
        extension/fasttrun--2.4.0--2.4.1.sql \
+       extension/fasttrun--2.4.1--2.5.0.sql \
        extension/fasttrun--unpackaged--2.0.sql
 DOCS = README.md
 PGFILEDESC = "fasttrun - sinval-free truncate and analyze for temporary tables"
@@ -49,6 +51,7 @@ REGRESS = fasttrun_basic \
           fasttrun_migration \
           fasttrun_bench \
           fasttrun_stats \
+          fasttrun_stats_cold \
           fasttrun_tracking \
           fasttrun_relstats_survive \
           fasttrun_plan_cache_survive \
@@ -69,6 +72,7 @@ include $(PGXS)
 endif
 
 .PHONY: check-parity check-soak check-perf-smoke check-hook-chain \
+        check-prepare-registry \
         check-zero-sinval check-commit-inval-overhead \
         check-bulk-overhead check-on-commit-drop-leak \
         check-commit-duration check-replace-catalog check-giant-temp \
@@ -127,6 +131,9 @@ check-fault-matrix:
 check-tracking-order:
 	PG_CONFIG="$(PG_CONFIG)" scripts/check_fasttrun_tracking_order.sh
 
+check-prepare-registry:
+	PG_CONFIG="$(PG_CONFIG)" scripts/check_fasttrun_prepare_registry.sh
+
 check-no-temp-impact:
 	PG_CONFIG="$(PG_CONFIG)" scripts/check_fasttrun_no_temp_impact.sh
 
@@ -154,4 +161,5 @@ check-deep-local: installcheck check-parity check-soak check-perf-smoke \
                   check-on-commit-drop-leak check-commit-duration \
                   check-replace-catalog check-giant-temp \
                   check-no-temp-impact check-tracking-persistence \
+                  check-prepare-registry \
                   check-required-suite check-docs
