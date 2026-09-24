@@ -1,23 +1,23 @@
 --
--- fasttrun_stats — статистика по колонкам, локальная для сессии
+-- fasttrun_stats - статистика по колонкам, локальная для сессии
 -- (через get_relation_stats_hook), без записи в pg_statistic.
 --
--- ВАЖНО: собранная статистика переживает commit и живёт до конца сеанса.
--- Транзакционный callback на commit снимает только привязку к счётчикам
+-- ВАЖНО: собранная статистика переживает commit и живет до конца сеанса.
+-- Транзакционный callback на commit снимает только привязку к счетчикам
 -- транзакции, а на abort откатывает изменения этой транзакции. В BEGIN/COMMIT
--- обёрнуты те секции, где важна граница транзакции сама по себе.
+-- обернуты те секции, где важна граница транзакции сама по себе.
 --
 /*
- * Поколоночный учёт UPDATE работает только там, где библиотека предзагружена:
- * иначе операторы, начавшиеся до её загрузки, остались невидимыми, и учёт
+ * Поколоночный учет UPDATE работает только там, где библиотека предзагружена:
+ * иначе операторы, начавшиеся до ее загрузки, остались невидимыми, и учет
  * выключается на весь сеанс. Набор поднимает предзагрузку для своей базы и
- * переподключается, а в конце возвращает всё как было.
+ * переподключается, а в конце возвращает все как было.
  */
 ALTER DATABASE :DBNAME SET session_preload_libraries = 'fasttrun';
 \connect -
 CREATE EXTENSION fasttrun;
 -- Узкая высокоселективная временная таблица с btree-индексом.
--- Без статистики по колонкам планировщик берёт DEFAULT_EQ_SEL=0.005
+-- Без статистики по колонкам планировщик берет DEFAULT_EQ_SEL=0.005
 -- и выбирает Bitmap Heap Scan.  С нашей статистикой (n_distinct ~
 -- reltuples, потому что id уникален) eq_sel = 1/N и план становится
 -- Index Scan.
@@ -26,7 +26,7 @@ INSERT INTO t_stats SELECT g, 'data_' || g FROM generate_series(1, 100000) g;
 CREATE INDEX ON t_stats (id);
 -- ----------------------------------------------------------------------
 -- 1. auto_collect_stats=off + ручной вызов fasttrun_collect_stats
---    внутри одной транзакции: до сбора — Bitmap Heap Scan, после —
+--    внутри одной транзакции: до сбора - Bitmap Heap Scan, после -
 --    Index Scan
 -- ----------------------------------------------------------------------
 BEGIN;
@@ -133,8 +133,8 @@ SELECT fasttrun_analyze('t_multi');
 (1 row)
 
 -- Equality по user_id (1000 уникальных значений, ~50 строк на каждое):
--- по умолчанию выбрался бы Bitmap, со статистикой — тоже Bitmap, но
--- более точная оценка стоимости; форма плана может не меняться
+-- по умолчанию выбрался бы Bitmap, со статистикой - тоже Bitmap, но
+-- более точная оценка стоимости, а форма плана может не меняться
 EXPLAIN (COSTS OFF) SELECT * FROM t_multi WHERE id = 12345;
                  QUERY PLAN                 
 --------------------------------------------
@@ -153,7 +153,7 @@ EXPLAIN (COSTS OFF) SELECT * FROM t_multi WHERE user_id = 42;
 
 COMMIT;
 -- ----------------------------------------------------------------------
--- 6. Молчаливое игнорирование отсутствующей таблицы — функция
+-- 6. Молчаливое игнорирование отсутствующей таблицы - функция
 --    ничего не делает, ошибки нет
 -- ----------------------------------------------------------------------
 SELECT fasttrun_collect_stats('nonexistent_temp_xyz');
@@ -178,7 +178,7 @@ SELECT 1 AS still_alive;
 
 -- ----------------------------------------------------------------------
 -- 8. Устаревшая статистика после UPDATE, меняющего распределение.
---    Хук должен заметить, что pgstat-счётчики изменились
+--    Хук должен заметить, что pgstat-счетчики изменились
 --    (tuples_updated), и НЕ отдавать кешированный n_distinct, иначе
 --    планировщик оставит план, рассчитанный на старое распределение.
 -- ----------------------------------------------------------------------
@@ -255,7 +255,7 @@ RESET fasttrun.auto_collect_stats;
 DROP TABLE t_policy_default;
 -- ----------------------------------------------------------------------
 -- 8c. Скрытая статистика должна безопасно работать и с BRIN.
---     BRIN передаёт хуку неинициализированный VariableStatData, поэтому
+--     BRIN передает хуку неинициализированный VariableStatData, поэтому
 --     ветка без локального statsTuple обязана явно вернуть NULL.
 -- ----------------------------------------------------------------------
 DO $$
@@ -278,7 +278,7 @@ END$$;
 brin_hidden_stats_safe
 DROP TABLE t_brin_hidden_stats;
 -- ----------------------------------------------------------------------
--- 8d. DDL нетронутой таблицы не должен скрывать её ядерную статистику,
+-- 8d. DDL нетронутой таблицы не должен скрывать ее ядерную статистику,
 --     даже если кэши fasttrun уже созданы для другой таблицы.
 -- ----------------------------------------------------------------------
 DO $$
@@ -329,7 +329,7 @@ DROP TABLE t_unmanaged_alter;
 -- ----------------------------------------------------------------------
 -- 9. fasttruncate должен явно вытеснить кэш статистики по OID таблицы
 --    (запасной механизм на случай, когда pgstat недоступен или
---    счётчики сброшены).
+--    счетчики сброшены).
 -- ----------------------------------------------------------------------
 CREATE TEMP TABLE t_trunc_evict (id int);
 INSERT INTO t_trunc_evict SELECT generate_series(1, 100000) g;
@@ -398,15 +398,15 @@ EXPLAIN (COSTS OFF) SELECT * FROM t_leak WHERE id = 12345;
 DROP TABLE t_leak;
 -- ----------------------------------------------------------------------
 -- 11. Автоматический пересбор статистики при значимом DML.
---     Управляется порогом: если доля изменённых строк
---     (insert+update+delete с момента предыдущего сбора, делённая на
+--     Управляется порогом: если доля измененных строк
+--     (insert+update+delete с момента предыдущего сбора, деленная на
 --     текущий reltuples) больше fasttrun.stats_refresh_threshold
 --     (значение по умолчанию 0.2 = 20%), то очередной fasttrun_analyze
 --     запускает пересбор статистики через полный reservoir sample.
 --     Это дороже старой блочной выборки, зато совпадает с качеством
 --     обычного ANALYZE на физически кластеризованных и sparse heap.
 -- ----------------------------------------------------------------------
--- 11a. Значительный UPDATE (churn=1.0) → пересбор → план обновляется
+-- 11a. Значительный UPDATE (churn=1.0) -> пересбор -> план обновляется
 CREATE TEMP TABLE t_refresh (id int, grp int);
 INSERT INTO t_refresh SELECT g, g FROM generate_series(1, 100000) g;
 CREATE INDEX ON t_refresh (grp);
@@ -424,7 +424,7 @@ EXPLAIN (COSTS OFF) SELECT * FROM t_refresh WHERE grp = 1;
    Index Cond: (grp = 1)
 (2 rows)
 
-UPDATE t_refresh SET grp = 1;        -- доля изменений = 1.0 > 0.2 → пересбор
+UPDATE t_refresh SET grp = 1;        -- доля изменений = 1.0 > 0.2 -> пересбор
 SELECT fasttrun_analyze('t_refresh');
  fasttrun_analyze 
 ------------------
@@ -439,10 +439,10 @@ EXPLAIN (COSTS OFF) SELECT * FROM t_refresh WHERE grp = 1;
 (2 rows)
 
 COMMIT;
--- 11b. Маленький DELETE при пороге 0.2 — 0.009% ниже порога → пересбора
+-- 11b. Маленький DELETE при пороге 0.2 - 0.009% ниже порога -> пересбора
 --      нет, но churn в пределах толерантности, поэтому soft freshness
---      отдаёт кешированную стату планировщику (как ядро PG между ANALYZE).
---      После 11a grp=1 — это все строки, так что план остаётся Seq Scan.
+--      отдает кешированную стату планировщику (как ядро PG между ANALYZE).
+--      После 11a grp=1 - это все строки, так что план остается Seq Scan.
 BEGIN;
 SELECT fasttrun_analyze('t_refresh');
  fasttrun_analyze 
@@ -503,9 +503,9 @@ EXPLAIN (COSTS OFF) SELECT * FROM t_refresh WHERE grp = 1;
 (2 rows)
 
 COMMIT;
--- 11d. Порог = 1.0 отключает пересбор и задаёт максимальную толерантность:
+-- 11d. Порог = 1.0 отключает пересбор и задает максимальную толерантность:
 --      стата прячется только когда churn достигает 100%.  Полный UPDATE
---      (100% строк) превышает порог → fallback к defaults.
+--      (100% строк) превышает порог -> fallback к defaults.
 BEGIN;
 SET LOCAL fasttrun.stats_refresh_threshold = 1;
 SELECT fasttrun_analyze('t_refresh');
@@ -521,7 +521,7 @@ EXPLAIN (COSTS OFF) SELECT * FROM t_refresh WHERE grp = 1;
    Filter: (grp = 1)
 (2 rows)
 
-UPDATE t_refresh SET grp = 999;     -- любой DML → пересбор отключён
+UPDATE t_refresh SET grp = 999;     -- любой DML -> пересбор отключен
 SELECT fasttrun_analyze('t_refresh');
  fasttrun_analyze 
 ------------------
@@ -539,9 +539,9 @@ EXPLAIN (COSTS OFF) SELECT * FROM t_refresh WHERE grp = 999;
 
 COMMIT;
 -- 11e. Below-threshold DML внутри savepoint.  После ROLLBACK TO SAVEPOINT
---      counters откатываются к pre-savepoint → стата точно свежая.  Без
---      rollback тот же below-threshold DML остаётся в пределах толерантности
---      → soft freshness продолжает отдавать кешированную стату планировщику.
+--      counters откатываются к pre-savepoint -> стата точно свежая.  Без
+--      rollback тот же below-threshold DML остается в пределах толерантности
+--      -> soft freshness продолжает отдавать кешированную стату планировщику.
 BEGIN;
 SELECT fasttrun_analyze('t_refresh');
  fasttrun_analyze 
@@ -560,7 +560,7 @@ SELECT fasttrun_analyze('t_refresh');
 ROLLBACK TO sp1;
 -- После отката savepoint хук должен вернуть кешированную статистику
 -- (counters откатились к pre-savepoint значениям, collected_* не
--- менялся внутри savepoint → match)
+-- менялся внутри savepoint -> match)
 EXPLAIN (COSTS OFF) SELECT * FROM t_refresh WHERE grp = 1;
                    QUERY PLAN                    
 -------------------------------------------------
@@ -568,7 +568,7 @@ EXPLAIN (COSTS OFF) SELECT * FROM t_refresh WHERE grp = 1;
    Index Cond: (grp = 1)
 (2 rows)
 
--- Теперь тот же DML без savepoint — churn в пределах порога → стата видна
+-- Теперь тот же DML без savepoint - churn в пределах порога -> стата видна
 DELETE FROM t_refresh WHERE id < 5;
 SELECT fasttrun_analyze('t_refresh');
  fasttrun_analyze 
@@ -585,12 +585,12 @@ EXPLAIN (COSTS OFF) SELECT * FROM t_refresh WHERE grp = 1;
 
 COMMIT;
 -- 11f. DML ниже порога внутри savepoint с последующим RELEASE.  RELEASE
---      продвигает pgstat counters в родительский subxact; churn остаётся в
---      пределах толерантности, поэтому soft freshness отдаёт кешированную
+--      продвигает pgstat counters в родительский subxact, а churn остается в
+--      пределах толерантности, поэтому soft freshness отдает кешированную
 --      стату.
 --
 --      High-cardinality таблица: редкий equality-предикат на кешированной
---      стате даёт Index Scan (на defaults был бы Bitmap).
+--      стате дает Index Scan (на defaults был бы Bitmap).
 CREATE TEMP TABLE t_release_stats (id int, grp int);
 INSERT INTO t_release_stats SELECT g, g FROM generate_series(1, 100000) g;
 CREATE INDEX ON t_release_stats (grp);
@@ -617,7 +617,7 @@ SELECT fasttrun_analyze('t_release_stats');
 (1 row)
 
 RELEASE SAVEPOINT sp_release;
--- Below-threshold churn → soft freshness держит стату → Index Scan.
+-- Below-threshold churn -> soft freshness держит стату -> Index Scan.
 EXPLAIN (COSTS OFF) SELECT * FROM t_release_stats WHERE grp = 50000;
                          QUERY PLAN                          
 -------------------------------------------------------------
@@ -627,10 +627,10 @@ EXPLAIN (COSTS OFF) SELECT * FROM t_release_stats WHERE grp = 50000;
 
 COMMIT;
 DROP TABLE t_release_stats;
--- 11g. Targeted UPDATE концентрирует 10% строк на grp=1 — выше строгого порога
+-- 11g. Targeted UPDATE концентрирует 10% строк на grp=1 - выше строгого порога
 --      для high-cardinality колонки.  Cardinality-aware freshness прячет стату,
 --      и planner уходит на defaults (Bitmap), а не строит Index Scan по
---      «редкому» grp=1, который на деле стал частым.  Защита сохраняется и
+--      "редкому" grp=1, который на деле стал частым.  Защита сохраняется и
 --      после COMMIT.
 CREATE TEMP TABLE t_commit_stale_stats (id int, grp int);
 INSERT INTO t_commit_stale_stats SELECT g, g FROM generate_series(1, 100000) g;
@@ -656,7 +656,7 @@ SELECT fasttrun_analyze('t_commit_stale_stats');
  
 (1 row)
 
--- Targeted churn выше строгого порога high-card → стата скрыта → defaults.
+-- Targeted churn выше строгого порога high-card -> стата скрыта -> defaults.
 EXPLAIN (COSTS OFF) SELECT * FROM t_commit_stale_stats WHERE grp = 1;
                        QUERY PLAN                        
 ---------------------------------------------------------
@@ -667,7 +667,7 @@ EXPLAIN (COSTS OFF) SELECT * FROM t_commit_stale_stats WHERE grp = 1;
 (4 rows)
 
 COMMIT;
--- После COMMIT защита сохраняется → план остаётся на defaults.
+-- После COMMIT защита сохраняется -> план остается на defaults.
 EXPLAIN (COSTS OFF) SELECT * FROM t_commit_stale_stats WHERE grp = 1;
                        QUERY PLAN                        
 ---------------------------------------------------------
@@ -687,9 +687,9 @@ SELECT count(*) = 10000 AS commit_stale_actual_grp1
 DROP TABLE t_commit_stale_stats;
 DROP TABLE t_refresh;
 -- 11h. Cardinality-aware граница: для high-cardinality (unique) колонки порог
---      толерантности ужесточён (concentrated DML может раздуть «редкое»
+--      толерантности ужесточен (concentrated DML может раздуть "редкое"
 --      значение в катастрофический Index Scan).  Мелкий churn ниже строгого
---      порога держит стату видимой (Index Scan), churn выше — прячет её.
+--      порога держит стату видимой (Index Scan), churn выше - прячет ее.
 CREATE TEMP TABLE t_skew_below (id int, grp int);
 INSERT INTO t_skew_below SELECT g, g FROM generate_series(1, 100000) g;
 CREATE INDEX ON t_skew_below (grp);
@@ -700,7 +700,7 @@ SELECT fasttrun_analyze('t_skew_below');
  
 (1 row)
 
-DELETE FROM t_skew_below WHERE id <= 3000;    -- 3% ниже строгого high-card порога → видна
+DELETE FROM t_skew_below WHERE id <= 3000;    -- 3% ниже строгого high-card порога -> видна
 EXPLAIN (COSTS OFF) SELECT * FROM t_skew_below WHERE grp = 50000;
                       QUERY PLAN                       
 -------------------------------------------------------
@@ -720,7 +720,7 @@ SELECT fasttrun_analyze('t_skew_above');
  
 (1 row)
 
-DELETE FROM t_skew_above WHERE id <= 10000;   -- 10% выше строгого high-card порога → прячется
+DELETE FROM t_skew_above WHERE id <= 10000;   -- 10% выше строгого high-card порога -> прячется
 EXPLAIN (COSTS OFF) SELECT * FROM t_skew_above WHERE grp = 50000;
                    QUERY PLAN                    
 -------------------------------------------------
@@ -735,7 +735,7 @@ DROP TABLE t_skew_above;
 -- ----------------------------------------------------------------------
 -- 12. Порог = 0 не должен запускать пересбор, если доля изменений
 --     равна нулю.  Семантика порога: "0 = пересбор при любом DML",
---     а не "при каждом тёплом попадании в кэш".
+--     а не "при каждом теплом попадании в кэш".
 -- ----------------------------------------------------------------------
 CREATE TEMP TABLE t_thr0 (id int, v int);
 INSERT INTO t_thr0 SELECT g, g FROM generate_series(1, 10000) g;
@@ -755,7 +755,7 @@ EXPLAIN (COSTS OFF) SELECT * FROM t_thr0 WHERE id = 5000;
    Index Cond: (id = 5000)
 (2 rows)
 
--- Никакого DML → доля изменений = 0 → пересбор не должен сработать,
+-- Никакого DML -> доля изменений = 0 -> пересбор не должен сработать,
 -- план идентичен
 SELECT fasttrun_analyze('t_thr0');
  fasttrun_analyze 
@@ -775,13 +775,13 @@ DROP TABLE t_thr0;
 -- ----------------------------------------------------------------------
 -- 13. Кэш статистики, понимающий точки сохранения: ROLLBACK TO
 --     SAVEPOINT должен полностью восстановить статистику родительского
---     уровня, а не просто вытеснить её.
+--     уровня, а не просто вытеснить ее.
 -- ----------------------------------------------------------------------
 CREATE TEMP TABLE t_sv (id int, grp int);
 INSERT INTO t_sv SELECT g, g FROM generate_series(1, 50000) g;
 CREATE INDEX ON t_sv (grp);
 BEGIN;
--- Порог по умолчанию = 0.2 → массовый UPDATE в подтранзакции
+-- Порог по умолчанию = 0.2 -> массовый UPDATE в подтранзакции
 -- пересчитает статистику, что и нужно для проверки отката с
 -- восстановлением.
 SELECT fasttrun_analyze('t_sv');
@@ -790,7 +790,7 @@ SELECT fasttrun_analyze('t_sv');
  
 (1 row)
 
--- На уровне родительской транзакции: высокий n_distinct → Index Scan
+-- На уровне родительской транзакции: высокий n_distinct -> Index Scan
 EXPLAIN (COSTS OFF) SELECT * FROM t_sv WHERE grp = 1;
               QUERY PLAN               
 ---------------------------------------
@@ -806,7 +806,7 @@ SELECT fasttrun_analyze('t_sv');
  
 (1 row)
 
--- Внутри подтранзакции: пересбор сработал, n_distinct=1 → Seq Scan
+-- Внутри подтранзакции: пересбор сработал, n_distinct=1 -> Seq Scan
 EXPLAIN (COSTS OFF) SELECT * FROM t_sv WHERE grp = 1;
      QUERY PLAN      
 ---------------------
@@ -815,7 +815,7 @@ EXPLAIN (COSTS OFF) SELECT * FROM t_sv WHERE grp = 1;
 (2 rows)
 
 ROLLBACK TO SAVEPOINT sp1;
--- После отката: статистика восстановлена из стека отмены →
+-- После отката: статистика восстановлена из стека отмены ->
 -- снова Index Scan
 EXPLAIN (COSTS OFF) SELECT * FROM t_sv WHERE grp = 1;
               QUERY PLAN               
@@ -827,9 +827,9 @@ EXPLAIN (COSTS OFF) SELECT * FROM t_sv WHERE grp = 1;
 COMMIT;
 DROP TABLE t_sv;
 -- ----------------------------------------------------------------------
--- 14. track_counts=off → нельзя проверить актуальность статистики →
+-- 14. track_counts=off -> нельзя проверить актуальность статистики ->
 --     не кэшируем, планировщик работает на оценках по умолчанию.
---     Главное: после DML никакая устаревшая статистика не выдаётся.
+--     Главное: после DML никакая устаревшая статистика не выдается.
 -- ----------------------------------------------------------------------
 CREATE TEMP TABLE t_tc (id int, grp int);
 INSERT INTO t_tc SELECT g, g FROM generate_series(1, 10000) g;
@@ -837,7 +837,7 @@ CREATE INDEX ON t_tc (grp);
 BEGIN;
 SET LOCAL track_counts = off;
 -- Первый вызов collect поднимет предупреждение WARNING (один раз
--- за сессию) — оно ожидается в diff'e pg_regress как маркер.
+-- за сессию) - оно ожидается в diff'e pg_regress как маркер.
 SELECT fasttrun_collect_stats('t_tc');
 WARNING:  fasttrun: pgstat tracking is unavailable, column statistics will not be cached for this session
 DETAIL:  fasttrun_analyze and fasttrun_collect_stats rely on per-backend pgstat counters to validate cached column statistics after DML. With pgstat unavailable (usually because track_counts = off), the planner hook cannot return cached stats and will fall back to default selectivity. Plans for temp tables may silently degrade.
@@ -858,7 +858,7 @@ EXPLAIN (COSTS OFF) SELECT * FROM t_tc WHERE grp = 1;
 (4 rows)
 
 UPDATE t_tc SET grp = 1;
--- Повторные вызовы collect в этой же сессии — молча, без
+-- Повторные вызовы collect в этой же сессии - молча, без
 -- предупреждения (оно уже было)
 SELECT fasttrun_collect_stats('t_tc');
  fasttrun_collect_stats 
@@ -872,7 +872,7 @@ SELECT fasttrun_analyze('t_tc');
  
 (1 row)
 
--- После UPDATE: всё ещё оценки по умолчанию, никакой устаревшей
+-- После UPDATE: все еще оценки по умолчанию, никакой устаревшей
 -- статистики
 EXPLAIN (COSTS OFF) SELECT * FROM t_tc WHERE grp = 1;
                QUERY PLAN                
@@ -937,11 +937,11 @@ SELECT count(*) = 10000 AS tc_toggle_actual_grp1
 DROP TABLE t_tc_toggle;
 -- ----------------------------------------------------------------------
 -- 15. Регрессионный тест: пересбор статистики после delta-hit должен
---     оставаться несмещённым и ANALYZE-подобным.
+--     оставаться несмещенным и ANALYZE-подобным.
 --
---     Раньше refresh path читал только часть heap-блоков.  Даже после
---     исправления early-stop bias это всё равно не было полной parity
---     с ANALYZE для физически упорядоченных или разреженных таблиц.
+--     Refresh path читает все heap-блоки. Выборка по части блоков даже
+--     без early-stop bias не дает полной parity с ANALYZE для физически
+--     упорядоченных или разреженных таблиц.
 --
 --     Конкретный пример (его и воспроизводим): первые ~3000 строк
 --     имеют grp=1, остальные ~50000 строк имеют уникальные grp.
@@ -973,7 +973,7 @@ SELECT stadistinct < -0.1 AS cold_ndistinct_high
  t
 (1 row)
 
--- INSERT 20000 строк → доля изменений 20k/73k ≈ 27% > 20% порога →
+-- INSERT 20000 строк -> доля изменений 20k/73k ~ 27% > 20% порога ->
 -- запускается полный reservoir refresh статистики
 INSERT INTO t_bias SELECT g, g FROM generate_series(53001, 73000) g;
 SELECT fasttrun_analyze('t_bias');
@@ -982,7 +982,7 @@ SELECT fasttrun_analyze('t_bias');
  
 (1 row)
 
--- После пересбора: n_distinct ВСЁ ЕЩЁ должен быть высоким.
+-- После пересбора: n_distinct ВСЕ ЕЩЕ должен быть высоким.
 SELECT stadistinct < -0.1 AS refresh_ndistinct_high
   FROM fasttrun_inspect_stats('t_bias')
  WHERE staattnum = 2;
@@ -997,19 +997,19 @@ DROP TABLE t_bias;
 -- 16. Регрессионный тест: пересбор после массового DELETE до пустой
 --     таблицы должен продвигать опорный снимок статистики.
 --
---     Раньше путь пересбора в delta-hit ветке вызывал
---     fasttrun_collect_and_store только при sample_count > 0.  После
---     mass DELETE до пустоты sample ничего не находил, baseline не
---     двигался, и каждый последующий fasttrun_analyze заново входил
---     в путь пересбора и заново платил за полный refresh, который
---     снова возвращал ноль строк.
+--     Путь пересбора в delta-hit ветке двигает baseline и на пустой
+--     выборке. Если бы fasttrun_collect_and_store вызывался только при
+--     sample_count > 0, после mass DELETE до пустоты baseline стоял бы на
+--     месте, и каждый следующий fasttrun_analyze заново входил бы в путь
+--     пересбора и платил за полный refresh, который снова возвращает ноль
+--     строк.
 --
 --     Тут проверяем строго по структуре, а не по таймингам (тайминги
 --     нестабильны на CI): каждый шаг должен соответствовать своей
---     ожидаемой чёткой ветке.  План для grp=1 после mass DELETE
---     ожидаем как Seq Scan на пустой таблице (через дефолты — потому
+--     ожидаемой четкой ветке.  План для grp=1 после mass DELETE
+--     ожидаем как Seq Scan на пустой таблице (через дефолты - потому
 --     что hook freshness check отвергает старую stats: pgstat
---     счётчики уже не совпадают со снимком от cold scan'а).  Главное:
+--     счетчики уже не совпадают со снимком от cold scan'а).  Главное:
 --     второй и третий fasttrun_analyze не должны падать и должны
 --     отдавать тот же self-consistent reltuples=0.
 -- ----------------------------------------------------------------------
@@ -1053,7 +1053,7 @@ SELECT count(*) = 0 AS empty_refresh_stats_evicted
 
 -- Второй analyze без DML.  С багом он бы снова входил в refresh path
 -- (потому что baseline не продвинулся при первом empty refresh) и
--- снова делал бы полный refresh.  С фиксом — pure delta path, мгновенно.
+-- снова делал бы полный refresh.  С фиксом - pure delta path, мгновенно.
 SELECT fasttrun_analyze('t_empty_refresh');
  fasttrun_analyze 
 ------------------
@@ -1067,7 +1067,7 @@ SELECT reltuples = 0 AS empty_after_second
  t
 (1 row)
 
--- Третий — то же самое, для уверенности что baseline стабилен.
+-- Третий - то же самое, для уверенности что baseline стабилен.
 SELECT fasttrun_analyze('t_empty_refresh');
  fasttrun_analyze 
 ------------------
@@ -1088,15 +1088,15 @@ DROP TABLE t_empty_refresh;
 --     не только сам кэш статистики колонок, но и опорный снимок
 --     для пути пересбора (stats baseline) в analyze cache.
 --
---     Раньше пересбор внутри подтранзакции продвигал stats baseline
---     до post-DML pgstat счётчиков, а subxact callback его не
---     откатывал.  После ROLLBACK TO SAVEPOINT pgstat счётчики
---     возвращались к pre-DML, а baseline в analyze cache оставался
---     "из будущего", и следующий fasttrun_analyze считал ненулевой
---     churn → лишний refresh-проход.
+--     Пересбор внутри подтранзакции продвигает stats baseline до
+--     post-DML pgstat счетчиков, и subxact callback откатывает его вместе
+--     с кэшем. Без этого после ROLLBACK TO SAVEPOINT pgstat счетчики
+--     вернулись бы к pre-DML, baseline в analyze cache остался бы "из
+--     будущего", и следующий fasttrun_analyze насчитал бы ненулевой
+--     churn -> лишний refresh-проход.
 --
 --     Тест в той же форме, что и секция 13, плюс explicit проверка
---     что пост-rollback план идентичен pre-savepoint плану — это
+--     что пост-rollback план идентичен pre-savepoint плану - это
 --     косвенно подтверждает что stats baseline тоже откатился (если
 --     бы остался "в будущем", refresh бы запустился и план сменился).
 -- ----------------------------------------------------------------------
@@ -1163,7 +1163,7 @@ DROP TABLE t_sv_baseline;
 -- ----------------------------------------------------------------------
 -- 18. Регрессионный тест: explicit fasttrun_collect_stats() должен
 --     продвигать опорный снимок stats baseline в analyze cache,
---     если запись там уже есть — иначе следующий маленький DML
+--     если запись там уже есть - иначе следующий маленький DML
 --     запустит ненужный пересбор по застаревшему churn.
 -- ----------------------------------------------------------------------
 CREATE TEMP TABLE t_cs_baseline (id int, grp int);
@@ -1221,19 +1221,19 @@ DROP TABLE t_cs_baseline;
 -- 19. Регрессионный тест: fasttruncate seed-ит analyze cache, чтобы
 --     первый fasttrun_analyze() после паттерна
 --         fasttruncate -> refill -> fasttrun_analyze
---     шёл по дельта-математике (а не платил за полный cold scan), и
---     при этом ещё и обновлял статистику колонок через полный reservoir
+--     шел по дельта-математике (а не платил за полный cold scan), и
+--     при этом еще и обновлял статистику колонок через полный reservoir
 --     refresh.
 --
 --     Структурные проверки:
 --       - после fasttruncate + INSERT + analyze reltuples должно быть
 --         равно числу вставленных строк (это обеспечивается delta math
---         от seed-нутого опорного снимка);
+--         от seed-нутого опорного снимка).
 --       - план для редкого значения после refill должен быть Index Scan
 --         (это значит refresh path сработал и собрал свежую статистику
---         колонок — иначе planner получил бы defaults и выбрал
---         Bitmap/Seq Scan);
---       - повторный analyze без DML — pure delta hot path, тот же
+--         колонок - иначе planner получил бы defaults и выбрал
+--         Bitmap/Seq Scan).
+--       - повторный analyze без DML - pure delta hot path, тот же
 --         reltuples без изменений.
 -- ----------------------------------------------------------------------
 CREATE TEMP TABLE t_seed_truncate (id int, grp int);
@@ -1254,7 +1254,7 @@ EXPLAIN (COSTS OFF) SELECT * FROM t_seed_truncate WHERE grp = 12345;
 (2 rows)
 
 -- Полный цикл: очистка, перезаливка, analyze.  С seed первый analyze
--- здесь идёт через delta-hit для rowcount + полный reservoir refresh
+-- здесь идет через delta-hit для rowcount + полный reservoir refresh
 -- для статистики колонок.
 SELECT fasttruncate('t_seed_truncate');
  fasttruncate 
@@ -1276,7 +1276,7 @@ SELECT reltuples = 50000 AS reltuples_after_refill
  t
 (1 row)
 
--- План должен использовать индекс — refresh собрал свежие stats.
+-- План должен использовать индекс - refresh собрал свежие stats.
 EXPLAIN (COSTS OFF) SELECT * FROM t_seed_truncate WHERE grp = 12345;
                          QUERY PLAN                          
 -------------------------------------------------------------
@@ -1284,7 +1284,7 @@ EXPLAIN (COSTS OFF) SELECT * FROM t_seed_truncate WHERE grp = 12345;
    Index Cond: (grp = 12345)
 (2 rows)
 
--- Второй analyze без DML — pure delta hot path
+-- Второй analyze без DML - pure delta hot path
 SELECT fasttrun_analyze('t_seed_truncate');
  fasttrun_analyze 
 ------------------
@@ -1394,8 +1394,8 @@ COMMIT;
 DROP TABLE t_stats_ddl;
 -- ----------------------------------------------------------------------
 -- 20a. CLUSTER на temp table физически переупорядочивает строки (rewrite):
---      correlation в кэше становится ложной при неизменных DML-счётчиках,
---      freshness это не ловит.  Эвикция срабатывает до выполнения; откат
+--      correlation в кэше становится ложной при неизменных DML-счетчиках,
+--      freshness это не ловит.  Эвикция срабатывает до выполнения, а откат
 --      в savepoint восстанавливает стату (undo), как у остальных DDL.
 -- ----------------------------------------------------------------------
 CREATE TEMP TABLE t_stats_cluster (id int, v int);
@@ -1460,7 +1460,7 @@ DROP TABLE t_stats_cluster;
 -- ----------------------------------------------------------------------
 -- 21. Регрессионный тест: relstats partial index должны обновляться
 --     вместе с fasttrun_analyze.  Обычный ANALYZE обновляет pg_class для
---     index relation; fasttrun должен публиковать тот же planner-visible
+--     index relation, и fasttrun должен публиковать тот же planner-visible
 --     размер хотя бы в rd_rel и session-local relstats cache.
 -- ----------------------------------------------------------------------
 CREATE TEMP TABLE t_partial_stats (id int, flag bool);
@@ -1606,21 +1606,21 @@ DROP TABLE t_index_no_colstats;
 --
 --     В планировщике есть ДВА независимых пути доступа к статистике
 --     колонок:
---       (а) get_relation_stats_hook → возвращает HeapTuple от
---           pg_statistic для функций селективности (eq_sel и т.п.);
---       (б) lsyscache.c:get_attavgwidth → читает stawidth напрямую
+--       (а) get_relation_stats_hook -> возвращает HeapTuple от
+--           pg_statistic для функций селективности (eq_sel и т.п.).
+--       (б) lsyscache.c:get_attavgwidth -> читает stawidth напрямую
 --           через get_attavgwidth_hook или syscache.
 --
---     Раньше у нас был зарегистрирован только (а), и (б) уходил в
+--     fasttrun регистрирует оба. Без (б) ширина уходила бы в
 --     get_typavgwidth() с дефолтной шириной типа.  Для text это
---     32 байта независимо от реального содержимого, что ломало
+--     32 байта независимо от реального содержимого, что ломает
 --     costing для hash join / sort / spool на временных таблицах
 --     с короткими text-колонками.
 --
 --     Тут проверяем что после fasttrun_analyze() планировщик видит
 --     нашу собранную ширину, а не дефолтную для типа.  Для строки
---     ровно 19 байт ожидаем width <= 25 (Haas-Stokes даёт ~19, а
---     get_typavgwidth() для text даёт 32 — далеко за порогом).
+--     ровно 19 байт ожидаем width <= 25 (Haas-Stokes дает ~19, а
+--     get_typavgwidth() для text дает 32 - далеко за порогом).
 -- ----------------------------------------------------------------------
 CREATE TEMP TABLE t_width (id int, name text);
 INSERT INTO t_width SELECT g, 'name_padded_to_20_x' FROM generate_series(1, 10000) g;
@@ -1632,7 +1632,7 @@ SELECT fasttrun_analyze('t_width');
  
 (1 row)
 
--- Прямой запрос к плану через EXPLAIN.  Используем функцию-обёртку,
+-- Прямой запрос к плану через EXPLAIN.  Используем функцию-обертку,
 -- которая вытаскивает width из текстового плана, чтобы тест был
 -- стабильным и читаемым.
 DO $$
@@ -1654,11 +1654,11 @@ BEGIN
     -- Реальная ширина ~20 байт (varlena overhead + 19 ASCII).
     -- Без get_attavgwidth_hook планировщик отдал бы 32.
     IF width_val > 25 THEN
-        RAISE EXCEPTION 'width % too high — get_attavgwidth_hook не сработал (ожидали ~20, лимит 25)',
+        RAISE EXCEPTION 'width % too high - get_attavgwidth_hook не сработал (ожидали ~20, лимит 25)',
                         width_val;
     END IF;
     IF width_val < 15 THEN
-        RAISE EXCEPTION 'width % подозрительно мал — Haas-Stokes/sample broken?',
+        RAISE EXCEPTION 'width % подозрительно мал - Haas-Stokes/sample broken?',
                         width_val;
     END IF;
 
@@ -1672,14 +1672,14 @@ DROP TABLE t_width;
 -- 23. Регрессионный тест: skew equality предикат через std_typanalyze.
 --
 --     99000 строк со значением v=1 и 1000 строк с уникальными редкими
---     значениями v in 2..1001.  С нашим путём через std_typanalyze
+--     значениями v in 2..1001.  С нашим путем через std_typanalyze
 --     (use_typanalyze=on, default) MCV должна поймать частое значение
 --     v=1, и план для WHERE v=1 должен быть Seq Scan с rows близким
 --     к реальным 99000 (а не bitmap heap scan с грубой оценкой по
 --     n_distinct ~ 3000).  Для редкого значения v=500 план должен
 --     быть Index Scan с маленьким rows.
 --
---     Сравниваем с use_typanalyze=off — там должна быть старая
+--     Сравниваем с use_typanalyze=off - там должна быть старая
 --     грубая оценка по n_distinct (rows одинаков для обоих v).
 -- ----------------------------------------------------------------------
 CREATE TEMP TABLE t_skew (id int, v int);
@@ -1759,9 +1759,9 @@ BEGIN
         END IF;
     END LOOP;
 
-    -- Без MCV оценки одинаковы — обе по 1/n_distinct
+    -- Без MCV оценки одинаковы - обе по 1/n_distinct
     IF rows_freq <> rows_rare THEN
-        RAISE EXCEPTION 'Haas-Stokes даёт разные оценки для v=1 (%) и v=500 (%): не должно быть разницы без MCV',
+        RAISE EXCEPTION 'Haas-Stokes дает разные оценки для v=1 (%) и v=500 (%): не должно быть разницы без MCV',
                         rows_freq, rows_rare;
     END IF;
 
@@ -1774,9 +1774,9 @@ DROP TABLE t_skew;
 -- ----------------------------------------------------------------------
 -- 24. Регрессионный тест: range предикат через std_typanalyze.
 --
---     100000 строк v in 1..100000.  WHERE v < 1000 — это селективность
---     ровно 1%.  С histogram planner должен дать оценку ~1000;
---     без histogram уйдёт в DEFAULT_RANGE_INEQ_SEL = 0.5 → ~50000.
+--     100000 строк v in 1..100000.  WHERE v < 1000 - это селективность
+--     ровно 1%.  С histogram planner должен дать оценку ~1000,
+--     а без histogram уйдет в DEFAULT_RANGE_INEQ_SEL = 0.5 -> ~50000.
 -- ----------------------------------------------------------------------
 CREATE TEMP TABLE t_range (id int, v int);
 INSERT INTO t_range SELECT g, g FROM generate_series(1, 100000) g;
@@ -1811,7 +1811,7 @@ END;
 $$;
 NOTICE:  range typanalyze: ok (within 500..2000 for real 999)
 COMMIT;
--- Контр-тест: без typanalyze идёт DEFAULT_RANGE_INEQ_SEL
+-- Контр-тест: без typanalyze идет DEFAULT_RANGE_INEQ_SEL
 BEGIN;
 SET LOCAL fasttrun.use_typanalyze = off;
 SELECT fasttrun_analyze('t_range');
@@ -1832,7 +1832,7 @@ BEGIN
         END IF;
     END LOOP;
 
-    -- Без histogram — DEFAULT_RANGE_INEQ_SEL × ndistinct, обычно >30000
+    -- Без histogram - DEFAULT_RANGE_INEQ_SEL x ndistinct, обычно >30000
     IF rows_est < 10000 THEN
         RAISE EXCEPTION 'Haas-Stokes неожиданно точна для range: rows=%, должно быть много',
                         rows_est;
@@ -1847,7 +1847,7 @@ DROP TABLE t_range;
 -- ----------------------------------------------------------------------
 -- 25. ABBA cross-validation: статистика собранная нашим path должна
 --     дать планировщику близкие оценки тому, что дал бы обычный
---     SQL ANALYZE — на широком спектре типов данных и предикатов.
+--     SQL ANALYZE - на широком спектре типов данных и предикатов.
 --
 --     Это **прямое доказательство** что наш HeapTuple в кэше
 --     корректно доходит до планировщика через get_relation_stats_hook
@@ -1856,7 +1856,7 @@ DROP TABLE t_range;
 --     varchar (high-cardinality eq), numeric (histogram/range),
 --     timestamptz (histogram/range), boolean (eq).
 --
---     Не сравниваем точные числа rows между ANALYZE и нашим путём
+--     Не сравниваем точные числа rows между ANALYZE и нашим путем
 --     (sample-based, шумные), а проверяем структурно: тип плана и
 --     rows в разумных границах от реального количества.
 -- ----------------------------------------------------------------------
@@ -1897,7 +1897,7 @@ DECLARE
     plan_line text;
     rows_est  int;
 BEGIN
-    -- int n_distinct: grp = 42 → ~50 строк (real 50)
+    -- int n_distinct: grp = 42 -> ~50 строк (real 50)
     FOR plan_line IN EXPLAIN SELECT * FROM t_abba WHERE grp = 42 LOOP
         IF plan_line ~ 'rows=' THEN
             rows_est := substring(plan_line FROM 'rows=(\d+)')::int;
@@ -1908,7 +1908,7 @@ BEGIN
         RAISE EXCEPTION 'int n_distinct broken: grp=42 rows=% (real ~50)', rows_est;
     END IF;
 
-    -- text MCV: status='active' (60% строк) → ~30000
+    -- text MCV: status='active' (60% строк) -> ~30000
     FOR plan_line IN EXPLAIN SELECT * FROM t_abba WHERE status = 'active' LOOP
         IF plan_line ~ 'rows=' THEN
             rows_est := substring(plan_line FROM 'rows=(\d+)')::int;
@@ -1919,7 +1919,7 @@ BEGIN
         RAISE EXCEPTION 'text MCV broken: active rows=% (real ~30000)', rows_est;
     END IF;
 
-    -- text MCV: status='archived' (5% строк) → ~2500
+    -- text MCV: status='archived' (5% строк) -> ~2500
     FOR plan_line IN EXPLAIN SELECT * FROM t_abba WHERE status = 'archived' LOOP
         IF plan_line ~ 'rows=' THEN
             rows_est := substring(plan_line FROM 'rows=(\d+)')::int;
@@ -1930,7 +1930,7 @@ BEGIN
         RAISE EXCEPTION 'text MCV broken: archived rows=% (real ~2500)', rows_est;
     END IF;
 
-    -- numeric histogram: amount BETWEEN 10 AND 20 → ~5000 (real ~5000)
+    -- numeric histogram: amount BETWEEN 10 AND 20 -> ~5000 (real ~5000)
     FOR plan_line IN EXPLAIN SELECT * FROM t_abba WHERE amount BETWEEN 10 AND 20 LOOP
         IF plan_line ~ 'rows=' THEN
             rows_est := substring(plan_line FROM 'rows=(\d+)')::int;
@@ -1941,7 +1941,7 @@ BEGIN
         RAISE EXCEPTION 'numeric histogram broken: 10..20 rows=% (real ~5000)', rows_est;
     END IF;
 
-    -- timestamptz histogram: created > '2026-01-15' → ~30000 (последние 70%)
+    -- timestamptz histogram: created > '2026-01-15' -> ~30000 (последние 70%)
     FOR plan_line IN EXPLAIN SELECT * FROM t_abba WHERE created > '2026-01-15'::timestamptz LOOP
         IF plan_line ~ 'rows=' THEN
             rows_est := substring(plan_line FROM 'rows=(\d+)')::int;
@@ -1952,7 +1952,7 @@ BEGIN
         RAISE EXCEPTION 'timestamptz histogram broken: rows=% (real ~30000)', rows_est;
     END IF;
 
-    -- boolean: flag = true (50%) → ~25000
+    -- boolean: flag = true (50%) -> ~25000
     FOR plan_line IN EXPLAIN SELECT * FROM t_abba WHERE flag = true LOOP
         IF plan_line ~ 'rows=' THEN
             rows_est := substring(plan_line FROM 'rows=(\d+)')::int;
@@ -1963,7 +1963,7 @@ BEGIN
         RAISE EXCEPTION 'boolean equality broken: flag=true rows=% (real ~25000)', rows_est;
     END IF;
 
-    -- varchar high-cardinality unique: name='name_25000' → 1
+    -- varchar high-cardinality unique: name='name_25000' -> 1
     FOR plan_line IN EXPLAIN SELECT * FROM t_abba WHERE name = 'name_25000' LOOP
         IF plan_line ~ 'rows=' THEN
             rows_est := substring(plan_line FROM 'rows=(\d+)')::int;
@@ -1981,18 +1981,18 @@ NOTICE:  ABBA cross-validation: stats reach planner for all 7 types (int, text M
 COMMIT;
 DROP TABLE t_abba;
 -- ----------------------------------------------------------------------
--- 26. fasttrun_inspect_stats() — observability функция для production
+-- 26. fasttrun_inspect_stats() - observability функция для production
 --     debugging.  Возвращает наши кешированные statsTuple в shape
 --     pg_catalog.pg_statistic.
 --
 --     Проверяем что:
 --       (1) функция возвращает по одной строке на каждую analyzed
---           колонку (3 колонки = 3 строки);
---       (2) staattnum совпадает с реальным;
---       (3) MCV-слот заполнен для skewed колонки status;
+--           колонку (3 колонки = 3 строки).
+--       (2) staattnum совпадает с реальным.
+--       (3) MCV-слот заполнен для skewed колонки status.
 --       (4) shape совпадает с pg_catalog.pg_statistic (можно делать
---           SELECT по знакомым полям);
---       (5) на несуществующей таблице — empty result, без ошибки.
+--           SELECT по знакомым полям).
+--       (5) на несуществующей таблице - empty result, без ошибки.
 -- ----------------------------------------------------------------------
 CREATE TEMP TABLE t_inspect (id int, status text);
 INSERT INTO t_inspect
@@ -2005,7 +2005,7 @@ SELECT fasttrun_analyze('t_inspect');
  
 (1 row)
 
--- Должна быть одна строка на колонку (id, status) — обе analyzable
+-- Должна быть одна строка на колонку (id, status) - обе analyzable
 SELECT count(*) = 2 AS two_rows FROM fasttrun_inspect_stats('t_inspect');
  two_rows 
 ----------
@@ -2052,16 +2052,16 @@ DROP TABLE t_no_stats;
 COMMIT;
 DROP TABLE t_inspect;
 -- ----------------------------------------------------------------------
--- 27. fasttrun.sample_rows = -1 (auto) — sample target автоматически
+-- 27. fasttrun.sample_rows = -1 (auto) - sample target автоматически
 --     совпадает с тем, что попросил бы std_typanalyze (по умолчанию
---     300 × default_statistics_target = 30000 при default DST=100).
+--     300 x default_statistics_target = 30000 при default DST=100).
 --
 --     Цели теста:
---       (1) -1 не ломает функционал — fasttrun_analyze не падает,
---           inspect_stats возвращает строки;
---       (2) на той же таблице -1 даёт **точно тот же набор колонок**
---           в кэше, что и default 3000 — отличается только sample
---           size, не shape;
+--       (1) -1 не ломает функционал - fasttrun_analyze не падает,
+--           inspect_stats возвращает строки.
+--       (2) на той же таблице -1 дает **точно тот же набор колонок**
+--           в кэше, что и default 3000 - отличается только sample
+--           size, не shape.
 --       (3) shape результата (количество MCV/histogram slots) совпадает
 --           с тем, что записал бы regular ANALYZE на той же таблице.
 --
@@ -2129,7 +2129,7 @@ BEGIN
             EXIT;
         END IF;
     END LOOP;
-    -- 50 уникальных label в 100k строк → реальных ~2000 на label
+    -- 50 уникальных label в 100k строк -> реальных ~2000 на label
     -- Допуск: 500..5000
     IF rows_est < 500 OR rows_est > 5000 THEN
         RAISE EXCEPTION 'sample_rows=-1 path: planner estimate off: rows=% (real ~2000)',
@@ -2188,19 +2188,19 @@ DROP TABLE t_attopts;
 --     транзакции (без вызова fasttrun_*) не должен оставлять stale
 --     MCV/n_distinct видимыми планировщику.
 --
---     pgstat-счётчики temp-таблицы обнуляются на границе транзакции
+--     pgstat-счетчики temp-таблицы обнуляются на границе транзакции
 --     (и trans-цепочка, и локальный snapshot), в shared pgstat temp не
---     флашится вовсе — то есть счётчик, переживающий commit, недоступен.
---     Единственный переживающий commit сигнал — физический размер, но он
+--     флашится вовсе - то есть счетчик, переживающий commit, недоступен.
+--     Единственный переживающий commit сигнал - физический размер, но он
 --     bloat-контаминирован (bulk UPDATE / откат подтранзакции удваивает
 --     страницы без смены данных). Поэтому это грубый backstop: стата
 --     прячется только при изменении размера на порядок (>=3x или <=1/3),
 --     что однозначно означает refill мимо fasttrun_analyze. Остаточный
 --     случай (refill той же величины, но иным распределением, закоммиченный
---     без вызова fasttrun) не ловится — для temp нет построчного сигнала.
+--     без вызова fasttrun) не ловится - для temp нет построчного сигнала.
 -- ----------------------------------------------------------------------
 CREATE TEMP TABLE t_xcommit (c int) ON COMMIT PRESERVE ROWS;
--- 1-строчный зонд с честной статистикой — детерминирует форму join-оценки.
+-- 1-строчный зонд с честной статистикой - детерминирует форму join-оценки.
 CREATE TEMP TABLE t_xc_probe (c int);
 INSERT INTO t_xc_probe VALUES (42);
 SELECT fasttrun_analyze('t_xc_probe');
@@ -2219,7 +2219,7 @@ SELECT fasttrun_analyze('t_xcommit');
 (1 row)
 
 COMMIT;
--- Позитивный контроль: размер не менялся через commit -> стата ОСТАЁТСЯ
+-- Позитивный контроль: размер не менялся через commit -> стата ОСТАЕТСЯ
 -- видимой (soft freshness переживает commit). Оценка c=5 ~ вся таблица.
 DO $$
 DECLARE ln text; est int := NULL;
@@ -2238,7 +2238,7 @@ SELECT 'xcommit_unchanged_visible_ok' AS marker;
 (1 row)
 
 -- Xact B: обычный INSERT 100000 РАЗНЫХ значений, БЕЗ fasttrun_analyze.
--- Размер вырастает в разы; relid не попадает в touched-список.
+-- Размер вырастает в разы, а relid не попадает в touched-список.
 INSERT INTO t_xcommit SELECT g FROM generate_series(1, 100000) g;
 -- Xact C: join probe -> t_xcommit по c. При stale n_distinct=1 планировщик
 -- считает join почти декартовым (~100k+). После фикса стата спрятана,
@@ -2265,12 +2265,12 @@ DROP TABLE t_xcommit;
 DROP TABLE t_xc_probe;
 -- ----------------------------------------------------------------------
 -- 30. use_typanalyze=off (Haas-Stokes): чрезмерно широкие varlena НЕ
---     детостятся — иначе полный TOAST-payload материализуется в памяти
---     и на multi-MB значениях × sample_rows раздувает backend до OOM.
+--     детостятся - иначе полный TOAST-payload материализуется в памяти
+--     и на multi-MB значениях x sample_rows раздувает backend до OOM.
 --     Зеркалим ядерный WIDTH_THRESHOLD (1024 байта): широкие значения
 --     считаются toowide (assumed distinct), а не детостятся и сравниваются.
 --     Наблюдаемо: набор ОДИНАКОВЫХ широких значений не схлопывается в
---     n_distinct=1 (что потребовало бы детоста всех) — stadistinct < 0
+--     n_distinct=1 (что потребовало бы детоста всех) - stadistinct < 0
 --     (все distinct), как у обычного ANALYZE.
 -- ----------------------------------------------------------------------
 CREATE TEMP TABLE t_wide (doc text);
@@ -2297,7 +2297,7 @@ DROP TABLE t_wide;
 --     fasttrun_analyze переходит на block-sampling (оценка count по
 --     плотности, как core ANALYZE) вместо полного скана всей таблицы.
 --     reltuples становится оценкой (±%), column-stats собираются с
---     выборочных блоков. Ниже порога / при 0 — точный полный скан.
+--     выборочных блоков. Ниже порога / при 0 - точный полный скан.
 -- ----------------------------------------------------------------------
 CREATE TEMP TABLE t_giant (id int, grp int);
 INSERT INTO t_giant SELECT g, g % 100 FROM generate_series(1, 50000) g;
@@ -2314,7 +2314,7 @@ DEBUG:  fasttrun: invalidating backend-local cached plans
 (1 row)
 
 RESET client_min_messages;
--- reltuples — оценка в разумной полосе вокруг 50000 (±25%).
+-- reltuples - оценка в разумной полосе вокруг 50000 (±25%).
 SELECT reltuples BETWEEN 37500 AND 62500 AS giant_reltuples_estimate
   FROM fasttrun_relstats('t_giant');
  giant_reltuples_estimate 
@@ -2345,7 +2345,7 @@ DROP TABLE t_giant;
 -- ----------------------------------------------------------------------
 -- 31b. Тот же guardrail покрывает delta-refresh (не только cold path):
 --      после надпорогового churn пересбор статы на гигантской temp тоже
---      идёт block-sampling, а не полный O(таблицы) скан.
+--      идет block-sampling, а не полный O(таблицы) скан.
 -- ----------------------------------------------------------------------
 CREATE TEMP TABLE t_giant_delta (id int, grp int);
 INSERT INTO t_giant_delta SELECT g, g % 100 FROM generate_series(1, 50000) g;
@@ -2380,8 +2380,8 @@ DROP TABLE t_giant_delta;
 -- ----------------------------------------------------------------------
 -- 32. Partial-index relstats при fasttrun.sample_rows = 0.  Без выборки
 --     column-stats отключены, но relpages (физический размер) и
---     reltuples partial-индекса всё равно должны обновляться: relpages
---     измеряется напрямую, reltuples берётся как верхняя граница
+--     reltuples partial-индекса все равно должны обновляться: relpages
+--     измеряется напрямую, reltuples берется как верхняя граница
 --     (totalrows) вместо устаревшего заниженного значения.  Проверяем
 --     через fasttrun_relstats -- planner-visible срез relstats из
 --     session-local кэша.
@@ -2405,8 +2405,8 @@ SELECT reltuples::bigint = 0 AS partial_zero_start
 
 -- Предикат начинает матчить половину строк.
 UPDATE t_partial_zero SET flag = true WHERE id <= 50000;
--- Без выборки relpages обновляется (физический замер), reltuples берётся
--- как верхняя граница totalrows, а не остаётся устаревшим нулём.
+-- Без выборки relpages обновляется (физический замер), reltuples берется
+-- как верхняя граница totalrows, а не остается устаревшим нулем.
 SET fasttrun.sample_rows = 0;
 SELECT fasttrun_analyze('t_partial_zero');
  fasttrun_analyze 
@@ -2431,7 +2431,7 @@ DROP TABLE t_partial_zero;
 --     churn от якоря последнего рескана, а не от baseline пересбора
 --     column stats (baseline ниже порога намеренно стоит на месте).
 --     max_analyze_pages=1 превращает каждый фактический скан в
---     block-sample DEBUG-маркер; 2000 строк < sample_rows делают выборку
+--     block-sample DEBUG-маркер, а 2000 строк < sample_rows делают выборку
 --     исчерпывающей, а оценки детерминированными.
 -- ----------------------------------------------------------------------
 CREATE TEMP TABLE t_partial_repeat (id int, flag bool);
@@ -2485,7 +2485,7 @@ DROP TABLE t_partial_repeat;
 -- ----------------------------------------------------------------------
 -- 33b. Якорь рескана откатывается вместе с savepoint'ом.  Рескан внутри
 --      откаченной подтранзакции не должен подавить рескан churn'а,
---      набранного до savepoint (index relstats тоже откатились); после
+--      набранного до savepoint (index relstats тоже откатились). После
 --      RELEASE якорь промоутится к родителю, и analyze без нового DML
 --      молчит.
 -- ----------------------------------------------------------------------
@@ -2549,9 +2549,9 @@ RESET client_min_messages;
 COMMIT;
 DROP TABLE t_partial_sp;
 -- ----------------------------------------------------------------------
--- 34. Обычный ANALYZE со списком колонок передаёт ядру только
+-- 34. Обычный ANALYZE со списком колонок передает ядру только
 --     перечисленные колонки. Для b сохраняется локальная статистика,
---     полный ANALYZE передаёт ядру обе колонки.
+--     полный ANALYZE передает ядру обе колонки.
 -- ----------------------------------------------------------------------
 CREATE TEMP TABLE t_handoff (a int, b int);
 INSERT INTO t_handoff SELECT g, 1 FROM generate_series(1, 100000) g;
@@ -2675,8 +2675,8 @@ SELECT count(*) = 2 AND
 DROP TABLE t_vacuum_snapshot;
 DROP TABLE t_vacuum_keep;
 -- ----------------------------------------------------------------------
--- 36. VACUUM (ANALYZE) со списком колонок ведёт себя как ANALYZE;
---     вызов без списка передаёт ядру все колонки.
+-- 36. VACUUM (ANALYZE) со списком колонок ведет себя как ANALYZE,
+--     а вызов без списка передает ядру все колонки.
 -- ----------------------------------------------------------------------
 CREATE TEMP TABLE t_vacuum_analyze (a int, b int);
 INSERT INTO t_vacuum_analyze SELECT g, 1 FROM generate_series(1, 100000) g;
@@ -2812,7 +2812,7 @@ DROP TABLE t_analyze_all_1;
 DROP TABLE t_analyze_all_2;
 -- ----------------------------------------------------------------------
 -- 39. После ошибки многотабличного VACUUM (ANALYZE) локальная
---     статистика всех затронутых таблиц остаётся скрытой.
+--     статистика всех затронутых таблиц остается скрытой.
 -- ----------------------------------------------------------------------
 CREATE TEMP TABLE t_vacuum_good (a int, b int);
 CREATE TEMP TABLE t_vacuum_bad (a int, b int);
@@ -2957,7 +2957,7 @@ virtual_generated_guard_ok
 -- 42. Статистические API отклоняют секционированные таблицы и родителей
 --     наследования, как fasttruncate: локальная inh=false статистика
 --     родителя спрятала бы ядерную inherited-статистику при
---     appendrel-планировании. Ядерная оценка переживает отклонённые вызовы.
+--     appendrel-планировании. Ядерная оценка переживает отклоненные вызовы.
 -- ----------------------------------------------------------------------
 CREATE TEMP TABLE t_inh_stats_parent (x int);
 CREATE TEMP TABLE t_inh_stats_child () INHERITS (t_inh_stats_parent);
@@ -2986,7 +2986,7 @@ HINT:  Use core SQL ANALYZE for inheritance or partition traversal.
 SELECT fasttrun_collect_stats('t_inh_stats_parent');
 ERROR:  fasttrun_collect_stats: relation "t_inh_stats_parent" is partitioned or an inheritance parent
 HINT:  Use core SQL ANALYZE for inheritance or partition traversal.
--- Batch прерывается на родителе (контракт bulk); обычная таблица
+-- Batch прерывается на родителе (контракт bulk), а обычная таблица
 -- обрабатывается вызовом без родителя в списке.
 CREATE TEMP TABLE t_inh_stats_flat (id int);
 INSERT INTO t_inh_stats_flat SELECT generate_series(1, 100);
@@ -3006,7 +3006,7 @@ SELECT reltuples = 100::real AS flat_processed FROM fasttrun_relstats('t_inh_sta
  t
 (1 row)
 
--- Ядерная inherited-стата не спрятана отклонёнными вызовами.
+-- Ядерная inherited-стата не спрятана отклоненными вызовами.
 DO $$
 DECLARE ln text; est int := NULL;
 BEGIN
@@ -3030,8 +3030,8 @@ DROP TABLE t_inh_stats_flat;
 -- 43. Expression-индексы: ядро читает статистику выражения из
 --     pg_statistic по OID индекса (examine_variable/btcostestimate),
 --     мимо column-хуков. После fasttruncate + refill эта каталожная
---     стата описывает старые данные — для managed-таблицы она должна
---     скрываться, планировщик берёт дефолтные оценки до ядерного
+--     стата описывает старые данные - для managed-таблицы она должна
+--     скрываться, планировщик берет дефолтные оценки до ядерного
 --     ANALYZE. Контроль: нетронутая fasttrun'ом таблица читает
 --     expression-стату из каталога как обычно.
 -- ----------------------------------------------------------------------
@@ -3071,7 +3071,7 @@ SELECT 'expression_stats_hidden_ok' AS marker;
  expression_stats_hidden_ok
 (1 row)
 
--- Контроль: chain работает — не-managed таблица читает expression-стату.
+-- Контроль: chain работает - не-managed таблица читает expression-стату.
 CREATE TEMP TABLE t_expr_core (id int, name text);
 INSERT INTO t_expr_core
   SELECT g, CASE WHEN g <= 9000 THEN 'dup' ELSE 'val_' || g END
@@ -3100,12 +3100,12 @@ SELECT 'expression_stats_core_readable_ok' AS marker;
 DROP TABLE t_expr_hidden;
 DROP TABLE t_expr_core;
 -- ----------------------------------------------------------------------
--- 44. Ёмкость: fasttrun_cache_stats() и fasttrun.max_stats_memory.
---     Сверх бюджета таблица без кешированной column-статы остаётся без
---     неё (WARNING один раз на бэкенд на авто-пути, NOTICE на каждый
+-- 44. Емкость: fasttrun_cache_stats() и fasttrun.max_stats_memory.
+--     Сверх бюджета таблица без кешированной column-статы остается без
+--     нее (WARNING один раз на бэкенд на авто-пути, NOTICE на каждый
 --     явный сбор), relation-level relstats продолжают работать.
 --     Таблицы с уже собранной статой рефрешатся без проверки бюджета,
---     эвикции нет. 0 (default) — без лимита.
+--     эвикции нет. 0 (default) - без лимита.
 -- ----------------------------------------------------------------------
 DISCARD TEMP;
 \pset format unaligned
@@ -3124,7 +3124,7 @@ FROM fasttrun_cache_stats();
 analyze_entries_bigint|relid_entries_bigint|column_entries_bigint|analyze_bytes_bigint|column_bytes_bigint|total_bytes_bigint
 t|t|t|t|t|t
 (1 row)
--- Узкая таблица A: кэш ещё под бюджетом, стата собирается.
+-- Узкая таблица A: кэш еще под бюджетом, стата собирается.
 CREATE TEMP TABLE t44_a (id int, name text);
 INSERT INTO t44_a SELECT g, 'val_' || g FROM generate_series(1, 10000) g;
 SELECT fasttrun_analyze('t44_a');
@@ -3143,7 +3143,7 @@ FROM fasttrun_cache_stats();
 analyze_entries|column_stats_relid_entries|column_stats_entries|analyze_bytes_positive|column_bytes_positive|total_is_sum
 1|1|2|t|t|t
 (1 row)
--- Ровно текущий размер разрешён; первая новая таблица может превысить порог.
+-- Ровно текущий размер разрешен, поэтому первая новая таблица может превысить порог.
 CREATE TEMP TABLE t44_budget AS
 SELECT column_stats_bytes AS bytes FROM fasttrun_cache_stats();
 DO $$
@@ -3182,7 +3182,7 @@ CREATE TEMP TABLE t44_b (id int, name text);
 INSERT INTO t44_b SELECT g, 'val_' || g FROM generate_series(1, 10000) g;
 SELECT fasttrun_analyze('t44_b');
 WARNING:  fasttrun: column statistics cache exceeds fasttrun.max_stats_memory, new tables are left without column statistics
-DETAIL:  A table without cached column statistics behaves as with fasttrun.auto_collect_stats = off: relation-level statistics keep working, the planner falls back to default selectivity. Tables that already hold cached column statistics keep refreshing; nothing is evicted.
+DETAIL:  A table without cached column statistics behaves as with fasttrun.auto_collect_stats = off: relation-level statistics keep working, the planner falls back to default selectivity. Tables that already hold cached column statistics keep refreshing, and nothing is evicted.
 HINT:  Raise fasttrun.max_stats_memory, or recycle the connection to free the cache. fasttrun_cache_stats() reports the current cache size.
 fasttrun_analyze
 
@@ -3195,7 +3195,7 @@ SELECT reltuples::int AS b_reltuples FROM fasttrun_relstats('t44_b');
 b_reltuples
 10000
 (1 row)
--- Статистика A остаётся видимой: уникальный столбец -> rows=1.
+-- Статистика A остается видимой: уникальный столбец -> rows=1.
 DO $$
 DECLARE ln text; est int := NULL;
 BEGIN
@@ -3326,7 +3326,7 @@ DROP TABLE t44_b2;
 DROP TABLE t44_c;
 -- ----------------------------------------------------------------------
 -- 45. UPDATE непричастной колонки не гасит статистику остальных.
---     pgstat считает tuples_updated по отношению целиком, поэтому без учёта
+--     pgstat считает tuples_updated по отношению целиком, поэтому без учета
 --     реально записанных колонок обогащающий UPDATE ослеплял планировщик на
 --     ключах соединения, которых он не касался.
 -- ----------------------------------------------------------------------
@@ -3377,7 +3377,7 @@ COMMIT;
 DROP TABLE t_col_churn;
 -- ----------------------------------------------------------------------
 -- 46. Маска UPDATE достоверна не всегда, и там где она недостоверна,
---     статистика обязана прятаться, как до появления поколоночного учёта.
+--     статистика обязана прятаться, как до появления поколоночного учета.
 --     Общий помощник: оценка строк из EXPLAIN.
 -- ----------------------------------------------------------------------
 CREATE FUNCTION ft_rows_est(q text, pat text) RETURNS int LANGUAGE plpgsql AS $ft$
@@ -3481,7 +3481,7 @@ t
 (1 row)
 DROP TABLE t_seq_generated;
 -- 46e. UPDATE наследника через родителя: у child RTE нет своей permission
---      information, поэтому какие колонки пишутся — неизвестно. Первый UPDATE
+--      information, поэтому какие колонки пишутся - неизвестно. Первый UPDATE
 --      специально оставляет непустую маску, чтобы она не сошла за доказательство.
 CREATE TEMP TABLE t_seq_parent (id int, note text);
 CREATE TEMP TABLE t_seq_child () INHERITS (t_seq_parent);
@@ -3577,8 +3577,8 @@ recollected_sample_still_trusted
 t
 (1 row)
 DROP TABLE t_seq_recollect;
--- 46j. Пересбор, пропускающий ранее собранную колонку: json берёт только
---      полный сборщик, облегчённому нужен btree-компаратор.
+-- 46j. Пересбор, пропускающий ранее собранную колонку: json берет только
+--      полный сборщик, облегченному нужен btree-компаратор.
 CREATE TEMP TABLE t_seq_skip (id int, j json);
 INSERT INTO t_seq_skip SELECT g, '{"a":1}'::json FROM generate_series(1, 100000) g;
 BEGIN;
@@ -3602,7 +3602,7 @@ t
 COMMIT;
 DROP TABLE t_seq_skip;
 -- 46k. Пороговая арифметика: у почти уникальной колонки допуск 5%, поэтому
---      UPDATE на 2% статистику сохраняет, а накопленный сверх порога — гасит.
+--      UPDATE на 2% статистику сохраняет, а накопленный сверх порога - гасит.
 CREATE TEMP TABLE t_seq_threshold (id int, note text);
 INSERT INTO t_seq_threshold SELECT g, 'x' FROM generate_series(1, 100000) g;
 SELECT fasttrun_analyze('t_seq_threshold');
@@ -3641,8 +3641,8 @@ t
 (1 row)
 ROLLBACK;
 DROP TABLE t_seq_two_collects;
--- 46m. Первый пересбор отношения, за которым расширение ещё не следит, изнутри
---      действующего UPDATE. Учёт начатых операторов ведётся и для таких
+-- 46m. Первый пересбор отношения, за которым расширение еще не следит, изнутри
+--      действующего UPDATE. Учет начатых операторов ведется и для таких
 --      отношений, иначе самый первый образец сходит за достоверный.
 CREATE TEMP TABLE t_seq_first_collect (id int, note text);
 INSERT INTO t_seq_first_collect SELECT g, 'x' FROM generate_series(1, 100000) g;
@@ -3656,8 +3656,8 @@ t
 (1 row)
 ROLLBACK;
 DROP TABLE t_seq_first_collect;
--- 46n. Пересбор наследника изнутри UPDATE через родителя: цель оператора —
---      таблица-наследник, и её начатый UPDATE обязан считаться так же.
+-- 46n. Пересбор наследника изнутри UPDATE через родителя: цель оператора -
+--      таблица-наследник, и ее начатый UPDATE обязан считаться так же.
 CREATE TEMP TABLE t_seq_inh_parent (id int, note text);
 CREATE TEMP TABLE t_seq_inh_child () INHERITS (t_seq_inh_parent);
 INSERT INTO t_seq_inh_child SELECT g, 'x' FROM generate_series(1, 100000) g;
@@ -3676,8 +3676,8 @@ t
 ROLLBACK;
 DROP TABLE t_seq_inh_child;
 DROP TABLE t_seq_inh_parent;
--- 46o. Поздний триггер и завершённая транзакция. Признак снимает сам оператор
---      CREATE TRIGGER, заблаговременно: после COMMIT счётчиков уже нет, и
+-- 46o. Поздний триггер и завершенная транзакция. Признак снимает сам оператор
+--      CREATE TRIGGER, заблаговременно: после COMMIT счетчиков уже нет, и
 --      доказать по ним ничего нельзя.
 CREATE TEMP TABLE t_seq_commit_trigger (id int, note text);
 INSERT INTO t_seq_commit_trigger SELECT g, 'x' FROM generate_series(1, 100000) g;
@@ -3699,9 +3699,9 @@ t
 (1 row)
 DROP TABLE t_seq_commit_trigger;
 DROP FUNCTION t_seq_commit_trigger_fn();
--- 46p. Рабочий цикл целиком, три раза подряд: учёт начатых операторов не должен
---      отбирать выигрыш у обычной последовательности «очистка — набор — анализ —
---      UPDATE служебной колонки — запрос по ключу».
+-- 46p. Рабочий цикл целиком, три раза подряд: учет начатых операторов не должен
+--      отбирать выигрыш у обычной последовательности "очистка - набор - анализ -
+--      UPDATE служебной колонки - запрос по ключу".
 CREATE TEMP TABLE t_seq_cycle (id int, grp int, f_units int, note text);
 DO $cy$
 DECLARE i int; est int;
@@ -3722,7 +3722,7 @@ END$cy$;
 NOTICE:  work cycle estimate survived three rounds
 DROP TABLE t_seq_cycle;
 -- 46q. Маска столбцов лежит в собственном контексте расширения и переживает
---      транзакцию. Отношение, покидающее кэш, обязано её освобождать: иначе
+--      транзакцию. Отношение, покидающее кэш, обязано ее освобождать: иначе
 --      каждый рабочий цикл оставляет за собой битовую карту, а у длинного
 --      сеанса таких циклов много. Вторая собранная таблица держит контекст,
 --      чтобы измерялся рост, а не создание контекста заново.
@@ -3746,7 +3746,7 @@ ANALYZE t_seq_mask_wide;
 SELECT sum(used_bytes) AS mask_bytes_before FROM pg_backend_memory_contexts
  WHERE name = 'fasttrun stats cache' \gset
 /* отношение покидает кэш только на COMMIT: до него передача ядру лишь меняет
-   правило, а запись остаётся на месте, и маску снял бы очередной пересбор */
+   правило, а запись остается на месте, и маску снял бы очередной пересбор */
 CREATE PROCEDURE t_seq_mask_cycles(n int) LANGUAGE plpgsql AS $mk$
 DECLARE i int;
 BEGIN
@@ -3767,9 +3767,9 @@ t
 DROP PROCEDURE t_seq_mask_cycles(int);
 DROP TABLE t_seq_mask_wide;
 DROP TABLE t_seq_mask_anchor;
--- 46r. Порог у почти уникальной колонки — ровно 5% строк, и доля считается
+-- 46r. Порог у почти уникальной колонки - ровно 5% строк, и доля считается
 --      накопленно от последнего пересбора, а не по одному оператору.
---      Счётчики привязаны к транзакции, поэтому накопление живёт внутри неё.
+--      Счетчики привязаны к транзакции, поэтому накопление живет внутри нее.
 CREATE TEMP TABLE t_seq_edge (id int, note text);
 INSERT INTO t_seq_edge SELECT g, 'x' FROM generate_series(1, 100000) g;
 SELECT fasttrun_analyze('t_seq_edge');
@@ -3797,7 +3797,7 @@ t
 (1 row)
 COMMIT;
 DROP TABLE t_seq_edge;
--- 46s. INSERT ... ON CONFLICT DO UPDATE — отдельный вход в учёт колонок:
+-- 46s. INSERT ... ON CONFLICT DO UPDATE - отдельный вход в учет колонок:
 --      названная в DO UPDATE гаснет, соседняя обязана уцелеть.
 CREATE TEMP TABLE t_seq_upsert (id int PRIMARY KEY, grp int, note text);
 INSERT INTO t_seq_upsert SELECT g, g % 10, 'x' FROM generate_series(1, 100000) g;
@@ -3818,7 +3818,7 @@ upsert_other_column_kept
 t
 (1 row)
 DROP TABLE t_seq_upsert;
--- 46t. MERGE ... WHEN MATCHED THEN UPDATE — такой же отдельный вход.
+-- 46t. MERGE ... WHEN MATCHED THEN UPDATE - такой же отдельный вход.
 CREATE TEMP TABLE t_seq_merge (id int, grp int, note text);
 INSERT INTO t_seq_merge SELECT g, g % 10, 'x' FROM generate_series(1, 100000) g;
 SELECT fasttrun_analyze('t_seq_merge');
@@ -3842,7 +3842,7 @@ t
 DROP TABLE t_seq_merge;
 DROP TABLE t_seq_merge_src;
 -- 46u. Доверие к списку колонок снимается и в планировщике. Откат убирает сам
---      триггер, но доверие не возвращает: потеря идёт в безопасную сторону и
+--      триггер, но доверие не возвращает: потеря идет в безопасную сторону и
 --      держится только до следующего пересбора.
 CREATE TEMP TABLE t_seq_plan_clear (id int, note text);
 INSERT INTO t_seq_plan_clear SELECT g, 'x' FROM generate_series(1, 100000) g;
@@ -3890,7 +3890,7 @@ BEGIN;
 DO $fs$
 BEGIN
   /* делитель зависит от строки, поэтому ошибка происходит уже в исполнении:
-     свёртка констант сняла бы оператор до старта и проверять было бы нечего */
+     свертка констант сняла бы оператор до старта и проверять было бы нечего */
   UPDATE t_seq_failed_stmt SET id = 1 / (id - id);
 EXCEPTION WHEN division_by_zero THEN NULL;
 END$fs$;
@@ -3906,7 +3906,7 @@ t
 (1 row)
 COMMIT;
 DROP TABLE t_seq_failed_stmt;
--- 46w. Обратная сторона: подтранзакция, отменённая внутри действующего UPDATE,
+-- 46w. Обратная сторона: подтранзакция, отмененная внутри действующего UPDATE,
 --      не должна уносить запись самого этого UPDATE.
 CREATE TEMP TABLE t_seq_nested_abort (id int, note text);
 INSERT INTO t_seq_nested_abort SELECT g, 'x' FROM generate_series(1, 100000) g;
@@ -3935,9 +3935,9 @@ ROLLBACK;
 DROP TABLE t_seq_nested_abort;
 DROP FUNCTION t_seq_nested_abort_fn(text);
 -- 46x. Пересбор из выходной части запроса, у которого modifying CTE уже
---      переписал таблицу. Скан идёт по снимку начала команды и новых версий не
---      видит, а счётчики рядом уже включают эти записи, поэтому сравнивать
---      образец не с чем: он не отдаётся до следующего чистого пересбора.
+--      переписал таблицу. Скан идет по снимку начала команды и новых версий не
+--      видит, а счетчики рядом уже включают эти записи, поэтому сравнивать
+--      образец не с чем: он не отдается до следующего чистого пересбора.
 CREATE TEMP TABLE t_seq_cte (id int, note int);
 INSERT INTO t_seq_cte SELECT g, 0 FROM generate_series(1, 100000) g;
 SELECT fasttrun_collect_stats('t_seq_cte');
@@ -3959,9 +3959,9 @@ t
 (1 row)
 ROLLBACK;
 DROP TABLE t_seq_cte;
--- 46y. Обратная сторона учёта по подтранзакциям: вложенный UPDATE того же
+-- 46y. Обратная сторона учета по подтранзакциям: вложенный UPDATE того же
 --      отношения упал и был перехвачен, внешний завершился штатно. Записи о
---      начатых операторах не остаётся, поэтому следующий пересбор снова точен.
+--      начатых операторах не остается, поэтому следующий пересбор снова точен.
 CREATE TEMP TABLE t_seq_nested_err (id int, note int);
 INSERT INTO t_seq_nested_err SELECT g, 0 FROM generate_series(1, 100000) g;
 SELECT fasttrun_collect_stats('t_seq_nested_err');
@@ -3991,9 +3991,10 @@ t
 COMMIT;
 DROP TABLE t_seq_nested_err;
 DROP FUNCTION t_seq_nested_err_fn();
--- 46z. Реестр начатых операторов конечен. Оператор, у которого целей больше,
---      чем слотов, переводит весь реестр в осторожный ответ до конца
---      транзакции, а её граница возвращает обычную работу.
+-- 46z. Реестр начатых операторов конечен. Оператор, у которого временных целей
+--      больше, чем слотов, переводит весь реестр в осторожный ответ до конца
+--      транзакции, а ее граница возвращает обычную работу. Постоянные цели в
+--      реестр не попадают, см. 46aj.
 CREATE TEMP TABLE t_seq_overflow (id int, note int);
 INSERT INTO t_seq_overflow SELECT g, 0 FROM generate_series(1, 100000) g;
 SELECT fasttrun_collect_stats('t_seq_overflow');
@@ -4058,9 +4059,9 @@ t
 (1 row)
 DROP TABLE t_seq_merge_keep;
 DROP TABLE t_seq_merge_keep_src;
--- 46ab. Учёт по колонкам решает «называли или нет», а не «сколько строк по
---       этой колонке». Пока колонку не называли, чужие UPDATE её не старят;
---       как только назвали хоть раз, ей засчитывается весь оборот таблицы за
+-- 46ab. Учет по колонкам решает "называли или нет", а не "сколько строк по
+--       этой колонке". Пока колонку не называли, чужие UPDATE ее не старят.
+--       Как только назвали хоть раз, ей засчитывается весь оборот таблицы за
 --       период, включая соседние UPDATE. Граница грубая и в безопасную сторону.
 CREATE TEMP TABLE t_seq_edge_mix (id int, note text);
 INSERT INTO t_seq_edge_mix SELECT g, 'x' FROM generate_series(1, 100000) g;
@@ -4094,13 +4095,13 @@ t
 (1 row)
 DROP TABLE t_seq_edge_mix;
 -- 46ac. Запрет принадлежит образцу, а не периоду сбора. Откат savepoint
---       возвращает образец прошлого периода вместе с его запретом; сам UPDATE
+--       возвращает образец прошлого периода вместе с его запретом, а сам UPDATE
 --       остался вне отката, поэтому данные так и остались переписанными.
 CREATE TEMP TABLE t_seq_undo (id int, note int);
 INSERT INTO t_seq_undo SELECT g, 0 FROM generate_series(1, 100000) g;
 BEGIN;
-/* Запрещённый образец: пересбор идёт из выходной части запроса, чей CTE уже
-   переписал таблицу. Счётчики рядом с образцом включают эти записи, поэтому
+/* Запрещенный образец: пересбор идет из выходной части запроса, чей CTE уже
+   переписал таблицу. Счетчики рядом с образцом включают эти записи, поэтому
    позже сравнивать будет не с чем -- разница оборота окажется нулевой. */
 WITH w AS (UPDATE t_seq_undo SET id = 1 RETURNING id)
 SELECT count(*) > 0 AS cte_rewrote, fasttrun_collect_stats('t_seq_undo') FROM w;
@@ -4113,7 +4114,7 @@ SELECT fasttrun_collect_stats('t_seq_undo');
 fasttrun_collect_stats
 
 (1 row)
-/* Откат возвращает запрещённый образец прошлого периода. Пометка периода тут
+/* Откат возвращает запрещенный образец прошлого периода. Пометка периода тут
    уже снята, и удержать образец может только его собственная. */
 ROLLBACK TO s;
 SELECT ft_rows_est('SELECT * FROM t_seq_undo WHERE id = 1', 'on t_seq_undo')
@@ -4124,11 +4125,11 @@ t
 ROLLBACK;
 DROP TABLE t_seq_undo;
 -- 46ad. Тот же запрет переживает пересбор, который эту колонку пропустил:
---       облегчённому сборщику нужен btree-компаратор, а json его не имеет.
+--       облегченному сборщику нужен btree-компаратор, а json его не имеет.
 CREATE TEMP TABLE t_seq_skip_unsafe (id int, j json);
 INSERT INTO t_seq_skip_unsafe SELECT g, '{"a":1}'::json FROM generate_series(1, 100000) g;
 BEGIN;
-/* Запрещённый образец json снимается тем же способом -- изнутри запроса, чей
+/* Запрещенный образец json снимается тем же способом -- изнутри запроса, чей
    CTE уже обнулил колонку. */
 SET LOCAL fasttrun.use_typanalyze = on;
 WITH w AS (UPDATE t_seq_skip_unsafe SET j = NULL RETURNING id)
@@ -4137,8 +4138,8 @@ SELECT count(*) > 0 AS cte_nulled_json, fasttrun_collect_stats('t_seq_skip_unsaf
 cte_nulled_json|fasttrun_collect_stats
 t|
 (1 row)
-/* Облегчённому сборщику нужен btree-компаратор, а у json его нет: новый период
-   эту колонку пропускает, и запрещённый образец остаётся на месте. */
+/* Облегченному сборщику нужен btree-компаратор, а у json его нет: новый период
+   эту колонку пропускает, и запрещенный образец остается на месте. */
 SET LOCAL fasttrun.use_typanalyze = off;
 SELECT fasttrun_collect_stats('t_seq_skip_unsafe');
 fasttrun_collect_stats
@@ -4152,7 +4153,7 @@ t
 ROLLBACK;
 DROP TABLE t_seq_skip_unsafe;
 -- 46ae. INSERT и DELETE из modifying CTE меняют таблицу так же незаметно для
---       выборки, идущей по снимку начала команды, поэтому в учёт начатых
+--       выборки, идущей по снимку начала команды, поэтому в учет начатых
 --       операторов входят все цели DML, а не только пишущие колонки.
 CREATE TEMP TABLE t_seq_cte_ins (id int);
 INSERT INTO t_seq_cte_ins SELECT g FROM generate_series(1, 100000) g;
@@ -4192,7 +4193,7 @@ t
 (1 row)
 ROLLBACK;
 DROP TABLE t_seq_cte_del;
--- 46af. Писатель может успеть завершиться, а выборка всё равно останется на
+-- 46af. Писатель может успеть завершиться, а выборка все равно останется на
 --       прежнем снимке: UPDATE внутри функции закончился, реестр пуст, но
 --       внешний снимок его строк не видит. Ловится по возрасту снимка.
 CREATE TEMP TABLE t_seq_spi (id int, note int);
@@ -4222,7 +4223,7 @@ DROP TABLE t_seq_spi;
 DROP FUNCTION t_seq_spi_fn();
 -- 46ag. Обратная сторона: обычный первый анализ в той же транзакции, где
 --       таблицу создали и наполнили, писателем не считается. Оператор INSERT
---       завершён, снимок анализа взят после него, и статистика обязана жить.
+--       завершен, снимок анализа взят после него, и статистика обязана жить.
 BEGIN;
 CREATE TEMP TABLE t_seq_plain_first (id int, note int);
 INSERT INTO t_seq_plain_first SELECT g, 0 FROM generate_series(1, 100000) g;
@@ -4244,8 +4245,8 @@ t
 COMMIT;
 DROP TABLE t_seq_plain_first;
 -- 46ah. COPY пишет строки мимо исполнителя, поэтому его цель отмечается как
---       идущий писатель отдельно: выборка внутри выражения COPY идёт по снимку
---       той же команды и уже вставленных строк не видит, а счётчики их держат.
+--       идущий писатель отдельно: выборка внутри выражения COPY идет по снимку
+--       той же команды и уже вставленных строк не видит, а счетчики их держат.
 CREATE TEMP TABLE t_seq_copy (id int);
 INSERT INTO t_seq_copy SELECT generate_series(1, 100000);
 SELECT fasttrun_analyze('t_seq_copy');
@@ -4297,6 +4298,135 @@ t
 DROP TABLE t_seq_untouched;
 DROP TABLE t_seq_other;
 DROP FUNCTION t_seq_other_noop();
+-- 46aj. Постоянные цели в реестр начатых операторов не попадают: статистику
+--       fasttrun собирает только для временных таблиц. UPDATE секционированной
+--       таблицы без отсечения секций перечисляет в целях каждую секцию, здесь
+--       их 100. Если бы они занимали слоты, реестр переполнился бы, как в 46z,
+--       и сбор до конца транзакции не доходил бы до планировщика. Секции
+--       чередуются, UNLOGGED и обычные, чтобы проверить любую невременную цель.
+CREATE TABLE t_seq_perm_parts (k int, v int) PARTITION BY HASH (k);
+DO $pp$
+DECLARE i int;
+BEGIN
+  FOR i IN 0..99 LOOP
+    EXECUTE format('CREATE %s TABLE t_seq_perm_parts_%s PARTITION OF t_seq_perm_parts '
+                   'FOR VALUES WITH (MODULUS 100, REMAINDER %s)',
+                   CASE WHEN i % 2 = 0 THEN 'UNLOGGED' ELSE '' END, i, i);
+  END LOOP;
+END$pp$;
+INSERT INTO t_seq_perm_parts SELECT g, 0 FROM generate_series(1, 1000) g;
+CREATE TEMP TABLE t_seq_perm_probe (id int, note int);
+INSERT INTO t_seq_perm_probe SELECT g, 0 FROM generate_series(1, 100000) g;
+SELECT fasttrun_collect_stats('t_seq_perm_probe');
+fasttrun_collect_stats
+
+(1 row)
+BEGIN;
+UPDATE t_seq_perm_parts SET v = 1 WHERE k <> 5;
+SELECT fasttrun_collect_stats('t_seq_perm_probe');
+fasttrun_collect_stats
+
+(1 row)
+SELECT ft_rows_est('SELECT * FROM t_seq_perm_probe WHERE id = 1', 'on t_seq_perm_probe')
+       <= 10 AS perm_partitions_update_keeps_stats;
+perm_partitions_update_keeps_stats
+t
+(1 row)
+COMMIT;
+-- 46ak. То же для DELETE и для рабочего цикла целиком: очистка, заполнение и
+--       fasttrun_analyze в транзакции, где уже прошел DELETE по всем секциям.
+BEGIN;
+DELETE FROM t_seq_perm_parts WHERE k <> 5 AND v = -1;
+SELECT fasttruncate('t_seq_perm_probe');
+fasttruncate
+
+(1 row)
+INSERT INTO t_seq_perm_probe SELECT g, 0 FROM generate_series(1, 100000) g;
+SELECT fasttrun_analyze('t_seq_perm_probe');
+fasttrun_analyze
+
+(1 row)
+SELECT ft_rows_est('SELECT * FROM t_seq_perm_probe WHERE id = 1', 'on t_seq_perm_probe')
+       <= 10 AS perm_partitions_delete_keeps_stats;
+perm_partitions_delete_keeps_stats
+t
+(1 row)
+COMMIT;
+-- 46al. COPY в постоянную таблицу тоже не занимает слот. Шестнадцать временных
+--       целей реестр заполняют, но не переполняют, это проверяется первым.
+--       Постоянная цель COPY, под которой триггер пишет те же шестнадцать,
+--       была бы семнадцатой.
+CREATE TABLE t_seq_perm_copy (x int);
+CREATE TEMP TABLE t_seq_sixteen (id int);
+DO $st$
+DECLARE i int;
+BEGIN
+  FOR i IN 1..15 LOOP
+    EXECUTE format('CREATE TEMP TABLE t_seq_sixteen_c%s () INHERITS (t_seq_sixteen)', i);
+  END LOOP;
+END$st$;
+CREATE FUNCTION t_seq_perm_copy_trg() RETURNS trigger LANGUAGE plpgsql AS $ct$
+BEGIN
+  UPDATE t_seq_sixteen SET id = id;
+  RETURN NEW;
+END$ct$;
+CREATE TRIGGER t_seq_perm_copy_trg BEFORE INSERT ON t_seq_perm_copy
+  FOR EACH ROW EXECUTE FUNCTION t_seq_perm_copy_trg();
+BEGIN;
+UPDATE t_seq_sixteen SET id = id;
+SELECT fasttrun_collect_stats('t_seq_perm_probe');
+fasttrun_collect_stats
+
+(1 row)
+SELECT ft_rows_est('SELECT * FROM t_seq_perm_probe WHERE id = 1', 'on t_seq_perm_probe')
+       <= 10 AS sixteen_temp_targets_fit;
+sixteen_temp_targets_fit
+t
+(1 row)
+COMMIT;
+BEGIN;
+COPY t_seq_perm_copy FROM STDIN;
+SELECT fasttrun_collect_stats('t_seq_perm_probe');
+fasttrun_collect_stats
+
+(1 row)
+SELECT ft_rows_est('SELECT * FROM t_seq_perm_probe WHERE id = 1', 'on t_seq_perm_probe')
+       <= 10 AS perm_copy_target_not_registered;
+perm_copy_target_not_registered
+t
+(1 row)
+COMMIT;
+DROP TABLE t_seq_perm_copy;
+DROP FUNCTION t_seq_perm_copy_trg();
+DO $st$
+DECLARE i int;
+BEGIN
+  FOR i IN 1..15 LOOP
+    EXECUTE format('DROP TABLE t_seq_sixteen_c%s', i);
+  END LOOP;
+END$st$;
+DROP TABLE t_seq_sixteen;
+DROP TABLE t_seq_perm_probe;
+DROP TABLE t_seq_perm_parts;
+-- 46am. Фильтр смотрит на каждую цель оператора, а не на названное отношение.
+--       Временный наследник постоянного родителя - цель UPDATE этого родителя,
+--       и пересбор наследника изнутри такого UPDATE обязан считаться идущим под
+--       писателем. Условию не отвечает ни одна строка: износа от UPDATE нет, и
+--       скрыть образец может только реестр.
+CREATE TABLE t_seq_perm_parent (id int, note int);
+CREATE TEMP TABLE t_seq_temp_child () INHERITS (t_seq_perm_parent);
+INSERT INTO t_seq_temp_child SELECT g, 0 FROM generate_series(1, 100000) g;
+BEGIN;
+UPDATE t_seq_perm_parent SET note = 1
+  WHERE id = (SELECT -1 FROM fasttrun_collect_stats('t_seq_temp_child'));
+SELECT ft_rows_est('SELECT * FROM t_seq_temp_child WHERE id = 1', 'on t_seq_temp_child')
+       >= 100 AS temp_child_of_permanent_parent_registered;
+temp_child_of_permanent_parent_registered
+t
+(1 row)
+ROLLBACK;
+DROP TABLE t_seq_temp_child;
+DROP TABLE t_seq_perm_parent;
 DROP FUNCTION ft_rows_est(text, text);
 \pset format aligned
 DROP EXTENSION fasttrun;

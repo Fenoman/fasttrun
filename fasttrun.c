@@ -2,8 +2,8 @@
  *
  * fasttrun.c
  *      Fast TRUNCATE for temporary tables that does not generate any
- *      shared invalidation messages beyond the unavoidable ones produced
- *      by heap_truncate() itself.
+ *      shared invalidation messages beyond the SMGR ones RelationTruncate()
+ *      sends when fasttrun.zero_sinval_truncate is off.
  *
  *-------------------------------------------------------------------------
  */
@@ -196,15 +196,15 @@ fasttrun_test_fail(const char *name, int ordinal)
  * the storage-locator check and once for the pgstat xact counters.  While
  * standard_planner runs, memoize both per relid (a relation cannot be dropped
  * and recreated mid-plan, the same consistency model the pgstat snapshot
- * relies on); outside planner_hook, fall back to direct reads.
+ * relies on).  Outside planner_hook, fall back to direct reads.
  *
  * One slot per distinct temp relid that supplied column stats in the current
- * plan.  256 slots cover join/CTE/partition-by-temp patterns; once a plan
+ * plan.  256 slots cover join/CTE/partition-by-temp patterns.  Once a plan
  * touches more distinct temp relids than that, round-robin eviction
  * (next_evict) makes the evicted relid pay one RelationIdGetRelation + pgstat
  * read on its next probe.  Correctness is unaffected -- every read matches
  * slot->relid, so an evicted slot is a miss, not a wrong answer.  ~10 KB of
- * bss per backend; linear scan stays cache-friendly at this size and beats
+ * bss per backend.  Linear scan stays cache-friendly at this size and beats
  * hashing.  The cache resets after each plan, so a simple FIFO is enough.
  */
 #define FASTTRUN_FRESHNESS_CACHE_SLOTS 256
@@ -223,8 +223,8 @@ typedef struct FasttrunFreshnessCacheEntry
 	bool		wide_writers;	/* relation can change a column no statement
 								 * named: row triggers, stored generated cols */
 	bool		upd_cached;		/* upd holds a real reading, not the zero a
-								 * caller that passed upd = NULL left behind;
-								 * placed here to reuse existing padding */
+								 * caller that passed upd = NULL left behind.
+								 * Placed here to reuse existing padding */
 	BlockNumber	pages;
 	bool		owner_checked;	/* owner_heap is filled in (index relids) */
 	Oid			owner_heap;		/* memoized owning heap of an index */
@@ -300,13 +300,13 @@ static FasttrunXactFrame *fasttrun_xact_frame = NULL;
  * goes away with the parent.
  *
  * A frame that grew wide is not pooled: dynahash never shrinks, so keeping it
- * would hold the enlarged table until the top transaction ends, while the old
- * behaviour returned it at the end of the subtransaction.
+ * would hold the enlarged table until the top transaction ends.  Deleting it
+ * returns that memory at the end of the subtransaction.
  */
 #define FASTTRUN_XACT_FRAME_POOL_MAX 4
 #define FASTTRUN_XACT_FRAME_POOL_ENTRIES_MAX 32
 
-/* Set on a pooled frame's context; a live frame carries no identifier. */
+/* Set on a pooled frame's context.  A live frame carries no identifier. */
 #define FASTTRUN_XACT_FRAME_POOLED_IDENT "pooled"
 
 static FasttrunXactFrame *fasttrun_xact_frame_pool = NULL;
@@ -337,7 +337,7 @@ fasttrun_xact_frame_for_subid(SubTransactionId subid, bool create)
 	MemoryContext oldcxt;
 	HASHCTL		ctl;
 
-	/* Active ancestors have smaller IDs; core rejects subid wraparound. */
+	/* Active ancestors have smaller IDs.  Core rejects subid wraparound. */
 	while (*link != NULL && (*link)->subid > subid)
 		link = &(*link)->parent;
 	if (*link != NULL && (*link)->subid == subid)
@@ -395,7 +395,7 @@ fasttrun_xact_frame_for_subid(SubTransactionId subid, bool create)
 /*
  * Release the frame of a finished subtransaction.  Its entries are cleared and
  * the empty frame, context and hash table included, goes to the pool.  A frame
- * that is too wide, or one arriving at a full pool, is deleted as before.
+ * that is too wide, or one arriving at a full pool, is deleted.
  */
 static void
 fasttrun_xact_frame_release(FasttrunXactFrame *frame)
@@ -608,6 +608,7 @@ struct FasttrunStatsEntry;
 
 static void fasttrun_stats_note_update_target(Oid relid,
 											  RTEPermissionInfo *perminfo);
+static bool fasttrun_relid_is_temp(Oid relid);
 static void fasttrun_stats_update_in_flight(Oid relid, int delta);
 static bool fasttrun_stats_relid_in_flight(Oid relid);
 static bool fasttrun_stats_relation_written_now(Relation rel);
@@ -633,7 +634,7 @@ static bool fasttrun_reinject_sublink_walker(Node *node, void *context);
 /*
  * Build a RangeVar from a text relation name.  Fast path for bare
  * lowercase identifiers (no '.', no '"', no uppercase) skips the parser
- * entirely; everything else falls back to stringToQualifiedNameList.
+ * entirely.  Everything else falls back to stringToQualifiedNameList.
  */
 static RangeVar *
 fasttrun_make_rangevar(text *name)
@@ -858,7 +859,7 @@ fasttrun_relation_has_same_locator(Relation rel, FasttrunAnalyzeCacheEntry *entr
  * index relstats.
  *
  * Runs from the subxact-abort callback, where relcache and syscache access
- * is off-limits (TRANS_ABORT; PG18 asserts inside RelationIdGetRelation).
+ * is off-limits (TRANS_ABORT, PG18 asserts inside RelationIdGetRelation).
  * The probe therefore stays at smgr level, addressing storage through the
  * RelFileLocatorBackend captured at store time.  A vanished or replaced
  * storage file (smgrexists false) means the cached identity no longer holds
@@ -895,7 +896,7 @@ fasttrun_cache_make_empty_storage_authoritative(FasttrunAnalyzeCacheEntry *entry
 	else if (smgrnblocks(own, MAIN_FORKNUM) != 0)
 		return false;
 
-	/* Heap gives 0 pages here; a rebuilt index keeps its metapage. */
+	/* Heap gives 0 pages here, while a rebuilt index keeps its metapage. */
 	entry->state.has_relstats = true;
 	entry->state.cached_pages = smgrnblocks(own, MAIN_FORKNUM);
 	entry->state.cached_tuples = 0;
@@ -978,31 +979,25 @@ fasttrun_cache_reset(void)
 /*
  * COMMIT-time bookkeeping for the analyze cache.
  *
- * The 2.2.0 version of this routine was a CPU hog.  It walked the entire
- * cache on every COMMIT.  For each entry it called
- * fasttrun_cache_make_empty_storage_authoritative() -- which does
- * try_relation_open plus RelationGetNumberOfBlocks per entry.  Then a
- * nested fasttrun_stats_cache_evict_relid scanned the stats hash, and a
- * burst of fasttrun_invalidate_local_plan_cache calls fired.  On a
- * backend with many ON COMMIT DELETE ROWS temp tables that get
- * re-analyzed every xact, the cost was N x (smgr call + plan-cache walk)
- * per COMMIT.  It dominated CPU.
+ * The walk covers only the relids this transaction touched, and it probes no
+ * storage and sends no invalidations.  Probing storage and walking the plan
+ * cache for every cached entry would cost N x (smgr call + plan-cache walk)
+ * per COMMIT, which dominates CPU on a backend with many ON COMMIT DELETE
+ * ROWS temp tables that get re-analyzed every xact.
  *
- * The empty-storage adoption survived, just in a different place.  It
- * now happens in fasttrun_reinject_relstats() on the planner_hook path.
- * Runs at most once per relation per query, and only when the planner
- * actually touches the table.  Stale shared-invalidation traffic from
- * the COMMIT callback is gone.
+ * Empty-storage adoption happens lazily instead, in
+ * fasttrun_reinject_relstats() on the planner_hook path: at most once per
+ * relation per query, and only when the planner actually touches the table.
  *
- * What this function does now:
- *   - walks the per-xact touched-relid list, not the whole cache;
+ * What this function does:
+ *   - walks the per-xact touched-relid list, not the whole cache
  *   - drops entries whose relation has vanished (the long-lived
  *     backend case -- ON COMMIT DROP temp tables die in
- *     PreCommit_on_commit_actions() before this callback fires; without
+ *     PreCommit_on_commit_actions() before this callback fires, so without
  *     explicit cleanup the entry would stay forever and the backend
- *     would slowly grow);
- *   - frees per-subxact undo chains attached to surviving entries;
- *   - clears the xact-scoped delta-math snapshot and baseline state;
+ *     would slowly grow)
+ *   - frees per-subxact undo chains attached to surviving entries
+ *   - clears the xact-scoped delta-math snapshot and baseline state
  *   - drops entries that lost their planner-visible relstats
  *     (has_relstats == false -- happens after DDL/DROP eviction).
  */
@@ -1401,7 +1396,7 @@ fasttrun_poison_check_relation(Relation rel, const char *operation,
 			 errhint("Retry fasttruncate, or DROP and recreate the temporary table.")));
 }
 
-/* DROP is transactional; only COMMIT removes an active block. */
+/* DROP is transactional, so only COMMIT removes an active block. */
 static void
 fasttrun_poison_commit_xact(void)
 {
@@ -1451,7 +1446,7 @@ fasttrun_cache_lookup(Oid relid)
 /*
  * HASH_ENTER an analyze-cache entry, zero-initializing the
  * stats-baseline fields on first creation.  Callers fill in cached_*
- * (delta-math snapshot) themselves; the stats baseline starts out as
+ * (delta-math snapshot) themselves.  The stats baseline starts out as
  * "no column stats collected yet for this relid".
  */
 static FasttrunAnalyzeCacheEntry *
@@ -1507,12 +1502,12 @@ fasttrun_cache_store_relstats(Relation rel, BlockNumber pages, int64 tuples,
 
 	/*
 	 * Register this relid so the xact-end callback walks it.  Index entries
-	 * land here too (via fasttrun_update_index_relstats and
-	 * fasttrun_rebuild_one_index) without going through the top-level touch
-	 * in fasttrun_analyze or fasttruncate.  Publishing relstats is
-	 * planner-visible: an abort restores the old values, so plans built on
-	 * the new ones must not survive it.  Mark before mutating -- a
-	 * mid-operation error keeps the abort path conservative.
+	 * land here too (via fasttrun_update_index_relstats) without going
+	 * through the top-level touch in fasttrun_analyze or
+	 * fasttrun_collect_stats.  Publishing relstats is planner-visible: an
+	 * abort restores the old values, so plans built on the new ones must not
+	 * survive it.  Mark before mutating -- a mid-operation error keeps the
+	 * abort path conservative.
 	 */
 	fasttrun_xact_mark_relid(RelationGetRelid(rel), RelationGetRelid(rel),
 								FASTTRUN_TOUCH_ANALYZE |
@@ -1528,7 +1523,7 @@ fasttrun_cache_store_relstats(Relation rel, BlockNumber pages, int64 tuples,
 	entry->state.cached_allvisible = allvisible;
 	entry->state.probe_rlb.locator = rel->rd_locator;
 	entry->state.probe_rlb.backend = rel->rd_backend;
-	/* Default: the entry is its own heap; index call sites override. */
+	/* Default: the entry is its own heap.  Index call sites override. */
 	entry->state.heap_relid = RelationGetRelid(rel);
 	entry->state.heap_rlb = entry->state.probe_rlb;
 	/* cached_pages changed -- the lazy-probe memo is now stale. */
@@ -1546,7 +1541,7 @@ fasttrun_cache_set_owning_heap(FasttrunAnalyzeCacheEntry *entry,
 	uint32		flags = FASTTRUN_TOUCH_ANALYZE;
 	Oid			root_relid = RelationGetRelid(heaprel);
 
-	/* TOAST has no user plan of its own; its main heap already owns the plan. */
+	/* TOAST has no user plan of its own.  Its main heap already owns the plan. */
 	if (heaprel->rd_rel->relkind != RELKIND_TOASTVALUE)
 		flags |= FASTTRUN_TOUCH_PLAN_INVALIDATE;
 	fasttrun_xact_mark_relid(entry->relid, root_relid, flags);
@@ -1581,7 +1576,7 @@ fasttrun_cache_store_delta_state(FasttrunAnalyzeCacheEntry *entry,
  *
  * Cross-subxact safety: if the existing baseline was set in an outer
  * subxact, push it onto the undo stack so a later ROLLBACK TO SAVEPOINT
- * restores it; same-subxact overwrites just clobber in place.
+ * restores it.  Same-subxact overwrites just clobber in place.
  */
 static void
 fasttrun_cache_set_stats_baseline(Oid relid, int64 ins, int64 upd, int64 del,
@@ -1701,15 +1696,12 @@ fasttrun_reinject_relstats(Relation rel, FasttrunAnalyzeCacheEntry *entry)
 	 * fasttruncate() also resets storage non-transactionally.  Either way,
 	 * the cache may carry stale page counts.
 	 *
-	 * Version 2.2.0 reconciled this eagerly.  It walked the entire cache
-	 * in fasttrun_cache_commit_xact() and read nblocks for each entry.  On
-	 * a backend holding many ON COMMIT DELETE ROWS temp tables, that scaled
-	 * as O(cache_size) per COMMIT and dominated CPU.
-	 *
-	 * The new approach observes the truth at planning time.  If storage
-	 * went to zero since we cached, adopt that fact in place.  One
-	 * smgrnblocks call per cached relid per query -- and only for relations
-	 * the planner actually touches.  Strictly less work than the old scan.
+	 * The truth is observed at planning time: if storage went to zero since
+	 * we cached, adopt that fact in place.  One smgrnblocks call per cached
+	 * relid per query -- and only for relations the planner actually
+	 * touches.  An eager pass in fasttrun_cache_commit_xact() would read
+	 * nblocks for every cached entry, O(cache_size) per COMMIT on a backend
+	 * holding many ON COMMIT DELETE ROWS temp tables.
 	 *
 	 * Empty heap means zero blocks.  An index keeps its metapage even after
 	 * truncate (a "fresh" btree is one page).  So index emptiness is judged
@@ -1974,14 +1966,14 @@ typedef struct FasttrunStatsEntry
 	int64				collected_upd;
 	int64				collected_del;
 	bool				collected_truncdropped;
-	BlockNumber			collected_pages;	/* physical block count at collect;
+	BlockNumber			collected_pages;	/* physical block count at collect,
 											 * the only change signal that
 											 * survives a temp table's commit */
 	bool				was_usable;		/* entry passed the freshness check at
-										 * the last analyze/publish; drives the
+										 * the last analyze/publish.  Drives the
 										 * visible->hidden flip detection */
-	uint64				collect_seq;	/* collect period this sample belongs to;
-										 * the per-column UPDATE mask describes
+	uint64				collect_seq;	/* collect period this sample belongs to.
+										 * The per-column UPDATE mask describes
 										 * the relation's current period only */
 	bool				unsafe;		/* taken while the relation was being
 									 * written: the scan and the counters
@@ -2014,10 +2006,9 @@ typedef struct FasttrunStatsRelidSavedState
  *
  * Used by fasttrun_stats_cache_evict_relid and
  * fasttrun_stats_cache_mark_evicted_relid.  They walk only the columns
- * belonging to a given relid -- O(#cached-cols), small.  No more full
- * hash_seq_search over the entire stats cache.  That sequential scan was
- * O(N) and grew large on long-lived backends that analyzed many temp
- * tables.
+ * belonging to a given relid -- O(#cached-cols), small -- instead of a
+ * hash_seq_search over the entire stats cache, which is O(N) and grows
+ * large on long-lived backends that analyze many temp tables.
  */
 typedef struct FasttrunStatsRelidEntry
 {
@@ -2026,14 +2017,14 @@ typedef struct FasttrunStatsRelidEntry
 	List	   *attkeys;	/* List of FasttrunStatsKey *, owns palloc'd keys */
 	Bitmapset  *updated_cols;	/* attnums named by an UPDATE since the last
 								 * collect, in RTEPermissionInfo.updatedCols
-								 * offset form; lives in fasttrun_stats_mcxt */
-	uint64		collect_seq;	/* current collect period; a column sample from
+								 * offset form.  Lives in fasttrun_stats_mcxt */
+	uint64		collect_seq;	/* current collect period.  A column sample from
 								 * an older period is not covered by the mask */
 	RelFileLocatorBackend heap_rlb;	/* heap storage identity for the commit-time size probe */
 	bool		heap_rlb_valid;
 	bool		updated_cols_exact;	/* the mask can be taken as the full set of
-									 * what an UPDATE changed on this relation;
-									 * placed here to reuse existing padding */
+									 * what an UPDATE changed on this relation.
+									 * Placed here to reuse existing padding */
 	bool		period_unsafe;	/* samples of the current period were taken
 								 * while a statement was writing the relation */
 	FasttrunRelStatsPolicy policy;
@@ -2091,8 +2082,9 @@ fasttrun_ensure_stats_hooks(void)
  * that had already started were never offered to the hook.  Which relations
  * they write, and whether they write at all, cannot be recovered afterwards, so
  * the per-column account does not run in such a backend at all: wear from an
- * UPDATE goes back to counting for every column, exactly as before the account
- * existed.  Put fasttrun in session_preload_libraries to get it.
+ * UPDATE counts for every column of the relation.  Put fasttrun in
+ * session_preload_libraries to get it, but a background worker never loads
+ * that list and needs shared_preload_libraries.
  */
 static bool fasttrun_lazy_loaded = false;
 static bool fasttrun_lazy_loaded_warned = false;
@@ -2136,9 +2128,13 @@ fasttrun_executor_walk_targets(PlannedStmt *stmt, bool starting)
 		 * their rows are invisible to a scan running on the same command's
 		 * snapshot just as an UPDATE's are.  The registry is kept even for a
 		 * relation fasttrun does not manage yet, because its first collect may
-		 * happen from inside this very statement.
+		 * happen from inside this very statement.  Only a temporary relation
+		 * can be collected at all, so a permanent target is left out: an
+		 * UPDATE or DELETE of a partitioned table lists every unpruned
+		 * partition and would overflow the registry for nothing.
 		 */
-		fasttrun_stats_update_in_flight(rte->relid, starting ? 1 : -1);
+		if (fasttrun_relid_is_temp(rte->relid))
+			fasttrun_stats_update_in_flight(rte->relid, starting ? 1 : -1);
 
 		if (starting && fasttrun_stats_relid_exists(rte->relid))
 		{
@@ -2294,7 +2290,7 @@ fasttrun_memory_context_bytes(MemoryContext mcxt)
  * cached column stats keep refreshing without this check, and nothing is
  * ever evicted.
  *
- * Signals: the auto-collect path warns once per backend; an explicit
+ * Signals: the auto-collect path warns once per backend, while an explicit
  * fasttrun_collect_stats() call gets a NOTICE every time.
  */
 static bool
@@ -2316,7 +2312,7 @@ fasttrun_stats_budget_blocks_collect(Relation rel, bool explicit_collect)
 	{
 		ereport(WARNING,
 				(errmsg("fasttrun: column statistics cache exceeds fasttrun.max_stats_memory, new tables are left without column statistics"),
-				 errdetail("A table without cached column statistics behaves as with fasttrun.auto_collect_stats = off: relation-level statistics keep working, the planner falls back to default selectivity. Tables that already hold cached column statistics keep refreshing; nothing is evicted."),
+				 errdetail("A table without cached column statistics behaves as with fasttrun.auto_collect_stats = off: relation-level statistics keep working, the planner falls back to default selectivity. Tables that already hold cached column statistics keep refreshing, and nothing is evicted."),
 				 errhint("Raise fasttrun.max_stats_memory, or recycle the connection to free the cache. fasttrun_cache_stats() reports the current cache size.")));
 		fasttrun_warned_stats_budget = true;
 	}
@@ -2394,14 +2390,17 @@ fasttrun_stats_note_update_target(Oid relid, RTEPermissionInfo *perminfo)
 }
 
 /*
- * Registry of UPDATE statements that have started and not finished.
+ * Registry of statements writing a temporary relation that have started and
+ * not finished.
  *
  * It has to live outside the stats cache: the very first collect of a relation
  * happens while no cache entry exists yet, and that collect still must not take
  * the column mask as a full account if an UPDATE is running underneath it.
- * Nesting is shallow -- a statement reaches here only through a subquery or a
- * modifying CTE -- so a short array beats a hash.  Overflow is answered
- * conservatively rather than grown.
+ * Permanent relations are never collected and never take a slot.  A statement
+ * can have several targets (a modifying CTE, an inheritance or partition
+ * tree), and statements nest when a trigger or a function runs one inside
+ * another.  Both are usually small, so a short array beats a hash.  Overflow
+ * is answered conservatively rather than grown.
  */
 #define FASTTRUN_IN_FLIGHT_SLOTS	16
 
@@ -2422,6 +2421,26 @@ static int	fasttrun_in_flight_used = 0;
 static bool fasttrun_in_flight_incomplete = false;
 
 
+/*
+ * The registry filter.  It must answer the same at a statement's start and end
+ * so the count balances.  No relation becomes or stops being temporary in
+ * between.  A relation the syscache does not know is not temporary.
+ */
+static bool
+fasttrun_relid_is_temp(Oid relid)
+{
+	HeapTuple	tp;
+	bool		result;
+
+	tp = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
+	if (!HeapTupleIsValid(tp))
+		return false;
+	result = (((Form_pg_class) GETSTRUCT(tp))->relpersistence ==
+			  RELPERSISTENCE_TEMP);
+	ReleaseSysCache(tp);
+	return result;
+}
+
 static void
 fasttrun_stats_update_in_flight(Oid relid, int delta)
 {
@@ -2434,7 +2453,7 @@ fasttrun_stats_update_in_flight(Oid relid, int delta)
 	 * the key is what lets a nested statement that raised an error be dropped
 	 * on its own, without touching the outer statement writing the same
 	 * relation.  A statement normally starts and ends in the same
-	 * subtransaction; the fallback covers the case where its subtransaction
+	 * subtransaction.  The fallback covers the case where its subtransaction
 	 * committed while it was still running.
 	 */
 	for (i = 0; i < fasttrun_in_flight_used; i++)
@@ -2501,7 +2520,7 @@ fasttrun_stats_relid_in_flight(Oid relid)
  *   * a statement writing the relation is running.  The registry knows every
  *     statement whose start was observed, nested ones included, and every DML
  *     target of it -- which is every statement at all, because the per-column
- *     account only runs in a backend that preloaded the library;
+ *     account only runs in a backend that preloaded the library.
  *   * a write already finished under a snapshot older than it.  The scan then
  *     runs on that older snapshot and does not see rows the counters count:
  *     an inner function's UPDATE, or an earlier command of this transaction
@@ -2579,7 +2598,7 @@ fasttrun_stats_in_flight_subxact_end(SubTransactionId mySubid,
  * DDL that can add a writer working outside a statement's target list must take
  * trust away from the column mask before the next UPDATE runs -- after COMMIT
  * the counters are gone and the evidence with them.  CREATE TRIGGER is the one
- * such statement that does not already go through eviction; ALTER TABLE does,
+ * such statement that does not already go through eviction.  ALTER TABLE does,
  * which is stronger.  The planner-path re-read stays as a second line.
  */
 static void
@@ -2606,14 +2625,14 @@ fasttrun_stats_note_wide_writer_ddl(RangeVar *rv)
  * Answers conservatively -- an over-reported column merely loses its statistics
  * -- whenever the mask cannot account for the change:
  *
- *   * the relation can change columns a statement does not name;
+ *   * the relation can change columns a statement does not name.
  *   * the sample predates the current collect period, so the mask, which was
  *     cleared at that collect, says nothing about it.  This covers a sample
- *     restored by savepoint rollback and a column the collect skipped;
+ *     restored by savepoint rollback and a column the collect skipped.
  *   * the mask is empty while the counters say an UPDATE happened, so the
  *     write did not reach the executor hook.  A write that mixes with an
- *     already recorded UPDATE is not detected -- see the direct table AM
- *     boundary in CLAUDE.md.
+ *     already recorded UPDATE is not detected -- see the limitation on
+ *     writes that bypass the executor in README.md and README_EN.md.
  */
 static bool
 fasttrun_stats_column_was_updated(FasttrunStatsRelidEntry *relentry,
@@ -2644,8 +2663,8 @@ fasttrun_stats_column_was_updated(FasttrunStatsRelidEntry *relentry,
  * their old sequence and stay outside the mask's account.
  *
  * A trigger may write columns the statement does not name, and a stored generated
- * column is recomputed outside the target list; on such a relation the mask is not
- * a full account.  That check is re-read here and again whenever a plan asks
+ * column is recomputed outside the target list.  On such a relation the mask is
+ * not a full account.  That check is re-read here and again whenever a plan asks
  * for this relation's statistics, so a trigger created between two collects is
  * covered.
  *
@@ -2676,11 +2695,22 @@ fasttrun_stats_begin_collect_period(Relation rel)
 	 */
 	if (fasttrun_lazy_loaded && !fasttrun_lazy_loaded_warned)
 	{
+		/*
+		 * Only interactive sessions load session_preload_libraries.  Any other
+		 * process -- a background worker above all -- is reached by
+		 * shared_preload_libraries alone, and short-lived workers would repeat
+		 * the line thousands of times a day, so it reports at DEBUG1.
+		 */
+		bool		interactive = (MyBackendType == B_BACKEND ||
+								   MyBackendType == B_STANDALONE_BACKEND);
+
 		fasttrun_lazy_loaded_warned = true;
-		ereport(LOG,
+		ereport(interactive ? LOG : DEBUG1,
 				(errmsg("fasttrun: per-column UPDATE accounting is off in this session"),
 				 errdetail("The library was loaded on first use, so statements that had already started were never seen."),
-				 errhint("Add fasttrun to session_preload_libraries or shared_preload_libraries.")));
+				 interactive ?
+				 errhint("Add fasttrun to session_preload_libraries or shared_preload_libraries.") :
+				 errhint("This process does not load session_preload_libraries, so add fasttrun to shared_preload_libraries.")));
 	}
 
 	wide = fasttrun_relation_has_wide_writers(rel);
@@ -3073,7 +3103,7 @@ typedef struct FasttrunUsableBaseline
  * (see FASTTRUN_SKEW_REFRESH_FLOOR).  Within tolerance the cached distribution
  * still beats planner defaults (core PG keeps using pg_statistic between
  * ANALYZE runs the same way).  A truncdropped flip means the storage was
- * emptied or rewritten; a missing analyze-cache row-count baseline means we
+ * emptied or rewritten.  A missing analyze-cache row-count baseline means we
  * cannot bound the drift.  Either makes the entry unusable.  Caller guarantees
  * entry->statsTuple != NULL and passes rel_baseline zero-initialized (or
  * carried over from previous columns of the same relid).
@@ -3100,7 +3130,7 @@ fasttrun_stats_entry_usable_ext(Oid relid, FasttrunStatsRelidEntry *relentry,
 	 * A sample taken while the relation was being written describes the
 	 * command snapshot its scan started from, while the counters stored beside
 	 * it already include those writes.  Nothing about them can be compared, so
-	 * it stays out of use for good; only a fresh sample replaces it.  The mark
+	 * it stays out of use for good.  Only a fresh sample replaces it.  The mark
 	 * belongs to the sample, not to the relation's current period: a period
 	 * ends, and the sample can outlive it through a savepoint rollback or a
 	 * collect that skipped its column.
@@ -3112,7 +3142,7 @@ fasttrun_stats_entry_usable_ext(Oid relid, FasttrunStatsRelidEntry *relentry,
 	 * pgstat counts tuples_updated per relation, not per column, so a single
 	 * UPDATE that rewrote one helper column would age the statistics of every
 	 * column of the table.  Charge this column only for UPDATEs that named it
-	 * in their target list; inserts and deletes still count for all of them,
+	 * in their target list.  Inserts and deletes still count for all of them,
 	 * since they change the row count every distribution rests on.
 	 */
 	upd_delta = upd_now - entry->collected_upd;
@@ -3136,7 +3166,7 @@ fasttrun_stats_entry_usable_ext(Oid relid, FasttrunStatsRelidEntry *relentry,
 		 * cached MCV/histogram/n_distinct are untrustworthy -- hide them and
 		 * let the planner fall back to defaults (as core does with no
 		 * pg_statistic row).  Within a transaction the counter path below
-		 * governs soft freshness; this check only guards the "counters see
+		 * governs soft freshness.  This check only guards the "counters see
 		 * nothing" blind spot.
 		 */
 		if (pages_now != entry->collected_pages)
@@ -3194,7 +3224,7 @@ fasttrun_stats_entry_usable_ext(Oid relid, FasttrunStatsRelidEntry *relentry,
 		churn = -churn;
 	baseline = rel_baseline->tuples;
 
-	/* stadistinct < 0 is a negative fraction of rows; > 0 is an absolute count. */
+	/* stadistinct < 0 is a negative fraction of rows, > 0 is an absolute count. */
 	stadistinct = ((Form_pg_statistic) GETSTRUCT(entry->statsTuple))->stadistinct;
 	dratio = (stadistinct < 0.0) ? -stadistinct : stadistinct / baseline;
 
@@ -3230,7 +3260,7 @@ fasttrun_stats_entry_usable(Oid relid, FasttrunStatsRelidEntry *relentry,
 /*
  * Find or create the freshness-cache slot for a relid.  Planner scope only:
  * callers must check fasttrun_in_planner first.  A new slot starts with all
- * memo flags clear.  When the cache is full the slot is claimed round-robin;
+ * memo flags clear.  When the cache is full the slot is claimed round-robin.
  * FIFO is good enough for the planner-scoped lifetime, and an overwritten
  * relid is a miss on its next probe, never a wrong answer.
  */
@@ -3318,7 +3348,7 @@ fasttrun_stats_relid_locator_valid(Oid relid,
 
 /*
  * Substitute our cached tuple while it stays within churn tolerance (see
- * fasttrun_stats_entry_usable); past the threshold we fall through so the
+ * fasttrun_stats_entry_usable).  Past the threshold we fall through so the
  * planner uses defaults instead of a distribution that has shifted too far.
  */
 static bool
@@ -3425,8 +3455,8 @@ fasttrun_type_default_width(Oid relid, AttrNumber attnum)
  * the real sample, which inflates hash-table / sort / spool costing
  * on temp tables with short text columns.
  *
- * Same ownership contract as the relation-stats hook.  CORE_ALLOWED chains;
- * neutral, stale, and zero-width local states return the type default here,
+ * Same ownership contract as the relation-stats hook.  CORE_ALLOWED chains.
+ * Neutral, stale, and zero-width local states return the type default here,
  * because returning 0 would make lsyscache read stale pg_statistic.stawidth.
  */
 static int32
@@ -3567,10 +3597,10 @@ fasttrun_index_owning_heap(Oid indexOid)
 
 /*
  * Expression indexes keep their stats in pg_statistic under the INDEX oid
- * (written only by core ANALYZE; the column hooks never see that path).
+ * (written only by core ANALYZE, and the column hooks never see that path).
  * fasttrun does not refresh those rows, so once the owning heap goes
  * LOCAL_NEUTRAL they describe data the table no longer has.  Hide them and
- * let the planner use defaults; unmanaged and CORE_ALLOWED heaps chain.
+ * let the planner use defaults.  Unmanaged and CORE_ALLOWED heaps chain.
  */
 static bool
 fasttrun_get_index_stats_hook(PlannerInfo *root, Oid indexOid,
@@ -3687,7 +3717,7 @@ fasttrun_contains_stats_sublink_walker(Node *node, void *context)
  * With detect_stats the same single walk also reports whether any visited
  * relation has cached column stats (the answer fasttrun_query_contains_
  * stats_relid gives), so the planner hook pays one tree walk instead of
- * two.  Probing stops after the first hit; the reinject part still visits
+ * two.  Probing stops after the first hit, but the reinject part still visits
  * everything.
  */
 typedef struct FasttrunReinjectWalkContext
@@ -3785,7 +3815,7 @@ fasttrun_poison_sublink_walker(Node *node, void *context)
 								  context);
 }
 
-/* Walk only while poison exists; hash misses do not open relations. */
+/* Walk only while poison exists.  Hash misses do not open relations. */
 static void
 fasttrun_poison_check_query(Query *query)
 {
@@ -3876,7 +3906,7 @@ fasttrun_planner_hook(Query *parse, const char *query_string,
 	/*
 	 * The freshness frame is only useful for cached column statistics
 	 * referenced by this query.  Keep unrelated plans to a plain hook call
-	 * plus relstats reinjection above; avoid PG_TRY/sigsetjmp on ordinary
+	 * plus relstats reinjection above.  Avoid PG_TRY/sigsetjmp on ordinary
 	 * queries after a backend has used fasttrun stats at least once.
 	 */
 	if (!stats_frame_needed)
@@ -3947,7 +3977,7 @@ fasttrun_planner_hook(Query *parse, const char *query_string,
 /*
  * Sum tuples_inserted/_updated/_deleted and OR truncdropped over the
  * full active subxact stack.  Pass upd=NULL on hot paths that don't
- * care about UPDATE (rolling-delta math); the column-stats freshness
+ * care about UPDATE (rolling-delta math).  The column-stats freshness
  * check passes a real pointer because UPDATE changes distribution
  * even though it doesn't change live row count.  Returns false if
  * pgstat is off -> caller falls back to always-scan.
@@ -3969,8 +3999,8 @@ fasttrun_read_pgstat_counters(Relation rel,
 	/*
 	 * relcache rebuilds leave rel->pgstat_info NULL even when tracking is
 	 * enabled and this backend already has pending xact counters for the
-	 * relation.  Associate lazily before deciding pgstat is unavailable;
-	 * otherwise a harmless relcache invalidation would make cached column
+	 * relation.  Associate lazily before deciding pgstat is unavailable.
+	 * Otherwise a harmless relcache invalidation would make cached column
 	 * stats look stale until some later heap scan/DML reinitializes pgstat.
 	 */
 	if (!pgstat_should_count_relation(rel))
@@ -4050,7 +4080,7 @@ fasttrun_stats_relid_nblocks_at_commit(const FasttrunStatsRelidEntry *relentry)
 	reln = smgropen(relentry->heap_rlb.locator, relentry->heap_rlb.backend);
 	/*
 	 * A local temp locator has one owning backend.  Core truncation leaves
-	 * its live SMgrRelation cache at zero; a later smgrextend either advances
+	 * its live SMgrRelation cache at zero.  A later smgrextend either advances
 	 * that zero or invalidates it.  Therefore zero is authoritative here and
 	 * avoids a filesystem size probe for ON COMMIT DELETE ROWS.  Nonzero and
 	 * unknown cache states still take the exact path below.
@@ -4124,7 +4154,7 @@ fasttrun_read_pgstat_counters_for_hook(Oid relid, bool *wide_writers,
 		have = fasttrun_read_pgstat_counters(rel, ins, upd, del, truncdropped);
 		/*
 		 * Physical size is the only change signal that survives a temp
-		 * table's commit (pgstat counters reset per xact; temp stats never
+		 * table's commit (pgstat counters reset per xact, and temp stats never
 		 * reach shared pgstat).  Read it in the same relation open the
 		 * freshness path already pays for.
 		 */
@@ -4539,7 +4569,7 @@ fasttrun_stats_entry_neutralize(Oid relid, FasttrunStatsEntry *entry)
 	if (!changed)
 		return false;
 
-	/* Hiding stats is planner-visible; mark before mutating. */
+	/* Hiding stats is planner-visible, so mark before mutating. */
 	fasttrun_xact_mark_relid(relid, relid,
 							FASTTRUN_TOUCH_STATS |
 							FASTTRUN_TOUCH_COLSTATS |
@@ -4568,20 +4598,18 @@ fasttrun_stats_entry_neutralize(Oid relid, FasttrunStatsEntry *entry)
 /*
  * COMMIT-time bookkeeping for the per-(relid, attnum) column-stats cache.
  *
- * Same pathology as fasttrun_cache_commit_xact() suffered before the
- * 2.2.0 regression.  The old code walked the full stats cache on every
- * COMMIT.  It did RelationIdGetRelation plus fasttrun_read_pgstat_counters
- * per entry.  Then it fired fasttrun_invalidate_local_plan_cache()
- * whenever the pgstat snapshot drifted -- the common case for ON COMMIT
- * DELETE ROWS temp tables re-analyzed every xact.  Result: all cached
- * plans walked once per stale entry, N x M work on every COMMIT.
+ * The cost follows the relations this transaction touched, not the cache
+ * size.  Opening the relation, reading pgstat and invalidating plans for
+ * every cached entry whose pgstat snapshot has drifted -- the common case
+ * for ON COMMIT DELETE ROWS temp tables re-analyzed every xact -- would walk
+ * all cached plans once per stale entry, N x M work on every COMMIT.
  *
- * The new code:
+ * What this function does:
  *   - walks the per-xact touched-relid list, then the attkeys backref
  *     for each one -- O(touched * cached-cols-per-rel), not
- *     O(total-stats-entries);
+ *     O(total-stats-entries)
  *   - reads pgstat counters once per relid, not once per attkey
- *     (a 20-column temp table used to cost 20 reads here);
+ *     (a 20-column temp table costs one read, not 20)
  *   - on staleness, turns the entry LOCAL_NEUTRAL and emits no shared
  *     invalidation.  Core pg_statistic stays hidden until an explicit
  *     handoff.  When DML makes at least one previously visible column
@@ -4667,7 +4695,7 @@ fasttrun_stats_cache_commit_xact(void)
 		/*
 		 * The common candidate path never mutates attkeys.  Walk it in place
 		 * and defer the rare stale/handoff unlinks until after the loop.  A
-		 * list_copy per touched relation used to dominate short COMMITs with
+		 * list_copy per touched relation would dominate short COMMITs with
 		 * many analyzed temp tables.
 		 */
 		foreach(klc, relentry->attkeys)
@@ -4711,10 +4739,9 @@ fasttrun_stats_cache_commit_xact(void)
 			}
 
 			/*
-			 * Read pgstat once per relid, not once per attkey.  All
-			 * statsTuples for this relid share the same counters; the
-			 * scalar-per-entry loop just compared them against the same
-			 * (ins, upd, del, truncdropped) tuple anyway.  The read is
+			 * Read pgstat once per relid, not once per attkey: all
+			 * statsTuples for this relid are compared against the same
+			 * (ins, upd, del, truncdropped) counters.  The read is
 			 * relcache-free: this callback runs at TRANS_COMMIT, where
 			 * catalog access is forbidden.
 			 */
@@ -4785,11 +4812,11 @@ fasttrun_stats_cache_commit_xact(void)
 		fasttrun_stats_relid_maybe_drop(relid, relentry);
 		/*
 		 * ON COMMIT DELETE ROWS has already truncated local storage before
-		 * this callback.  Keep its old zero-invalidation contract: no rows
+		 * this callback.  Empty storage gets no invalidation here: no rows
 		 * can use the cached plan, while the next explicit refresh owns any
-		 * needed invalidation after refill.  This is the original hot path
-		 * that must not turn N tables into N plan-cache walks per COMMIT.
-		 * Ordinary DELETE keeps heap pages and therefore still invalidates.
+		 * needed invalidation after refill.  This is the hot path that must
+		 * not turn N tables into N plan-cache walks per COMMIT.  Ordinary
+		 * DELETE keeps heap pages and therefore invalidates.
 		 */
 		if (plan_inval_needed && storage_nonempty)
 			fasttrun_invalidate_local_plan_cache(xentry->root_relid);
@@ -4814,7 +4841,7 @@ fasttrun_stats_cache_commit_xact(void)
  * refresh observes a now-empty sample.
  *
  * Iterates only the keys registered in fasttrun_stats_relid_cache for
- * this relid -- O(#cached-cols).  No more hash_seq_search over the whole
+ * this relid -- O(#cached-cols), not a hash_seq_search over the whole
  * stats hash (O(total-stats-entries)).
  */
 static bool
@@ -4865,7 +4892,7 @@ fasttrun_stats_cache_evict_relid(Oid relid)
 /*
  * Soft-evict every visible statsTuple for `relid`.
  *
- * statsTuple goes to NULL; the old version is pushed onto the per-entry
+ * statsTuple goes to NULL.  The old version is pushed onto the per-entry
  * undo stack so ROLLBACK TO SAVEPOINT can restore it.  Called from DDL
  * eviction via fasttrun_evict_temp_relid.
  *
@@ -4942,7 +4969,7 @@ fasttrun_stats_handoff_columns(Relation rel, Bitmapset *attnums,
 		 * PREPARE normally created a neutral override for every selected
 		 * attribute.  VACUUM can own transaction boundaries, though, and a
 		 * rewrite can replace the locator before post-success handoff.  Create
-		 * missing CORE_ALLOWED overrides here too; relation default may still
+		 * missing CORE_ALLOWED overrides here too.  Relation default may still
 		 * be LOCAL_NEUTRAL after a partial ANALYZE.
 		 */
 		while ((attnum = bms_next_member(attnums, attnum)) >= 0)
@@ -5045,14 +5072,14 @@ fasttrun_stats_note_visibility(Oid relid, bool have_counters,
  * Per-column stats cache (statsTuple + freshness counters):
  *   ABORT_SUB:
  *     - entry has undo -> pop top saved state back into entry (full
- *       restore of pre-subxact version);
+ *       restore of pre-subxact version)
  *     - no undo -> entry was created inside aborting subxact -> remove.
- *   COMMIT_SUB: re-label sub-local entries with the parent subid; if
+ *   COMMIT_SUB: re-label sub-local entries with the parent subid.  If
  *     the undo top is already at parent level, collapse it.
  *
  * Analyze-cache stats baseline (used by the refresh-path churn check):
  *   ABORT_SUB:
- *     - baseline was set in this subxact and has undo -> pop;
+ *     - baseline was set in this subxact and has undo -> pop
  *     - was set in this subxact and no undo -> mark has_stats_baseline
  *       false (it was created from scratch inside the rolled-back
  *       subxact, there is nothing to restore to).
@@ -5080,11 +5107,14 @@ fasttrun_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 										 event == SUBXACT_EVENT_ABORT_SUB);
 
 	/*
-	 * Hot-path shortcut.  When no fasttrun cache mutation happened anywhere
-	 * in the current top xact, the cache holds nothing that needs
-	 * subxact-aware rollback or promotion.  PL/pgSQL EXCEPTION blocks (each
-	 * iteration is its own subxact) and similar savepoint-heavy patterns
-	 * skip the whole walk entirely.
+	 * Hot-path shortcut.  Frames are lazy: a subtransaction gets one only
+	 * when a relation is marked at its level, a committing child hands its
+	 * entries to its parent's level, and an aborting one releases its frame.
+	 * So the ending subtransaction owns the innermost frame exactly when it
+	 * or a committed descendant marked something.  Without that frame there
+	 * is nothing to undo or promote, and savepoint-heavy code that leaves
+	 * fasttrun state alone, such as a PL/pgSQL EXCEPTION block in a loop,
+	 * skips the walk.
 	 */
 	frame = fasttrun_xact_frame;
 	if (frame == NULL || frame->subid != mySubid)
@@ -5299,7 +5329,7 @@ fasttrun_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 						 * fasttruncate() is non-transactional for local
 						 * storage: after ROLLBACK TO SAVEPOINT the rows are
 						 * still gone.  Do not restore the old relstats undo
-						 * chain; make the observed empty storage the new
+						 * chain.  Make the observed empty storage the new
 						 * outer-subxact truth instead.
 						 */
 						fasttrun_analyze_free_undo(aentry);
@@ -5410,7 +5440,7 @@ fasttrun_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 	{
 		/*
 		 * Frames are lazy, so the immediate parent may have no frame while an
-		 * older ancestor does.  Keep this frame and retag it; merging into the
+		 * older ancestor does.  Keep this frame and retag it.  Merging into the
 		 * ancestor would make a later ROLLBACK TO the empty parent invisible.
 		 */
 		frame->subid = parentSubid;
@@ -5739,8 +5769,8 @@ fasttrun_compute_max_minrows(Relation rel)
 /*
  * Resolve fasttrun.sample_rows GUC into the actual reservoir size.
  *   < 0 -> autosize via fasttrun_compute_max_minrows() (full ANALYZE
- *         parity, follows default_statistics_target);
- *   = 0 -> caller treats as "stats collection disabled";
+ *         parity, follows default_statistics_target)
+ *   = 0 -> caller treats as "stats collection disabled"
  *   > 0 -> explicit override.
  */
 static int
@@ -5834,7 +5864,7 @@ fasttrun_index_rels_have_partial(List *index_rels)
 /*
  * Refresh relpages/reltuples/relallvisible of every index of `rel`.
  * index_rels is an already-open list from fasttrun_open_index_rels so hot
- * callers pay one open per index per analyze; NIL means open (and close)
+ * callers pay one open per index per analyze.  NIL means open (and close)
  * here.
  */
 static bool
@@ -5942,15 +5972,15 @@ fasttrun_cmp_heap_tuples_by_tid(const void *a, const void *b)
 
 /*
  * For every column of rel, compute stats from the sample and store in
- * the session-local cache.  Columns without a btree-orderable type are
- * skipped (planner falls back to defaults).  Also captures the current
- * pgstat counters as a freshness baseline -- the planner hook compares
- * against them and refuses to return stale stats after DML.
+ * the session-local cache.  The Haas-Stokes path skips columns without a
+ * btree-orderable type (planner falls back to defaults).  Also captures
+ * the current pgstat counters as a freshness baseline -- the planner hook
+ * compares against them and refuses to return stale stats after DML.
  *
  * Two implementations of "compute the stats" coexist, switched by
  * fasttrun.use_typanalyze (default on):
  *   * on  -> fasttrun_collect_via_typanalyze: full core std_typanalyze
- *           with MCV / histogram / correlation;
+ *           with MCV / histogram / correlation
  *   * off -> fasttrun_collect_via_haas_stokes: lightweight n_distinct /
  *           null_frac / width only.
  * Both branches end at the same fasttrun_stats_cache_store() and
@@ -6033,7 +6063,7 @@ fasttrun_collect_and_store(Relation rel, HeapTuple *sample, int sample_count,
 		 * Sort the sample by physical TID first.  compute_scalar_stats
 		 * (and other compute_stats variants) use the array position as
 		 * the physical-order rank when computing correlation.  Core
-		 * acquire_sample_rows() returns rows in block/offset order;
+		 * acquire_sample_rows() returns rows in block/offset order, while
 		 * reservoir sampling places them in random slots.  Without
 		 * this sort, correlation degrades to ~0 even on perfectly
 		 * ordered data.
@@ -6168,7 +6198,7 @@ fasttrun_collect_and_store(Relation rel, HeapTuple *sample, int sample_count,
 				 * pass-by-value, varlena, and fixed-length by-reference are
 				 * mutually exclusive branches, so no width is double-counted.
 				 * Only non-toowide values land in values[] for the distinct
-				 * sort; n_nonnull counts every non-null, n_array the sortable
+				 * sort.  n_nonnull counts every non-null, n_array the sortable
 				 * subset.
 				 */
 				if (attr->attbyval)
@@ -6303,9 +6333,9 @@ fasttrun_collect_and_store(Relation rel, HeapTuple *sample, int sample_count,
 	 * It is set by the callers of this function -- fasttrun_analyze()
 	 * cold path and refresh path -- both of which already own (or just
 	 * created) an analyze cache entry to attach it to.  fasttrun_collect_
-	 * stats() does NOT touch the baseline, by design: it is a "give me
-	 * column stats now" entry point that doesn't participate in delta-
-	 * math state tracking and shouldn't interfere with it.
+	 * stats() only advances a baseline that already exists and never
+	 * creates the entry: it is a "give me column stats now" entry point
+	 * that must not seed delta-math state.
 	 */
 	return result;
 }
@@ -6315,9 +6345,10 @@ fasttrun_collect_and_store(Relation rel, HeapTuple *sample, int sample_count,
  * *tuples_out and up to sample_target tuples via the pre-allocated
  * sample[] array (heap_copytuple'd in the current memory context).
  *
- * Used by the cold-scan path and by delta-hit stats refresh.  The refresh
- * path used to sample only a subset of heap blocks, but that was not
- * ANALYZE-equivalent for physically clustered or sparse temp tables.
+ * Used by the cold-scan path and by delta-hit stats refresh, so a refresh
+ * reads the whole heap as the cold scan does.  Sampling only enough heap
+ * blocks to fill the row target is not ANALYZE-equivalent for physically
+ * clustered or sparse temp tables.
  */
 static void
 fasttrun_scan_with_sample(Relation rel, int64 *tuples_out,
@@ -6378,18 +6409,6 @@ fasttrun_scan_with_sample(Relation rel, int64 *tuples_out,
 }
 
 /*
- * Block-sampled variant of fasttrun_scan_with_sample for giant temp tables
- * (heap pages > fasttrun.max_analyze_pages).  Reads only a bounded random
- * sample of blocks instead of the whole relation and estimates the row count
- * from tuple density, exactly like core acquire_sample_rows() -- so cold
- * analyze cost stays O(sample) rather than O(table).  *tuples_out is an
- * ESTIMATE (like a regular ANALYZE), not an exact count.
- *
- * Ported from commands/analyze.c on the public block-sampling API
- * (BlockSampler_* + table_scan_analyze_next_block/tuple).  Prefetch and
- * progress reporting are dropped; the reservoir + density math match core.
- */
-/*
  * Reservoir bookkeeping for one analyzed block: pull every live tuple the
  * analyze scan yields (which also advances *liverows for the density
  * estimate) and, when the caller wants a column-stats sample, keep a Vitter
@@ -6445,6 +6464,20 @@ fasttrun_block_sample_stream_next(ReadStream *stream, void *callback_private_dat
 }
 #endif
 
+/*
+ * Block-sampled variant of fasttrun_scan_with_sample for giant temp tables
+ * (heap pages > fasttrun.max_analyze_pages).  Reads only a bounded random
+ * sample of blocks instead of the whole relation and estimates the row count
+ * from tuple density, like core acquire_sample_rows(), so the analyze cost
+ * stays O(sample) rather than O(table).  *tuples_out is an ESTIMATE (like a
+ * regular ANALYZE), not an exact count.
+ *
+ * Ported from commands/analyze.c on the public block-sampling API
+ * (BlockSampler_* + table_scan_analyze_next_block/tuple).  PG17+ feeds the
+ * blocks through a ReadStream as core does, PG16 reads them one by one
+ * without core's prefetch.  Progress reporting is dropped.  The reservoir
+ * and density math match core.
+ */
 static void
 fasttrun_block_sample_rows(Relation rel, int64 *tuples_out,
 						   HeapTuple *sample, int sample_target,
@@ -6528,8 +6561,8 @@ fasttrun_block_sample_rows(Relation rel, int64 *tuples_out,
 
 /*
  * Sample rows for analyze, honoring fasttrun.max_analyze_pages: above the
- * threshold use bounded block sampling (estimated row count, O(sample) cost);
- * at or below it -- or when the threshold is 0 -- do the exact full scan.
+ * threshold use bounded block sampling (estimated row count, O(sample) cost).
+ * At or below it -- or when the threshold is 0 -- do the exact full scan.
  * Shared by the cold path, the delta-refresh, and the partial-index rescan so
  * the giant-temp guardrail covers all three scans, not just the cold one.
  */
@@ -6555,13 +6588,11 @@ fasttrun_sample_for_analyze(Relation rel, BlockNumber pages_now,
  * Unlink every segment of a relation fork file.
  *
  * heap files are split into 1 GB segments with suffixes .1, .2, ...
- * starting from segment 1; segment 0 has no suffix.  We loop until the
+ * starting from segment 1.  Segment 0 has no suffix.  We loop until the
  * next segment doesn't exist (ENOENT) and stop.
  *
- * On unlink failure for any other reason we ereport(WARNING) and bail
- * out -- the caller (fasttrun_smgr_bypass_truncate) treats partial
- * unlink as a hard error because the relation will be in a half-state
- * otherwise.
+ * On unlink failure for any other reason we ereport(ERROR) -- a partial
+ * unlink is a hard error because it leaves the relation in a half-state.
  */
 static void
 fasttrun_unlink_fork_segments(const char *base_path)
@@ -6594,9 +6625,9 @@ fasttrun_unlink_fork_segments(const char *base_path)
  *
  * Functionally equivalent to RelationTruncate(rel, 0) -- empties one
  * storage relation to zero blocks and discards local buffers -- but does NOT call
- * smgrtruncate() and therefore never reaches CacheInvalidateSmgr().
- * That removes the last shared-invalidation message that fasttruncate
- * was sending; the path is now literally zero sinval.
+ * smgrtruncate() and therefore never reaches CacheInvalidateSmgr(), the
+ * one shared-invalidation message RelationTruncate() sends, so the path
+ * is literally zero sinval.
  *
  * How:
  *   1. Discover all forks that currently exist (main / fsm / vm).
@@ -6671,7 +6702,7 @@ fasttrun_smgr_bypass_truncate(Relation rel, bool buffers_already_dropped)
 	 * CacheInvalidateSmgr(), so the path stays sinval-free.
 	 *
 	 * smgrrelease() does NOT destroy the SMgrRelation in any supported PG
-	 * version: in PG 16 the rel is owned via smgrsetowner(); in PG 17/18
+	 * version: in PG 16 the rel is owned via smgrsetowner(), and in PG 17/18
 	 * RelationGetSmgr() pinned it via smgrpin().  Either way `reln` stays
 	 * a valid pointer through this whole function.
 	 */
@@ -7215,29 +7246,6 @@ fasttrun_clear_partial_publication(FasttrunTruncateOperation *operation)
 }
 
 /*
- * Zero-sinval truncate of a relation AND all its indexes and toast.
- *
- * The order must not change.  An empty heap must never be paired with an
- * index that still contains old TIDs, because after a refill those TIDs
- * could point to unrelated new rows.
- *
- *   1. Open every index, the toast table and its indexes BEFORE any
- *      destructive call.  A failure here leaves the table untouched.
- *   2. Phase 1: drop the storage of every index and toast (unlink +
- *      smgrcreate); the heap keeps its data.  A failure mid-way leaves
- *      the heap correct: untouched indexes stay valid, already-emptied
- *      ones fail loudly on their missing metapage.
- *   3. Truncate the heap -- the last destructive step; every index is
- *      already empty by now.
- *   4. Phase 2: run every ambuild to recreate the empty index
- *      structures (metapages).
- *
- * Phase 1 must finish before phase 2 starts.  Once all index storage has
- * gone, an ambuild failure leaves at worst an empty index without a
- * metapage, and any scan fails with an error.  Rebuilding each index
- * immediately would leave later indexes carrying old TIDs after a failure.
- */
-/*
  * Invalidate backend-local cached plans for heap relation `relid`.
  * This reaches `PlanCacheRelCallback` through
  * `LocalExecuteInvalidationMessage(SHAREDINVALRELCACHE_ID)` and does
@@ -7278,7 +7286,7 @@ fasttrun_invalidate_local_plan_cache(Oid relid)
 	fasttrun_test_plan_invalidations++;
 #endif
 
-	/* InvalidOid would target the whole relcache; defend against that. */
+	/* InvalidOid would target the whole relcache, so defend against that. */
 	Assert(OidIsValid(relid));
 
 	/* Fixed text (no OID) so regression tests can count calls. */
@@ -7301,29 +7309,53 @@ fasttrun_invalidate_local_plan_cache(Oid relid)
  *     not exist, the function silently does nothing -- this lets callers
  *     drop the usual `IF EXISTS` / pre-check pattern and simplifies the
  *     recovery logic of bulk PL/pgSQL routines.
- *   * Verifies the relation lives in a temp namespace; otherwise raises
+ *   * Verifies the relation lives in a temp namespace and otherwise raises
  *     an error (this prevents accidentally truncating a regular table).
- *   * Opens the heap, its indexes, TOAST heap and TOAST indexes before
- *     changing cache or storage state.  Partition/inheritance traversal
- *     is deliberately unsupported.
- *   * Resets indexes before the heap.  The default path emits no shared
- *     invalidation; the fallback calls RelationTruncate once per relation
- *     and emits one SMGR message after each successful call.
- *   * An error before file changes rolls back normally.  After file changes
- *     start, access stays blocked until fasttruncate is retried successfully.
+ *   * Then runs these steps in order:
+ *       1. fasttrun_prepare_truncate_workset() opens the heap, its indexes,
+ *          the TOAST heap and the TOAST indexes before any cache or storage
+ *          side effect.  Partition/inheritance traversal is deliberately
+ *          unsupported.  If the table's empty state is already fully
+ *          published, fasttruncate returns here without file changes.
+ *       2. The operation and its registry entry are allocated, the undo
+ *          state is saved, the cached stats of the set are reset to
+ *          neutral, and local cached plans on the table are invalidated.
+ *       3. fasttrun_execute_truncate_storage() empties the user indexes,
+ *          then the TOAST indexes, then the TOAST heap, and the main heap
+ *          last.  With fasttrun.zero_sinval_truncate on, each one gets
+ *          unlink + smgrcreate and no shared invalidation.  With it off,
+ *          RelationTruncate() sends one shared SMGR invalidation per
+ *          relation.
+ *       4. fasttrun_rebuild_truncate_indexes() runs ambuild for the TOAST
+ *          indexes, then for the user indexes.
+ *       5. fasttrun_publish_empty_workset() publishes the relstats of the
+ *          emptied set: zero tuples, and the rebuilt size of each index.
+ *     The order is load-bearing.  Each heap is emptied only after its
+ *     indexes, so no failure state pairs an empty heap with an index that
+ *     still holds old TIDs, which after a refill would point at unrelated
+ *     rows.  Every storage drop also finishes before the first ambuild, so
+ *     a failure cannot leave an index rebuilt empty over rows the heap
+ *     still holds, where index scans would silently miss them.
+ *   * An error before step 3 rolls back normally, and a block left by an
+ *     earlier failed attempt stays.  An error from step 3 on blocks the
+ *     table in this backend: planning a query on it, the other fasttrun
+ *     functions and utility commands on it such as COPY, TRUNCATE, VACUUM
+ *     or REINDEX fail with SQLSTATE 55000.  The block ends when a later
+ *     fasttruncate of the table succeeds, a DROP of the table commits, the
+ *     table's creation rolls back, or DISCARD TEMP/ALL runs.
  *
  * IMPORTANT: this function is FOREIGN-KEY-UNSAFE.  fasttruncate does
  * NOT scan pg_constraint.  If you have FKs involving temp tables, use
  * SQL TRUNCATE instead.  Workloads this extension is built for never
  * declare FKs on temp tables -- we skip the check by design.
  *
- * Importantly, fasttruncate() does NOT call vacuum() or analyze_rel()
- * after the truncate.  Earlier versions of this extension used to do so,
- * but on a busy server with many concurrent backends that pattern is
- * catastrophic: each ANALYZE generates dozens of pg_class / pg_statistic
- * invalidation messages, the shared invalidation queue overflows, and
- * every backend ends up spending all of its CPU draining that queue
- * inside ReceiveSharedInvalidMessages() rather than doing useful work.
+ * fasttruncate() does NOT call vacuum() or analyze_rel() after the
+ * truncate.  On a busy server with many concurrent backends that pattern
+ * is catastrophic: each ANALYZE generates dozens of pg_class /
+ * pg_statistic invalidation messages, the shared invalidation queue
+ * overflows, and every backend ends up spending all of its CPU draining
+ * that queue inside ReceiveSharedInvalidMessages() rather than doing
+ * useful work.
  *
  * Skipping ANALYZE is functionally safe.  The planner reads the current
  * page count via RelationGetNumberOfBlocks() (which always reflects the
@@ -7333,7 +7365,7 @@ fasttrun_invalidate_local_plan_cache(Oid relid)
  * the catalogue stats would be wrong either way until the next ANALYZE.
  *
  * Warning: this function is NOT transaction-safe.  Storage reset cannot be
- * rolled back; after surrounding rollback the table remains physically
+ * rolled back.  After surrounding rollback the table remains physically
  * empty.  The session-local cache follows that physical truth.
  */
 Datum
@@ -7467,7 +7499,7 @@ fasttruncate(PG_FUNCTION_ARGS)
  *
  * Behaviour:
  *
- *   * Resolves the relation name; silently returns on a missing
+ *   * Resolves the relation name.  Silently returns on a missing
  *     relation, raises ERROR on a non-temp relation or on a
  *     partitioned / inheritance parent (same contract as fasttruncate).
  *
@@ -7475,23 +7507,33 @@ fasttruncate(PG_FUNCTION_ARGS)
  *     when the cache/delta state cannot prove that storage size is
  *     unchanged (this never touches the catalog).
  *
- *   * Consults the lazy-mode cache.  Cache hit reuses cached_tuples +
- *     delta_ins - delta_del without touching the heap; cache hit
+ *   * Consults the lazy-mode cache.  Cache hit computes the row count as
+ *     cached_tuples + delta_ins - delta_del without reading the heap and
  *     refreshes the snapshot in place so the next call sees only
- *     the next delta.
+ *     the next delta.  It still samples the heap for a column-stats
+ *     refresh once churn reaches fasttrun.stats_refresh_threshold, and
+ *     for a partial-index rescan after new churn, taking the row count
+ *     from that scan.
  *
- *   * On cache miss (first call, page count dropped, truncdropped
- *     bit changed, or pgstat off) does a full sequential scan with
- *     reservoir sampling, optionally collecting per-column stats
+ *   * On cache miss (no delta state in this transaction yet, page count
+ *     dropped, truncdropped bit changed, or pgstat off) scans the heap,
+ *     optionally collecting per-column stats from a reservoir sample
  *     (see fasttrun.auto_collect_stats GUC), and populates the cache.
+ *
+ *   * Every heap scan here goes through fasttrun_sample_for_analyze():
+ *     an exact full scan up to fasttrun.max_analyze_pages heap pages, and
+ *     above that block sampling with the row count estimated from tuple
+ *     density.  Setting the limit to 0 keeps every scan exact.
  *
  * The published reltuples/relpages are visible only inside the current
  * backend's relcache.  pg_class on disk is NOT modified.
  *
  * Column-level coverage: if auto_collect_stats is on (default), the
- * cold scan collects full per-column stats via the planner hook.
- * With use_typanalyze=on (default) this includes MCV, histogram,
- * correlation -- same quality as regular ANALYZE.
+ * cold scan and the churn refresh collect per-column stats from their
+ * sample, and the planner hooks serve them.  With use_typanalyze=on
+ * (default) this includes MCV, histogram and correlation, computed as
+ * regular ANALYZE computes them from a fasttrun.sample_rows sample
+ * (-1 matches the ANALYZE sample size).
  */
 /*
  * Workhorse for fasttrun_analyze() and fasttrun_analyze_bulk().
@@ -7510,15 +7552,15 @@ fasttruncate(PG_FUNCTION_ARGS)
  * (or past table_close) and our values get silently wiped.
  *
  * Caller is responsible for:
- *   - resolving the RangeVar to relOid + table_open(NoLock);
+ *   - resolving the RangeVar to relOid + table_open(NoLock)
  *   - verifying relpersistence == RELPERSISTENCE_TEMP, isTempNamespace,
- *     heap-AM, no inheritance/partition parent;
- *   - recording relOid in the current transaction frame;
+ *     heap-AM, no inheritance/partition parent
+ *   - recording relOid in the current transaction frame
  *   - table_close(rel, AccessShareLock) afterwards.
  *
  * fasttrun_analyze_bulk() invokes this once per relation in its array.
  * Each invalidation still makes PG's PlanCacheRelCallback walk the whole
- * cached-plan list; the saving is per-plan, not per-walk -- a plan an
+ * cached-plan list.  The saving is per-plan, not per-walk -- a plan an
  * earlier message already marked is_valid=false is skipped cheaply rather
  * than re-marked.
  */
@@ -7617,9 +7659,10 @@ fasttrun_analyze_relation(Relation rel)
 
 	/*
 	 * Delta-hit stats refresh: when DML churn since the last collect
-	 * reaches the threshold, do the same full-table reservoir sample as
-	 * the cold path.  The old block-level refresh was cheaper, but it
-	 * was not ANALYZE-equivalent on clustered or sparse heaps.
+	 * reaches the threshold, take the same sample as the cold path
+	 * (fasttrun_sample_for_analyze).  Sampling only enough heap blocks to
+	 * fill the row target would be cheaper, but it is not
+	 * ANALYZE-equivalent on clustered or sparse heaps.
 	 */
 	if (!scan_needed && have_counters && fasttrun_auto_collect_stats &&
 		fasttrun_sample_rows != 0 &&
@@ -7827,7 +7870,7 @@ fasttrun_analyze_relation(Relation rel)
 		{
 			/*
 			 * Giant temp table: block-sample above max_analyze_pages (estimated
-			 * row count, O(sample)); exact full scan at or below.  Same helper
+			 * row count, O(sample)), exact full scan at or below.  Same helper
 			 * gates the delta-refresh and partial-index rescans.
 			 */
 			fasttrun_sample_for_analyze(rel, pages_now, sample, sample_target,
@@ -7840,7 +7883,7 @@ fasttrun_analyze_relation(Relation rel)
 
 			/*
 			 * Sort needed only when reservoir sampling displaced entries.
-			 * published_any stays false when track_counts is off; then the
+			 * published_any stays false when track_counts is off.  Then the
 			 * !stats_recollected path below still refreshes index relstats.
 			 * became_neutral rides the same single plan-invalidation site.
 			 */
@@ -8146,7 +8189,7 @@ fasttrun_analyze_bulk(PG_FUNCTION_ARGS)
 	 * The helper emits per-relid fasttrun_invalidate_local_plan_cache()
 	 * inline.  It has to fire before the rd_rel mutation -- see the
 	 * comment above fasttrun_analyze_relation().  Each call still walks the
-	 * whole cached-plan list via PG's PlanCacheRelCallback; a plan already
+	 * whole cached-plan list via PG's PlanCacheRelCallback, but a plan already
 	 * marked is_valid=false by an earlier call is skipped cheaply, so the
 	 * batch trims per-plan work, not the walk count.  The rest is just a
 	 * convenience wrapper.
@@ -8164,7 +8207,7 @@ fasttrun_analyze_bulk(PG_FUNCTION_ARGS)
  * substitute for poking around with gdb.
  *
  * Like fasttruncate, this function silently returns NULL when the
- * relation does not exist; it raises ERROR when the relation exists but
+ * relation does not exist.  It raises ERROR when the relation exists but
  * is not a temporary table, because asking about a regular table via this
  * helper is almost certainly a bug.
  */
@@ -8238,7 +8281,7 @@ fasttrun_relstats(PG_FUNCTION_ARGS)
  *
  * Capacity monitoring: entry counts and recursively allocated memory of
  * the analyze and column-stats contexts.  The function does not modify
- * catalogs and takes no locks itself; a missing cache reads as zero.
+ * catalogs and takes no locks itself.  A missing cache reads as zero.
  */
 Datum
 fasttrun_cache_stats(PG_FUNCTION_ARGS)
@@ -8285,10 +8328,13 @@ fasttrun_cache_stats(PG_FUNCTION_ARGS)
 /*
  * fasttrun_collect_stats(text)
  *
- * Explicit-call sample -> per-column n_distinct/null_frac/width ->
- * session-local stats cache.  No catalog write.  Same path is taken
- * automatically by fasttrun_analyze on cold scan when
- * fasttrun.auto_collect_stats is on (default).
+ * Explicit collect: reservoir sample -> per-column stats -> session-local
+ * stats cache.  No catalog write.  fasttrun_collect_and_store() is the
+ * same step the cold fasttrun_analyze runs when fasttrun.auto_collect_stats
+ * is on (default), so fasttrun.use_typanalyze decides what is computed:
+ * the full std_typanalyze output when on (default), only n_distinct,
+ * null_frac and width when off.  Unlike fasttrun_analyze, this call always
+ * reads the whole heap: fasttrun.max_analyze_pages does not apply.
  */
 Datum
 fasttrun_collect_stats(PG_FUNCTION_ARGS)
@@ -8444,10 +8490,10 @@ fasttrun_collect_stats(PG_FUNCTION_ARGS)
  *   * The cached statsTuples are already in pg_statistic shape (built
  *     by fasttrun_build_pg_statistic_tuple from VacAttrStats), so we
  *     just stuff each one straight into the tuplestore.
- *   * If the table doesn't exist, isn't temp, or has no cached stats
- *     yet, the function returns an empty set -- same defensive
- *     behaviour as fasttrun_relstats() / fasttrun_analyze() on
- *     missing tables.
+ *   * If the table doesn't exist or has no cached stats yet, the
+ *     function returns an empty set -- same defensive behaviour as
+ *     fasttrun_relstats() / fasttrun_analyze() on missing tables.  A
+ *     table that is not temp raises an ERROR.
  */
 Datum
 fasttrun_inspect_stats(PG_FUNCTION_ARGS)
@@ -8490,7 +8536,7 @@ fasttrun_inspect_stats(PG_FUNCTION_ARGS)
 
 	MemoryContextSwitchTo(oldcxt);
 
-	/* Resolve relation; missing -> empty result. */
+	/* Resolve relation, missing -> empty result. */
 	relvar = fasttrun_make_rangevar(name);
 	relOid = RangeVarGetRelid(relvar, AccessShareLock, true);
 	if (!OidIsValid(relOid))
@@ -8554,12 +8600,12 @@ typedef struct FasttrunTrackSnapshot
 
 static HTAB			   *fasttrun_track_htab = NULL;
 static LWLockId			fasttrun_track_lock;
-static bool				fasttrun_track_enabled = true;
+static bool				fasttrun_track_enabled = false;
 static int				fasttrun_prewarm_count = 1000;
 /*
  * Re-entrancy guard: true while fasttrun_prewarm() runs its SPI create loop.
  * The CREATE TEMP TABLE (LIKE dummy.*) issued by create_temp_table re-enters
- * fasttrun_utility_hook; without this guard prewarm would count its own
+ * fasttrun_utility_hook.  Without this guard prewarm would count its own
  * creates as user creates and inflate its own top-N ranking.
  */
 static bool				fasttrun_in_prewarm = false;
@@ -8572,7 +8618,8 @@ static shmem_request_hook_type prev_shmem_request_hook = NULL;
 
 /*
  * Track schedule: tracking is only active inside the configured time
- * windows.  Empty schedule = always active (default).
+ * windows.  The default is "mon-fri 08:00-18:00".  An empty schedule
+ * means always active.
  */
 #define FASTTRUN_SCHED_MAX_WINDOWS 8
 
@@ -8864,7 +8911,7 @@ fasttrun_track_save(int code, Datum arg)
 	LWLockAcquire(fasttrun_track_lock, LW_SHARED);
 	lock_held = true;
 
-	/* magic + count placeholder; count is rewritten below */
+	/* magic + count placeholder, count is rewritten below */
 	phase = "track_save_header";
 	if (fwrite(&magic, sizeof(magic), 1, f) != 1 ||
 		fwrite(&count, sizeof(count), 1, f) != 1)
@@ -9661,8 +9708,8 @@ fasttrun_prepare_utility_handoff(Node *parsetree,
 /*
  * A heap rewrite changes relfilenode.  Rebind the current neutral state to
  * the new locator without losing the undo nodes that restore the old locator
- * on ROLLBACK TO SAVEPOINT.  Non-rewriting DDL targets share this post-step;
- * for them the locator assignment is an intentional no-op.
+ * on ROLLBACK TO SAVEPOINT.  Non-rewriting DDL targets share this post-step.
+ * For them the locator assignment is an intentional no-op.
  */
 static void
 fasttrun_finish_rewrite_handoff(List *rewrite_relids)
@@ -9803,7 +9850,8 @@ fasttrun_evict_utility_caches(Node *parsetree)
  * COPY ... FROM writes rows without going through the executor, so nothing else
  * records it.  Return its target so the caller can count it as a running writer
  * for the duration: a collect called from a COPY expression scans on the same
- * command's snapshot and cannot see the rows the counters already hold.
+ * command's snapshot and cannot see the rows the counters already hold.  A
+ * permanent target is not returned.  The registry holds temporary relations only.
  */
 static Oid
 fasttrun_mark_copy_from(Node *parsetree)
@@ -9822,13 +9870,15 @@ fasttrun_mark_copy_from(Node *parsetree)
 	if (fasttrun_stats_relid_cache != NULL &&
 		fasttrun_stats_relid_exists(relid))
 		fasttrun_xact_mark_relid(relid, relid, FASTTRUN_TOUCH_DML);
+	if (!fasttrun_relid_is_temp(relid))
+		return InvalidOid;
 	return relid;
 }
 
 /*
  * Dependency-machinery drops (DROP ... CASCADE, DROP OWNED BY, DISCARD)
  * delete relations without a per-table DropStmt, so the utility hook never
- * sees them.  Touch the relid and note the drop with its subxact id; the
+ * sees them.  Touch the relid and note the drop with its subxact id.  The
  * commit callbacks remove noted entries without probing the syscache
  * (TRANS_COMMIT forbids catalog access).  Rollback semantics stay intact:
  * if the drop aborts, the subxact callback prunes the note and the cache
@@ -9980,7 +10030,7 @@ fasttrun_track_snapshot(int limit)
 	int			worst = 0;
 	bool		bounded;
 
-	/* Tiny top-N stays allocation- and copy-bounded; large readers copy all. */
+	/* Tiny top-N stays allocation- and copy-bounded.  Large readers copy all. */
 	bounded = (limit > 0 && limit <= 32);
 	capacity = bounded ? limit : FASTTRUN_TRACK_MAX;
 	snapshot.entries = (FasttrunTrackEntry *)
@@ -10142,7 +10192,7 @@ fasttrun_hot_temp_tables(PG_FUNCTION_ARGS)
 	return (Datum) 0;
 }
 
-/* Complete deterministic order; explicit branches avoid subtraction overflow. */
+/* Complete deterministic order.  Explicit branches avoid subtraction overflow. */
 static int
 fasttrun_track_cmp_desc(const void *a, const void *b)
 {
@@ -10174,13 +10224,13 @@ fasttrun_prewarm(PG_FUNCTION_ARGS)
 	limit = fasttrun_track_select_top(sorted, snapshot.count, limit);
 
 	{
-		/* Verify dummy schema exists; if not, skip all prewarm. */
+		/* Verify dummy schema exists.  If not, skip all prewarm. */
 		Oid		nspOid = get_namespace_oid(fasttrun_prewarm_schema, true);
 		bool	save_in_prewarm = fasttrun_in_prewarm;
 
 		/*
 		 * Suppress tracking of our own re-entrant CREATE TEMP TABLE.  Save and
-		 * restore the flag so nesting stays correct; PG_FINALLY restores it
+		 * restore the flag so nesting stays correct.  PG_FINALLY restores it
 		 * even if SPI_connect or the SPI query throws.
 		 */
 		fasttrun_in_prewarm = true;
@@ -10334,7 +10384,7 @@ fasttrun_test_evict_missing_relid(PG_FUNCTION_ARGS)
 #endif
 
 #ifdef USE_ASSERT_CHECKING
-/* Planner probe counters; true returns and resets them. */
+/* Returns the planner probe counters.  true also resets them. */
 Datum
 fasttrun_test_planner_probe(PG_FUNCTION_ARGS)
 {
@@ -10387,12 +10437,12 @@ _PG_init(void)
 							"-1 = auto: pick the largest minrows that "
 							"std_typanalyze / type-specific typanalyze ask "
 							"for across all columns of the table (this is "
-							"normally 300 * default_statistics_target — i.e. "
+							"normally 300 * default_statistics_target - i.e. "
 							"the same sample size that core ANALYZE would "
 							"use, with full MCV / histogram parity).  "
 							"0 = disable column-stats collection entirely.  "
-							"N > 0 = explicit fixed sample size; default 3000 "
-							"is a deliberate trade-off — lighter than core "
+							"N > 0 = explicit fixed sample size.  Default 3000 "
+							"is a deliberate trade-off - lighter than core "
 							"ANALYZE in exchange for ~10x cheaper cold scan "
 							"on wide tables, sufficient for typical "
 							"distributions but may miss MCV entries with "
@@ -10407,14 +10457,14 @@ _PG_init(void)
 							NULL, NULL, NULL);
 
 	DefineCustomRealVariable("fasttrun.stats_refresh_threshold",
-							 "DML churn ratio (vs reltuples) at which a delta-hit "
-							 "fasttrun_analyze refreshes column stats",
-							 "Default 0.2 — significant DML (>=20% churn) auto-"
-							 "triggers a full reservoir-sample refresh of column "
-							 "stats.  Set to 0 to refresh on any DML, set to 1 "
-							 "to disable auto-refresh entirely; post-DML cached "
-							 "stats are then hidden from the planner until an "
-							 "explicit refresh.",
+							 "DML churn ratio (vs reltuples) that triggers a "
+							 "column-stats refresh and limits planner use of the stats",
+							 "fasttrun_analyze recollects column stats once churn since "
+							 "the last collect reaches the ratio.  The planner uses a "
+							 "column's stats only while churn stays under its tolerance: "
+							 "ratio * (1 - distinct fraction of rows), but at least "
+							 "min(ratio, 5%).  0 refreshes on any DML.  1 disables the "
+							 "refresh, but churn past the tolerance still hides stats.",
 							 &fasttrun_stats_refresh_threshold,
 							 0.2,
 							 0.0,
@@ -10427,15 +10477,15 @@ _PG_init(void)
 							 "Relstats drift ratio (vs reltuples or relpages) below "
 							 "which fasttrun_analyze skips invalidating backend-"
 							 "local cached SPI/PREPARE plans",
-							 "Default 0.2 -- matches fasttrun.stats_refresh_threshold. "
-							 "Plan-cache invalidation and column-stats refresh fire "
-							 "together: below the threshold neither happens, above both do. "
-							 "Set to 0 to invalidate plans on any relstats change. "
-							 "Other signals always fire an invalidation: a fresh "
-							 "column-stats refresh, an index relstats change "
-							 "(e.g. partial index), or a stats visibility flip. "
-							 "Those signal distribution changes that the per-row "
-							 "ratio here cannot measure.",
+							 "Default 0.2, the same value as "
+							 "fasttrun.stats_refresh_threshold, though the two measure "
+							 "different things: here the larger relative change of "
+							 "reltuples or relpages since the last invalidation, there "
+							 "DML churn since the last collect.  Set to 0 to invalidate "
+							 "plans on any relstats change.  A column-stats refresh, an "
+							 "index relstats change (e.g. partial index) or a stats "
+							 "visibility flip always invalidates: those signal "
+							 "distribution changes that this size ratio cannot measure.",
 							 &fasttrun_invalidate_threshold,
 							 0.2,
 							 0.0,
@@ -10451,11 +10501,11 @@ _PG_init(void)
 							 "When on (default), fasttrun reuses PostgreSQL's "
 							 "own std_typanalyze / type-specific typanalyze "
 							 "callbacks to compute n_distinct, MCV, histogram, "
-							 "correlation and type-specific stats — same path "
+							 "correlation and type-specific stats - same path "
 							 "as a regular ANALYZE, only without sinval / "
 							 "catalog updates.  When off, falls back to the "
-							 "older lightweight path that only computes "
-							 "n_distinct/null_frac/width via Haas-Stokes; "
+							 "lightweight Haas-Stokes path that only computes "
+							 "n_distinct/null_frac/width.  It is "
 							 "useful for comparing plan quality before / after "
 							 "and as a safety fallback if a custom typanalyze "
 							 "misbehaves on a particular type.",
@@ -10473,7 +10523,7 @@ _PG_init(void)
 							 "TOAST relations "
 							 "with unlink and smgrcreate, without calling "
 							 "CacheInvalidateSmgr.  When off, it calls "
-							 "RelationTruncate for each relation; every "
+							 "RelationTruncate for each relation, and every "
 							 "successful call sends one shared SMGR "
 							 "invalidation.  Both modes rebuild indexes and "
 							 "block access if cleanup is interrupted.",
@@ -10488,7 +10538,7 @@ _PG_init(void)
 							"switches to bounded block sampling",
 							"Default 100000 (~800 MB).  A cold fasttrun_analyze "
 							"normally scans the whole temp table for an exact "
-							"row count; above this many heap pages it instead "
+							"row count.  Above this many heap pages it instead "
 							"reads a bounded random block sample and ESTIMATES "
 							"the row count from tuple density (like a regular "
 							"ANALYZE), keeping cost O(sample) instead of "
@@ -10555,14 +10605,14 @@ _PG_init(void)
 
 	/*
 	 * Preloading runs before the session executes anything, so neither a portal
-	 * nor a snapshot is set yet -- measured for shared_preload_libraries and
-	 * for session_preload_libraries alike, even though the latter does run
+	 * nor a snapshot is set yet -- for shared_preload_libraries and for
+	 * session_preload_libraries alike, even though the latter does run
 	 * inside the startup transaction.  What matters is the writer that could
 	 * be running above us: to write it needs a snapshot, and the paths that
 	 * reach the executor without a portal set one before they get there -- a
 	 * login event trigger, a logical replication apply worker, a fastpath
 	 * function call.  So either mark here means something may already be
-	 * running and its start was missed; only the absence of both is taken as
+	 * running and its start was missed.  Only the absence of both is taken as
 	 * proof of an early load.
 	 */
 	fasttrun_lazy_loaded = (ActiveSnapshotSet() || ActivePortal != NULL);
@@ -10584,7 +10634,7 @@ _PG_init(void)
 							 "Track CREATE TEMP TABLE frequency in shared memory",
 							 NULL,
 							 &fasttrun_track_enabled,
-							 true,
+							 false,
 							 PGC_SUSET,
 							 0,
 							 NULL, NULL, NULL);

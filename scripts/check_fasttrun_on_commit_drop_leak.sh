@@ -1,24 +1,15 @@
 #!/usr/bin/env bash
 #
-# Regression-проверка против memory leak в fasttrun analyze cache
-# при сценарии CREATE TEMP ... ON COMMIT DROP + fasttrun_analyze в
-# долгоживущем backend.
+# Проверка памяти analyze-кэша fasttrun при CREATE TEMP ... ON COMMIT DROP
+# и fasttrun_analyze в долгоживущем backend.
 #
-# Что было сломано (выявлено внешним ревью 2.3.0-pre):
-#   ON COMMIT DROP уничтожает temp таблицу через
-#   PreCommit_on_commit_actions() -- до того как стрельнёт наш
-#   XACT_EVENT_COMMIT callback.  Этот путь не идёт через утильный
-#   ProcessUtility-хук, и fasttrun_evict_temp_relid не отрабатывает.
-#   В 2.2.0/2.2.1 fasttrun_cache_commit_xact удалял entry только при
-#   !has_relstats, поэтому каждая ON COMMIT DROP таблица оставляла
-#   живую запись на dead OID.  Backend с длинной сессией медленно
-#   копил мёртвые entries.
-#
-# Что должно быть после фикса:
-#   object_access_hook(OAT_DROP) ставит на relid drop-отметку с subid,
-#   fasttrun_cache_commit_xact для каждого touched relid проверяет её
-#   (syscache в TRANS_COMMIT запрещён).  Если relation dropped --
-#   HASH_REMOVE entry полностью.  Никакого linear growth.
+# ON COMMIT DROP удаляет temp-таблицу в PreCommit_on_commit_actions(), до
+# XACT_EVENT_COMMIT и мимо ProcessUtility-хука, поэтому
+# fasttrun_evict_temp_relid ее не видит. Удаление ловит
+# object_access_hook(OAT_DROP): он ставит на relid отметку с subid, а
+# fasttrun_cache_commit_xact удаляет отмеченные записи целиком. Syscache в
+# TRANS_COMMIT запрещен, поэтому колбэк смотрит только на отметку. Если
+# запись удаленной таблицы остается, кэш растет с каждой итерацией.
 #
 # Условия успеха при ITERATIONS=500: сумма used_bytes по всем контекстам
 # fasttrun в двух финальных точках не превышает прогретое значение более чем
@@ -65,7 +56,7 @@ trap cleanup EXIT
 require_cmd()
 {
 	if ! command -v "$1" >/dev/null 2>&1; then
-		echo "не нашёл команду: $1" >&2
+		echo "не нашел команду: $1" >&2
 		exit 1
 	fi
 }
@@ -89,11 +80,10 @@ run_pg "$CREATEDB" -h "$WORKDIR" -p "$PORT" "$DBNAME"
 run_pg "$PSQL" -h "$WORKDIR" -p "$PORT" -d "$DBNAME" -X -qAt \
 	-v ON_ERROR_STOP=1 -c "CREATE EXTENSION fasttrun" >/dev/null
 
-# Reproducer: один backend, $ITERATIONS отдельных xact'ов, каждый
-# создаёт temp таблицу с одним и тем же именем через ON COMMIT DROP,
-# наполняет, делает fasttrun_analyze, коммитит.  ON COMMIT DROP
-# гарантирует что каждая итерация работает с НОВЫМ OID -- старый OID
-# становится сиротой, по которому до фикса оставалась запись в кэше.
+# Один backend, $ITERATIONS отдельных транзакций. Каждая создает temp-таблицу
+# с одним и тем же именем через ON COMMIT DROP, наполняет ее, вызывает
+# fasttrun_analyze и фиксируется. ON COMMIT DROP гарантирует, что каждая
+# итерация работает с НОВЫМ OID, а запись старого OID должна уйти при COMMIT.
 cat >"$WORKDIR/leak.sql" <<SQL
 \\set ON_ERROR_STOP on
 \\pset format unaligned
@@ -188,8 +178,8 @@ if [ "$growth" -gt "$MAX_GROWTH_BYTES" ] || \
 	[ "$stable_contexts" -ne "$warm_contexts" ]; then
 	echo ""
 	echo "FAIL: память fasttrun не стабилизировалась за $ITERATIONS циклов" >&2
-	echo "записи ON COMMIT DROP не удаляются в fasttrun_cache_commit_xact" >&2
-	echo "См. fasttrun.c:fasttrun_cache_commit_xact (SearchSysCacheExists1 проверка)" >&2
+	echo "записи таблиц ON COMMIT DROP не удаляются при COMMIT" >&2
+	echo "См. fasttrun.c: fasttrun_object_access_hook (отметка OAT_DROP) и fasttrun_cache_commit_xact" >&2
 	exit 1
 fi
 

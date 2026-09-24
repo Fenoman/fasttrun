@@ -175,8 +175,13 @@ run_clean_case()
 CREATE EXTENSION fasttrun;
 SELECT fasttrun_reset_temp_stats();
 CREATE SCHEMA dummy_tmp;
+CREATE TABLE dummy_tmp.persist_default (id integer);
 CREATE TABLE dummy_tmp.persist_clean (id integer);
 SET fasttrun.track_schedule = '';
+-- По умолчанию запись учета выключена, эта таблица в реестр не попадает.
+CREATE TEMP TABLE persist_default
+  (LIKE dummy_tmp.persist_default INCLUDING ALL);
+SET fasttrun.track_temp_creates = on;
 CREATE TEMP TABLE persist_clean
   (LIKE dummy_tmp.persist_clean INCLUDING ALL);
 SQL

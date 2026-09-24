@@ -5,14 +5,14 @@
 fasttrun is an extension for PostgreSQL 16, PostgreSQL 17, and PostgreSQL 18.
 It speeds up a recurring workflow built around temporary tables:
 
-1. clear the table;
-2. refill it;
-3. update planner statistics;
-4. run the calculation.
+1. clear the table
+2. refill it
+3. update planner statistics
+4. run the calculation
 
 The extension's main functions are:
 
-- `fasttruncate()`, which clears a local temporary table;
+- `fasttruncate()`, which clears a local temporary table.
 - `fasttrun_analyze()`, which updates planner estimates after the table is filled.
 
 Regular `TRUNCATE` and `ANALYZE` notify other PostgreSQL server processes about
@@ -35,14 +35,14 @@ Quick links: [pre-deployment checklist](#pre-deployment-checklist),
 
 Consider fasttrun when:
 
-- the application repeatedly reuses local temporary tables;
-- dozens of long-lived server connections operate concurrently;
-- regular `TRUNCATE` and `ANALYZE` produce measurable overhead;
-- the application can be changed to call fasttrun functions explicitly;
-- temporary-table contents do not have to be restored after `ROLLBACK`.
+- the application repeatedly reuses local temporary tables
+- dozens of long-lived server connections operate concurrently
+- regular `TRUNCATE` and `ANALYZE` produce measurable overhead
+- the application can be changed to call fasttrun functions explicitly
+- temporary-table contents do not have to be restored after `ROLLBACK`
 
 A typical use case is a large PL/pgSQL calculation behind a connection pooler.
-A PostgreSQL backend—the server process behind one physical connection—lives
+A PostgreSQL backend - the server process behind one physical connection - lives
 for a long time, serves many clients, and gradually accumulates temporary tables
 for reuse.
 
@@ -106,8 +106,8 @@ Run `make install` as an operating-system user that can write to PostgreSQL's
 library and extension directories.
 
 PostgreSQL 16, 17, and 18 require separate builds. When building sequentially
-from the same source tree, run `make clean` before switching `PG_CONFIG`;
-otherwise, `make` may reuse an object file built for another major version.
+from the same source tree, run `make clean` before switching `PG_CONFIG`.
+Otherwise, `make` may reuse an object file built for another major version.
 Install the built files on every cluster node that can serve the database or be
 promoted to primary.
 
@@ -123,7 +123,7 @@ FROM pg_extension
 WHERE extname = 'fasttrun';
 ```
 
-The default version is `2.5.0`.
+The default version is `2.5.1`.
 
 Instead of a plain `CREATE EXTENSION`, you can install the extension into a
 dedicated schema. Untrusted roles must not be allowed to create objects in the
@@ -135,7 +135,7 @@ REVOKE CREATE ON SCHEMA fasttrun_api FROM PUBLIC;
 CREATE EXTENSION fasttrun WITH SCHEMA fasttrun_api;
 ```
 
-With this layout, qualify calls—for example,
+With this layout, qualify calls - for example,
 `fasttrun_api.fasttruncate(...)`. The example under `examples/` calls
 `public.fasttruncate()` explicitly and must be adapted separately.
 
@@ -147,9 +147,10 @@ The main functions, including `fasttruncate()` and `fasttrun_analyze()`, require
 neither a PostgreSQL restart nor `shared_preload_libraries` or
 `session_preload_libraries`. The library is loaded on the first function call.
 
-`shared_preload_libraries` is required only for the shared tracking registry and
-`fasttrun_prewarm()`. fasttrun does not need a special position in the library
-list.
+`shared_preload_libraries` is required for the shared tracking registry and
+`fasttrun_prewarm()`, and in background workers also for per-column `UPDATE`
+accounting (see "Column statistics"). fasttrun does not need a special position
+in the library list.
 
 ### Privileges
 
@@ -347,7 +348,7 @@ The public API contains 10 SQL functions.
 
 | Function | Purpose | Shared invalidation messages |
 |---|---|---|
-| `fasttruncate(text)` | Clears one local temporary heap table, its indexes, TOAST table, and TOAST indexes | None with `zero_sinval_truncate=on`; with `off`, one shared storage-manager message is sent for every cleared relation |
+| `fasttruncate(text)` | Clears one local temporary heap table, its indexes, TOAST table, and TOAST indexes | None with `zero_sinval_truncate=on`, while with `off`, one shared storage-manager message is sent for every cleared relation |
 | `fasttrun_analyze(text)` | Updates local size estimates and, when needed, column statistics | None |
 | `fasttrun_analyze_bulk(VARIADIC text[])` | Runs `fasttrun_analyze` sequentially for an array of tables | None |
 | `fasttrun_collect_stats(text)` | Explicitly rebuilds local column statistics | None |
@@ -356,6 +357,16 @@ The public API contains 10 SQL functions.
 `fasttrun_collect_stats()` take an `AccessShareLock` while they run. An open
 cursor or active query against the table being cleared causes a regular SQL
 error before any files are changed.
+
+If the table and its TOAST table are physically empty and the local statistics
+of the table and its indexes already match that state, a repeated
+`fasttruncate()` skips the file cleanup, the index rebuild, and plan
+invalidation. The checks for active use of the table still run. A mismatch in
+locators, sizes, statistics, or DML counters, or an unfinished cleanup, sends
+the call back to the full path. `reltuples = 0` alone is not enough to skip.
+After `COMMIT`, the fast path restores the counter baseline for the next refill
+and `fasttrun_analyze()`. If the empty state has not yet been reconciled with
+the cached plans, a full cleanup with invalidation runs.
 
 For these functions, `NULL` and a missing table are no-ops.
 `fasttrun_analyze_bulk()` also skips `NULL` elements in its array. The function
@@ -384,12 +395,12 @@ freshness check may temporarily hide them.
 
 `fasttrun_cache_stats()` always returns one row with these fields:
 
-- `analyze_entries`;
-- `column_stats_relid_entries`;
-- `column_stats_entries`;
-- `analyze_bytes`;
-- `column_stats_bytes`;
-- `total_bytes`.
+- `analyze_entries`
+- `column_stats_relid_entries`
+- `column_stats_entries`
+- `analyze_bytes`
+- `column_stats_bytes`
+- `total_bytes`
 
 `total_bytes` is the sum of `analyze_bytes` and `column_stats_bytes`. All values
 apply only to the current physical backend.
@@ -445,9 +456,9 @@ can differ. Collection is more expensive than with the default settings.
 client.
 
 `UPDATE` is accounted for per column. pgstat counts changed rows per relation,
-so updating a single helper column used to age the statistics of every other
-column. Wear from an `UPDATE` now applies only to the columns named in `SET`;
-`INSERT` and `DELETE` still apply to all of them.
+and counted that way, updating a single helper column would age the statistics
+of every other column. Wear from an `UPDATE` therefore applies only to the
+columns named in `SET`, while `INSERT` and `DELETE` apply to all of them.
 
 The account requires a preload: a statement's target list is visible only at its
 start, and the hooks are installed when the library loads.
@@ -456,13 +467,23 @@ start, and the hooks are installed when the library loads.
 session_preload_libraries = 'fasttrun'
 ```
 
-Without the preload the per-column account is off entirely, wear again applies to
-every column, and the server log gets one line about it per session. The old
-behaviour is **not** restored in full: a sample taken while the relation was
-being written is not served to the planner in either mode until a fresh one
-replaces it. There is nothing to compare it with -- the scan runs on its own
-command's snapshot, while the counters stored beside it already include those
-writes.
+Without the preload the per-column account is off entirely, wear from an
+`UPDATE` applies to every column, and the server log gets one line about it per
+session. A sample taken while the relation was being written is not served to
+the planner in either mode until a fresh one replaces it. There is nothing to
+compare it with - the scan runs on its own command's snapshot, while the
+counters stored beside it already include those writes.
+
+Only client sessions load `session_preload_libraries`. Background workers -
+pg_background, pg_cron in background-worker mode, TimescaleDB jobs - never
+process it, so in them the per-column account is enabled only by
+`shared_preload_libraries`. That requires a PostgreSQL restart, and upgrading
+the library then needs a restart too (see "Upgrading and removing"). The shared
+`CREATE TEMP TABLE` tracking registry is created as well, but recording into it
+is off by default and is enabled by `fasttrun.track_temp_creates` (see "Tracking
+and table prewarming"). Such processes write the line about the disabled
+account at DEBUG1 instead of LOG: otherwise short-lived workers would write
+thousands of identical lines a day.
 
 For a given relation the account is off until the next collect whenever the
 column list cannot be trusted: the relation has triggers or a stored generated
@@ -474,15 +495,19 @@ changed: an `UPDATE` that matched no row still marks its columns, and from then
 on the relation's whole turnover for that period is charged to them.
 
 The price: a bulk `UPDATE` spoils the physical order of rows, so for the
-untouched columns the correlation can end up overstated -- index access looks
+untouched columns the correlation can end up overstated - index access looks
 cheaper for them than it is. The number of distinct values, the NULL fraction
 and the MCV list stay correct.
 
 After a small amount of DML, cached statistics can remain visible, just as they
-do between regular runs of `ANALYZE`. When
-`fasttrun.stats_refresh_threshold` is reached, the statistics are rebuilt if
-automatic collection is enabled, `sample_rows` is not zero, and the memory
-limit permits collection. Otherwise, fasttrun hides the statistics so that the
+do between regular runs of `ANALYZE`. A column's tolerance is
+`fasttrun.stats_refresh_threshold` multiplied by `1 - d`, where `d` is the
+fraction of distinct values among the rows, but no less than the smaller of the
+threshold and 5%. A column with few values gets almost the whole threshold, a
+near-unique one at most 5%. With a threshold of `0.2`, the statistics of a
+near-unique column are hidden after 5% of changes. When the
+threshold itself is reached, the statistics are rebuilt if automatic collection
+is enabled, `sample_rows` is not zero, and the memory limit permits collection. Otherwise, fasttrun hides the statistics so that the
 planner does not use a distribution known to be outdated. This is not a full
 guarantee: the change ratio is measured against the transaction's counters, so
 several sub-threshold transactions in a row can rewrite the relation between
@@ -503,9 +528,9 @@ limit, an explicit `fasttrun_collect_stats()` performs a full table scan. The
 
 A regular full `ANALYZE` hands statistics management for the whole table back
 to PostgreSQL core. `ANALYZE table (col1, ...)` hands back only the listed
-columns; local statistics for the remaining columns stay in place. `VACUUM`
-without `ANALYZE` changes nothing. Commands that rewrite the table hide old
-local statistics until the next collection.
+columns, while local statistics for the remaining columns stay in place.
+`VACUUM` without `ANALYZE` changes nothing. Commands that rewrite the table hide
+old local statistics until the next collection.
 
 ## Settings
 
@@ -518,13 +543,13 @@ The "user" context means that the parameter can be changed with `SET`. The
 | Parameter | Default | Range | Context | Purpose |
 |---|---:|---:|---|---|
 | `fasttrun.auto_collect_stats` | `on` | boolean | user | Collect column statistics inside `fasttrun_analyze()` |
-| `fasttrun.sample_rows` | `3000` | `-1..1000000` | user | `0` disables column collection; with `use_typanalyze=on`, `-1` uses the sample size requested by PostgreSQL, while with `off` it uses 3,000 rows |
-| `fasttrun.stats_refresh_threshold` | `0.2` | `0..1` | user | Fraction of DML that triggers an automatic rebuild; `0` means any DML, and `1` disables automatic rebuilding |
+| `fasttrun.sample_rows` | `3000` | `-1..1000000` | user | `0` disables column collection. With `use_typanalyze=on`, `-1` uses the sample size requested by PostgreSQL, while with `off` it uses 3,000 rows |
+| `fasttrun.stats_refresh_threshold` | `0.2` | `0..1` | user | Fraction of DML that triggers an automatic rebuild, and the base of the statistics visibility tolerance. `0` means a rebuild on any DML. `1` disables the DML-triggered rebuild, but statistics past the tolerance are still hidden |
 | `fasttrun.invalidate_threshold` | `0.2` | `0..1` | user | Allowed cumulative size change before local plans are invalidated |
-| `fasttrun.use_typanalyze` | `on` | boolean | user | Use PostgreSQL's built-in statistics handlers; `off` keeps only basic metrics |
-| `fasttrun.zero_sinval_truncate` | `on` | boolean | user | `on` clears files without shared messages; `off` uses the PostgreSQL core cleanup path |
-| `fasttrun.max_analyze_pages` | `100000` | `0..2147483647` pages | user | Above this threshold, `fasttrun_analyze()` switches to block sampling; `0` requires a full scan whenever a scan is needed |
-| `fasttrun.max_stats_memory` | `0` | KB | user | Soft memory limit for column statistics; `0` means unlimited |
+| `fasttrun.use_typanalyze` | `on` | boolean | user | Use PostgreSQL's built-in statistics handlers. `off` keeps only basic metrics |
+| `fasttrun.zero_sinval_truncate` | `on` | boolean | user | `on` clears files without shared messages, while `off` uses the PostgreSQL core cleanup path |
+| `fasttrun.max_analyze_pages` | `100000` | `0..2147483647` pages | user | Above this threshold, `fasttrun_analyze()` switches to block sampling. `0` requires a full scan whenever a scan is needed |
+| `fasttrun.max_stats_memory` | `0` | KB | user | Soft memory limit for column statistics. `0` means unlimited |
 
 With an 8 KB page size, `max_analyze_pages=100000` corresponds to approximately
 800 MB of heap data.
@@ -533,24 +558,24 @@ Keep `fasttrun.zero_sinval_truncate=on` in production. The `off` value is meant
 for diagnostics and compatibility testing. It does not make cleanup safer and
 re-enables shared invalidation messages. An error inside a PostgreSQL core
 critical section in this mode can trigger a `PANIC` that terminates every
-database session in the PostgreSQL instance. Automatic process reinitialization
+server session in the PostgreSQL instance. Automatic process reinitialization
 then depends on `restart_after_crash`.
 
 `max_stats_memory` is checked only before the first statistics collection for a
 new table. Existing statistics continue to be updated. A current size exactly
 equal to the limit is allowed, so the first new table may exceed the limit by
 the full size of statistics for all of its columns. The amount of this overshoot
-is not bounded in advance. Only `column_stats_bytes` counts toward the limit;
-`analyze_bytes` does not. There is no automatic eviction or LRU. If the limit
-stops automatic collection, the backend emits one `WARNING`. An explicit
+is not bounded in advance. Only `column_stats_bytes` counts toward the limit,
+while `analyze_bytes` does not. There is no automatic eviction or LRU. If the
+limit stops automatic collection, the backend emits one `WARNING`. An explicit
 `fasttrun_collect_stats()` emits a `NOTICE` for every such attempt.
 
 ### Tracking and prewarming parameters
 
 | Parameter | Default | Range | Context | Purpose |
 |---|---:|---:|---|---|
-| `fasttrun.track_temp_creates` | `on` | boolean | administrator | Track matching `CREATE TEMP TABLE` attempts |
-| `fasttrun.prewarm_count` | `1000` | `0..8192` | user | Maximum number of helper-function calls; `0` disables prewarming |
+| `fasttrun.track_temp_creates` | `off` | boolean | administrator | Track matching `CREATE TEMP TABLE` attempts |
+| `fasttrun.prewarm_count` | `1000` | `0..8192` | user | Maximum number of helper-function calls. `0` disables prewarming |
 | `fasttrun.prewarm_schema` | `dummy_tmp` | schema name | administrator | Schema containing template tables |
 | `fasttrun.track_schedule` | `mon-fri 08:00-18:00` | string | administrator | Time windows during which table-creation attempts are tracked |
 
@@ -591,11 +616,16 @@ efficient than creating every possible table.
 
 ### Enabling the feature
 
-Add fasttrun to `shared_preload_libraries` and restart PostgreSQL:
+Add fasttrun to `shared_preload_libraries`, enable recording, and restart
+PostgreSQL:
 
 ```ini
 shared_preload_libraries = 'fasttrun'
+fasttrun.track_temp_creates = on
 ```
+
+Without `fasttrun.track_temp_creates = on`, the shared registry is created but
+new attempts are not recorded in it.
 
 If the list already contains other extensions, keep them. fasttrun does not
 have to be placed last.
@@ -631,11 +661,11 @@ rolled back by the transaction also increment it.
 
 The registry:
 
-- is shared across the entire PostgreSQL instance;
-- holds no more than 8,192 names;
-- stores only the table name, without a database OID, schema, or user;
-- combines identical names from different databases;
-- silently rejects new names after it becomes full.
+- is shared across the entire PostgreSQL instance
+- holds no more than 8,192 names
+- stores only the table name, without a database OID, schema, or user
+- combines identical names from different databases
+- silently rejects new names after it becomes full
 
 The registry is not an audit or security source. A session that can issue a
 matching `CREATE TEMP TABLE` command can increment counters even with failed
@@ -650,7 +680,8 @@ count, then by the time of the latest attempt, and then by name.
 
 ### Schedule
 
-By default, attempts are tracked on weekdays from 08:00 to 18:00:
+When recording is enabled, attempts are tracked by default on weekdays from
+08:00 to 18:00:
 
 ```ini
 fasttrun.track_schedule = 'mon-fri 08:00-18:00'
@@ -721,12 +752,12 @@ During a clean PostgreSQL shutdown, the registry is saved atomically to
 `$PGDATA/pg_stat/fasttrun_temp_stats` and loaded on the next startup.
 
 After a crash, the current state is not written. An older successfully saved
-copy may be loaded instead. Write errors are recorded in the PostgreSQL log;
-an incomplete temporary file is removed.
+copy may be loaded instead. Write errors are recorded in the PostgreSQL log,
+and an incomplete temporary file is removed.
 
 The file is not written to WAL, is not replicated, and is not included in
 `pg_dump`. `fasttrun_reset_temp_stats()` clears the registry and removes the
-file immediately; `ROLLBACK` does not undo this reset.
+file immediately. `ROLLBACK` does not undo this reset.
 
 </details>
 
@@ -743,7 +774,10 @@ If an error occurs after cleanup begins, the old files can no longer be safely
 restored. fasttrun blocks the table in the current backend. `SELECT`, DML,
 `COPY`, planning, and extension functions for that table return
 `SQLSTATE 55000`. A regular `ROLLBACK` or rollback to a savepoint does not remove
-the block.
+the block while the table itself exists. If the creation of the table is rolled
+back, the extension removes the table's unfinished-operation record together
+with its local caches. This also holds when the first fasttrun call is made
+inside a nested block.
 
 First end the failed transaction:
 
@@ -794,7 +828,7 @@ starts the processes again and performs crash recovery. The pooler sees a mass
 disconnect.
 
 With `restart_after_crash=off`, PostgreSQL does not reinitialize the processes
-automatically; restart and recovery are left to the operator or cluster
+automatically. Restart and recovery are left to the operator or cluster
 manager.
 
 Check the PostgreSQL log and the state of the entire instance. The old
@@ -803,7 +837,7 @@ connections cannot continue after this event.
 ## Upgrading and removing
 
 Upgrades are supported from versions `2.0`, `2.1`, `2.1.1`, `2.1.2`, `2.2.0`,
-`2.3.0`, `2.3.1`, `2.3.2`, `2.3.3`, `2.3.4`, and `2.4.0`.
+`2.3.0`, `2.3.1`, `2.3.2`, `2.3.3`, `2.3.4`, `2.4.0`, `2.4.1`, and `2.5.0`.
 
 Treat a C-library upgrade as maintenance on the server processes. Install the
 new build and SQL files on every cluster node.
@@ -825,7 +859,7 @@ After startup or after opening a new connection, run the following in every
 database as the extension owner or a superuser:
 
 ```sql
-ALTER EXTENSION fasttrun UPDATE TO '2.5.0';
+ALTER EXTENSION fasttrun UPDATE TO '2.5.1';
 ```
 
 With physical replication, install the files on standby nodes too, but run
@@ -835,29 +869,31 @@ standbys through normal replication.
 This is important for an upgrade from 2.3.4 to 2.4.0: the SQL migration adds a
 function that does not exist in the old C library.
 
-Version 2.5.0 adds per-column accounting of statistics wear: an `UPDATE` of a
-helper column no longer devalues the statistics of the join keys. The 2.4.1 to
-2.5.0 upgrade leaves SQL objects unchanged but **requires a configuration
-change**:
+The extension's SQL objects do not change between versions 2.4.0, 2.4.1, 2.5.0,
+and 2.5.1, so an upgrade between them comes down to replacing the C library and
+running `ALTER EXTENSION ... UPDATE`. Versions 2.5 also **need the library to be
+preloaded**. If fasttrun is already in `shared_preload_libraries`, nothing needs
+to change. Otherwise, for client sessions add:
 
 ```
 session_preload_libraries = 'fasttrun'
 ```
 
-Without that line the extension behaves as before, over the whole relation, and
-writes one line about it to the server log per session. A statement's column
-list is visible only at its start, and the hooks are installed when the library
-loads: if it loads on first use, the statements already running cannot be
-recovered.
+Background processes do not load that parameter and need
+`shared_preload_libraries`. Without a preload, statistics wear from an `UPDATE`
+is counted for the whole relation rather than per column, and a client session
+writes one line about it to the server log. A statement's column list is visible
+only at its start, and the hooks are installed when the library loads: if it
+loads on first use, the statements already running cannot be recovered.
 
-Version 2.4.1 fixes memory leaks after rolling back temporary-table creation
-and speeds up repeated truncation of an already empty table. The upgrade
-from 2.4.0 to 2.4.1 leaves SQL objects unchanged; the fixes require the new
-C library.
+The shared `CREATE TEMP TABLE` tracking registry exists only with
+`shared_preload_libraries`, and recording into it is off by default. If you
+need `fasttrun_prewarm()`, set `fasttrun.track_temp_creates = on` (see
+"Tracking and table prewarming").
 
 When moving to a new PostgreSQL major version with `pg_upgrade`, build and
 install fasttrun against the new `pg_config` in advance. The extension's catalog
-entries move with the database; do not run `CREATE EXTENSION` again. The shared
+entries move with the database. Do not run `CREATE EXTENSION` again. The shared
 tracking-registry file is outside the extension catalog and should be treated
 as disposable, reconstructible state rather than data that `pg_upgrade` must
 transfer.
@@ -901,12 +937,12 @@ preload is already disabled, stop PostgreSQL and remove the file manually.
   important.
 - Extended statistics created with `CREATE STATISTICS`, expression-index
   statistics, and inheritance statistics are not collected.
-- Stale catalog statistics for index expressions are hidden; until a regular
+- Stale catalog statistics for index expressions are hidden. Until a regular
   `ANALYZE`, the planner uses default estimates.
 - ACL, RLS, and security-barrier behavior of regular `ANALYZE` is not
   reproduced.
 - The functions do not check table ownership or the privileges enforced by
-  built-in `TRUNCATE` and `ANALYZE`; restrict access through `EXECUTE` grants.
+  built-in `TRUNCATE` and `ANALYZE`. Restrict access through `EXECUTE` grants.
 - Local statistics survive transactions in one backend but disappear when the
   connection ends.
 - After DML is committed without `fasttrun_analyze()`, a same-sized change in
@@ -918,9 +954,15 @@ preload is already disabled, stop PostgreSQL and remove the file manually.
 - Once per-column `UPDATE` accounting has been dropped for a relation, only the
   next collect brings it back: if a trigger was created inside a savepoint and
   the savepoint was rolled back, the account for that relation stays suspended.
-- A write that bypasses the executor -- a direct heap/table AM API call from
-  another extension -- never reaches the column list. No core path does that to
+- A write that bypasses the executor - a direct heap/table AM API call from
+  another extension - never reaches the column list. No core path does that to
   a temporary table.
+- If a statement writes more than 16 temporary tables at once (an `UPDATE` or
+  `DELETE` of a partitioned temporary table without partition pruning, an
+  inheritance parent with children), every table counts as being written until
+  the transaction ends: statistics collected in that transaction after such a
+  statement are not served to the planner until a later collect replaces them.
+  Permanent tables do not count.
 - fasttrun is not a security boundary between connection-pooler clients.
 
 ## Performance
@@ -930,11 +972,11 @@ PostgreSQL settings, and plan-cache size.
 
 The main expected effects are:
 
-- `fasttruncate()` avoids shared file-change messages in standard mode;
-- `fasttrun_analyze()` does not write `pg_class` or `pg_statistic`;
-- repeated analyze calls within one transaction usually do not scan the table;
-- `invalidate_threshold` reduces unnecessary walks over the local plan cache;
-- queries without temporary tables keep the same plans and results.
+- `fasttruncate()` avoids shared file-change messages in standard mode
+- `fasttrun_analyze()` does not write `pg_class` or `pg_statistic`
+- repeated analyze calls within one transaction usually do not scan the table
+- `invalidate_threshold` reduces unnecessary walks over the local plan cache
+- queries without temporary tables keep the same plans and results
 
 The `check-no-temp-impact` test compares plans, results, replanning, and memory
 for queries that do not use temporary tables. Once local caches are active,
@@ -989,8 +1031,8 @@ wall clock, so it depends on machine speed. It takes two measurements with
 separate limits: a narrow table (1M rows, two columns, one index) at 100 ms and
 a wide one (1M rows, 50 columns, four indexes, TOAST, 637 MB) at 500 ms. Both
 come from the `MAX_TRUNC_MS` and `MAX_TRUNC_WIDE_MS` environment variables. The
-wide limit is provisional -- it is set with room for slow storage and should be
-re-derived from a measurement on your own machine; the script prints both
+wide limit is provisional - it is set with room for slow storage and should be
+re-derived from a measurement on your own machine. The script prints both
 medians. The target needs Linux, `bpftrace` and `sudo`, so it does not run on
 macOS.
 
@@ -1042,10 +1084,17 @@ files. Indexes, TOAST, and their metadata are rebuilt in the same backend.
 
 `fasttrun_analyze()` keeps table-size estimates and column statistics in backend
 memory. Planner hooks substitute those values for stale catalog values. A global
-`ResetPlanCache` is not used; when necessary, plans are marked stale only in the
+`ResetPlanCache` is not used. When necessary, plans are marked stale only in the
 current backend through `PlanCacheRelCallback`. Statistics hooks are installed
 lazily when the local cache is first created, so the position of fasttrun in
 `shared_preload_libraries` does not determine their order.
+
+fasttrun keeps its own journal of touched relations in backend memory,
+organized by subtransaction level. The journal also records the level at which
+a temporary relation was created. When that level is rolled back, the entries
+of the vanishing table and its indexes are freed. Empty files of a table that
+PostgreSQL core has not removed yet do not keep its cache in memory. When a
+level ends, only the relations marked in that level are walked.
 
 In standard mode, the main functions do not modify `pg_class`, `pg_statistic`,
 or the target table's relfilenode. Prewarming uses regular DDL and is outside
