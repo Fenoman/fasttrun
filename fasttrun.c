@@ -6345,10 +6345,11 @@ fasttrun_collect_and_store(Relation rel, HeapTuple *sample, int sample_count,
  * *tuples_out and up to sample_target tuples via the pre-allocated
  * sample[] array (heap_copytuple'd in the current memory context).
  *
- * Used by the cold-scan path and by delta-hit stats refresh, so a refresh
- * reads the whole heap as the cold scan does.  Sampling only enough heap
- * blocks to fill the row target is not ANALYZE-equivalent for physically
- * clustered or sparse temp tables.
+ * Every fasttrun_analyze scan at or below fasttrun.max_analyze_pages comes
+ * here through fasttrun_sample_for_analyze(), and fasttrun_collect_stats()
+ * calls it directly at any size.  Sampling only enough heap blocks to fill
+ * the row target is not ANALYZE-equivalent for physically clustered or
+ * sparse temp tables.
  */
 static void
 fasttrun_scan_with_sample(Relation rel, int64 *tuples_out,
@@ -6565,6 +6566,7 @@ fasttrun_block_sample_rows(Relation rel, int64 *tuples_out,
  * At or below it -- or when the threshold is 0 -- do the exact full scan.
  * Shared by the cold path, the delta-refresh, and the partial-index rescan so
  * the giant-temp guardrail covers all three scans, not just the cold one.
+ * fasttrun_collect_stats() does not come here: it always reads the whole heap.
  */
 static void
 fasttrun_sample_for_analyze(Relation rel, BlockNumber pages_now,
@@ -8334,7 +8336,11 @@ fasttrun_cache_stats(PG_FUNCTION_ARGS)
  * is on (default), so fasttrun.use_typanalyze decides what is computed:
  * the full std_typanalyze output when on (default), only n_distinct,
  * null_frac and width when off.  Unlike fasttrun_analyze, this call always
- * reads the whole heap: fasttrun.max_analyze_pages does not apply.
+ * reads the whole heap: fasttrun.max_analyze_pages does not apply.  It is
+ * the way to get an exact row count and a row sample drawn from the whole
+ * heap on demand where a block sample cannot be trusted: values grouped by
+ * page, or a sparse heap after a mass DELETE, where a block sample can miss
+ * every live block.
  */
 Datum
 fasttrun_collect_stats(PG_FUNCTION_ARGS)
@@ -10534,17 +10540,20 @@ _PG_init(void)
 							 NULL, NULL, NULL);
 
 	DefineCustomIntVariable("fasttrun.max_analyze_pages",
-							"Heap page count above which cold fasttrun_analyze "
-							"switches to bounded block sampling",
-							"Default 100000 (~800 MB).  A cold fasttrun_analyze "
-							"normally scans the whole temp table for an exact "
-							"row count.  Above this many heap pages it instead "
-							"reads a bounded random block sample and ESTIMATES "
-							"the row count from tuple density (like a regular "
-							"ANALYZE), keeping cost O(sample) instead of "
-							"O(table) on anomalously giant temp tables.  Column "
-							"statistics are collected from the same sample.  "
-							"Set to 0 to always do the exact full scan.",
+							"Heap page count above which fasttrun_analyze scans "
+							"switch to bounded block sampling",
+							"Default 100000 (~800 MB).  Every heap scan of "
+							"fasttrun_analyze (cold pass, stats refresh, "
+							"partial-index rescan) normally reads the whole temp "
+							"table for an exact row count.  Above this many heap "
+							"pages it instead reads a bounded random block sample "
+							"and ESTIMATES the row count from tuple density (like "
+							"a regular ANALYZE), keeping cost O(sample) instead "
+							"of O(table) on anomalously giant temp tables.  "
+							"Column statistics are collected from the same "
+							"sample.  Set to 0 to always do the exact full scan.  "
+							"The explicit fasttrun_collect_stats ignores this "
+							"limit and always reads the whole heap.",
 							&fasttrun_max_analyze_pages,
 							100000,
 							0,

@@ -524,7 +524,11 @@ extension emits one `WARNING` during the backend's lifetime. After enabling
 Unless collection is disabled with `sample_rows=0` or stopped by the memory
 limit, an explicit `fasttrun_collect_stats()` performs a full table scan. The
 `fasttrun.max_analyze_pages` limit applies to scans inside
-`fasttrun_analyze()` and does not limit this explicit call.
+`fasttrun_analyze()` and does not limit this explicit call. This way the
+explicit call gives an exact row count and a row sample drawn from the whole
+heap where a block sample cannot be trusted: values are grouped by page, or a
+mass `DELETE` left a sparse heap in which a block sample can miss every live
+block. The price is a full table scan on every such call.
 
 A regular full `ANALYZE` hands statistics management for the whole table back
 to PostgreSQL core. `ANALYZE table (col1, ...)` hands back only the listed

@@ -1527,6 +1527,24 @@ COMMIT;
 DROP TABLE t_giant_delta;
 
 -- ----------------------------------------------------------------------
+-- 31c. Явный fasttrun_collect_stats порог не использует и читает всю
+--      кучу: так статистику можно получить без ошибок выборки блоков.
+--      При пороге 1 fasttrun_analyze дает DEBUG-маркер выборки блоков
+--      (положительный контроль), а явный сбор - нет.
+-- ----------------------------------------------------------------------
+CREATE TEMP TABLE t_giant_explicit (id int, grp int);
+INSERT INTO t_giant_explicit SELECT g, g % 100 FROM generate_series(1, 50000) g;
+
+BEGIN;
+SET LOCAL fasttrun.max_analyze_pages = 1;
+SET LOCAL client_min_messages = debug1;
+SELECT fasttrun_analyze('t_giant_explicit');        -- выборка блоков
+SELECT fasttrun_collect_stats('t_giant_explicit');  -- полный проход
+RESET client_min_messages;
+COMMIT;
+DROP TABLE t_giant_explicit;
+
+-- ----------------------------------------------------------------------
 -- 32. Partial-index relstats при fasttrun.sample_rows = 0.  Без выборки
 --     column-stats отключены, но relpages (физический размер) и
 --     reltuples partial-индекса все равно должны обновляться: relpages
