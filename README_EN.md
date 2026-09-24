@@ -967,6 +967,12 @@ preload is already disabled, stop PostgreSQL and remove the file manually.
   the transaction ends: statistics collected in that transaction after such a
   statement are not served to the planner until a later collect replaces them.
   Permanent tables do not count.
+- `DISCARD TEMP` lifts the unfinished-cleanup block at once, not at commit. If
+  the transaction that ran it rolls back, the table comes back without the
+  block. Queries on it either fail reading an index or TOAST page, or see
+  correct data or an already empty table: there are no silent wrong results.
+  Running `fasttruncate()` again repairs the table. For recovery, run
+  `DISCARD TEMP` outside a transaction.
 - fasttrun is not a security boundary between connection-pooler clients.
 
 ## Performance
