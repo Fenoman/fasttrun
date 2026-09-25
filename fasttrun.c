@@ -53,6 +53,7 @@
 #include "utils/pgstat_internal.h"	/* pgstat_fetch_pending_entry */
 #include "storage/buf_internals.h"
 #include "storage/bufmgr.h"
+#include "storage/ipc.h"
 #include "storage/lmgr.h"
 #include "storage/smgr.h"
 #include "utils/array.h"
@@ -64,6 +65,7 @@
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/plancache.h"
 #include "utils/regproc.h"
 #include "utils/rel.h"
 #include "utils/relcache.h"
@@ -241,9 +243,6 @@ static bool		fasttrun_warned_track_counts_off = false;
 
 /* fasttrun.max_stats_memory warning -- one shot per backend. */
 static bool		fasttrun_warned_stats_budget = false;
-
-/* RNG state for reservoir sampling */
-static pg_prng_state fasttrun_prng_state;
 
 #ifdef USE_ASSERT_CHECKING
 /* Test probe: counts relids examined by subxact cleanup. */
@@ -835,6 +834,8 @@ static MemoryContext fasttrun_operation_mcxt = NULL;
 static HTAB *fasttrun_poison_cache = NULL;
 
 static void fasttrun_xact_callback(XactEvent event, void *arg);
+static void fasttrun_exit_plan_reset_note_commit(void);
+static void fasttrun_exit_plan_reset_register(void);
 static void fasttrun_analyze_save_undo(FasttrunAnalyzeCacheEntry *entry);
 static void fasttrun_poison_commit_xact(void);
 static void fasttrun_poison_clear_all(void);
@@ -1083,6 +1084,54 @@ fasttrun_cache_commit_xact(void)
 		fasttrun_cache_reset();
 }
 
+/*
+ * At backend exit the core drops the temporary relations in
+ * RemoveTempRelationsCallback, and every relcache message of that drop walks
+ * all saved plans of the backend.  Once the plans are marked invalid, each
+ * visit stops at the is_valid check.  Exit callbacks run in reverse
+ * registration order, and the core registers its callback at the commit that
+ * creates the temporary namespace, after the XACT_EVENT_COMMIT callbacks.  So
+ * the commit callback only notes that the namespace exists, and the next
+ * statement that reaches the executor or utility hook registers the fasttrun
+ * callback, which then runs before the core cleanup.  A backend with no such
+ * statement after that commit keeps the plain exit.  Registration stays out of
+ * the commit callback: running out of exit callback slots is FATAL, which must
+ * not happen after the commit record.
+ */
+static bool fasttrun_exit_plan_reset_pending = false;
+static bool fasttrun_exit_plan_reset_registered = false;
+
+static void
+fasttrun_exit_plan_reset(int code, Datum arg)
+{
+	/* Fixed text so that scripts/check_fasttrun_exit_plan_reset.sh finds it. */
+	elog(DEBUG1, "fasttrun: marking cached plans invalid before temporary relation cleanup");
+	ResetPlanCache();
+}
+
+static void
+fasttrun_exit_plan_reset_note_commit(void)
+{
+	Oid			temp_namespace;
+	Oid			temp_toast_namespace;
+
+	if (fasttrun_exit_plan_reset_registered || fasttrun_exit_plan_reset_pending)
+		return;
+	GetTempNamespaceState(&temp_namespace, &temp_toast_namespace);
+	if (OidIsValid(temp_namespace))
+		fasttrun_exit_plan_reset_pending = true;
+}
+
+static void
+fasttrun_exit_plan_reset_register(void)
+{
+	if (likely(!fasttrun_exit_plan_reset_pending))
+		return;
+	fasttrun_exit_plan_reset_pending = false;
+	fasttrun_exit_plan_reset_registered = true;
+	before_shmem_exit(fasttrun_exit_plan_reset, (Datum) 0);
+}
+
 /* Finish analyze + stats caches on xact end.  PRE_COMMIT skipped -- txn may still abort. */
 static void
 fasttrun_xact_callback(XactEvent event, void *arg)
@@ -1091,6 +1140,9 @@ fasttrun_xact_callback(XactEvent event, void *arg)
 	{
 		case XACT_EVENT_COMMIT:
 		case XACT_EVENT_PARALLEL_COMMIT:
+			/* A parallel worker's temporary namespace belongs to its leader. */
+			if (event == XACT_EVENT_COMMIT)
+				fasttrun_exit_plan_reset_note_commit();
 			fasttrun_poison_commit_xact();
 			fasttrun_cache_commit_xact();
 			fasttrun_stats_cache_commit_xact();
@@ -2154,6 +2206,7 @@ fasttrun_executor_walk_targets(PlannedStmt *stmt, bool starting)
 static void
 fasttrun_executor_start(QueryDesc *queryDesc, int eflags)
 {
+	fasttrun_exit_plan_reset_register();
 	fasttrun_executor_walk_targets(queryDesc->plannedstmt, true);
 
 	if (prev_ExecutorStart != NULL)
@@ -2518,9 +2571,11 @@ fasttrun_stats_relid_in_flight(Oid relid)
  * Two ways that happens:
  *
  *   * a statement writing the relation is running.  The registry knows every
- *     statement whose start was observed, nested ones included, and every DML
- *     target of it -- which is every statement at all, because the per-column
- *     account only runs in a backend that preloaded the library.
+ *     statement whose start was observed, nested ones included, and every
+ *     temporary DML target of it.  Permanent targets are left out, since only
+ *     a temporary relation is ever sampled.  The observed starts are every
+ *     statement at all, because the per-column account only runs in a backend
+ *     that preloaded the library.
  *   * a write already finished under a snapshot older than it.  The scan then
  *     runs on that older snapshot and does not see rows the counters count:
  *     an inner function's UPDATE, or an earlier command of this transaction
@@ -2632,7 +2687,8 @@ fasttrun_stats_note_wide_writer_ddl(RangeVar *rv)
  *   * the mask is empty while the counters say an UPDATE happened, so the
  *     write did not reach the executor hook.  A write that mixes with an
  *     already recorded UPDATE is not detected -- see the limitation on
- *     writes that bypass the executor in README.md and README_EN.md.
+ *     writes that bypass the executor in docs/ru/limitations.md and
+ *     docs/en/limitations.md.
  */
 static bool
 fasttrun_stats_column_was_updated(FasttrunStatsRelidEntry *relentry,
@@ -6502,7 +6558,13 @@ fasttrun_block_sample_rows(Relation rel, int64 *tuples_out,
 
 	totalblocks = RelationGetNumberOfBlocks(rel);
 	OldestXmin = GetOldestNonRemovableTransactionId(rel);
-	randseed = pg_prng_uint32(&fasttrun_prng_state);
+	/*
+	 * The core seeds the global state in every process at its start, and
+	 * ANALYZE takes its seed from it too.  A state seeded in _PG_init would
+	 * be inherited from the postmaster under shared_preload_libraries on fork
+	 * builds, the same sequence in every backend.
+	 */
+	randseed = pg_prng_uint32(&pg_global_prng_state);
 	(void) BlockSampler_Init(&bs, totalblocks, sample_target, randseed);
 	reservoir_init_selection_state(&rstate, sample_target);
 	strategy = GetAccessStrategy(BAS_VACUUM);
@@ -9931,6 +9993,7 @@ fasttrun_utility_hook(PlannedStmt *pstmt,
 	bool	discard_session_state = false;
 	Oid		copy_relid = InvalidOid;
 
+	fasttrun_exit_plan_reset_register();
 	fasttrun_poison_check_utility(parsetree);
 	if (IsA(parsetree, DiscardStmt))
 	{
@@ -10583,8 +10646,6 @@ _PG_init(void)
 							PGC_USERSET,
 							GUC_UNIT_KB,
 							NULL, NULL, NULL);
-
-	pg_prng_seed(&fasttrun_prng_state, (uint64) MyProcPid);
 
 	/*
 	 * Register the xact + subxact callbacks once per backend, here in

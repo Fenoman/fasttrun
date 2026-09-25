@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 #
-# check_cassert_allversions.sh — прогон regress-набора fasttrun на
+# check_cassert_allversions.sh - прогон regress-набора fasttrun на
 # cassert-сборках PostgreSQL 16/17/18 с детекцией assert-падений (TRAP).
 #
 # Зачем: обычный installcheck на release-сборке PG НЕ ловит нарушения
 # инвариантов, которые PostgreSQL проверяет только под --enable-cassert.
 # У fasttrun вся архитектура xact-колбэков опирается на то, что в
-# TRANS_COMMIT/TRANS_ABORT запрещён каталожный доступ (Assert(IsTransactionState())
-# в RelationIdGetRelation; PG18 добавил AssertCouldGetRelation).  Эти
+# TRANS_COMMIT/TRANS_ABORT запрещен каталожный доступ (Assert(IsTransactionState())
+# в RelationIdGetRelation, а PG18 добавил AssertCouldGetRelation).  Эти
 # ассерты обязаны проверяться живым cassert-бэкендом на КАЖДОЙ поддержанной
 # версии, а не только на PG16.
 #
@@ -16,7 +16,7 @@
 # строк "TRAP:" в логе сервера.  Успех = все тесты ok И нулевая дельта TRAP.
 #
 # --- ПРЕДУСЛОВИЕ: cassert-сборки ядра -----------------------------------
-# Скрипт НЕ собирает ядро (это ~5 мин × 3 версии и специфично для машины).
+# Скрипт НЕ собирает ядро (это ~5 мин x 3 версии и специфично для машины).
 # Собрать cassert-ядро версии N один раз:
 #
 #   git -C <postgres-src> worktree add --detach <SRC_N> REL_N_STABLE
@@ -31,7 +31,7 @@
 #       -o "-p <PORT_N> -c listen_addresses=127.0.0.1 \
 #           -c unix_socket_directories=<SHORT_SOCKDIR> -c fsync=off" -w start
 #
-# ВАЖНО (macOS): unix_socket_directories должен быть КОРОТКИМ путём
+# ВАЖНО (macOS): unix_socket_directories должен быть КОРОТКИМ путем
 # (лимит сокета 104 байта) -- длинный scratch-путь не влезает.
 #
 # --- ЗАПУСК -------------------------------------------------------------
@@ -44,7 +44,7 @@
 #   18:/scratch/pg18-cassert/bin/pg_config:5548:/scratch/server18.log" \
 #     bash scripts/check_cassert_allversions.sh
 #
-# Каждый сервер должен быть УЖЕ ПОДНЯТ на своём порту (см. предусловие), но
+# Каждый сервер должен быть УЖЕ ПОДНЯТ на своем порту (см. предусловие), но
 # без fasttrun в shared_preload_libraries: расширение устанавливается после
 # старта сервера и должно загрузиться из новой сборки в новом процессе.
 # Набор должен содержать ровно по одной цели PG16, PG17 и PG18. Скрипт
@@ -59,7 +59,7 @@
 #
 set -uo pipefail
 
-# C-локаль для старта: без неё тестовый postmaster на macOS падает с
+# C-локаль для старта: без нее тестовый postmaster на macOS падает с
 # "postmaster became multithreaded during startup".  installcheck ниже
 # переопределяет на ru_RU.UTF-8 внутри своего окружения.
 export LC_ALL=C LANG=C
@@ -85,9 +85,9 @@ esac
 # принадлежать root (наследие sudo-прогонов) и ломать pg_regress.
 OUTDIR=${FT_CASSERT_OUTDIR:-$(mktemp -d "${TMPDIR:-/tmp}/ft-cassert.XXXXXX")}
 mkdir -p "$OUTDIR"
-# Число наборов берётся из Makefile, а не хранится числом: иначе добавленный
-# набор превращает успешный прогон в «регрессию» на ровном месте.
-# Путь строится от REPO_ROOT, а не от $0: скрипт уже перешёл в корень, и
+# Число наборов берется из Makefile, а не хранится числом: иначе добавленный
+# набор превращает успешный прогон в "регрессию" на ровном месте.
+# Путь строится от REPO_ROOT, а не от $0: скрипт уже перешел в корень, и
 # относительный $0 после этого указывает мимо репозитория.
 EXPECTED_REGRESS=$(awk '/^REGRESS[ \t]*=/,/[^\\]$/' "$REPO_ROOT/Makefile" \
 	| tr -d '\\' | sed 's/^REGRESS[ \t]*=//' | tr -s ' \t\n' '\n' | grep -c .)
@@ -104,7 +104,7 @@ for t in "${TARGET_ARR[@]}"; do
 	IFS=':' read -r ver pgcfg port srvlog extra <<< "$t"
 	if [ -z "$ver" ] || [ -z "$pgcfg" ] || [ -z "$port" ] || \
 		[ -z "$srvlog" ] || [ -n "${extra:-}" ]; then
-		echo "ОШИБКА: неверная цель '$t'; нужен формат версия:pg_config:port:server_log." >&2
+		echo "ОШИБКА: неверная цель '$t', нужен формат версия:pg_config:port:server_log." >&2
 		exit 2
 	fi
 	case "$ver" in
@@ -119,7 +119,7 @@ done
 
 actual_majors=$(printf '%s\n' "${target_majors[@]}" | sort -n | tr '\n' ' ')
 if [ "$actual_majors" != "$EXPECTED_MAJORS" ]; then
-	echo "ОШИБКА: нужны уникальные цели PG16, PG17 и PG18; получено: $actual_majors" >&2
+	echo "ОШИБКА: нужны уникальные цели PG16, PG17 и PG18, получено: $actual_majors" >&2
 	exit 2
 fi
 
@@ -254,7 +254,7 @@ for t in "${TARGET_ARR[@]}"; do
 		exit 2
 	fi
 	if [ "$fasttrun_preloaded" != f ]; then
-		echo "ОШИБКА: сервер PG$ver уже загрузил fasttrun через shared_preload_libraries; перезапустите его без fasttrun." >&2
+		echo "ОШИБКА: сервер PG$ver уже загрузил fasttrun через shared_preload_libraries. Перезапустите его без fasttrun." >&2
 		exit 2
 	fi
 	configured_pkglibdir=$(canonical_dir "$($pgcfg --pkglibdir)") || {
@@ -338,7 +338,7 @@ for t in "${TARGET_ARR[@]}"; do
 
 	# 3. installcheck с ru_RU.UTF-8 и обособленным outputdir.
 	# (Скрипт работает без set -e -- см. `set -uo pipefail` в шапке -- поэтому
-	# ненулевой installcheck/grep не должен ронять цикл; коды разбираем сами.)
+	# ненулевой installcheck/grep не должен ронять цикл, коды разбираем сами.)
 	rm -rf "$OUTDIR/rc${ver}"
 	env "${HARNESS_ENV_ARGS[@]}" \
 		LC_ALL=ru_RU.UTF-8 LANG=ru_RU.UTF-8 PGUSER="$test_role" \
@@ -369,6 +369,11 @@ for t in "${TARGET_ARR[@]}"; do
 	planner_rc=125
 	publication_rc=125
 	persistence_rc=125
+	exit_reset_rc=125
+	tracking_preload_rc=125
+	prepare_registry_rc=125
+	bgworker_log_rc=125
+	block_seed_rc=125
 	if [ "$check_rc" -eq 0 ] && [ "$passed" -eq "$EXPECTED_REGRESS" ] && \
 		[ "$failed" -eq 0 ]; then
 		run_isolated_harness "$pgcfg" scripts/check_fasttrun_fault_matrix.sh \
@@ -397,9 +402,24 @@ for t in "${TARGET_ARR[@]}"; do
 		run_isolated_harness "$pgcfg" scripts/check_fasttrun_tracking_persistence.sh \
 			>"$OUTDIR/persistence${ver}.log" 2>&1
 		persistence_rc=$?
+		run_isolated_harness "$pgcfg" scripts/check_fasttrun_exit_plan_reset.sh \
+			>"$OUTDIR/exit_reset${ver}.log" 2>&1
+		exit_reset_rc=$?
+		run_isolated_harness "$pgcfg" scripts/check_fasttrun_tracking_preload.sh \
+			>"$OUTDIR/tracking_preload${ver}.log" 2>&1
+		tracking_preload_rc=$?
+		run_isolated_harness "$pgcfg" scripts/check_fasttrun_prepare_registry.sh \
+			>"$OUTDIR/prepare_registry${ver}.log" 2>&1
+		prepare_registry_rc=$?
+		run_isolated_harness "$pgcfg" scripts/check_fasttrun_bgworker_log.sh \
+			>"$OUTDIR/bgworker_log${ver}.log" 2>&1
+		bgworker_log_rc=$?
+		run_isolated_harness "$pgcfg" scripts/check_fasttrun_block_sample_seed.sh \
+			>"$OUTDIR/block_seed${ver}.log" 2>&1
+		block_seed_rc=$?
 	fi
 
-	echo "  тесты: пройдено ${passed}/${EXPECTED_REGRESS}, ошибок ${failed}, новых TRAP ${trap_delta}; дополнительные проверки: ошибки=${fault_rc}, cache-init=${cache_init_rc}, BRIN-${BRIN_LEVEL}=${brin_rc}, порядок=${order_rc}, память=${memory_rc}, планировщик=${planner_rc}, публикация=${publication_rc}, persistence=${persistence_rc}"
+	echo "  тесты: пройдено ${passed}/${EXPECTED_REGRESS}, ошибок ${failed}, новых TRAP ${trap_delta}. Дополнительные проверки: ошибки=${fault_rc}, cache-init=${cache_init_rc}, BRIN-${BRIN_LEVEL}=${brin_rc}, порядок=${order_rc}, память=${memory_rc}, планировщик=${planner_rc}, публикация=${publication_rc}, persistence=${persistence_rc}, выход=${exit_reset_rc}, трекинг с предзагрузкой=${tracking_preload_rc}, PREPARE=${prepare_registry_rc}, фоновый воркер=${bgworker_log_rc}, зерно выборки=${block_seed_rc}"
 	if [ "$check_rc" -ne 0 ] || [ "$passed" -ne "$EXPECTED_REGRESS" ] || \
 		[ "$failed" -ne 0 ]; then
 		echo "  РЕГРЕСС: см. $OUTDIR/rc${ver}/regression.diffs" >&2
@@ -408,8 +428,11 @@ for t in "${TARGET_ARR[@]}"; do
 	if [ "$fault_rc" -ne 0 ] || [ "$cache_init_rc" -ne 0 ] || \
 		[ "$brin_rc" -ne 0 ] || [ "$order_rc" -ne 0 ] || \
 		[ "$memory_rc" -ne 0 ] || [ "$planner_rc" -ne 0 ] || \
-		[ "$publication_rc" -ne 0 ] || [ "$persistence_rc" -ne 0 ]; then
-		echo "  не прошли дополнительные проверки; журналы находятся в $OUTDIR" >&2
+		[ "$publication_rc" -ne 0 ] || [ "$persistence_rc" -ne 0 ] || \
+		[ "$exit_reset_rc" -ne 0 ] || [ "$tracking_preload_rc" -ne 0 ] || \
+		[ "$prepare_registry_rc" -ne 0 ] || [ "$bgworker_log_rc" -ne 0 ] || \
+		[ "$block_seed_rc" -ne 0 ]; then
+		echo "  не прошли дополнительные проверки, журналы находятся в $OUTDIR" >&2
 		overall_rc=1
 	fi
 	if [ "$trap_delta" -ne 0 ]; then
@@ -420,8 +443,8 @@ done
 
 echo "========================================================"
 if [ "$overall_rc" -eq 0 ]; then
-	echo "ИТОГ: все версии прошли ${EXPECTED_REGRESS}/${EXPECTED_REGRESS} тестов и дополнительные проверки; новых TRAP нет."
+	echo "ИТОГ: все версии прошли ${EXPECTED_REGRESS}/${EXPECTED_REGRESS} тестов и дополнительные проверки, новых TRAP нет."
 else
-	echo "ИТОГ: есть ошибки тестов или падения на Assert; см. вывод выше и $OUTDIR." >&2
+	echo "ИТОГ: есть ошибки тестов или падения на Assert, см. вывод выше и $OUTDIR." >&2
 fi
 exit "$overall_rc"

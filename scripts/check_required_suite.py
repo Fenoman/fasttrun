@@ -66,8 +66,8 @@ def main() -> int:
     runner = read(errors, "scripts/check_cassert_allversions.sh")
     fault = read(errors, "scripts/check_fasttrun_fault_matrix.sh")
     makefile = read(errors, "Makefile")
-    readme = read(errors, "README.md")
-    readme_en = read(errors, "README_EN.md")
+    testing_ru = read(errors, "docs/ru/testing.md")
+    testing_en = read(errors, "docs/en/testing.md")
 
     require_tokens(
         errors,
@@ -98,7 +98,7 @@ def main() -> int:
         prerelease,
         r'^export FASTTRUN_BRIN_LEVEL=full\s+'
         r'exec "\$SCRIPT_DIR/check_cassert_allversions\.sh" "\$@"$',
-        "full-режим не передаётся общему runner-у через exec",
+        "full-режим не передается общему runner-у через exec",
     )
     require_regex(
         errors,
@@ -191,45 +191,156 @@ def main() -> int:
         "scripts/check_cassert_allversions.sh: очищенное окружение должно "
         "использоваться в двух ветках harness, build, install и installcheck",
     )
+    # Каждая строка вызова привязана к началу строки и разделена только
+    # пробелами и табуляцией: закомментированная строка вызова оставила бы
+    # отдельное перенаправление, то есть пустой журнал и нулевой код.
     require_regex(
         errors,
         "scripts/check_cassert_allversions.sh",
         runner,
-        r'run_isolated_harness "\$pgcfg" '
-        r'scripts/check_fasttrun_fault_matrix\.sh\s*\\\n\s*'
-        r'>"\$OUTDIR/fault\$\{ver\}\.log" 2>&1\s*fault_rc=\$\?',
+        r'^[ \t]*run_isolated_harness "\$pgcfg" '
+        r'scripts/check_fasttrun_fault_matrix\.sh[ \t]*\\\n'
+        r'[ \t]*>"\$OUTDIR/fault\$\{ver\}\.log" 2>&1[ \t]*\n'
+        r'[ \t]*fault_rc=\$\?',
         "fault matrix не запускается с сохранением кода возврата",
     )
     require_regex(
         errors,
         "scripts/check_cassert_allversions.sh",
         runner,
-        r'run_isolated_harness "\$pgcfg" env '
-        r'FASTTRUN_CACHE_INIT_MODE=cassert\s*\\\n\s*'
-        r'scripts/check_fasttrun_cache_init_faults\.sh\s*\\\n\s*'
-        r'>"\$OUTDIR/cache_init\$\{ver\}\.log" 2>&1\s*'
-        r'cache_init_rc=\$\?',
+        r'^[ \t]*run_isolated_harness "\$pgcfg" env '
+        r'FASTTRUN_CACHE_INIT_MODE=cassert[ \t]*\\\n'
+        r'[ \t]*scripts/check_fasttrun_cache_init_faults\.sh[ \t]*\\\n'
+        r'[ \t]*>"\$OUTDIR/cache_init\$\{ver\}\.log" 2>&1[ \t]*\n'
+        r'[ \t]*cache_init_rc=\$\?',
         "cache-init не запускается с сохранением кода возврата",
     )
     require_regex(
         errors,
         "scripts/check_cassert_allversions.sh",
         runner,
-        r'run_isolated_harness "\$pgcfg" env '
-        r'FASTTRUN_BRIN_LEVEL="\$BRIN_LEVEL"\s*\\\n\s*'
-        r'scripts/check_fasttrun_brin_stress\.sh\s*\\\n\s*'
-        r'>"\$OUTDIR/brin\$\{ver\}\.log" 2>&1\s*brin_rc=\$\?',
+        r'^[ \t]*run_isolated_harness "\$pgcfg" env '
+        r'FASTTRUN_BRIN_LEVEL="\$BRIN_LEVEL"[ \t]*\\\n'
+        r'[ \t]*scripts/check_fasttrun_brin_stress\.sh[ \t]*\\\n'
+        r'[ \t]*>"\$OUTDIR/brin\$\{ver\}\.log" 2>&1[ \t]*\n'
+        r'[ \t]*brin_rc=\$\?',
         "BRIN harness не запускается с сохранением кода возврата",
     )
-    require_regex(
-        errors,
-        "scripts/check_cassert_allversions.sh",
-        runner,
-        r'if \[ "\$fault_rc" -ne 0 \].*?'
-        r'\[ "\$cache_init_rc" -ne 0 \].*?'
-        r'\[ "\$brin_rc" -ne 0 \].*?overall_rc=1\s+fi',
-        "ошибки cache-init/BRIN не входят в общий код возврата",
+    # Блок дополнительных проверок разбирается целиком. В нем разрешены только
+    # пары "вызов через run_isolated_harness с перенаправлением в журнал" и
+    # "сохранение его кода". Комментарий, другая команда или вложенный if
+    # отвергаются: иначе проверку можно пропустить, а текст вокруг останется.
+    mandatory = (
+        "fault_matrix", "cache_init_faults", "brin_stress", "tracking_order",
+        "xact_journal_memory", "planner_probes", "publication_atomicity",
+        "tracking_persistence", "exit_plan_reset", "tracking_preload",
+        "prepare_registry", "bgworker_log", "block_sample_seed",
     )
+    ident = r'[A-Za-z_][A-Za-z0-9_]*'
+    block = re.search(
+        r'^[ \t]*if[ \t]+\[ "\$check_rc" -eq 0 \](?:[^\n]*\\\n)*[^\n]*?'
+        r';[ \t]*then[ \t]*\n(.*?)^[ \t]*fi[ \t]*$',
+        runner,
+        re.MULTILINE | re.DOTALL,
+    )
+    require(
+        errors,
+        block is not None,
+        "scripts/check_cassert_allversions.sh: не найден блок дополнительных "
+        "проверок",
+    )
+    saved_rc: list[str] = []
+    if block is not None:
+        commands: list[str] = []
+        current: list[str] = []
+        for line in block.group(1).splitlines():
+            stripped = line.strip()
+            if not stripped and not current:
+                continue
+            continued = stripped.endswith("\\")
+            current.append(stripped[:-1] if continued else stripped)
+            if not continued:
+                commands.append(" ".join(" ".join(current).split()))
+                current = []
+        if current:
+            commands.append(" ".join(" ".join(current).split()))
+        called: list[str] = []
+        bad: list[str] = []
+        if len(commands) % 2:
+            bad.append(commands[-1])
+        for call, save in zip(commands[0::2], commands[1::2]):
+            m_call = re.fullmatch(
+                r'run_isolated_harness "\$pgcfg" (?:[^#;&|`$]|\$\{?[A-Za-z_]+\}?|"\$[A-Za-z_]+")*?'
+                r'scripts/check_fasttrun_([a-z_]+)\.sh(?: [a-z]+)? '
+                r'>"\$OUTDIR/[A-Za-z0-9_]+\$\{ver\}\.log" 2>&1',
+                call,
+            )
+            m_save = re.fullmatch(rf'({ident}_rc)=\$\?', save)
+            if m_call is None or m_save is None:
+                bad.extend(c for c, m in ((call, m_call), (save, m_save)) if m is None)
+                continue
+            called.append(m_call.group(1))
+            saved_rc.append(m_save.group(1))
+        require(
+            errors,
+            not bad,
+            "scripts/check_cassert_allversions.sh: блок дополнительных проверок "
+            f"содержит не только вызовы и сохранение кода: {bad[:3]}",
+        )
+        require(
+            errors,
+            sorted(called) == sorted(mandatory),
+            "scripts/check_cassert_allversions.sh: обязательные проверки "
+            f"вызываются не по одному разу: {sorted(called)}",
+        )
+    # Условие провала дополнительных проверок разбирается как один блок if:
+    # строки продолжения до "; then", тело до первого fi. Каждый операнд - это
+    # проверка кода возврата, и соединены они только через ||, иначе провал
+    # одной проверки мог бы не попасть в общий код возврата. В теле разрешены
+    # только сообщение в stderr и overall_rc=1.
+    condition = re.search(
+        r'^[ \t]*if[ \t]+(\[ "\$fault_rc" -ne 0 \](?:[^\n]*\\\n)*[^\n]*?)'
+        r';[ \t]*then[ \t]*\n(.*?)^[ \t]*fi[ \t]*$',
+        runner,
+        re.MULTILINE | re.DOTALL,
+    )
+    require(
+        errors,
+        condition is not None,
+        "scripts/check_cassert_allversions.sh: не найдено условие провала "
+        "дополнительных проверок",
+    )
+    if condition is not None:
+        normalized = " ".join(condition.group(1).replace("\\\n", " ").split())
+        operands = [o.strip() for o in normalized.split("||")]
+        require(
+            errors,
+            all(re.fullmatch(rf'\[ "\${ident}_rc" -ne 0 \]', o) for o in operands),
+            "scripts/check_cassert_allversions.sh: операнды условия провала "
+            f"должны соединяться только через ||: {normalized}",
+        )
+        # В условие обязана попасть каждая проверка, код которой заранее
+        # выставлен в 125 или сохранен в блоке дополнительных проверок.
+        initialized = re.findall(rf'^[ \t]*({ident}_rc)=125[ \t]*$', runner,
+                                 re.MULTILINE)
+        for rc in sorted(set(initialized) | set(saved_rc)):
+            require(
+                errors,
+                f'[ "${rc}" -ne 0 ]' in operands,
+                f"scripts/check_cassert_allversions.sh: {rc} не входит в общий "
+                "код возврата",
+            )
+        body = [line.strip() for line in condition.group(2).splitlines()
+                if line.strip()]
+        require(
+            errors,
+            "overall_rc=1" in body
+            and all(line == "overall_rc=1" or re.fullmatch(r'echo "[^"`$]*(?:\$OUTDIR[^"`$]*)?" >&2', line)
+                    for line in body),
+            "scripts/check_cassert_allversions.sh: тело условия провала "
+            f"дополнительных проверок должно только сообщать и ставить "
+            f"overall_rc=1: {body}",
+        )
     require_tokens(
         errors,
         "scripts/check_fasttrun_fault_matrix.sh",
@@ -318,11 +429,27 @@ def main() -> int:
         makefile,
         ("NO_PGXS_GOALS = check-docs check-required-suite check-prerelease",),
     )
+    # README ссылается на docs/ относительными путями, поэтому установка кладет
+    # все дерево документации в свой подкаталог, а плоско - только README.fasttrun.
+    require_tokens(
+        errors,
+        "Makefile",
+        makefile,
+        (
+            "DOCS = README.fasttrun",
+            "install: install-docs-tree",
+            "uninstall: uninstall-docs-tree",
+            "$(srcdir)/README.md $(srcdir)/README_EN.md",
+            "$(srcdir)/docs/ru/*.md",
+            "$(srcdir)/docs/en/*.md",
+            "$(srcdir)/docs/images/*.png",
+        ),
+    )
 
     require_tokens(
         errors,
-        "README.md",
-        readme,
+        "docs/ru/testing.md",
+        testing_ru,
         (
             "50 сценариев на 25 точках отказа",
             "96 обычных",
@@ -333,8 +460,8 @@ def main() -> int:
     )
     require_tokens(
         errors,
-        "README_EN.md",
-        readme_en,
+        "docs/en/testing.md",
+        testing_en,
         (
             "50 cases across 25",
             "96 regular",
@@ -344,8 +471,8 @@ def main() -> int:
         ),
     )
     for relative, content in (
-        ("README.md", readme),
-        ("README_EN.md", readme_en),
+        ("docs/ru/testing.md", testing_ru),
+        ("docs/en/testing.md", testing_en),
     ):
         require_tokens(
             errors,
@@ -363,7 +490,7 @@ def main() -> int:
 
     # Обязательный прогон сверяет число пройденных наборов с числом в
     # Makefile. Хранить его отдельным числом нельзя: добавленный набор тогда
-    # превращает зелёный прогон в «регрессию».
+    # превращает зеленый прогон в "регрессию".
     cassert = ROOT / "scripts" / "check_cassert_allversions.sh"
     if cassert.exists():
         body = cassert.read_text(encoding="utf-8")

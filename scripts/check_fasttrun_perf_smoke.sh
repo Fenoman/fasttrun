@@ -24,12 +24,12 @@ FASTTRUN_SO=${FASTTRUN_SO:-"$PG_PKGLIBDIR/fasttrun.so"}
 # MAX_TRUNC_MS -- для узкой таблицы: 1 млн строк, две колонки, один индекс.
 # Под эту нагрузку предел и калибровался. Он тесный, но переносимый: на
 # медленном виртуальном сервере узкая таблица очищается за 32 мс, то есть
-# запас трёхкратный, и настоящее замедление он поймает где угодно.
+# запас трехкратный, и настоящее замедление он поймает где угодно.
 #
 # MAX_TRUNC_WIDE_MS -- для широкой: 1 млн строк, 50 колонок, четыре индекса,
 # TOAST, семь файлов отношения, 637 МБ. Этот замер появился позже и унаследовал
 # чужой предел в 100 мс, из-за чего на обычном сервере показывал отказ там, где
-# отказа нет: та же машина даёт по узкой таблице 32 мс, а по широкой 194.
+# отказа нет: та же машина дает по узкой таблице 32 мс, а по широкой 194.
 # Значение 500 мс взято по образцу мягкого предела в pg_regress, поднятого
 # ровно из-за медленных машин. Оно предварительное: его стоит пересчитать по
 # замеру на эталонной машине, и скрипт для этого печатает обе медианы.
@@ -38,6 +38,15 @@ FASTTRUN_SO=${FASTTRUN_SO:-"$PG_PKGLIBDIR/fasttrun.so"}
 # машины.
 MAX_TRUNC_MS=${MAX_TRUNC_MS:-100}
 MAX_TRUNC_WIDE_MS=${MAX_TRUNC_WIDE_MS:-500}
+# MAX_REFRESH_MS -- предел полного пересбора статистики fasttrun_analyze после
+# DELETE и после UPDATE 500 тыс. строк таблицы 1 млн строк x 50 колонок, шаги
+# sql/fasttrun_bench.sql. Бенч идет REFRESH_RUNS раз: с медианой каждого шага
+# сравнивается предел, с каждым отдельным замером - удвоенный предел. На сервере
+# с 2 vCPU медианы по PostgreSQL 16/17/18 лежат в 260-540 мс, а отдельные замеры
+# доходят до 670 мс. В самом бенче для этих шагов стоит мягкий порог 2000 мс.
+MAX_REFRESH_MS=${MAX_REFRESH_MS:-1000}
+REFRESH_RUNS=${REFRESH_RUNS:-5}
+BENCH_SQL=${BENCH_SQL:-"$(cd "$(dirname "$0")" && pwd)/../sql/fasttrun_bench.sql"}
 
 run_pg()
 {
@@ -143,10 +152,9 @@ wait_trace_ready()
 	local i
 	local tries
 
-	# Ждать дольше, чем живёт сам bpftrace, бессмысленно: его снимает timeout.
-	# Раньше здесь стояло фиксированное 10 с при TRACE_SECONDS=6, и на машине,
-	# где присоединение зондов занимает больше, проверка падала то в одном
-	# подтесте, то в другом.
+	# Метку ждем TRACE_SECONDS, но не меньше 10 с. Дольше bpftrace не живет
+	# (его снимает timeout), поэтому на машине, где зонды присоединяются
+	# долго, поднимают TRACE_SECONDS, и ожидание растет вместе с ним.
 	tries=$(( TRACE_SECONDS * 20 ))
 	[ "$tries" -lt 200 ] && tries=200
 
@@ -159,9 +167,9 @@ wait_trace_ready()
 			return 0
 		fi
 		# Живость по $trace_pid здесь не проверяется: это pid sudo, а он
-		# уходит, передав управление bpftrace, и гонка «sudo исчез за миг до
-		# метки» объявляла бы удачное присоединение неудачей. Признак один --
-		# метка; её отсутствие за отведённое время и есть неудача.
+		# уходит, передав управление bpftrace, и гонка "sudo исчез за миг до
+		# метки" объявляла бы удачное присоединение неудачей. Признак один --
+		# метка, и ее отсутствие за отведенное время означает неудачу.
 		sleep 0.05
 	done
 	return 1
@@ -571,6 +579,9 @@ from pathlib import Path
 text = Path(sys.argv[1]).read_text(errors="replace")
 wide_limit = float(sys.argv[2])
 skinny_limit = float(sys.argv[3])
+for name, value in (("MAX_TRUNC_WIDE_MS", wide_limit), ("MAX_TRUNC_MS", skinny_limit)):
+    if not math.isfinite(value) or value <= 0:
+        raise SystemExit(f"{name} must be a positive number, got {value}")
 failed = False
 
 
@@ -612,5 +623,111 @@ if failed:
     raise SystemExit(1)
 PY
 echo "strict truncate SLO passed"
+
+# Строгий предел полного пересбора: те же шаги, что в sql/fasttrun_bench.sql,
+# но по медиане REFRESH_RUNS прогонов. Каждый прогон идет в новой базе, потому
+# что бенч сам создает и удаляет расширение. Параметры, от которых зависит путь
+# пересбора, выставлены в копии бенча явно, а PGOPTIONS снят: иначе, например,
+# stats_refresh_threshold=1 из окружения подменил бы пересбор дельтой.
+if [ ! -f "$BENCH_SQL" ]; then
+	echo "missing bench file: $BENCH_SQL" >&2
+	exit 1
+fi
+case "$REFRESH_RUNS" in
+	''|*[!0-9]*|0)
+		echo "refresh SLO: REFRESH_RUNS must be a positive integer" >&2
+		exit 1
+		;;
+esac
+sed 's/^SET client_min_messages = WARNING;$/SET client_min_messages = NOTICE;\
+SET fasttrun.stats_refresh_threshold = 0.2;\
+SET fasttrun.auto_collect_stats = on;\
+SET fasttrun.sample_rows = 3000;\
+SET fasttrun.use_typanalyze = on;\
+SET fasttrun.max_analyze_pages = 100000;\
+SET fasttrun.max_stats_memory = 0;/' \
+	"$BENCH_SQL" >"$WORKDIR/refresh_bench.sql"
+if ! grep -q '^SET client_min_messages = NOTICE;$' "$WORKDIR/refresh_bench.sql"; then
+	echo "refresh SLO: the bench notices could not be switched on" >&2
+	exit 1
+fi
+: >"$WORKDIR/refresh_slo.out"
+run_no=1
+while [ "$run_no" -le "$REFRESH_RUNS" ]; do
+	run_pg "$PSQL" -h "$WORKDIR" -p "$PORT" -d postgres -X -q \
+		-v ON_ERROR_STOP=1 -c "CREATE DATABASE ft_refresh_slo" >/dev/null
+	run_pg env -u PGOPTIONS "$PSQL" -h "$WORKDIR" -p "$PORT" -d ft_refresh_slo -X -q \
+		-v ON_ERROR_STOP=1 -f "$WORKDIR/refresh_bench.sql" \
+		>"$WORKDIR/refresh_run$run_no.out" 2>&1 || {
+		cat "$WORKDIR/refresh_run$run_no.out" >&2
+		echo "refresh SLO: bench run $run_no failed" >&2
+		exit 1
+	}
+	run_pg "$PSQL" -h "$WORKDIR" -p "$PORT" -d postgres -X -q \
+		-v ON_ERROR_STOP=1 -c "DROP DATABASE ft_refresh_slo" >/dev/null
+	cat "$WORKDIR/refresh_run$run_no.out" >>"$WORKDIR/refresh_slo.out"
+	run_no=$((run_no + 1))
+done
+
+"$PYTHON" - "$WORKDIR/refresh_slo.out" "$MAX_REFRESH_MS" "$REFRESH_RUNS" <<'PY'
+import math
+import re
+import statistics
+import sys
+from pathlib import Path
+
+text = Path(sys.argv[1]).read_text(errors="replace")
+limit = float(sys.argv[2])
+if not math.isfinite(limit) or limit <= 0:
+    raise SystemExit(f"MAX_REFRESH_MS must be a positive number, got {sys.argv[2]}")
+runs = int(sys.argv[3])
+failed = False
+for step in ("DELETE", "UPDATE"):
+    pairs = [
+        (float(first), float(second))
+        for first, second in re.findall(
+            rf"after {step} 500k: 1st=([0-9]+(?:\.[0-9]+)?) ms \(full refresh\), "
+            r"2nd=([0-9]+(?:\.[0-9]+)?) ms",
+            text,
+        )
+    ]
+    if len(pairs) != runs:
+        raise SystemExit(
+            f"refresh after {step}: expected {runs} samples, got {len(pairs)}"
+        )
+    # Полный пересбор читает всю таблицу, чистая дельта - только счетчики.
+    # Первый замер, сравнимый со вторым, значит, что пересбора не было.
+    for first, second in pairs:
+        if first < 20.0 * second:
+            print(
+                f"FAIL: refresh after {step} took {first:.3f} ms against a pure "
+                f"delta of {second:.3f} ms, so no full refresh ran",
+                file=sys.stderr,
+            )
+            failed = True
+    values = [first for first, _ in pairs]
+    median = statistics.median(values)
+    rendered = ",".join(f"{value:.3f}" for value in values)
+    print(
+        f"refresh_after_{step.lower()}_500k samples_ms=[{rendered}] "
+        f"median_ms={median:.3f}"
+    )
+    if median > limit:
+        print(
+            f"FAIL: refresh after {step} median {median:.3f} ms > {limit:.3f} ms",
+            file=sys.stderr,
+        )
+        failed = True
+    if max(values) > 2.0 * limit:
+        print(
+            f"FAIL: refresh after {step} sample {max(values):.3f} ms > 2x limit "
+            f"{2.0 * limit:.3f} ms",
+            file=sys.stderr,
+        )
+        failed = True
+if failed:
+    raise SystemExit(1)
+PY
+echo "strict refresh SLO passed"
 
 echo "fasttrun perf smoke passed"

@@ -1,9 +1,9 @@
 --
--- fasttrun_tracking — тесты трекинга CREATE TEMP TABLE и прогрева.
+-- fasttrun_tracking - тесты трекинга CREATE TEMP TABLE и прогрева.
 --
 -- Тест работает в обоих режимах:
---   * без shared_preload_libraries → graceful degradation
---   * с shared_preload_libraries → полный трекинг через GUC
+--   * без shared_preload_libraries -> graceful degradation
+--   * с shared_preload_libraries -> полный трекинг через GUC
 --
 
 CREATE EXTENSION IF NOT EXISTS fasttrun;
@@ -65,7 +65,7 @@ CREATE TABLE dummy_tmp.temp_wide_report (
     n_col05 numeric, n_col06 numeric, n_col07 numeric, n_col08 numeric
 );
 
--- Упрощённая create_temp_table
+-- Упрощенная create_temp_table
 CREATE OR REPLACE FUNCTION public.create_temp_table(
     _c_temp_table text,
     _c_dummy_schema text DEFAULT 'dummy_tmp'
@@ -117,7 +117,7 @@ $_$;
 -- Сброс предыдущей статистики (если shmem есть)
 SELECT fasttrun_reset_temp_stats();
 
--- После сброса — пусто
+-- После сброса - пусто
 SELECT count(*) = 0 AS hot_empty FROM fasttrun_hot_temp_tables(10);
 
 -- Прогрев 0 таблиц
@@ -128,10 +128,10 @@ SELECT fasttrun_prewarm() = 0 AS prewarm_zero;
 --    индексы, CHECK, IDENTITY
 -- ======================================================================
 
--- Первый вызов — создание (true)
+-- Первый вызов - создание (true)
 SELECT create_temp_table('temp_calc_main') AS first_create;
 
--- Повторный вызов — fasttruncate (false)
+-- Повторный вызов - fasttruncate (false)
 INSERT INTO temp_calc_main (f_division, n_amount) VALUES (1, 100.50);
 SELECT count(*) = 1 AS has_data FROM temp_calc_main;
 SELECT create_temp_table('temp_calc_main') AS second_call;
@@ -160,11 +160,11 @@ FROM temp_calc_main ORDER BY link DESC LIMIT 1;
 
 -- ======================================================================
 -- 3. Трекинг через GUC (работает если shmem доступен).
---    Определяем доступность через probe: создаём temp table и смотрим
+--    Определяем доступность через probe: создаем temp table и смотрим
 --    появилась ли запись в fasttrun_hot_temp_tables.
 -- ======================================================================
 
--- Probe: создаём temp table и проверяем записался ли он в трекинг
+-- Probe: создаем temp table и проверяем записался ли он в трекинг
 -- Выключаем расписание на сессию, чтобы тест не зависел от времени запуска
 SET fasttrun.track_schedule = '';
 DO $$
@@ -173,7 +173,11 @@ DECLARE
     _count     bigint;
     _prewarm   int;
 BEGIN
-    /* Probe через LIKE из dummy_tmp — попадёт в трекинг если shmem есть */
+    /* Probe через LIKE из dummy_tmp - попадет в трекинг если shmem есть.
+       Учет по умолчанию выключен, поэтому включается до пробы, а схема
+       шаблонов задается явно: учет пишет только LIKE из нее. */
+    SET LOCAL fasttrun.track_temp_creates = on;
+    SET LOCAL fasttrun.prewarm_schema = 'dummy_tmp';
     CREATE TEMP TABLE IF NOT EXISTS temp_calc_main (LIKE dummy_tmp.temp_calc_main);
     DROP TABLE temp_calc_main;
     SELECT count(*) > 0 INTO _has_shmem
@@ -181,11 +185,17 @@ BEGIN
     WHERE relname = 'temp_calc_main';
 
     IF NOT _has_shmem THEN
-        RAISE NOTICE 'shmem not available (no shared_preload_libraries) — skipping tracking tests';
+        /* Пропуск допустим только на сервере без предзагрузки fasttrun. */
+        IF EXISTS (SELECT 1
+                   FROM unnest(string_to_array(current_setting('shared_preload_libraries'), ',')) AS lib
+                   WHERE regexp_replace(btrim(lib, ' "'), '^.*/', '') ~ '^fasttrun(\.(so|dylib))?$') THEN
+            RAISE EXCEPTION 'fasttrun is in shared_preload_libraries, but the tracking probe was not recorded';
+        END IF;
+        RAISE NOTICE 'shmem not available (no shared_preload_libraries) - skipping tracking tests';
         RETURN;
     END IF;
 
-    RAISE NOTICE 'shmem available — running tracking tests';
+    RAISE NOTICE 'shmem available - running tracking tests';
 
     -- 3a. Сброс и проверка что пусто
     PERFORM fasttrun_reset_temp_stats();
@@ -194,7 +204,7 @@ BEGIN
         RAISE EXCEPTION 'expected 0 after reset, got %', _count;
     END IF;
 
-    -- 3b. Трекинг ON: создаём таблицы разное количество раз
+    -- 3b. Трекинг ON: создаем таблицы разное количество раз
     SET LOCAL fasttrun.track_temp_creates = on;
 
     FOR i IN 1..20 LOOP
@@ -206,7 +216,7 @@ BEGIN
         DROP TABLE temp_calc_detail;
     END LOOP;
 
-    -- Проверяем счётчики
+    -- Проверяем счетчики
     SELECT create_count INTO _count
     FROM fasttrun_hot_temp_tables(100) WHERE relname = 'temp_calc_main';
     IF _count != 20 THEN
@@ -229,7 +239,7 @@ BEGIN
         DROP TABLE temp_calc_main;
     END LOOP;
 
-    -- Счётчик a должен остаться 20 (не 30)
+    -- Счетчик a должен остаться 20 (не 30)
     SELECT create_count INTO _count
     FROM fasttrun_hot_temp_tables(100) WHERE relname = 'temp_calc_main';
     IF _count != 20 THEN
@@ -238,7 +248,7 @@ BEGIN
 
     RAISE NOTICE '3c OK: tracking OFF, counter stayed at 20';
 
-    -- 3d. Трекинг ON снова: счётчик продолжает расти
+    -- 3d. Трекинг ON снова: счетчик продолжает расти
     SET LOCAL fasttrun.track_temp_creates = on;
 
     FOR i IN 1..3 LOOP
@@ -277,7 +287,7 @@ BEGIN
 
     RAISE NOTICE 'prewarm_count=0 disabled prewarm';
 
-    -- 3e. Prewarm: создаёт таблицы из top-N
+    -- 3e. Prewarm: создает таблицы из top-N
     SET LOCAL fasttrun.prewarm_count = 2;
     SELECT fasttrun_prewarm() INTO _prewarm;
     IF _prewarm != 2 THEN
@@ -294,7 +304,7 @@ BEGIN
 
     RAISE NOTICE '3e OK: prewarm created 2 tables';
 
-    -- 3f. Повторный prewarm — таблицы уже есть, fasttruncate path
+    -- 3f. Повторный prewarm - таблицы уже есть, fasttruncate path
     SELECT fasttrun_prewarm() INTO _prewarm;
     IF _prewarm != 2 THEN
         RAISE EXCEPTION 'second prewarm expected 2, got %', _prewarm;
@@ -317,7 +327,7 @@ BEGIN
 
     RAISE NOTICE '3g OK: reset cleared everything, prewarm returns 0';
 
-    -- 3g2. prewarm создаёт temp tables через create_temp_table -> CREATE TEMP
+    -- 3g2. prewarm создает temp tables через create_temp_table -> CREATE TEMP
     --      TABLE (LIKE dummy_tmp.x), что повторно входит в utility hook.  Эти
     --      внутренние creates НЕ должны считаться пользовательскими, иначе
     --      prewarm накручивает собственный top-N рейтинг.
@@ -347,7 +357,7 @@ BEGIN
     DROP TABLE IF EXISTS temp_calc_main;
     RAISE NOTICE '3g2 OK: prewarm did not inflate own create_count';
 
-    -- 3h. Schedule: empty = always active, стандартный счёт растёт
+    -- 3h. Schedule: empty = always active, стандартный счет растет
     SET LOCAL fasttrun.track_schedule = '';
     PERFORM fasttrun_reset_temp_stats();
     CREATE TEMP TABLE IF NOT EXISTS temp_calc_main (LIKE dummy_tmp.temp_calc_main);
@@ -359,19 +369,23 @@ BEGIN
     END IF;
     RAISE NOTICE '3h OK: empty schedule tracks everything';
 
-    -- 3i. Schedule: окно в прошлом → не трекать
-    -- Выбираем окно заведомо НЕ сейчас (далёкое от текущего времени)
+    -- 3i. Schedule: окно, в которое текущий момент не попадает -> не трекать.
+    -- Окно - целые сутки через день по log_timezone, по которому считается
+    -- расписание: смена суток во время теста в него не попадет.
     PERFORM fasttrun_reset_temp_stats();
-    SET LOCAL fasttrun.track_schedule = 'mon 00:00-00:01';  -- 1 минута в понедельник
-    -- Если сегодня не понедельник 00:00-00:01, трекинг не сработает
+    PERFORM set_config('fasttrun.track_schedule',
+        to_char((now() AT TIME ZONE current_setting('log_timezone')) + interval '2 days', 'dy')
+            || ' 00:00-24:00',
+        true);
     CREATE TEMP TABLE IF NOT EXISTS temp_calc_main (LIKE dummy_tmp.temp_calc_main);
     DROP TABLE temp_calc_main;
     SELECT count(*) INTO _count FROM fasttrun_hot_temp_tables(10);
-    -- Тест может попасть в понедельник 00:00-00:01, но это редкий случай
-    -- Для надёжности проверяем через assign_hook что парсинг прошёл
-    RAISE NOTICE '3i schedule parsing ok (count=%)', _count;
+    IF _count != 0 THEN
+        RAISE EXCEPTION 'schedule outside now: expected 0, got %', _count;
+    END IF;
+    RAISE NOTICE '3i OK: schedule outside now does not track';
 
-    -- 3j. Schedule: ошибочный формат → WARNING и fallback на always-on
+    -- 3j. Schedule: ошибочный формат -> WARNING и fallback на always-on
     PERFORM fasttrun_reset_temp_stats();
     SET LOCAL client_min_messages = error;  -- подавляем WARNING в expected output
     SET LOCAL fasttrun.track_schedule = 'garbage';
@@ -386,9 +400,9 @@ BEGIN
     END IF;
     RAISE NOTICE '3j OK: invalid schedule falls back to always-on';
 
-    -- 3k. Schedule: широкое окно (все дни, вся сутки) → трекаем
+    -- 3k. Schedule: широкое окно (все дни, все сутки до 24:00) -> трекаем
     PERFORM fasttrun_reset_temp_stats();
-    SET LOCAL fasttrun.track_schedule = 'mon-sun 00:00-23:59';
+    SET LOCAL fasttrun.track_schedule = 'mon-sun 00:00-24:00';
     CREATE TEMP TABLE IF NOT EXISTS temp_calc_main (LIKE dummy_tmp.temp_calc_main);
     DROP TABLE temp_calc_main;
     SELECT count(*) INTO _count
@@ -406,7 +420,7 @@ BEGIN
 END $$;
 
 -- ======================================================================
--- 4. Многократный цикл create_temp_table — fasttruncate path
+-- 4. Многократный цикл create_temp_table - fasttruncate path
 -- ======================================================================
 
 SELECT create_temp_table('temp_calc_detail');

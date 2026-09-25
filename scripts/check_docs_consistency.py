@@ -8,11 +8,27 @@ import hashlib
 import re
 import sys
 from pathlib import Path
+from urllib.parse import unquote
 
 
 ROOT = Path(__file__).resolve().parent.parent
 EXTENSION_SQL_DIR = ROOT / "extension"
 README_PATHS = (ROOT / "README.md", ROOT / "README_EN.md")
+# Документация языка - это README плюс его каталог docs/<язык>.
+DOC_SETS = (
+    (ROOT / "README.md", ROOT / "docs" / "ru"),
+    (ROOT / "README_EN.md", ROOT / "docs" / "en"),
+)
+# Цель встроенной ссылки: [текст](цель), [текст](<цель>), с заголовком или без.
+MD_INLINE_LINK_RE = re.compile(
+    r"\[[^\]]*\]\(\s*(?:<([^>]*)>|([^)\s]+))"
+    r"(?:\s+(?:\"[^\"]*\"|'[^']*'|\([^)]*\)))?\s*\)"
+)
+# Сноска: использование [текст][метка] или [метка][] и определение [метка]: цель.
+MD_REF_USE_RE = re.compile(r"\[([^\]]+)\]\[([^\]]*)\]")
+MD_REF_DEF_RE = re.compile(r"^ {0,3}\[([^\]]+)\]:\s*(?:<([^>]*)>|(\S+))")
+HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
+INLINE_CODE_RE = re.compile(r"(`+)(.+?)(?<!`)\1(?!`)")
 CACHE_STATS_FIELDS = (
     "analyze_entries",
     "column_stats_relid_entries",
@@ -66,13 +82,118 @@ def make_variable(makefile: str, name: str) -> list[str]:
     return []
 
 
+def github_slug(heading: str) -> str:
+    """Основа якоря по правилам GitHub: строчные буквы, без пунктуации,
+    пробелы заменены дефисами."""
+    text = re.sub(r"[^\w\- ]", "", heading.strip().lower())
+    return text.replace(" ", "-")
+
+
+def strip_html_comments(text: str) -> str:
+    """Текст без HTML-комментариев: читатель их не видит."""
+    return HTML_COMMENT_RE.sub("", text)
+
+
+def markdown_outline(text: str) -> tuple[set[str], list[str]]:
+    """Якоря заголовков и цели ссылок вне кода и HTML-комментариев.
+
+    Повторы заголовков нумеруются как в github-slugger: следующий свободный
+    номер, даже если заголовок с таким суффиксом уже есть."""
+    anchors: set[str] = set()
+    targets: list[str] = []
+    occurrences: dict[str, int] = {}
+    labels: dict[str, str] = {}
+    used_labels: list[str] = []
+    fence = None
+    for line in strip_html_comments(text).splitlines():
+        marker = re.match(r"^ {0,3}(`{3,}|~{3,})", line)
+        if fence is None:
+            if marker:
+                fence = marker.group(1)
+                continue
+        else:
+            if (marker and marker.group(1)[0] == fence[0]
+                    and len(marker.group(1)) >= len(fence)
+                    and not line.strip()[len(marker.group(1)):].strip()):
+                fence = None
+            continue
+        line = INLINE_CODE_RE.sub("", line)
+        heading = re.match(r"^ {0,3}#{1,6}\s+(.+?)\s*#*\s*$", line)
+        if heading:
+            base = github_slug(heading.group(1))
+            slug = base
+            while slug in occurrences:
+                occurrences[base] += 1
+                slug = f"{base}-{occurrences[base]}"
+            occurrences[slug] = 0
+            anchors.add(slug)
+        definition = MD_REF_DEF_RE.match(line)
+        if definition:
+            label = " ".join(definition.group(1).lower().split())
+            labels[label] = definition.group(2) or definition.group(3)
+            continue
+        for bracketed, plain in MD_INLINE_LINK_RE.findall(line):
+            targets.append(bracketed or plain)
+        for shown, label in MD_REF_USE_RE.findall(line):
+            used_labels.append(" ".join((label or shown).lower().split()))
+    targets.extend(labels.values())
+    for label in used_labels:
+        if label not in labels:
+            targets.append(f"\0undefined-reference:{label}")
+    return anchors, targets
+
+
+def check_doc_structure(errors: list[str]) -> None:
+    """Пары документов на двух языках, ссылки README на них и целые ссылки."""
+    names = [
+        sorted(path.name for path in docs_dir.glob("*.md"))
+        for _, docs_dir in DOC_SETS
+    ]
+    require(errors, all(names), "docs/ru и docs/en не должны быть пустыми")
+    require(errors, names[0] == names[1],
+            f"docs/ru и docs/en расходятся по составу: {names[0]} != {names[1]}")
+    for readme, docs_dir in DOC_SETS:
+        _, readme_targets = markdown_outline(read(readme))
+        linked = {unquote(target.partition("#")[0]) for target in readme_targets}
+        for path in sorted(docs_dir.glob("*.md")):
+            require(errors, f"docs/{docs_dir.name}/{path.name}" in linked,
+                    f"{readme.name}: нет ссылки на docs/{docs_dir.name}/{path.name}")
+
+    pages = [
+        *README_PATHS,
+        *(path for _, docs_dir in DOC_SETS for path in sorted(docs_dir.glob("*.md"))),
+    ]
+    outlines = {path.resolve(): markdown_outline(read(path)) for path in pages}
+    for path in pages:
+        _, targets = outlines[path.resolve()]
+        for target in targets:
+            where = f"{path.relative_to(ROOT)}: ссылка {target}"
+            if target.startswith("\0undefined-reference:"):
+                errors.append(f"{path.relative_to(ROOT)}: сноска "
+                              f"[{target.split(':', 1)[1]}] не определена")
+                continue
+            if re.match(r"^[a-z][a-z0-9+.-]*:", target):
+                continue
+            file_part, _, anchor = target.partition("#")
+            file_part, anchor = unquote(file_part), unquote(anchor)
+            dest = (path.parent / file_part).resolve() if file_part else path.resolve()
+            if not dest.exists():
+                errors.append(f"{where} ведет на несуществующий файл")
+                continue
+            if anchor:
+                if dest not in outlines:
+                    errors.append(f"{where}: якорь в файле вне документации")
+                elif anchor not in outlines[dest][0]:
+                    errors.append(f"{where}: нет такого заголовка")
+
+
 def require(errors: list[str], condition: bool, message: str) -> None:
     if not condition:
         errors.append(message)
 
 
 def path_exists(graph: dict[str, set[str]], source: str, target: str) -> bool:
-    """Проверяет достижимость версии по направленным upgrade-рёбрам."""
+    """Проверяет достижимость версии по направленным upgrade-ребрам."""
     queue = deque([source])
     visited: set[str] = set()
 
@@ -196,7 +317,7 @@ def main() -> int:
             require(
                 errors,
                 actual_sha == expected_sha,
-                f"{filename}: изменён замороженный SQL, SHA256 {actual_sha}",
+                f"{filename}: изменен замороженный SQL, SHA256 {actual_sha}",
             )
 
     install_sql = EXTENSION_SQL_DIR / f"fasttrun--{version}.sql"
@@ -247,9 +368,10 @@ def main() -> int:
             "fasttrun.c: default fasttrun.track_schedule не найден")
     schedule = schedule_match.group(1) if schedule_match else "<unknown>"
 
-    for path in README_PATHS:
-        content = read(path)
-        label = path.name
+    for readme, docs_dir in DOC_SETS:
+        files = [readme, *sorted(docs_dir.glob("*.md"))]
+        content = "\n".join(strip_html_comments(read(path)) for path in files)
+        label = f"{readme.name} + docs/{docs_dir.name}"
         require(
             errors,
             re.search(r"^extension/\s+#", content, re.MULTILINE) is not None,
@@ -304,6 +426,8 @@ def main() -> int:
             f"{label}: cassert-итог {len(regress)}/{len(regress)} не документирован",
         )
 
+    check_doc_structure(errors)
+
     legacy = read(ROOT / "README.fasttrun")
     require(errors, "README.md" in legacy and "README_EN.md" in legacy,
             "README.fasttrun: нет ссылок на актуальные README")
@@ -326,6 +450,7 @@ def main() -> int:
     }
     scan_paths = [
         *README_PATHS,
+        *(path for _, docs_dir in DOC_SETS for path in sorted(docs_dir.glob("*.md"))),
         ROOT / "README.fasttrun",
         *sorted(EXTENSION_SQL_DIR.glob("fasttrun--2.3.[0-9].sql")),
     ]

@@ -29,6 +29,7 @@ DATA = extension/fasttrun--2.0.sql \
        extension/fasttrun--2.4.1.sql \
        extension/fasttrun--2.5.0.sql \
        extension/fasttrun--2.5.1.sql \
+       extension/fasttrun--2.5.2.sql \
        extension/fasttrun--2.0--2.1.sql \
        extension/fasttrun--2.1--2.1.1.sql \
        extension/fasttrun--2.1.1--2.1.2.sql \
@@ -42,8 +43,9 @@ DATA = extension/fasttrun--2.0.sql \
        extension/fasttrun--2.4.0--2.4.1.sql \
        extension/fasttrun--2.4.1--2.5.0.sql \
        extension/fasttrun--2.5.0--2.5.1.sql \
+       extension/fasttrun--2.5.1--2.5.2.sql \
        extension/fasttrun--unpackaged--2.0.sql
-DOCS = README.md
+DOCS = README.fasttrun
 PGFILEDESC = "fasttrun - sinval-free truncate and analyze for temporary tables"
 
 REGRESS = fasttrun_basic \
@@ -73,6 +75,29 @@ PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
 endif
 
+# Каталог DOCS у PGXS общий для всех расширений и плоский, а README ссылается на
+# docs/ru, docs/en и docs/images относительными путями. Поэтому плоско ставится
+# только README.fasttrun, а вся документация идет своим деревом в подкаталог
+# fasttrun, где ссылки остаются рабочими.
+ifdef docdir
+DOCS_TREE = $(docdir)/$(docmoduledir)/fasttrun
+
+install: install-docs-tree
+uninstall: uninstall-docs-tree
+.PHONY: install-docs-tree uninstall-docs-tree
+
+install-docs-tree:
+	$(MKDIR_P) '$(DESTDIR)$(DOCS_TREE)/docs/ru' '$(DESTDIR)$(DOCS_TREE)/docs/en' \
+		'$(DESTDIR)$(DOCS_TREE)/docs/images'
+	$(INSTALL_DATA) $(srcdir)/README.md $(srcdir)/README_EN.md '$(DESTDIR)$(DOCS_TREE)/'
+	$(INSTALL_DATA) $(wildcard $(srcdir)/docs/ru/*.md) '$(DESTDIR)$(DOCS_TREE)/docs/ru/'
+	$(INSTALL_DATA) $(wildcard $(srcdir)/docs/en/*.md) '$(DESTDIR)$(DOCS_TREE)/docs/en/'
+	$(INSTALL_DATA) $(wildcard $(srcdir)/docs/images/*.png) '$(DESTDIR)$(DOCS_TREE)/docs/images/'
+
+uninstall-docs-tree:
+	rm -rf '$(DESTDIR)$(DOCS_TREE)'
+endif
+
 .PHONY: check-parity check-soak check-perf-smoke check-hook-chain \
         check-prepare-registry check-bgworker-log \
         check-zero-sinval check-commit-inval-overhead \
@@ -81,7 +106,8 @@ endif
         check-xact-journal-memory check-cache-init-faults check-fault-matrix \
         check-tracking-order check-no-temp-impact check-planner-probes \
         check-publication-atomicity check-tracking-persistence \
-        check-brin-stress check-required-suite check-prerelease \
+        check-exit-plan-reset check-tracking-preload \
+        check-block-sample-seed check-brin-stress check-required-suite check-prerelease \
         check-docs check-deep-local
 
 check-parity:
@@ -151,6 +177,15 @@ check-publication-atomicity:
 check-tracking-persistence:
 	PG_CONFIG="$(PG_CONFIG)" scripts/check_fasttrun_tracking_persistence.sh
 
+check-exit-plan-reset:
+	PG_CONFIG="$(PG_CONFIG)" scripts/check_fasttrun_exit_plan_reset.sh
+
+check-tracking-preload:
+	PG_CONFIG="$(PG_CONFIG)" scripts/check_fasttrun_tracking_preload.sh
+
+check-block-sample-seed:
+	PG_CONFIG="$(PG_CONFIG)" scripts/check_fasttrun_block_sample_seed.sh
+
 check-docs:
 	python3 scripts/check_docs_consistency.py
 
@@ -167,4 +202,5 @@ check-deep-local: installcheck check-parity check-soak check-perf-smoke \
                   check-replace-catalog check-giant-temp \
                   check-no-temp-impact check-tracking-persistence \
                   check-prepare-registry check-bgworker-log \
-                  check-required-suite check-docs
+                  check-exit-plan-reset check-tracking-preload \
+                  check-block-sample-seed check-required-suite check-docs
