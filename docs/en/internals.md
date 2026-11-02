@@ -39,6 +39,13 @@ of the vanishing table and its indexes are freed. Empty files of a table that
 PostgreSQL core has not removed yet do not keep its cache in memory. When a
 level ends, only the relations marked in that level are walked.
 
+The journal also records the level at which `fasttruncate()` reset the files.
+Rolling back such a level does not restore the statistics saved before the
+reset: the old rows are gone, and the rows written after the reset are rolled
+back with the level. The table is treated as empty, the pages of the rolled-back
+refill stay in the page count because a scan reads them, and the column
+statistics stay hidden until the next `fasttrun_analyze()`.
+
 In standard mode, the main functions do not modify `pg_class`, `pg_statistic`,
 or the target table's relfilenode. Prewarming uses regular DDL and is outside
 this contract.
@@ -52,7 +59,11 @@ The main expected effects are:
 
 - `fasttruncate()` avoids shared file-change messages in standard mode
 - `fasttrun_analyze()` does not write `pg_class` or `pg_statistic`
-- repeated analyze calls within one transaction usually do not scan the table
+- repeated analyze calls, in later transactions too, do not scan the table
+  while the delta state is kept (the cases of a new pass are in
+  [statistics](statistics.md)), and a statistics rebuild takes a block sample
+  and deforms the sampled rows once per group of columns instead of once per
+  column
 - `invalidate_threshold` reduces unnecessary walks over the local plan cache
 - queries without temporary tables keep the same plans and results
 - at backend exit, the removal of temporary tables by PostgreSQL core walks the
@@ -69,6 +80,24 @@ The plan reset at backend exit was measured on a release build of PostgreSQL 16
 plans took 11.4 s instead of 20.1 s when the plans have a generic plan, and
 15.5 s instead of 17.4 s without one. The absolute saving grows with the number
 of temporary tables and saved plans.
+
+A statistics rebuild after a refill (Apple M2 Max, PostgreSQL 16) takes 47 ms
+instead of 267 ms on 100,000 rows of 300 columns with a leading text column,
+19 ms instead of 29 ms on 300,000 rows of 30 columns, and 39 ms instead of
+94 ms on 300,000 rows of 100 columns. The gain comes from deforming the sampled
+rows once per group of columns instead of once per column and from block
+sampling instead of a full scan. A group is bounded by a 16 MB array of sample
+values, and the tables above fit in one. Narrow tables below 3,000 pages see
+no difference.
+
+The own work of `fasttruncate()` takes milliseconds, but on ext4 with
+`data=ordered` removing the file of a large, freshly filled table can wait for
+the kernel to write its dirty pages: on Linux, removing 512 MB took 175-205 ms,
+almost all of it inside `unlink()`. The pages reach the OS cache when the table
+does not fit in `temp_buffers` and is evicted from local buffers. If slow
+`fasttruncate()` of large tables is noticeable, `temp_tablespaces` on a file
+system without that mode (for example, XFS) helps, or a `temp_buffers` large
+enough for the table's working set. The latter costs memory in every backend.
 
 The synthetic test is in
 [sql/fasttrun_bench.sql](../../sql/fasttrun_bench.sql). Use real plans and load tests

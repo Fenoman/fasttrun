@@ -302,8 +302,83 @@ run_case()
 	echo "tracking persistence passed: $point sha256=$baseline_sha"
 }
 
+# Immediate shutdown убивает backend, который держит блокировку реестра.
+# Postmaster все равно выходит штатным путем и сохраняет реестр, а ждать
+# блокировку без PGPROC не может: сохранение пропускается с LOG, без PANIC, и
+# прежний файл остается на месте.
+run_immediate_lock_case()
+{
+	local case_dir=$WORKDIR/immediate_lock
+	local data=$case_dir/data
+	local socket=$case_dir/socket
+	local track_file=$data/pg_stat/fasttrun_temp_stats
+	local baseline_log=$case_dir/baseline.log
+	local failure_log=$case_dir/failure.log
+	local baseline_sha after_sha
+	local port
+	local holder_pid
+	local i
+
+	mkdir -p "$socket"
+	if [ -n "$PG_RUN_AS" ]; then
+		chown "$PG_RUN_AS" "$case_dir" "$socket"
+	fi
+	port=${PGPORT:-$($PYTHON -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')}
+	run_pg "$INITDB" -D "$data" --no-locale -E UTF8 >/dev/null
+
+	start_cluster "$data" "$socket" "$baseline_log" "$port" ""
+	run_pg "$CREATEDB" -h "$socket" -p "$port" "$DBNAME"
+	run_pg "$PSQL" -h "$socket" -p "$port" -d "$DBNAME" -XAtq \
+		-v ON_ERROR_STOP=1 -c 'CREATE EXTENSION fasttrun' >/dev/null
+	install_test_function "$socket" "$port"
+	set_rows "$socket" "$port" old
+	stop_cluster "$data"
+	baseline_sha=$(file_sha256 "$track_file")
+
+	start_cluster "$data" "$socket" "$failure_log" "$port" ""
+	run_pg "$PSQL" -h "$socket" -p "$port" -d "$DBNAME" -XAtq \
+		-v ON_ERROR_STOP=1 >/dev/null <<'SQL'
+CREATE OR REPLACE FUNCTION public.fasttrun_test_track_hold_lock(integer)
+RETURNS void
+AS '$libdir/fasttrun', 'fasttrun_test_track_hold_lock'
+LANGUAGE C STRICT;
+SQL
+	run_pg "$PSQL" -h "$socket" -p "$port" -d "$DBNAME" -XAtq \
+		-c 'SELECT public.fasttrun_test_track_hold_lock(60)' \
+		>/dev/null 2>&1 &
+	holder_pid=$!
+	for i in $(seq 1 100); do
+		if run_pg "$PSQL" -h "$socket" -p "$port" -d "$DBNAME" -XAtq -c \
+			"SELECT 1 FROM pg_stat_activity WHERE query LIKE '%track_hold_lock(60)%' AND state = 'active' AND pid <> pg_backend_pid()" \
+			| grep -q 1; then
+			break
+		fi
+		sleep 0.1
+	done
+	sleep 0.5
+	run_pg "$PG_CTL" -D "$data" -m immediate -w stop >/dev/null
+	wait "$holder_pid" || true
+
+	if grep -q 'PANIC' "$failure_log"; then
+		grep 'PANIC' "$failure_log" >&2
+		echo "FAIL: immediate shutdown with the lock held panicked" >&2
+		return 1
+	fi
+	grep -q 'fasttrun: tracking statistics lock is held at shutdown, not saving' \
+		"$failure_log" || {
+		echo "FAIL: skipped save is not logged" >&2
+		return 1
+	}
+	after_sha=$(file_sha256 "$track_file")
+	[ "$after_sha" = "$baseline_sha" ] || {
+		echo "FAIL: skipped save replaced the stable tracking file" >&2
+		return 1
+	}
+	echo "tracking persistence passed: immediate_lock"
+}
+
 case "$CASE_NAME" in
-	all|clean|track_save_write|track_save_close|track_save_pre_rename)
+	all|clean|track_save_write|track_save_close|track_save_pre_rename|immediate_lock)
 		;;
 	*)
 		echo "unknown FASTTRUN_TRACKING_PERSISTENCE_CASE: $CASE_NAME" >&2
@@ -326,9 +401,13 @@ case "$CASE_NAME" in
 		run_case track_save_write
 		run_case track_save_close
 		run_case track_save_pre_rename
+		run_immediate_lock_case
 		;;
 	track_save_write|track_save_close|track_save_pre_rename)
 		run_case "$CASE_NAME"
+		;;
+	immediate_lock)
+		run_immediate_lock_case
 		;;
 esac
 

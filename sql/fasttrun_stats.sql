@@ -269,9 +269,9 @@ DROP TABLE t_leak;
 --     (insert+update+delete с момента предыдущего сбора, деленная на
 --     текущий reltuples) больше fasttrun.stats_refresh_threshold
 --     (значение по умолчанию 0.2 = 20%), то очередной fasttrun_analyze
---     запускает пересбор статистики через полный reservoir sample.
---     Это дороже старой блочной выборки, зато совпадает с качеством
---     обычного ANALYZE на физически кластеризованных и sparse heap.
+--     запускает пересбор статистики. Число строк при точном счете берется
+--     из дельты, строки для статистики - выборкой блоков, как у ANALYZE,
+--     а при fasttrun.max_analyze_pages = 0 - полным проходом.
 -- ----------------------------------------------------------------------
 
 -- 11a. Значительный UPDATE (churn=1.0) -> пересбор -> план обновляется
@@ -531,14 +531,14 @@ DROP TABLE t_tc_toggle;
 -- 15. Регрессионный тест: пересбор статистики после delta-hit должен
 --     оставаться несмещенным и ANALYZE-подобным.
 --
---     Refresh path читает все heap-блоки. Выборка по части блоков даже
---     без early-stop bias не дает полной parity с ANALYZE для физически
---     упорядоченных или разреженных таблиц.
+--     Выборка блоков пересбора берет столько блоков, сколько строк в
+--     выборке (3000), поэтому на этой таблице (около 330 страниц) она
+--     читает все блоки, и оценка совпадает с полным проходом.
 --
 --     Конкретный пример (его и воспроизводим): первые ~3000 строк
 --     имеют grp=1, остальные ~50000 строк имеют уникальные grp.
 --     После cold scan'а статистика честная, n_distinct высокий.
---     Затем INSERT 20000 строк запускает полный reservoir refresh.
+--     Затем INSERT 20000 строк запускает пересбор.
 --     Проверяем сам stadistinct, а не точный план: на разных cost model
 --     редкий equality может быть как Index Scan, так и Bitmap Heap Scan
 --     при одинаково хорошей оценке rows.
@@ -558,7 +558,7 @@ SELECT stadistinct < -0.1 AS cold_ndistinct_high
  WHERE staattnum = 2;
 
 -- INSERT 20000 строк -> доля изменений 20k/73k ~ 27% > 20% порога ->
--- запускается полный reservoir refresh статистики
+-- запускается пересбор статистики
 INSERT INTO t_bias SELECT g, g FROM generate_series(53001, 73000) g;
 SELECT fasttrun_analyze('t_bias');
 -- После пересбора: n_distinct ВСЕ ЕЩЕ должен быть высоким.
@@ -1008,10 +1008,12 @@ $$;
 COMMIT;
 
 -- Контр-тест: при use_typanalyze=off оценки должны быть одинаковы
--- для обоих значений (грубая Haas-Stokes оценка по n_distinct).
+-- для обоих значений (грубая Haas-Stokes оценка по n_distinct).  Статистика
+-- прошлой транзакции свежа и переживает COMMIT, поэтому другой способ сбора
+-- применяет только явный пересбор.
 BEGIN;
 SET LOCAL fasttrun.use_typanalyze = off;
-SELECT fasttrun_analyze('t_skew');
+SELECT fasttrun_collect_stats('t_skew');
 DO $$
 DECLARE
     plan_line text;
@@ -1080,10 +1082,11 @@ END;
 $$;
 COMMIT;
 
--- Контр-тест: без typanalyze идет DEFAULT_RANGE_INEQ_SEL
+-- Контр-тест: без typanalyze идет DEFAULT_RANGE_INEQ_SEL.  Как и выше, другой
+-- способ сбора применяет явный пересбор.
 BEGIN;
 SET LOCAL fasttrun.use_typanalyze = off;
-SELECT fasttrun_analyze('t_range');
+SELECT fasttrun_collect_stats('t_range');
 DO $$
 DECLARE
     plan_line text;

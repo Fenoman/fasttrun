@@ -830,6 +830,320 @@ for target in TEMP ALL; do
 	echo "discard passed: target=$target"
 done
 
+# DISCARD TEMP откатывается вместе с транзакцией, и заблокированная таблица
+# возвращается.  Блокировка обязана вернуться с ней: запрос дает SQLSTATE
+# 55000, а повтор fasttruncate чинит таблицу.
+cat >"$WORKDIR/discard_rollback.sql" <<'SQL'
+\set ON_ERROR_STOP 1
+LOAD 'fasttrun';
+SET client_min_messages = warning;
+CREATE TEMP TABLE ft_discard_rb(id int PRIMARY KEY, payload text);
+INSERT INTO ft_discard_rb SELECT g, md5(g::text) FROM generate_series(1, 1000) g;
+CREATE FUNCTION pg_temp.ft_discard_rb_probe() RETURNS text
+LANGUAGE plpgsql AS $probe$
+BEGIN
+  PERFORM count(*) FROM ft_discard_rb WHERE id = 5;
+  RETURN 'readable';
+EXCEPTION WHEN OTHERS THEN
+  RETURN SQLSTATE;
+END
+$probe$;
+SET fasttrun.test_failpoint = 'after_user_index:1';
+DO $case$
+BEGIN
+  BEGIN
+    PERFORM fasttruncate('ft_discard_rb');
+  EXCEPTION WHEN SQLSTATE '55000' THEN
+    NULL;
+  END;
+END
+$case$;
+SET fasttrun.test_failpoint = '';
+BEGIN;
+DISCARD TEMP;
+ROLLBACK;
+SELECT 'DISCARD_ROLLBACK_BLOCKED ' || pg_temp.ft_discard_rb_probe();
+SELECT fasttruncate('ft_discard_rb');
+SELECT 'DISCARD_ROLLBACK_REPAIRED ' || pg_temp.ft_discard_rb_probe();
+SQL
+
+if ! run_pg "$PSQL" -h "$SOCKET_DIR" -p "$PORT" -d "$DBNAME" -XAtq \
+	-f "$WORKDIR/discard_rollback.sql" >"$WORKDIR/discard_rollback.out" \
+	2>"$WORKDIR/discard_rollback.err"; then
+	cat "$WORKDIR/discard_rollback.out" "$WORKDIR/discard_rollback.err" >&2
+	echo "FAIL: DISCARD TEMP rollback" >&2
+	exit 1
+fi
+if ! grep -q '^DISCARD_ROLLBACK_BLOCKED 55000$' "$WORKDIR/discard_rollback.out" || \
+	! grep -q '^DISCARD_ROLLBACK_REPAIRED readable$' "$WORKDIR/discard_rollback.out"; then
+	cat "$WORKDIR/discard_rollback.out" >&2
+	echo "FAIL: DISCARD TEMP rollback did not keep the block" >&2
+	exit 1
+fi
+echo "discard rollback passed"
+
+# ANALYZE без списка таблиц проверяет каждую заблокированную таблицу. Одна из
+# двух удалена в той же транзакции, и ее запись живет до COMMIT, другая обязана
+# остановить ANALYZE. Порядок записей в хеше заранее не известен, поэтому
+# удаляется то одна, то другая.
+cat >"$WORKDIR/poison_any.sql" <<'SQL'
+\set ON_ERROR_STOP 1
+LOAD 'fasttrun';
+SET client_min_messages = warning;
+CREATE TEMP TABLE ft_poison_a(id int PRIMARY KEY);
+CREATE TEMP TABLE ft_poison_b(id int PRIMARY KEY);
+INSERT INTO ft_poison_a SELECT generate_series(1, 1000);
+INSERT INTO ft_poison_b SELECT generate_series(1, 1000);
+SET fasttrun.test_failpoint = 'after_user_index:1';
+DO $case$
+BEGIN
+  BEGIN
+    PERFORM fasttruncate('ft_poison_a');
+  EXCEPTION WHEN SQLSTATE '55000' THEN
+    NULL;
+  END;
+  BEGIN
+    PERFORM fasttruncate('ft_poison_b');
+  EXCEPTION WHEN SQLSTATE '55000' THEN
+    NULL;
+  END;
+END
+$case$;
+SET fasttrun.test_failpoint = '';
+DO $case$
+BEGIN
+  DROP TABLE ft_poison_a;
+  ANALYZE;
+  RAISE WARNING 'POISON_ANY not blocked';
+EXCEPTION WHEN OTHERS THEN
+  RAISE WARNING 'POISON_ANY %', SQLSTATE;
+END
+$case$;
+DO $case$
+BEGIN
+  DROP TABLE ft_poison_b;
+  ANALYZE;
+  RAISE WARNING 'POISON_ANY not blocked';
+EXCEPTION WHEN OTHERS THEN
+  RAISE WARNING 'POISON_ANY %', SQLSTATE;
+END
+$case$;
+SQL
+
+if ! run_pg "$PSQL" -h "$SOCKET_DIR" -p "$PORT" -d "$DBNAME" -XAtq \
+	-f "$WORKDIR/poison_any.sql" >"$WORKDIR/poison_any.out" \
+	2>"$WORKDIR/poison_any.err"; then
+	cat "$WORKDIR/poison_any.out" "$WORKDIR/poison_any.err" >&2
+	echo "FAIL: poison check of every blocked table" >&2
+	exit 1
+fi
+if [ "$(grep -c 'POISON_ANY 55000' "$WORKDIR/poison_any.err")" -ne 2 ]; then
+	cat "$WORKDIR/poison_any.out" "$WORKDIR/poison_any.err" >&2
+	echo "FAIL: ANALYZE passed a blocked table" >&2
+	exit 1
+fi
+echo "poison any passed"
+
+# Блокировка действует и на отношения, которых нет в тексте запроса: тело
+# встроенной SQL-функции и потомка, до которого план доходит через родителя
+# наследования. Таблицы без индексов, а отказ идет после очистки кучи, поэтому
+# без блокировки оба запроса молча вернули бы ноль строк.
+cat >"$WORKDIR/poison_plan.sql" <<'SQL'
+\set ON_ERROR_STOP 1
+LOAD 'fasttrun';
+SET client_min_messages = warning;
+CREATE TEMP TABLE ft_poison_inline(id int, payload text);
+INSERT INTO ft_poison_inline SELECT g, md5(g::text) FROM generate_series(1, 1000) g;
+CREATE FUNCTION pg_temp.ft_poison_inline_rows() RETURNS TABLE(id int)
+LANGUAGE sql STABLE AS 'SELECT id FROM ft_poison_inline';
+CREATE TEMP TABLE ft_poison_parent(id int);
+CREATE TEMP TABLE ft_poison_child() INHERITS (ft_poison_parent);
+INSERT INTO ft_poison_child SELECT generate_series(1, 1000);
+CREATE FUNCTION pg_temp.ft_poison_plan_probe(q text) RETURNS text
+LANGUAGE plpgsql AS $probe$
+DECLARE n bigint;
+BEGIN
+  EXECUTE q INTO n;
+  RETURN 'readable ' || n;
+EXCEPTION WHEN OTHERS THEN
+  RETURN SQLSTATE;
+END
+$probe$;
+SET fasttrun.test_failpoint = 'after_main_heap';
+DO $case$
+BEGIN
+  BEGIN
+    PERFORM fasttruncate('ft_poison_inline');
+  EXCEPTION WHEN OTHERS THEN
+    NULL;
+  END;
+  BEGIN
+    PERFORM fasttruncate('ft_poison_child');
+  EXCEPTION WHEN OTHERS THEN
+    NULL;
+  END;
+END
+$case$;
+SET fasttrun.test_failpoint = '';
+SELECT 'POISON_PLAN_DIRECT ' || pg_temp.ft_poison_plan_probe('SELECT count(*) FROM ft_poison_inline');
+SELECT 'POISON_PLAN_INLINE ' || pg_temp.ft_poison_plan_probe('SELECT count(*) FROM pg_temp.ft_poison_inline_rows()');
+SELECT 'POISON_PLAN_CHILD ' || pg_temp.ft_poison_plan_probe('SELECT count(*) FROM ft_poison_parent');
+SELECT fasttruncate('ft_poison_inline');
+SELECT fasttruncate('ft_poison_child');
+SELECT 'POISON_PLAN_REPAIRED ' || pg_temp.ft_poison_plan_probe('SELECT count(*) FROM pg_temp.ft_poison_inline_rows()')
+  || ' ' || pg_temp.ft_poison_plan_probe('SELECT count(*) FROM ft_poison_parent');
+SQL
+
+if ! run_pg "$PSQL" -h "$SOCKET_DIR" -p "$PORT" -d "$DBNAME" -XAtq \
+	-f "$WORKDIR/poison_plan.sql" >"$WORKDIR/poison_plan.out" \
+	2>"$WORKDIR/poison_plan.err"; then
+	cat "$WORKDIR/poison_plan.out" "$WORKDIR/poison_plan.err" >&2
+	echo "FAIL: poison check of the finished plan" >&2
+	exit 1
+fi
+for probe in DIRECT INLINE CHILD; do
+	if ! grep -q "^POISON_PLAN_$probe 55000\$" "$WORKDIR/poison_plan.out"; then
+		cat "$WORKDIR/poison_plan.out" >&2
+		echo "FAIL: a query reached a blocked table ($probe)" >&2
+		exit 1
+	fi
+done
+if ! grep -q '^POISON_PLAN_REPAIRED readable 0 readable 0$' "$WORKDIR/poison_plan.out"; then
+	cat "$WORKDIR/poison_plan.out" >&2
+	echo "FAIL: fasttruncate did not repair the blocked tables" >&2
+	exit 1
+fi
+echo "poison plan passed"
+
+# Запись через секционированного родителя доходит до секции, которую выбирает
+# маршрутизация строк, а не план. Блокировка секции действует и для INSERT, и
+# для COPY через родителя.
+cat >"$WORKDIR/poison_route.sql" <<'SQL'
+\set ON_ERROR_STOP 1
+LOAD 'fasttrun';
+SET client_min_messages = warning;
+CREATE TEMP TABLE ft_poison_route(id int) PARTITION BY RANGE (id);
+CREATE TEMP TABLE ft_poison_route_leaf PARTITION OF ft_poison_route FOR VALUES FROM (0) TO (100000);
+INSERT INTO ft_poison_route SELECT generate_series(1, 1000);
+CREATE FUNCTION pg_temp.ft_poison_route_probe(q text) RETURNS text
+LANGUAGE plpgsql AS $probe$
+BEGIN
+  EXECUTE q;
+  RETURN 'written';
+EXCEPTION WHEN OTHERS THEN
+  RETURN SQLSTATE;
+END
+$probe$;
+SET fasttrun.test_failpoint = 'after_main_heap';
+DO $case$
+BEGIN
+  PERFORM fasttruncate('ft_poison_route_leaf');
+EXCEPTION WHEN OTHERS THEN
+  NULL;
+END
+$case$;
+SET fasttrun.test_failpoint = '';
+SELECT 'POISON_ROUTE_INSERT ' || pg_temp.ft_poison_route_probe('INSERT INTO ft_poison_route VALUES (5)');
+SELECT 'POISON_ROUTE_COPY ' || pg_temp.ft_poison_route_probe($q$COPY ft_poison_route FROM PROGRAM 'echo 6'$q$);
+SELECT fasttruncate('ft_poison_route_leaf');
+SELECT 'POISON_ROUTE_REPAIRED ' || pg_temp.ft_poison_route_probe('INSERT INTO ft_poison_route VALUES (7)');
+SQL
+
+if ! run_pg "$PSQL" -h "$SOCKET_DIR" -p "$PORT" -d "$DBNAME" -XAtq \
+	-f "$WORKDIR/poison_route.sql" >"$WORKDIR/poison_route.out" \
+	2>"$WORKDIR/poison_route.err"; then
+	cat "$WORKDIR/poison_route.out" "$WORKDIR/poison_route.err" >&2
+	echo "FAIL: poison check of routed writes" >&2
+	exit 1
+fi
+for probe in INSERT COPY; do
+	if ! grep -q "^POISON_ROUTE_$probe 55000\$" "$WORKDIR/poison_route.out"; then
+		cat "$WORKDIR/poison_route.out" >&2
+		echo "FAIL: a routed write reached a blocked partition ($probe)" >&2
+		exit 1
+	fi
+done
+if ! grep -q '^POISON_ROUTE_REPAIRED written$' "$WORKDIR/poison_route.out"; then
+	cat "$WORKDIR/poison_route.out" >&2
+	echo "FAIL: fasttruncate did not repair the blocked partition" >&2
+	exit 1
+fi
+echo "poison route passed"
+
+# План, построенный до сбоя, исполняется позже: SQL-функция в PG 16 и 17
+# планирует все операторы до первого, а первый вызывает отказавший
+# fasttruncate. TRUNCATE через родителя наследования дает потомку новый файл,
+# и откат возвращает поврежденный: блокировка обязана вернуться вместе с ним.
+cat >"$WORKDIR/poison_late.sql" <<'SQL'
+\set ON_ERROR_STOP 1
+LOAD 'fasttrun';
+SET client_min_messages = warning;
+CREATE TEMP TABLE ft_poison_sqlfn(id int);
+INSERT INTO ft_poison_sqlfn VALUES (1);
+CREATE FUNCTION pg_temp.ft_poison_make() RETURNS void
+LANGUAGE plpgsql AS $f$
+BEGIN
+  PERFORM fasttruncate('ft_poison_sqlfn');
+EXCEPTION WHEN OTHERS THEN
+  NULL;
+END
+$f$;
+CREATE FUNCTION pg_temp.ft_poison_read_after() RETURNS bigint
+LANGUAGE sql VOLATILE AS $f$
+  SELECT pg_temp.ft_poison_make();
+  SELECT count(*) FROM ft_poison_sqlfn;
+$f$;
+CREATE FUNCTION pg_temp.ft_poison_late_probe(q text) RETURNS text
+LANGUAGE plpgsql AS $probe$
+DECLARE r text;
+BEGIN
+  EXECUTE q INTO r;
+  RETURN 'readable ' || r;
+EXCEPTION WHEN OTHERS THEN
+  RETURN SQLSTATE;
+END
+$probe$;
+SET fasttrun.test_failpoint = 'after_main_heap';
+SELECT 'POISON_LATE_SQLFN ' || pg_temp.ft_poison_late_probe('SELECT pg_temp.ft_poison_read_after()');
+SET fasttrun.test_failpoint = '';
+CREATE TEMP TABLE ft_poison_inh_parent(id int);
+CREATE TEMP TABLE ft_poison_inh_child() INHERITS (ft_poison_inh_parent);
+INSERT INTO ft_poison_inh_child SELECT generate_series(1, 100);
+SET fasttrun.test_failpoint = 'after_main_heap';
+DO $case$
+BEGIN
+  PERFORM fasttruncate('ft_poison_inh_child');
+EXCEPTION WHEN OTHERS THEN
+  NULL;
+END
+$case$;
+SET fasttrun.test_failpoint = '';
+BEGIN;
+TRUNCATE ft_poison_inh_parent;
+SELECT 'POISON_LATE_TRUNCATED ' || pg_temp.ft_poison_late_probe('SELECT count(*) FROM ft_poison_inh_child');
+ROLLBACK;
+SELECT 'POISON_LATE_ROLLBACK ' || pg_temp.ft_poison_late_probe('SELECT count(*) FROM ft_poison_inh_child');
+SELECT fasttruncate('ft_poison_inh_child');
+SELECT 'POISON_LATE_REPAIRED ' || pg_temp.ft_poison_late_probe('SELECT count(*) FROM ft_poison_inh_child');
+SQL
+
+if ! run_pg "$PSQL" -h "$SOCKET_DIR" -p "$PORT" -d "$DBNAME" -XAtq \
+	-f "$WORKDIR/poison_late.sql" >"$WORKDIR/poison_late.out" \
+	2>"$WORKDIR/poison_late.err"; then
+	cat "$WORKDIR/poison_late.out" "$WORKDIR/poison_late.err" >&2
+	echo "FAIL: poison check of late plans and swapped files" >&2
+	exit 1
+fi
+for expect in 'POISON_LATE_SQLFN 55000' 'POISON_LATE_TRUNCATED readable 0' \
+	'POISON_LATE_ROLLBACK 55000' 'POISON_LATE_REPAIRED readable 0'; do
+	if ! grep -qx "$expect" "$WORKDIR/poison_late.out"; then
+		cat "$WORKDIR/poison_late.out" >&2
+		echo "FAIL: expected '$expect'" >&2
+		exit 1
+	fi
+done
+echo "poison late passed"
+
 if grep -Eq 'TRAP|Assertion|FailedAssertion|PANIC|terminated by signal|server process .* was terminated|Segmentation fault|Abort trap' \
 	"$LOG"; then
 	grep -E 'TRAP|Assertion|FailedAssertion|PANIC|terminated by signal|server process .* was terminated|Segmentation fault|Abort trap' \

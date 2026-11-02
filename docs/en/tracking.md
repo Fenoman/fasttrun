@@ -175,8 +175,10 @@ During a clean PostgreSQL shutdown, the registry is saved atomically to
 `$PGDATA/pg_stat/fasttrun_temp_stats` and loaded on the next startup.
 
 After a crash, the current state is not written. An older successfully saved
-copy may be loaded instead. Write errors are recorded in the PostgreSQL log,
-and an incomplete temporary file is removed.
+copy may be loaded instead. An `immediate` shutdown saves the registry too, but
+if it interrupted a backend in the middle of writing to it, the save is skipped
+with a message in the log and the previous file stays. Write errors are
+recorded in the PostgreSQL log, and an incomplete temporary file is removed.
 
 The file is not written to WAL, is not replicated, and is not included in
 `pg_dump`. `fasttrun_reset_temp_stats()` clears the registry and removes the

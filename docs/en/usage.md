@@ -132,9 +132,10 @@ of the table and its indexes already match that state, a repeated
 invalidation. The checks for active use of the table still run. A mismatch in
 locators, sizes, statistics, or DML counters, or an unfinished cleanup, sends
 the call back to the full path. `reltuples = 0` alone is not enough to skip.
-After `COMMIT`, the fast path restores the counter baseline for the next refill
-and `fasttrun_analyze()`. If the empty state has not yet been reconciled with
-the cached plans, a full cleanup with invalidation runs.
+If `COMMIT` could not carry the counter baseline over (counters unavailable),
+the fast path restores it for the next refill and `fasttrun_analyze()`. If the
+empty state has not yet been reconciled with the cached plans, a full cleanup
+with invalidation runs.
 
 For these functions, `NULL` and a missing table are no-ops.
 `fasttrun_analyze_bulk()` also skips `NULL` elements in its array. The function
@@ -188,11 +189,15 @@ operation back normally and the old data remains intact.
 If an error occurs after cleanup begins, the old files can no longer be safely
 restored. fasttrun blocks the table in the current backend. `SELECT`, DML,
 `COPY`, planning, and extension functions for that table return
-`SQLSTATE 55000`. A regular `ROLLBACK` or rollback to a savepoint does not remove
-the block while the table itself exists. If the creation of the table is rolled
-back, the extension removes the table's unfinished-operation record together
-with its local caches. This also holds when the first fasttrun call is made
-inside a nested block.
+`SQLSTATE 55000`, including a query that reads it through an inlined SQL
+function or through an inheritance parent, a write through a partitioned parent,
+and a plan made before the failure, such as the next statement of a SQL
+function. A regular `ROLLBACK`, a rollback to a savepoint, and a `TRUNCATE`
+through an inheritance parent that is later rolled back do not remove the block
+while the table itself exists. If the creation of the table is rolled back, the
+extension removes the table's unfinished-operation record together with its
+local caches. This also holds when the first fasttrun call is made inside a
+nested block.
 
 First end the failed transaction:
 

@@ -9,17 +9,34 @@
 `fasttrun_analyze()` publishes values in the current backend's memory for the
 planner to use when estimating the size of the table and its indexes.
 
-Within one transaction, a repeated call usually derives the row count from
-change counters instead of scanning the table. This delta state is cleared at
-`COMMIT`. The local size estimates and column statistics remain, but the first
-call in the next transaction may scan the table again.
+A repeated call derives the row count from change counters instead of scanning
+the table, in later transactions too: at `COMMIT` fasttrun carries over the
+counters of the finished transaction, and writes made without any fasttrun call
+are counted the same way. The table is scanned again by the first call in
+these cases:
+
+- after a core `TRUNCATE` or a change of the table's file
+- after a write with `track_counts` off and with counters unavailable
+- after a pass over the table inside a statement that writes it: such a pass
+  does not see rows the counters already count
+- after a `COMMIT` that hid a column's statistics
+- after `VACUUM`, which changes the page count and visibility without counters
+- after an `ON COMMIT DELETE ROWS` cleanup: the first call of a transaction
+  checks whether the storage is empty
+
+A delta to a row count taken by block sampling stays an estimate as well.
 
 If the table does not exceed `fasttrun.max_analyze_pages`, the scan produces an
 exact row count. For a larger table, fasttrun takes a bounded block sample and
-produces an estimate, as regular `ANALYZE` does. The sample seed also comes from
-where `ANALYZE` takes it, a generator the core seeds in every process
-separately, so backends choose blocks independently of each other even with
-`shared_preload_libraries`.
+produces an estimate, as regular `ANALYZE` does. A statistics rebuild after
+changes and a partial-index recount know the exact row count from the counters
+when a full scan produced the original count, and then take a block sample at
+any size instead of reading the whole table. When the original count was an
+estimate, they behave like the first pass and replace it with what they
+measured. `max_analyze_pages=0` brings back the full scan for them too. The
+sample seed also comes from where `ANALYZE` takes it, a generator the core
+seeds in every process separately, so backends choose blocks independently of
+each other even with `shared_preload_libraries`.
 
 ### Column statistics
 
@@ -93,14 +110,22 @@ do between regular runs of `ANALYZE`. A column's tolerance is
 fraction of distinct values among the rows, but no less than the smaller of the
 threshold and 5%. A column with few values gets almost the whole threshold, a
 near-unique one at most 5%. With a threshold of `0.2`, the statistics of a
-near-unique column are hidden after 5% of changes. When the
-threshold itself is reached, the statistics are rebuilt if automatic collection
-is enabled, `sample_rows` is not zero, and the memory limit permits collection. Otherwise, fasttrun hides the statistics so that the
-planner does not use a distribution known to be outdated. This is not a full
-guarantee: the change ratio is measured against the transaction's counters, so
-several sub-threshold transactions in a row can rewrite the relation between
-them without hiding anything. Across a commit only a change in physical size is
-noticed.
+near-unique column are hidden after 5% of changes. `fasttrun_analyze()`
+rebuilds the statistics when the change ratio reaches the threshold itself or
+when the statistics of at least one column are already hidden by the
+tolerance, if automatic collection is enabled, `sample_rows` is not zero, and
+the memory limit permits collection. This way, after an analyze call the
+planner is usually not left on default estimates for a column that has a
+sample. A call inside a statement that writes the table postpones the rebuild:
+fasttrun never gives the planner a sample taken during a write. The next call
+after the write ends, in the same transaction or after `COMMIT`, collects
+again. Without new changes a column stays on default estimates in a few cases,
+listed in [limitations](limitations.md). Without an analyze call,
+fasttrun hides the statistics so that the planner does not use a distribution
+known to be outdated. Changes add up across `COMMIT`, so several sub-threshold
+transactions in a row hide the statistics just as one would. A write that goes
+past both the executor and `COPY` does not reach the transaction journal, see
+[limitations](limitations.md).
 
 `track_counts=on` is required for column-statistics freshness checks and the
 fast delta path. With `off`, fasttrun still updates the table-size estimate by
@@ -113,10 +138,12 @@ Unless collection is disabled with `sample_rows=0` or stopped by the memory
 limit, an explicit `fasttrun_collect_stats()` performs a full table scan. The
 `fasttrun.max_analyze_pages` limit applies to scans inside
 `fasttrun_analyze()` and does not limit this explicit call. This way the
-explicit call gives an exact row count and a row sample drawn from the whole
-heap where a block sample cannot be trusted: values are grouped by page, or a
-mass `DELETE` left a sparse heap in which a block sample can miss every live
-block. The price is a full table scan on every such call.
+explicit call builds column statistics from an exact row count and a row sample
+drawn from the whole heap where a block sample cannot be trusted: values are
+grouped by page, or a mass `DELETE` left a sparse heap in which a block sample
+can miss every live block. It does not publish the table size for the planner,
+`fasttrun_analyze()` does that. The price is a full table scan on every such
+call.
 
 A regular full `ANALYZE` hands statistics management for the whole table back
 to PostgreSQL core. `ANALYZE table (col1, ...)` hands back only the listed
@@ -136,11 +163,11 @@ The "user" context means that the parameter can be changed with `SET`. The
 |---|---:|---:|---|---|
 | `fasttrun.auto_collect_stats` | `on` | boolean | user | Collect column statistics inside `fasttrun_analyze()` |
 | `fasttrun.sample_rows` | `3000` | `-1..1000000` | user | `0` disables column collection. With `use_typanalyze=on`, `-1` uses the sample size requested by PostgreSQL, while with `off` it uses 3,000 rows |
-| `fasttrun.stats_refresh_threshold` | `0.2` | `0..1` | user | Fraction of DML that triggers an automatic rebuild, and the base of the statistics visibility tolerance. `0` means a rebuild on any DML. `1` disables the DML-triggered rebuild, but statistics past the tolerance are still hidden |
-| `fasttrun.invalidate_threshold` | `0.2` | `0..1` | user | Allowed cumulative size change before local plans are invalidated |
+| `fasttrun.stats_refresh_threshold` | `0.2` | `0..1` | user | Fraction of DML that triggers an automatic rebuild, and the base of the statistics visibility tolerance. A column hidden by the tolerance triggers the rebuild too. `0` means a rebuild on any DML. `1` disables the DML-triggered rebuild, but statistics past the tolerance are still hidden |
+| `fasttrun.invalidate_threshold` | `0.2` | `0..1` | user | Allowed cumulative size change of the table and its indexes before local plans are invalidated |
 | `fasttrun.use_typanalyze` | `on` | boolean | user | Use PostgreSQL's built-in statistics handlers. `off` keeps only basic metrics |
 | `fasttrun.zero_sinval_truncate` | `on` | boolean | user | `on` clears files without shared messages, while `off` uses the PostgreSQL core cleanup path |
-| `fasttrun.max_analyze_pages` | `100000` | `0..2147483647` pages | user | Above this threshold, `fasttrun_analyze()` switches to block sampling. `0` requires a full scan whenever a scan is needed |
+| `fasttrun.max_analyze_pages` | `100000` | `0..2147483647` pages | user | Above this threshold, the first `fasttrun_analyze()` pass switches to block sampling. A rebuild after changes samples blocks at any size when the count is exact. `0` requires a full scan everywhere |
 | `fasttrun.max_stats_memory` | `0` | KB | user | Soft memory limit for column statistics. `0` means unlimited |
 
 With an 8 KB page size, `max_analyze_pages=100000` corresponds to approximately

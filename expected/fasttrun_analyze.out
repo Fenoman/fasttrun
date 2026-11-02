@@ -911,6 +911,290 @@ SELECT (fasttrun_relstats('t_frame_nested')).reltuples = 10000
 COMMIT;
 DROP TABLE t_frame_nested;
 -- ----------------------------------------------------------------------
+-- 17e. fasttruncate и заполнение в одной точке сохранения, затем откат.
+--      Очистка необратима, а заполнение откатывается, поэтому живых строк
+--      нет, хотя страницы откатившегося заполнения остаются в файле.
+--      Статистика таблицы до очистки не восстанавливается ни сразу, ни
+--      следующим analyze, ни после COMMIT.
+-- ----------------------------------------------------------------------
+CREATE TEMP TABLE t_refill_rb (id int, grp int);
+CREATE INDEX t_refill_rb_grp ON t_refill_rb (grp);
+INSERT INTO t_refill_rb SELECT g, g % 10 FROM generate_series(1, 1000) g;
+BEGIN;
+SELECT fasttrun_analyze('t_refill_rb');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+SELECT reltuples = 1000 AS refill17e_pre FROM fasttrun_relstats('t_refill_rb');
+ refill17e_pre 
+---------------
+ t
+(1 row)
+
+SELECT count(*) > 0 AS refill17e_pre_colstats
+  FROM fasttrun_inspect_stats('t_refill_rb');
+ refill17e_pre_colstats 
+------------------------
+ t
+(1 row)
+
+SAVEPOINT sp_refill;
+SELECT fasttruncate('t_refill_rb');
+ fasttruncate 
+--------------
+ 
+(1 row)
+
+INSERT INTO t_refill_rb SELECT g, g % 10 FROM generate_series(1, 1000) g;
+SELECT fasttrun_analyze('t_refill_rb');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+ROLLBACK TO SAVEPOINT sp_refill;
+SELECT count(*) = 0 AS refill17e_actual_empty FROM t_refill_rb;
+ refill17e_actual_empty 
+------------------------
+ t
+(1 row)
+
+SELECT pg_relation_size('t_refill_rb') > 0 AS refill17e_dead_pages_left;
+ refill17e_dead_pages_left 
+---------------------------
+ t
+(1 row)
+
+SELECT reltuples = 0 AS refill17e_tuples_zero,
+       relpages = pg_relation_size('t_refill_rb') / current_setting('block_size')::int
+         AS refill17e_pages_physical
+  FROM fasttrun_relstats('t_refill_rb');
+ refill17e_tuples_zero | refill17e_pages_physical 
+-----------------------+--------------------------
+ t                     | t
+(1 row)
+
+SELECT reltuples = 0 AS refill17e_index_tuples_zero
+  FROM fasttrun_relstats('t_refill_rb_grp');
+ refill17e_index_tuples_zero 
+-----------------------------
+ t
+(1 row)
+
+SELECT count(*) = 0 AS refill17e_colstats_hidden
+  FROM fasttrun_inspect_stats('t_refill_rb');
+ refill17e_colstats_hidden 
+---------------------------
+ t
+(1 row)
+
+SELECT fasttrun_analyze('t_refill_rb');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+SELECT reltuples = 0 AS refill17e_after_analyze FROM fasttrun_relstats('t_refill_rb');
+ refill17e_after_analyze 
+-------------------------
+ t
+(1 row)
+
+COMMIT;
+SELECT reltuples = 0 AS refill17e_after_commit FROM fasttrun_relstats('t_refill_rb');
+ refill17e_after_commit 
+------------------------
+ t
+(1 row)
+
+-- То же через блок EXCEPTION: он и есть точка сохранения.
+SELECT fasttruncate('t_refill_rb');
+ fasttruncate 
+--------------
+ 
+(1 row)
+
+INSERT INTO t_refill_rb SELECT g, g % 10 FROM generate_series(1, 1000) g;
+SELECT fasttrun_analyze('t_refill_rb');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+DO $$
+BEGIN
+  PERFORM fasttruncate('t_refill_rb');
+  INSERT INTO t_refill_rb SELECT g, g % 10 FROM generate_series(1, 1000) g;
+  PERFORM fasttrun_analyze('t_refill_rb');
+  RAISE EXCEPTION USING ERRCODE = 'ZX002', MESSAGE = 'abort refill';
+EXCEPTION WHEN SQLSTATE 'ZX002' THEN
+  NULL;
+END
+$$;
+SELECT count(*) = 0 AS refill17e_plpgsql_empty FROM t_refill_rb;
+ refill17e_plpgsql_empty 
+-------------------------
+ t
+(1 row)
+
+SELECT reltuples = 0 AS refill17e_plpgsql_tuples_zero
+  FROM fasttrun_relstats('t_refill_rb');
+ refill17e_plpgsql_tuples_zero 
+-------------------------------
+ t
+(1 row)
+
+SELECT fasttrun_analyze('t_refill_rb');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+SELECT reltuples = 0 AS refill17e_plpgsql_after_analyze
+  FROM fasttrun_relstats('t_refill_rb');
+ refill17e_plpgsql_after_analyze 
+---------------------------------
+ t
+(1 row)
+
+-- Откат всей транзакции.
+SELECT fasttruncate('t_refill_rb');
+ fasttruncate 
+--------------
+ 
+(1 row)
+
+INSERT INTO t_refill_rb SELECT g, g % 10 FROM generate_series(1, 1000) g;
+SELECT fasttrun_analyze('t_refill_rb');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+BEGIN;
+SELECT fasttruncate('t_refill_rb');
+ fasttruncate 
+--------------
+ 
+(1 row)
+
+INSERT INTO t_refill_rb SELECT g, g % 10 FROM generate_series(1, 1000) g;
+SELECT fasttrun_analyze('t_refill_rb');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+ROLLBACK;
+SELECT count(*) = 0 AS refill17e_top_empty FROM t_refill_rb;
+ refill17e_top_empty 
+---------------------
+ t
+(1 row)
+
+SELECT reltuples = 0 AS refill17e_top_tuples_zero
+  FROM fasttrun_relstats('t_refill_rb');
+ refill17e_top_tuples_zero 
+---------------------------
+ t
+(1 row)
+
+-- Очистка в дочерней точке, RELEASE, затем откат родителя: очистку
+-- родитель получил от дочерней, и его откат ее тоже не отменяет.
+SELECT fasttruncate('t_refill_rb');
+ fasttruncate 
+--------------
+ 
+(1 row)
+
+INSERT INTO t_refill_rb SELECT g, g % 10 FROM generate_series(1, 1000) g;
+SELECT fasttrun_analyze('t_refill_rb');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+BEGIN;
+SAVEPOINT refill_parent;
+SAVEPOINT refill_child;
+SELECT fasttruncate('t_refill_rb');
+ fasttruncate 
+--------------
+ 
+(1 row)
+
+RELEASE SAVEPOINT refill_child;
+INSERT INTO t_refill_rb SELECT g, g % 10 FROM generate_series(1, 1000) g;
+SELECT fasttrun_analyze('t_refill_rb');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+ROLLBACK TO SAVEPOINT refill_parent;
+SELECT count(*) = 0 AS refill17e_released_empty FROM t_refill_rb;
+ refill17e_released_empty 
+--------------------------
+ t
+(1 row)
+
+SELECT reltuples = 0 AS refill17e_released_tuples_zero
+  FROM fasttrun_relstats('t_refill_rb');
+ refill17e_released_tuples_zero 
+--------------------------------
+ t
+(1 row)
+
+COMMIT;
+-- Контроль: откат уровня, который очистку не содержит, восстанавливает
+-- состояние, сохраненное после очистки.
+BEGIN;
+SELECT fasttruncate('t_refill_rb');
+ fasttruncate 
+--------------
+ 
+(1 row)
+
+INSERT INTO t_refill_rb SELECT g, g % 10 FROM generate_series(1, 100) g;
+SELECT fasttrun_analyze('t_refill_rb');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+SAVEPOINT refill_inner;
+INSERT INTO t_refill_rb SELECT g, g % 10 FROM generate_series(101, 150) g;
+SELECT fasttrun_analyze('t_refill_rb');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+SELECT reltuples = 150 AS refill17e_inner_pre FROM fasttrun_relstats('t_refill_rb');
+ refill17e_inner_pre 
+---------------------
+ t
+(1 row)
+
+ROLLBACK TO SAVEPOINT refill_inner;
+SELECT count(*) = 100 AS refill17e_inner_actual FROM t_refill_rb;
+ refill17e_inner_actual 
+------------------------
+ t
+(1 row)
+
+SELECT reltuples = 100 AS refill17e_inner_restored
+  FROM fasttrun_relstats('t_refill_rb');
+ refill17e_inner_restored 
+--------------------------
+ t
+(1 row)
+
+COMMIT;
+DROP TABLE t_refill_rb;
+-- ----------------------------------------------------------------------
 -- 18. Регрессионный тест: ошибка ленивого режима после SQL TRUNCATE
 --     (исправление приоритета P1).
 --
@@ -1237,4 +1521,840 @@ SELECT pg_temp.assert_birth_cache_empty();
  
 (1 row)
 
+-- ----------------------------------------------------------------------
+-- 21. Счетчики изменений переживают COMMIT.  При max_analyze_pages = 1
+--     любой проход по таблице пишет DEBUG-строку о выборке блоков, так что
+--     видно, где analyze сканировал.  Первый analyze новой транзакции без
+--     DML не сканирует и не сбрасывает планы.  Строки, записанные в
+--     транзакциях без вызовов fasttrun, учитываются, откаченные - нет.
+--     Изменения ниже порога пересбора накапливаются через COMMIT, и
+--     пересбор происходит, когда сумма его достигает.  У таблицы одна
+--     колонка с 10 значениями, чтобы порог колонки совпадал с общим.
+-- ----------------------------------------------------------------------
+CREATE TEMP TABLE t_carry (grp int);
+INSERT INTO t_carry SELECT g % 10 FROM generate_series(1, 10000) g;
+SELECT fasttrun_analyze('t_carry');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+BEGIN;
+SET LOCAL fasttrun.max_analyze_pages = 1;
+SET LOCAL client_min_messages = debug1;
+SELECT fasttrun_analyze('t_carry');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+RESET client_min_messages;
+SELECT reltuples = 10000 AS carry21_noop_count FROM fasttrun_relstats('t_carry');
+ carry21_noop_count 
+--------------------
+ t
+(1 row)
+
+COMMIT;
+INSERT INTO t_carry SELECT g % 10 FROM generate_series(1, 1000) g;
+BEGIN;
+INSERT INTO t_carry SELECT g % 10 FROM generate_series(1, 500) g;
+ROLLBACK;
+BEGIN;
+SET LOCAL fasttrun.max_analyze_pages = 1;
+SET LOCAL client_min_messages = debug1;
+SELECT fasttrun_analyze('t_carry');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+RESET client_min_messages;
+SELECT reltuples = 11000 AS carry21_counted_without_scan
+  FROM fasttrun_relstats('t_carry');
+ carry21_counted_without_scan 
+------------------------------
+ t
+(1 row)
+
+COMMIT;
+INSERT INTO t_carry SELECT g % 10 FROM generate_series(1, 1000) g;
+BEGIN;
+SET LOCAL fasttrun.max_analyze_pages = 1;
+SET LOCAL client_min_messages = debug1;
+SELECT fasttrun_analyze('t_carry');
+DEBUG:  fasttrun: invalidating backend-local cached plans
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+RESET client_min_messages;
+COMMIT;
+-- Сумма достигла порога: 3000 изменений на 13000 строк, пересбор.
+INSERT INTO t_carry SELECT g % 10 FROM generate_series(1, 1000) g;
+BEGIN;
+SET LOCAL fasttrun.max_analyze_pages = 1;
+SET LOCAL client_min_messages = debug1;
+SELECT fasttrun_analyze('t_carry');
+DEBUG:  fasttrun: block-sampling analyze scan
+DEBUG:  fasttrun: invalidating backend-local cached plans
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+RESET client_min_messages;
+SELECT reltuples = 13000 AS carry21_refresh_count FROM fasttrun_relstats('t_carry');
+ carry21_refresh_count 
+-----------------------
+ t
+(1 row)
+
+COMMIT;
+-- Ядерный TRUNCATE обрывает перенос: следующий analyze сканирует.
+TRUNCATE t_carry;
+INSERT INTO t_carry SELECT g % 10 FROM generate_series(1, 1000) g;
+BEGIN;
+SET LOCAL fasttrun.max_analyze_pages = 1;
+SET LOCAL client_min_messages = debug1;
+SELECT fasttrun_analyze('t_carry');
+DEBUG:  fasttrun: block-sampling analyze scan
+DEBUG:  fasttrun: invalidating backend-local cached plans
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+RESET client_min_messages;
+SELECT reltuples = 1000 AS carry21_after_core_truncate FROM fasttrun_relstats('t_carry');
+ carry21_after_core_truncate 
+-----------------------------
+ t
+(1 row)
+
+COMMIT;
+DROP TABLE t_carry;
+-- Статистика колонок тоже видит изменения, накопленные несколькими
+-- транзакциями.  Пол допуска near-unique колонки - 5%, каждая транзакция
+-- добавляет 2% строк без analyze.  После третьей сумма выше пола, COMMIT
+-- скрывает статистику, и оценка уходит к значению по умолчанию.
+CREATE TEMP TABLE t_carry_cols (id int);
+INSERT INTO t_carry_cols SELECT g FROM generate_series(1, 10000) g;
+SELECT fasttrun_analyze('t_carry_cols');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+CREATE FUNCTION pg_temp.carry_est() RETURNS int LANGUAGE plpgsql AS $$
+DECLARE ln text;
+BEGIN
+  FOR ln IN EXPLAIN SELECT * FROM t_carry_cols WHERE id = 5 LOOP
+    IF ln ~ 'rows=' THEN RETURN substring(ln FROM 'rows=(\d+)')::int; END IF;
+  END LOOP;
+  RETURN NULL;
+END
+$$;
+SELECT pg_temp.carry_est() < 5 AS carry21_cols_visible;
+ carry21_cols_visible 
+----------------------
+ t
+(1 row)
+
+INSERT INTO t_carry_cols SELECT g FROM generate_series(10001, 10200) g;
+INSERT INTO t_carry_cols SELECT g FROM generate_series(10201, 10400) g;
+SELECT pg_temp.carry_est() < 5 AS carry21_cols_visible_at_4pct;
+ carry21_cols_visible_at_4pct 
+------------------------------
+ t
+(1 row)
+
+INSERT INTO t_carry_cols SELECT g FROM generate_series(10401, 10600) g;
+SELECT pg_temp.carry_est() > 20 AS carry21_cols_hidden_at_6pct;
+ carry21_cols_hidden_at_6pct 
+-----------------------------
+ t
+(1 row)
+
+DROP TABLE t_carry_cols;
+-- 21b. Перенос верен, только пока журнал видит каждую запись.  Ниже пути,
+--      где запись или сброс таблицы идут мимо обычного учета.
+-- ON COMMIT DELETE ROWS очищает таблицу на COMMIT без счетчиков, а COPY не
+-- планируется, поэтому перед ним пустоту хранилища проверяет сам fasttrun.
+CREATE TEMP TABLE t_carry_odr (id int) ON COMMIT DELETE ROWS;
+BEGIN;
+INSERT INTO t_carry_odr SELECT generate_series(1, 10);
+SELECT fasttrun_analyze('t_carry_odr');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+COMMIT;
+BEGIN;
+COPY t_carry_odr FROM stdin;
+SELECT fasttrun_analyze('t_carry_odr');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+SELECT reltuples = 10 AS carry21b_odr_copy FROM fasttrun_relstats('t_carry_odr');
+ carry21b_odr_copy 
+-------------------
+ t
+(1 row)
+
+COMMIT;
+DROP TABLE t_carry_odr;
+-- Ядерный TRUNCATE в точке сохранения: при RELEASE ее счетчики заменяют
+-- счетчики родителя, а не складываются с ними.
+CREATE TEMP TABLE t_carry_trunc (grp int);
+BEGIN;
+INSERT INTO t_carry_trunc SELECT g % 10 FROM generate_series(1, 100) g;
+SAVEPOINT s;
+TRUNCATE t_carry_trunc;
+INSERT INTO t_carry_trunc SELECT g % 10 FROM generate_series(1, 1000) g;
+SELECT fasttrun_analyze('t_carry_trunc');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+RELEASE SAVEPOINT s;
+SELECT fasttrun_analyze('t_carry_trunc');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+SELECT reltuples = 1000 AS carry21b_trunc_release FROM fasttrun_relstats('t_carry_trunc');
+ carry21b_trunc_release 
+------------------------
+ t
+(1 row)
+
+COMMIT;
+SELECT fasttrun_analyze('t_carry_trunc');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+SELECT reltuples = 1000 AS carry21b_trunc_commit FROM fasttrun_relstats('t_carry_trunc');
+ carry21b_trunc_commit 
+-----------------------
+ t
+(1 row)
+
+DROP TABLE t_carry_trunc;
+-- Запись при выключенном track_counts счетчики не видят.
+CREATE TEMP TABLE t_carry_uncounted (id int);
+INSERT INTO t_carry_uncounted SELECT generate_series(1, 1000);
+SELECT fasttrun_analyze('t_carry_uncounted');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+BEGIN;
+SET LOCAL track_counts = off;
+INSERT INTO t_carry_uncounted SELECT generate_series(1001, 1100);
+SET LOCAL track_counts = on;
+COMMIT;
+SELECT fasttrun_analyze('t_carry_uncounted');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+SELECT reltuples = 1100 AS carry21b_uncounted FROM fasttrun_relstats('t_carry_uncounted');
+ carry21b_uncounted 
+--------------------
+ t
+(1 row)
+
+DROP TABLE t_carry_uncounted;
+-- analyze внутри modifying CTE сканирует по снимку, который не видит
+-- вставленные строки, а счетчики их уже учитывают.
+CREATE TEMP TABLE t_carry_cte (id int);
+INSERT INTO t_carry_cte SELECT generate_series(1, 1000);
+BEGIN;
+WITH w AS (INSERT INTO t_carry_cte SELECT generate_series(1001, 2000) RETURNING id)
+SELECT count(*) AS carry21b_cte_inserted, fasttrun_analyze('t_carry_cte') IS NOT NULL AS analyzed FROM w;
+ carry21b_cte_inserted | analyzed 
+-----------------------+----------
+                  1000 | t
+(1 row)
+
+COMMIT;
+SELECT fasttrun_analyze('t_carry_cte');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+SELECT reltuples = 2000 AS carry21b_cte FROM fasttrun_relstats('t_carry_cte');
+ carry21b_cte 
+--------------
+ t
+(1 row)
+
+DROP TABLE t_carry_cte;
+-- Строки, вставленные через секционированного родителя, попадают в секцию.
+CREATE TEMP TABLE t_carry_parent (id int) PARTITION BY RANGE (id);
+CREATE TEMP TABLE t_carry_leaf PARTITION OF t_carry_parent FOR VALUES FROM (0) TO (100000);
+INSERT INTO t_carry_leaf SELECT generate_series(1, 1000);
+SELECT fasttrun_analyze('t_carry_leaf');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+INSERT INTO t_carry_parent SELECT generate_series(1001, 2000);
+COPY t_carry_parent FROM stdin;
+SELECT fasttrun_analyze('t_carry_leaf');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+SELECT reltuples = 2010 AS carry21b_partition FROM fasttrun_relstats('t_carry_leaf');
+ carry21b_partition 
+--------------------
+ t
+(1 row)
+
+DROP TABLE t_carry_parent;
+-- Счет разреженной кучи по выборке блоков - оценка.  Пересбор не выдает ее
+-- за точный счет: 200 строк на первой странице и пустой хвост.
+CREATE TEMP TABLE t_carry_sparse (grp int);
+INSERT INTO t_carry_sparse SELECT 1 FROM generate_series(1, 200);
+INSERT INTO t_carry_sparse SELECT 2 FROM generate_series(1, 20000);
+DELETE FROM t_carry_sparse WHERE grp = 2;
+BEGIN;
+SET LOCAL fasttrun.max_analyze_pages = 1;
+SET LOCAL fasttrun.sample_rows = 30;
+SELECT fasttrun_analyze('t_carry_sparse');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+SET LOCAL fasttrun.sample_rows = 1000;
+UPDATE t_carry_sparse SET grp = grp;
+SELECT fasttrun_analyze('t_carry_sparse');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+SELECT reltuples = 200 AS carry21b_sparse_count FROM fasttrun_relstats('t_carry_sparse');
+ carry21b_sparse_count 
+-----------------------
+ t
+(1 row)
+
+SELECT stadistinct > -1e9 AND stadistinct < 1e9 AS carry21b_sparse_finite
+  FROM fasttrun_inspect_stats('t_carry_sparse') WHERE staattnum = 1;
+ carry21b_sparse_finite 
+------------------------
+ t
+(1 row)
+
+COMMIT;
+DROP TABLE t_carry_sparse;
+-- Сдвиг якоря индекса записывается в журнал: откат точки сохранения и затем
+-- транзакции возвращает relstats индекса к значению до транзакции.
+CREATE TEMP TABLE t_carry_idx (id int);
+CREATE INDEX t_carry_idx_id ON t_carry_idx (id);
+INSERT INTO t_carry_idx SELECT generate_series(1, 20000);
+SELECT fasttrun_analyze('t_carry_idx');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+BEGIN;
+INSERT INTO t_carry_idx SELECT generate_series(20001, 20400);
+SET LOCAL fasttrun.auto_collect_stats = off;
+SELECT fasttrun_analyze('t_carry_idx');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+SAVEPOINT s;
+SET LOCAL fasttrun.stats_refresh_threshold = 0;
+SELECT fasttrun_analyze('t_carry_idx');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+ROLLBACK TO SAVEPOINT s;
+ROLLBACK;
+SELECT reltuples = 20000 AS carry21b_index_rollback FROM fasttrun_relstats('t_carry_idx_id');
+ carry21b_index_rollback 
+-------------------------
+ t
+(1 row)
+
+DROP TABLE t_carry_idx;
+-- analyze внутри оператора, который пишет таблицу, статистику колонок
+-- планировщику не отдает.  Следующий analyze без нового DML собирает ее
+-- заново, и после COMMIT, и в той же транзакции, а не оставляет колонки
+-- пустыми.  Первый случай - пересбор дельтой (UPDATE всех строк превышает
+-- порог), второй - тот же пересбор без COMMIT, третий - холодный проход.
+CREATE TEMP TABLE t_carry_unsafe (id int, grp int);
+INSERT INTO t_carry_unsafe SELECT g, g % 10 FROM generate_series(1, 1000) g;
+SELECT fasttrun_analyze('t_carry_unsafe');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+BEGIN;
+WITH w AS (UPDATE t_carry_unsafe SET grp = grp RETURNING id)
+SELECT count(*) AS carry21b_unsafe_updated, fasttrun_analyze('t_carry_unsafe') IS NOT NULL AS analyzed FROM w;
+ carry21b_unsafe_updated | analyzed 
+-------------------------+----------
+                    1000 | t
+(1 row)
+
+COMMIT;
+SELECT fasttrun_analyze('t_carry_unsafe');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+SELECT count(*) = 2 AS carry21b_unsafe_recollected FROM fasttrun_inspect_stats('t_carry_unsafe');
+ carry21b_unsafe_recollected 
+-----------------------------
+ t
+(1 row)
+
+BEGIN;
+WITH w AS (UPDATE t_carry_unsafe SET grp = grp RETURNING id)
+SELECT count(*) AS carry21b_unsafe_updated_inxact, fasttrun_analyze('t_carry_unsafe') IS NOT NULL AS analyzed FROM w;
+ carry21b_unsafe_updated_inxact | analyzed 
+--------------------------------+----------
+                           1000 | t
+(1 row)
+
+SELECT fasttrun_analyze('t_carry_unsafe');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+SELECT count(*) = 2 AS carry21b_unsafe_recollected_inxact FROM fasttrun_inspect_stats('t_carry_unsafe');
+ carry21b_unsafe_recollected_inxact 
+------------------------------------
+ t
+(1 row)
+
+COMMIT;
+DROP TABLE t_carry_unsafe;
+CREATE TEMP TABLE t_carry_unsafe_cold (id int, grp int);
+INSERT INTO t_carry_unsafe_cold SELECT g, g % 10 FROM generate_series(1, 1000) g;
+BEGIN;
+WITH w AS (UPDATE t_carry_unsafe_cold SET grp = grp RETURNING id)
+SELECT count(*) AS carry21b_unsafe_cold_updated, fasttrun_analyze('t_carry_unsafe_cold') IS NOT NULL AS analyzed FROM w;
+ carry21b_unsafe_cold_updated | analyzed 
+------------------------------+----------
+                         1000 | t
+(1 row)
+
+COMMIT;
+SELECT fasttrun_analyze('t_carry_unsafe_cold');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+SELECT count(*) = 2 AS carry21b_unsafe_cold_recollected FROM fasttrun_inspect_stats('t_carry_unsafe_cold');
+ carry21b_unsafe_cold_recollected 
+----------------------------------
+ t
+(1 row)
+
+SELECT reltuples = 1000 AS carry21b_unsafe_cold_count FROM fasttrun_relstats('t_carry_unsafe_cold');
+ carry21b_unsafe_cold_count 
+----------------------------
+ t
+(1 row)
+
+DROP TABLE t_carry_unsafe_cold;
+-- Явный fasttrun_collect_stats внутри пишущего оператора тоже дает образец,
+-- который планировщику не отдается.  Следующий analyze собирает заново и
+-- после COMMIT, и в той же транзакции.
+CREATE TEMP TABLE t_carry_unsafe_explicit (id int, grp int);
+INSERT INTO t_carry_unsafe_explicit SELECT g, g % 10 FROM generate_series(1, 1000) g;
+SELECT fasttrun_analyze('t_carry_unsafe_explicit');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+BEGIN;
+WITH w AS (UPDATE t_carry_unsafe_explicit SET grp = grp RETURNING id)
+SELECT count(*) AS carry21b_unsafe_explicit_updated, fasttrun_collect_stats('t_carry_unsafe_explicit') FROM w;
+ carry21b_unsafe_explicit_updated | fasttrun_collect_stats 
+----------------------------------+------------------------
+                             1000 | 
+(1 row)
+
+COMMIT;
+SELECT fasttrun_analyze('t_carry_unsafe_explicit');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+SELECT count(*) = 2 AS carry21b_unsafe_explicit_commit FROM fasttrun_inspect_stats('t_carry_unsafe_explicit');
+ carry21b_unsafe_explicit_commit 
+---------------------------------
+ t
+(1 row)
+
+BEGIN;
+WITH w AS (UPDATE t_carry_unsafe_explicit SET grp = grp RETURNING id)
+SELECT count(*) AS carry21b_unsafe_explicit_updated_inxact, fasttrun_collect_stats('t_carry_unsafe_explicit') FROM w;
+ carry21b_unsafe_explicit_updated_inxact | fasttrun_collect_stats 
+-----------------------------------------+------------------------
+                                    1000 | 
+(1 row)
+
+SELECT fasttrun_analyze('t_carry_unsafe_explicit');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+SELECT count(*) = 2 AS carry21b_unsafe_explicit_inxact FROM fasttrun_inspect_stats('t_carry_unsafe_explicit');
+ carry21b_unsafe_explicit_inxact 
+---------------------------------
+ t
+(1 row)
+
+COMMIT;
+DROP TABLE t_carry_unsafe_explicit;
+-- Явный сбор во время записи при нулевом износе: UPDATE не меняет ни одной
+-- строки, а образец все равно небезопасен.  COMMIT его скрывает и сбрасывает
+-- дельту, поэтому следующий analyze собирает заново.
+CREATE TEMP TABLE t_carry_unsafe_zero (id int, grp int);
+INSERT INTO t_carry_unsafe_zero SELECT g, g % 10 FROM generate_series(1, 1000) g;
+SELECT fasttrun_analyze('t_carry_unsafe_zero');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+BEGIN;
+WITH w AS (UPDATE t_carry_unsafe_zero SET grp = grp WHERE false RETURNING id)
+SELECT count(*) AS carry21b_unsafe_zero_updated, fasttrun_collect_stats('t_carry_unsafe_zero') FROM w;
+ carry21b_unsafe_zero_updated | fasttrun_collect_stats 
+------------------------------+------------------------
+                            0 | 
+(1 row)
+
+COMMIT;
+SELECT fasttrun_analyze('t_carry_unsafe_zero');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+SELECT count(*) = 2 AS carry21b_unsafe_zero_recollected FROM fasttrun_inspect_stats('t_carry_unsafe_zero');
+ carry21b_unsafe_zero_recollected 
+----------------------------------
+ t
+(1 row)
+
+DROP TABLE t_carry_unsafe_zero;
+-- Явный сбор пустой выборкой во время записи тоже ничего не говорит о
+-- таблице: база пересбора остается на месте, и после COMMIT analyze собирает.
+CREATE TEMP TABLE t_carry_unsafe_empty (id int, grp int);
+SELECT fasttrun_analyze('t_carry_unsafe_empty');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+BEGIN;
+WITH w AS (INSERT INTO t_carry_unsafe_empty SELECT g, g % 10 FROM generate_series(1, 1000) g RETURNING id)
+SELECT count(*) AS carry21b_unsafe_empty_inserted, fasttrun_collect_stats('t_carry_unsafe_empty') FROM w;
+ carry21b_unsafe_empty_inserted | fasttrun_collect_stats 
+--------------------------------+------------------------
+                           1000 | 
+(1 row)
+
+COMMIT;
+SELECT fasttrun_analyze('t_carry_unsafe_empty');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+SELECT count(*) = 2 AS carry21b_unsafe_empty_recollected FROM fasttrun_inspect_stats('t_carry_unsafe_empty');
+ carry21b_unsafe_empty_recollected 
+-----------------------------------
+ t
+(1 row)
+
+DROP TABLE t_carry_unsafe_empty;
+-- ON COMMIT DELETE ROWS и закешированный общий план: INSERT идет без
+-- планирования, и пустоту хранилища проверяет первая запись транзакции.
+CREATE TEMP TABLE t_carry_odr_generic (id int) ON COMMIT DELETE ROWS;
+BEGIN;
+INSERT INTO t_carry_odr_generic SELECT generate_series(1, 10);
+SELECT fasttrun_analyze('t_carry_odr_generic');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+PREPARE carry_odr_ins AS INSERT INTO t_carry_odr_generic SELECT generate_series(1, 10);
+EXPLAIN (COSTS OFF) EXECUTE carry_odr_ins;
+          QUERY PLAN           
+-------------------------------
+ Insert on t_carry_odr_generic
+   ->  ProjectSet
+         ->  Result
+(3 rows)
+
+COMMIT;
+BEGIN;
+EXECUTE carry_odr_ins;
+SELECT fasttrun_analyze('t_carry_odr_generic');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+SELECT reltuples = 10 AS carry21b_odr_generic FROM fasttrun_relstats('t_carry_odr_generic');
+ carry21b_odr_generic 
+----------------------
+ t
+(1 row)
+
+COMMIT;
+DEALLOCATE carry_odr_ins;
+DROP TABLE t_carry_odr_generic;
+-- Пересчет частичного индекса внутри пишущего оператора ждет конца записи:
+-- полный проход по старому снимку дал бы 1000 строк при 1010 по счетчикам.
+CREATE TEMP TABLE t_carry_partial (id int, flag bool);
+CREATE INDEX t_carry_partial_flag ON t_carry_partial (id) WHERE flag;
+INSERT INTO t_carry_partial SELECT g, g % 2 = 0 FROM generate_series(1, 1000) g;
+SET fasttrun.auto_collect_stats = off;
+SET fasttrun.max_analyze_pages = 0;
+SELECT fasttrun_analyze('t_carry_partial');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+BEGIN;
+WITH w AS (INSERT INTO t_carry_partial SELECT g, true FROM generate_series(1001, 1010) g RETURNING id)
+SELECT count(*) AS carry21b_partial_inserted, fasttrun_analyze('t_carry_partial') IS NOT NULL AS analyzed FROM w;
+ carry21b_partial_inserted | analyzed 
+---------------------------+----------
+                        10 | t
+(1 row)
+
+COMMIT;
+SELECT fasttrun_analyze('t_carry_partial');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+SELECT reltuples = 1010 AS carry21b_partial_count FROM fasttrun_relstats('t_carry_partial');
+ carry21b_partial_count 
+------------------------
+ t
+(1 row)
+
+RESET fasttrun.auto_collect_stats;
+RESET fasttrun.max_analyze_pages;
+DROP TABLE t_carry_partial;
+-- Пересчет без нового DML публикует новое число строк: оценка по выборке
+-- блоков заменяется полным проходом, хотя дельта нулевая.
+CREATE TEMP TABLE t_carry_recount (grp int);
+INSERT INTO t_carry_recount SELECT 1 FROM generate_series(1, 200);
+INSERT INTO t_carry_recount SELECT 2 FROM generate_series(1, 20000);
+DELETE FROM t_carry_recount WHERE grp = 2;
+BEGIN;
+SET LOCAL fasttrun.max_analyze_pages = 1;
+SET LOCAL fasttrun.sample_rows = 30;
+SELECT fasttrun_analyze('t_carry_recount');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+SET LOCAL fasttrun.auto_collect_stats = off;
+UPDATE t_carry_recount SET grp = grp;
+SELECT fasttrun_analyze('t_carry_recount');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+SET LOCAL fasttrun.auto_collect_stats = on;
+SET LOCAL fasttrun.max_analyze_pages = 0;
+SET LOCAL fasttrun.sample_rows = 1000;
+SELECT fasttrun_analyze('t_carry_recount');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+SELECT reltuples = 200 AS carry21b_recount_published FROM fasttrun_relstats('t_carry_recount');
+ carry21b_recount_published 
+----------------------------
+ t
+(1 row)
+
+COMMIT;
+DROP TABLE t_carry_recount;
+-- VACUUM сокращает хвост кучи мимо счетчиков: следующий analyze проходит
+-- таблицу заново и публикует фактический размер.
+CREATE TEMP TABLE t_carry_vacuum (grp int);
+INSERT INTO t_carry_vacuum SELECT 1 FROM generate_series(1, 200);
+INSERT INTO t_carry_vacuum SELECT 2 FROM generate_series(1, 20000);
+DELETE FROM t_carry_vacuum WHERE grp = 2;
+SELECT fasttrun_analyze('t_carry_vacuum');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+VACUUM (TRUNCATE ON) t_carry_vacuum;
+SELECT fasttrun_analyze('t_carry_vacuum');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+SELECT relpages = pg_relation_size('t_carry_vacuum') / 8192 AND reltuples = 200
+  AS carry21b_vacuum_pages FROM fasttrun_relstats('t_carry_vacuum');
+ carry21b_vacuum_pages 
+-----------------------
+ t
+(1 row)
+
+DROP TABLE t_carry_vacuum;
+-- Ноль, оцененный выборкой блоков, не подтверждает базу пересбора, пока
+-- пересбор отложен записью: следующий analyze пересчитывает строки.
+CREATE TEMP TABLE t_carry_zero (grp int);
+INSERT INTO t_carry_zero SELECT 1 FROM generate_series(1, 200);
+INSERT INTO t_carry_zero SELECT 2 FROM generate_series(1, 20000);
+DELETE FROM t_carry_zero WHERE grp = 2;
+SET fasttrun.max_analyze_pages = 1;
+SET fasttrun.sample_rows = 1;
+SELECT fasttrun_analyze('t_carry_zero');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+SET fasttrun.max_analyze_pages = 0;
+SET fasttrun.sample_rows = 1000;
+WITH w AS (UPDATE t_carry_zero SET grp = grp RETURNING grp)
+SELECT count(*) AS carry21b_zero_updated, fasttrun_analyze('t_carry_zero') IS NOT NULL AS analyzed FROM w;
+ carry21b_zero_updated | analyzed 
+-----------------------+----------
+                   200 | t
+(1 row)
+
+SELECT fasttrun_analyze('t_carry_zero');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+SELECT reltuples = 200 AS carry21b_zero_recount FROM fasttrun_relstats('t_carry_zero');
+ carry21b_zero_recount 
+-----------------------
+ t
+(1 row)
+
+RESET fasttrun.max_analyze_pages;
+RESET fasttrun.sample_rows;
+DROP TABLE t_carry_zero;
+-- Откат точки сохранения после пересбора возвращает образец прошлого сбора.
+-- Следующий analyze видит, что допуск его скрыл, и собирает заново.
+CREATE TEMP TABLE t_carry_rollback_seq (id int);
+INSERT INTO t_carry_rollback_seq SELECT generate_series(1, 10000);
+SELECT fasttrun_analyze('t_carry_rollback_seq');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+BEGIN;
+INSERT INTO t_carry_rollback_seq SELECT generate_series(10001, 10600);
+SAVEPOINT s;
+SELECT fasttrun_analyze('t_carry_rollback_seq');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+ROLLBACK TO SAVEPOINT s;
+SELECT fasttrun_analyze('t_carry_rollback_seq');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+SELECT count(*) = 1 AS carry21b_rollback_seq_inxact FROM fasttrun_inspect_stats('t_carry_rollback_seq');
+ carry21b_rollback_seq_inxact 
+------------------------------
+ t
+(1 row)
+
+COMMIT;
+SELECT fasttrun_analyze('t_carry_rollback_seq');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+SELECT count(*) = 1 AS carry21b_rollback_seq_commit FROM fasttrun_inspect_stats('t_carry_rollback_seq');
+ carry21b_rollback_seq_commit 
+------------------------------
+ t
+(1 row)
+
+DROP TABLE t_carry_rollback_seq;
+-- Первый analyze транзакции после очистки ON COMMIT DELETE ROWS сам проверяет
+-- хранилище: пустая таблица публикуется пустой, и сохраненные планы
+-- сбрасываются (строка DEBUG ниже).
+CREATE TEMP TABLE t_carry_odr_analyze (id int) ON COMMIT DELETE ROWS;
+BEGIN;
+INSERT INTO t_carry_odr_analyze SELECT generate_series(1, 100);
+SELECT fasttrun_analyze('t_carry_odr_analyze');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+COMMIT;
+BEGIN;
+SET LOCAL client_min_messages = debug1;
+SELECT fasttrun_analyze('t_carry_odr_analyze');
+DEBUG:  fasttrun: invalidating backend-local cached plans
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+RESET client_min_messages;
+COMMIT;
+DROP TABLE t_carry_odr_analyze;
 DROP EXTENSION fasttrun;

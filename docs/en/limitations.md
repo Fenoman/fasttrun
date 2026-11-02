@@ -66,9 +66,15 @@ work without `shared_preload_libraries`.
   built-in `TRUNCATE` and `ANALYZE`. Restrict access through `EXECUTE` grants.
 - Local statistics survive transactions in one backend but disappear when the
   connection ends.
-- After DML is committed without `fasttrun_analyze()`, a same-sized change in
-  the data distribution can go unnoticed. Call `fasttrun_analyze()` after every
-  fill.
+- A write that goes past both the executor and `COPY`, such as a direct table
+  AM write by another extension, does not reach the transaction journal. If
+  the same transaction made no `fasttrun_analyze()` call for that table,
+  `COMMIT` does not carry its counters over, and the next call counts rows from
+  the old base. The row count stays old, and only a threefold or larger change
+  in table size hides the column statistics. A `fasttrun_analyze()` call after
+  the fill in the same transaction carries such a write over too, so call it
+  after every fill. fasttrun recognizes an `ON COMMIT DELETE ROWS` cleanup by
+  the empty storage on the next access to the table.
 - Local plans are invalidated only in the current backend. `ResetPlanCache` is
   not called during normal work: it is called at most once, at backend exit,
   before PostgreSQL core removes the temporary tables.
@@ -92,11 +98,22 @@ work without `shared_preload_libraries`.
   records the parent named in the statement, while PostgreSQL core picks the
   partition later, when it routes rows. Collecting statistics of that partition
   from inside such a statement, for example from a trigger, does not see the
-  running write and may serve a sample taken during it.
-- `DISCARD TEMP` lifts the unfinished-cleanup block at once, not at commit. If
-  the transaction that ran it rolls back, the table comes back without the
-  block. Queries on it either fail reading an index or TOAST page, or see
-  correct data or an already empty table: there are no silent wrong results.
-  Running `fasttruncate()` again repairs the table. For recovery, run
-  `DISCARD TEMP` outside a transaction.
+  running write and may serve a sample taken during it. The first pass over the
+  partition from inside such a statement counts rows on the old snapshot, and
+  that count carries into later transactions until `fasttruncate()` or
+  `TRUNCATE` empties the partition. The `UPDATE` of an
+  `INSERT ... ON CONFLICT` through the parent goes straight to the partition,
+  and the partition's account of changed columns does not see it.
+- In a session without a preloaded library, the first fasttrun call inside a
+  modifying CTE does not see the outer statement, and the first pass over the
+  table may keep a row count from the old snapshot. Preloading through
+  `shared_preload_libraries` or `session_preload_libraries` rules this out.
+- A function that turns `track_counts` off inside a writing statement (a
+  superuser parameter) stops counting for an already open table, and such a
+  write is not carried over `COMMIT`.
+- Only changes start a rebuild of column statistics. Without new DML or an
+  explicit `fasttrun_collect_stats()`, a column stays on default estimates in
+  these cases: after an explicit collect during a write when analyze runs
+  before `COMMIT`, with `stats_refresh_threshold = 1`, and until the
+  transaction ends after the registry of writing statements overflows.
 - fasttrun is not a security boundary between connection-pooler clients.

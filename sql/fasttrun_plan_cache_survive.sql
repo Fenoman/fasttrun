@@ -384,6 +384,41 @@ DROP TABLE t_cum_drift;
 RESET fasttrun.sample_rows;
 
 -- ----------------------------------------------------------------------
+-- 9b. Размер индекса проходит тот же порог от якоря последней
+--     инвалидации.  Прирост на 2% добавляет индексу страницы, но ниже
+--     порога: инвалидации нет.  Еще +25% от якоря: инвалидация одна.  При
+--     пороге 0 любой рост индекса инвалидирует.
+-- ----------------------------------------------------------------------
+SET fasttrun.sample_rows = 0;
+CREATE TEMP TABLE t_idx_drift (id int, pad text);
+CREATE INDEX ON t_idx_drift (id);
+INSERT INTO t_idx_drift SELECT g, repeat('x', 100) FROM generate_series(1, 20000) g;
+
+BEGIN;
+SELECT fasttrun_analyze('t_idx_drift');
+SELECT relpages AS idx_pages_before FROM fasttrun_relstats('t_idx_drift_id_idx') \gset
+INSERT INTO t_idx_drift SELECT g, repeat('x', 100) FROM generate_series(20001, 20400) g;
+SET client_min_messages = debug1;
+SELECT fasttrun_analyze('t_idx_drift');
+RESET client_min_messages;
+SELECT relpages > :idx_pages_before AS idx9b_index_grew
+  FROM fasttrun_relstats('t_idx_drift_id_idx');
+
+INSERT INTO t_idx_drift SELECT g, repeat('x', 100) FROM generate_series(20401, 25500) g;
+SET client_min_messages = debug1;
+SELECT fasttrun_analyze('t_idx_drift');
+RESET client_min_messages;
+
+SET LOCAL fasttrun.invalidate_threshold = 0;
+INSERT INTO t_idx_drift SELECT g, repeat('x', 100) FROM generate_series(25501, 25900) g;
+SET client_min_messages = debug1;
+SELECT fasttrun_analyze('t_idx_drift');
+RESET client_min_messages;
+COMMIT;
+DROP TABLE t_idx_drift;
+RESET fasttrun.sample_rows;
+
+-- ----------------------------------------------------------------------
 -- 10. Якорь порога сбрасывается при откате savepoint: инвалидация из
 --     ABORT_SUB рушит планы, но якорь last_inval_* без сброса остался бы
 --     от отменённого analyze — и подавлял бы следующую инвалидацию, пока
@@ -442,16 +477,13 @@ COMMIT;
 DROP TABLE t_inval_dedup;
 
 -- ----------------------------------------------------------------------
--- 12. Смена видимости column stats инвалидирует generic plan.  Near-unique
---     колонка получает cardinality-scaled freshness-порог (пол 5%), а
---     пересбор статы гейтится плоским stats_refresh_threshold (20%):
---     churn в полосе между ними прячет стату от новых планов без
---     пересбора.  Generic план, построенный на видимой стате (grp=$1 ->
---     оценка ~1 строка), обязан инвалидироваться тем же fasttrun_analyze,
---     который наблюдает флип visible->hidden, иначе живёт на stale rows=1
---     при факте 10000.  Всё в одной транзакции: analyze в новой xact идёт
---     cold-recollect'ом и инвалидирует безусловно.  Считаем по
---     DEBUG-строке из fasttrun_invalidate_local_plan_cache.
+-- 12. Скрытая колонка запускает пересбор.  Near-unique колонка получает
+--     cardinality-scaled freshness-порог (пол 5%), а общий churn таблицы
+--     сравнивается с stats_refresh_threshold (20%).  Churn в полосе между
+--     ними прячет стату колонки, и fasttrun_analyze, который это видит,
+--     пересобирает статистику, хотя общий churn ниже порога: одна
+--     инвалидация (DEBUG-строка из fasttrun_invalidate_local_plan_cache), а
+--     свежая выборка ловит горячее значение grp = 1 (10000 строк).
 -- ----------------------------------------------------------------------
 BEGIN;
 SET LOCAL plan_cache_mode = force_generic_plan;
@@ -483,19 +515,19 @@ SET client_min_messages = debug1;
 SELECT fasttrun_analyze('t_vis_flip');
 RESET client_min_messages;
 
--- План обязан перепланироваться: оценка коллапсирует к defaults (~500),
--- а не остаётся stale rows=1 от спрятанной статы.
+-- Свежая статистика видит горячее значение: оценка около 10000, а не 1 от
+-- прежней выборки и не дефолтные ~500.
 DO $$
 DECLARE ln text; est int := NULL;
 BEGIN
-  FOR ln IN EXPLAIN EXECUTE q_flip(1) LOOP
+  FOR ln IN EXPLAIN SELECT count(*) FROM t_vis_flip WHERE grp = 1 LOOP
     IF ln ~ 'on t_vis_flip' THEN est := substring(ln FROM 'rows=(\d+)')::int; EXIT; END IF;
   END LOOP;
-  IF est IS NULL OR est < 100 THEN
-    RAISE EXCEPTION 'stale generic plan after visibility flip: est=%', est;
+  IF est IS NULL OR est < 5000 OR est > 20000 THEN
+    RAISE EXCEPTION 'hidden column was not recollected: est=%', est;
   END IF;
 END$$;
-SELECT 'vis_flip_replanned_ok' AS marker;
+SELECT 'vis_flip_recollected_ok' AS marker;
 
 DEALLOCATE q_flip;
 COMMIT;
