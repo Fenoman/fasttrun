@@ -30,6 +30,7 @@ DATA = extension/fasttrun--2.0.sql \
        extension/fasttrun--2.5.0.sql \
        extension/fasttrun--2.5.1.sql \
        extension/fasttrun--2.5.2.sql \
+       extension/fasttrun--2.6.0.sql \
        extension/fasttrun--2.0--2.1.sql \
        extension/fasttrun--2.1--2.1.1.sql \
        extension/fasttrun--2.1.1--2.1.2.sql \
@@ -44,6 +45,7 @@ DATA = extension/fasttrun--2.0.sql \
        extension/fasttrun--2.4.1--2.5.0.sql \
        extension/fasttrun--2.5.0--2.5.1.sql \
        extension/fasttrun--2.5.1--2.5.2.sql \
+       extension/fasttrun--2.5.2--2.6.0.sql \
        extension/fasttrun--unpackaged--2.0.sql
 DOCS = README.fasttrun
 PGFILEDESC = "fasttrun - sinval-free truncate and analyze for temporary tables"
@@ -61,7 +63,8 @@ REGRESS = fasttrun_basic \
           fasttrun_plan_cache_survive \
           fasttrun_stats_width \
           fasttrun_discard \
-          fasttrun_zero_sinval_catalog
+          fasttrun_zero_sinval_catalog \
+          fasttrun_observe
 
 PG_CONFIG ?= pg_config
 

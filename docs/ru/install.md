@@ -36,7 +36,7 @@ FROM pg_extension
 WHERE extname = 'fasttrun';
 ```
 
-Версия по умолчанию - `2.5.2`.
+Версия по умолчанию - `2.6.0`.
 
 Вместо обычного `CREATE EXTENSION` расширение можно установить в отдельную
 схему. Схема с API не должна разрешать недоверенным ролям создавать объекты:
@@ -66,7 +66,7 @@ CREATE EXTENSION fasttrun WITH SCHEMA fasttrun_api;
 
 ## Права
 
-Все 10 SQL-функций после установки имеют стандартное для PostgreSQL право
+Все 14 SQL-функций после установки имеют стандартное для PostgreSQL право
 `EXECUTE` для `PUBLIC` и работают как `SECURITY INVOKER`. Внутренние проверки
 владения и ACL таблицы не выполняются. Это особенно важно в transaction
 pooling, если один backend работает под разными ролями через `SET ROLE`.
@@ -102,6 +102,10 @@ REVOKE EXECUTE ON FUNCTION public.fasttrun_cache_stats() FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION public.fasttrun_hot_temp_tables(integer) FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION public.fasttrun_prewarm() FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION public.fasttrun_reset_temp_stats() FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION public.fasttrun_counters() FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION public.fasttrun_counters_reset() FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION public.fasttrun_cached_tables() FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION public.fasttrun_blocked_tables() FROM PUBLIC;
 
 GRANT EXECUTE ON FUNCTION public.fasttruncate(text) TO app_role;
 GRANT EXECUTE ON FUNCTION public.fasttrun_analyze(text) TO app_role;
@@ -171,7 +175,7 @@ make install PG_CONFIG=/path/to/pg_config
 владельца расширения или суперпользователя:
 
 ```sql
-ALTER EXTENSION fasttrun UPDATE TO '2.5.2';
+ALTER EXTENSION fasttrun UPDATE TO '2.6.0';
 ```
 
 При физической репликации установите файлы и на резервные узлы, но выполняйте
@@ -183,7 +187,12 @@ ALTER EXTENSION fasttrun UPDATE TO '2.5.2';
 
 Между версиями 2.4.0, 2.4.1, 2.5.0, 2.5.1 и 2.5.2 SQL-объекты расширения не
 меняются, поэтому обновление сводится к замене C-библиотеки и
-`ALTER EXTENSION ... UPDATE`.
+`ALTER EXTENSION ... UPDATE`. Обновление 2.5.2 -> 2.6.0 добавляет четыре
+функции наблюдаемости: `fasttrun_counters()`, `fasttrun_counters_reset()`,
+`fasttrun_cached_tables()` и `fasttrun_blocked_tables()`. Их нет в старой
+C-библиотеке, поэтому сначала установите новую. Счетчикам по всему экземпляру
+нужен fasttrun в `shared_preload_libraries`, и новая общая память появляется
+только после перезапуска PostgreSQL.
 Для учета износа статистики по колонкам версиям 2.5 **нужна предзагрузка
 библиотеки**, основные функции работают и без нее. Если fasttrun уже есть
 в `shared_preload_libraries`, менять ничего не нужно. Иначе для клиентских
@@ -236,6 +245,6 @@ DROP EXTENSION fasttrun;
 
 | PostgreSQL | Сборка | Базовые тесты |
 |---|---|---|
-| PostgreSQL 16 | да | 14/14 |
-| PostgreSQL 17 | да | 14/14 |
-| PostgreSQL 18 | да | 14/14 |
+| PostgreSQL 16 | да | 15/15 |
+| PostgreSQL 17 | да | 15/15 |
+| PostgreSQL 18 | да | 15/15 |

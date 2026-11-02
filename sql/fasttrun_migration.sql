@@ -231,8 +231,39 @@ SELECT extname, extversion = (SELECT default_version FROM pg_available_extension
                               WHERE name = 'fasttrun') AS at_latest
   FROM pg_extension WHERE extname = 'fasttrun';
 
+-- ----------------------------------------------------------------------
+-- 10. Обновление дает тот же набор функций, что и чистая установка,
+--     включая функции наблюдаемости 2.6.0.
+-- ----------------------------------------------------------------------
+CREATE TEMP TABLE mig_upgraded_funcs AS
+SELECT p.oid::regprocedure::text AS func
+  FROM pg_proc p
+  JOIN pg_depend d ON d.objid = p.oid AND d.deptype = 'e'
+  JOIN pg_extension e ON e.oid = d.refobjid AND e.extname = 'fasttrun';
+SELECT func FROM mig_upgraded_funcs
+ WHERE func ~ '^fasttrun_(counters|counters_reset|cached_tables|blocked_tables)\('
+ ORDER BY func COLLATE "C";
+
 DROP EXTENSION fasttrun;
 SELECT to_regprocedure('public.fasttrun_cache_stats()') IS NULL
        AS cache_stats_removed_after_drop;
+
+CREATE EXTENSION fasttrun;
+SELECT count(*) AS functions_only_in_fresh_install
+  FROM (SELECT p.oid::regprocedure::text AS func
+          FROM pg_proc p
+          JOIN pg_depend d ON d.objid = p.oid AND d.deptype = 'e'
+          JOIN pg_extension e ON e.oid = d.refobjid AND e.extname = 'fasttrun'
+        EXCEPT
+        SELECT func FROM mig_upgraded_funcs) diff;
+SELECT count(*) AS functions_only_after_upgrade
+  FROM (SELECT func FROM mig_upgraded_funcs
+        EXCEPT
+        SELECT p.oid::regprocedure::text
+          FROM pg_proc p
+          JOIN pg_depend d ON d.objid = p.oid AND d.deptype = 'e'
+          JOIN pg_extension e ON e.oid = d.refobjid AND e.extname = 'fasttrun') diff;
+DROP EXTENSION fasttrun;
+DROP TABLE mig_upgraded_funcs;
 \pset format aligned
 -- Конец прямого пути обновления.

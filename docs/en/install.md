@@ -36,7 +36,7 @@ FROM pg_extension
 WHERE extname = 'fasttrun';
 ```
 
-The default version is `2.5.2`.
+The default version is `2.6.0`.
 
 Instead of a plain `CREATE EXTENSION`, you can install the extension into a
 dedicated schema. Untrusted roles must not be allowed to create objects in the
@@ -67,7 +67,7 @@ in the library list.
 
 ## Privileges
 
-After installation, PostgreSQL grants `EXECUTE` on all 10 SQL functions to
+After installation, PostgreSQL grants `EXECUTE` on all 14 SQL functions to
 `PUBLIC` by default. They run as `SECURITY INVOKER`. The functions do not perform
 internal ownership or table ACL checks. This matters especially in transaction
 pooling when one backend operates under different roles through `SET ROLE`.
@@ -104,6 +104,10 @@ REVOKE EXECUTE ON FUNCTION public.fasttrun_cache_stats() FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION public.fasttrun_hot_temp_tables(integer) FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION public.fasttrun_prewarm() FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION public.fasttrun_reset_temp_stats() FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION public.fasttrun_counters() FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION public.fasttrun_counters_reset() FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION public.fasttrun_cached_tables() FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION public.fasttrun_blocked_tables() FROM PUBLIC;
 
 GRANT EXECUTE ON FUNCTION public.fasttruncate(text) TO app_role;
 GRANT EXECUTE ON FUNCTION public.fasttrun_analyze(text) TO app_role;
@@ -172,7 +176,7 @@ After startup or after opening a new connection, run the following in every
 database as the extension owner or a superuser:
 
 ```sql
-ALTER EXTENSION fasttrun UPDATE TO '2.5.2';
+ALTER EXTENSION fasttrun UPDATE TO '2.6.0';
 ```
 
 With physical replication, install the files on standby nodes too, but run
@@ -184,8 +188,13 @@ function that does not exist in the old C library.
 
 The extension's SQL objects do not change between versions 2.4.0, 2.4.1, 2.5.0,
 2.5.1, and 2.5.2, so an upgrade between them comes down to replacing the C
-library and
-running `ALTER EXTENSION ... UPDATE`. For per-column accounting of statistics
+library and running `ALTER EXTENSION ... UPDATE`. The 2.5.2 -> 2.6.0 upgrade
+adds four observability functions: `fasttrun_counters()`,
+`fasttrun_counters_reset()`, `fasttrun_cached_tables()`, and
+`fasttrun_blocked_tables()`. The old C library does not have them, so install
+the new one first. Instance-wide counters need fasttrun in
+`shared_preload_libraries`, and the new shared memory appears only after a
+PostgreSQL restart. For per-column accounting of statistics
 wear, versions 2.5 **need the library to be preloaded**, and the main functions
 work without it. If fasttrun is already in `shared_preload_libraries`, nothing needs
 to change. Otherwise, for client sessions add:
@@ -237,6 +246,6 @@ preload is already disabled, stop PostgreSQL and remove the file manually.
 
 | PostgreSQL | Builds | Basic tests |
 |---|---|---|
-| PostgreSQL 16 | yes | 14/14 |
-| PostgreSQL 17 | yes | 14/14 |
-| PostgreSQL 18 | yes | 14/14 |
+| PostgreSQL 16 | yes | 15/15 |
+| PostgreSQL 17 | yes | 15/15 |
+| PostgreSQL 18 | yes | 15/15 |

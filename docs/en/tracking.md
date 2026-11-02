@@ -88,7 +88,8 @@ The registry:
 - holds no more than 8,192 names
 - stores only the table name, without a database OID, schema, or user
 - combines identical names from different databases
-- silently rejects new names after it becomes full
+- rejects new names after it becomes full, and the `tracking_rejected` counter
+  of `fasttrun_counters()` shows how many
 
 The registry is not an audit or security source. A session that can issue a
 matching `CREATE TEMP TABLE` command can increment counters even with failed

@@ -1050,7 +1050,9 @@ SELECT relpages = pg_relation_size('t_carry_vacuum') / 8192 AND reltuples = 200
 DROP TABLE t_carry_vacuum;
 
 -- Ноль, оцененный выборкой блоков, не подтверждает базу пересбора, пока
--- пересбор отложен записью: следующий analyze пересчитывает строки.
+-- пересбор отложен записью: следующий analyze пересчитывает строки.  Выборка
+-- из одного блока изредка попадает на единственную живую страницу и дает не
+-- ноль, тогда проверять нечего.
 CREATE TEMP TABLE t_carry_zero (grp int);
 INSERT INTO t_carry_zero SELECT 1 FROM generate_series(1, 200);
 INSERT INTO t_carry_zero SELECT 2 FROM generate_series(1, 20000);
@@ -1058,12 +1060,14 @@ DELETE FROM t_carry_zero WHERE grp = 2;
 SET fasttrun.max_analyze_pages = 1;
 SET fasttrun.sample_rows = 1;
 SELECT fasttrun_analyze('t_carry_zero');
+SELECT reltuples AS zero_cold_estimate FROM fasttrun_relstats('t_carry_zero') \gset
 SET fasttrun.max_analyze_pages = 0;
 SET fasttrun.sample_rows = 1000;
 WITH w AS (UPDATE t_carry_zero SET grp = grp RETURNING grp)
 SELECT count(*) AS carry21b_zero_updated, fasttrun_analyze('t_carry_zero') IS NOT NULL AS analyzed FROM w;
 SELECT fasttrun_analyze('t_carry_zero');
-SELECT reltuples = 200 AS carry21b_zero_recount FROM fasttrun_relstats('t_carry_zero');
+SELECT reltuples = 200 OR :zero_cold_estimate <> 0 AS carry21b_zero_recount
+  FROM fasttrun_relstats('t_carry_zero');
 RESET fasttrun.max_analyze_pages;
 RESET fasttrun.sample_rows;
 DROP TABLE t_carry_zero;

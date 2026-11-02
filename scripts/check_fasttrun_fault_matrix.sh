@@ -988,8 +988,11 @@ SET fasttrun.test_failpoint = '';
 SELECT 'POISON_PLAN_DIRECT ' || pg_temp.ft_poison_plan_probe('SELECT count(*) FROM ft_poison_inline');
 SELECT 'POISON_PLAN_INLINE ' || pg_temp.ft_poison_plan_probe('SELECT count(*) FROM pg_temp.ft_poison_inline_rows()');
 SELECT 'POISON_PLAN_CHILD ' || pg_temp.ft_poison_plan_probe('SELECT count(*) FROM ft_poison_parent');
+SELECT 'POISON_PLAN_BLOCKED ' || string_agg(relname, ',' ORDER BY relname)
+  FROM fasttrun_blocked_tables();
 SELECT fasttruncate('ft_poison_inline');
 SELECT fasttruncate('ft_poison_child');
+SELECT 'POISON_PLAN_BLOCKED_AFTER ' || count(*) FROM fasttrun_blocked_tables();
 SELECT 'POISON_PLAN_REPAIRED ' || pg_temp.ft_poison_plan_probe('SELECT count(*) FROM pg_temp.ft_poison_inline_rows()')
   || ' ' || pg_temp.ft_poison_plan_probe('SELECT count(*) FROM ft_poison_parent');
 SQL
@@ -1008,6 +1011,12 @@ for probe in DIRECT INLINE CHILD; do
 		exit 1
 	fi
 done
+if ! grep -qx 'POISON_PLAN_BLOCKED ft_poison_child,ft_poison_inline' "$WORKDIR/poison_plan.out" ||
+	! grep -qx 'POISON_PLAN_BLOCKED_AFTER 0' "$WORKDIR/poison_plan.out"; then
+	cat "$WORKDIR/poison_plan.out" >&2
+	echo "FAIL: fasttrun_blocked_tables() does not list the blocked tables" >&2
+	exit 1
+fi
 if ! grep -q '^POISON_PLAN_REPAIRED readable 0 readable 0$' "$WORKDIR/poison_plan.out"; then
 	cat "$WORKDIR/poison_plan.out" >&2
 	echo "FAIL: fasttruncate did not repair the blocked tables" >&2
@@ -1143,6 +1152,35 @@ for expect in 'POISON_LATE_SQLFN 55000' 'POISON_LATE_TRUNCATED readable 0' \
 	fi
 done
 echo "poison late passed"
+
+# fasttrun.log_min_duration = 0 пишет в журнал сервера строку на каждый вызов:
+# имя таблицы, время и путь, которым шел вызов.
+cat >"$WORKDIR/slow_log.sql" <<'SQL'
+\set ON_ERROR_STOP 1
+SET client_min_messages = warning;
+SET fasttrun.log_min_duration = 0;
+CREATE TEMP TABLE ft_slow_log(id int);
+INSERT INTO ft_slow_log SELECT generate_series(1, 1000);
+SELECT fasttrun_analyze('ft_slow_log');
+SELECT fasttruncate('ft_slow_log');
+SQL
+
+if ! run_pg "$PSQL" -h "$SOCKET_DIR" -p "$PORT" -d "$DBNAME" -XAtq \
+	-f "$WORKDIR/slow_log.sql" >"$WORKDIR/slow_log.out" 2>&1; then
+	cat "$WORKDIR/slow_log.out" >&2
+	echo "FAIL: slow call log scenario" >&2
+	exit 1
+fi
+for expect in 'fasttrun: fasttrun_analyze of "ft_slow_log" took' \
+	'fasttrun: fasttruncate of "ft_slow_log" took' 'Path: full scan.' \
+	'Path: storage reset.'; do
+	if ! grep -qF "$expect" "$LOG"; then
+		grep -n 'fasttrun:' "$LOG" | tail -5 >&2
+		echo "FAIL: server log has no '$expect'" >&2
+		exit 1
+	fi
+done
+echo "slow log passed"
 
 if grep -Eq 'TRAP|Assertion|FailedAssertion|PANIC|terminated by signal|server process .* was terminated|Segmentation fault|Abort trap' \
 	"$LOG"; then

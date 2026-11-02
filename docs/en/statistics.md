@@ -61,6 +61,22 @@ can differ. Collection is more expensive than with the default settings.
 `SET LOCAL` prevents the modified parameters from leaking to the next pooler
 client.
 
+fasttrun honors a column's statistics target (`ALTER TABLE ... ALTER COLUMN ...
+SET STATISTICS`) the way `ANALYZE` does: `0` turns collection of the column
+off, and a value above zero sets the number of MCVs and histogram buckets.
+`CREATE TABLE ... (LIKE template)` does not copy this setting, and an
+`ALTER TABLE` on every temporary table writes the catalog itself and sends
+shared invalidation messages. So a column of a temporary table with no target
+of its own takes the target of the same-named column of the same-named table
+in the `fasttrun.prewarm_schema` schema. The setting is made once on the
+template:
+
+```sql
+ALTER TABLE dummy_tmp.my_table ALTER COLUMN payload SET STATISTICS 0;
+```
+
+`fasttrun.template_stattarget = off` turns this behavior off.
+
 `UPDATE` is accounted for per column. pgstat counts changed rows per relation,
 and counted that way, updating a single helper column would age the statistics
 of every other column. Wear from an `UPDATE` therefore applies only to the
@@ -169,6 +185,8 @@ The "user" context means that the parameter can be changed with `SET`. The
 | `fasttrun.zero_sinval_truncate` | `on` | boolean | user | `on` clears files without shared messages, while `off` uses the PostgreSQL core cleanup path |
 | `fasttrun.max_analyze_pages` | `100000` | `0..2147483647` pages | user | Above this threshold, the first `fasttrun_analyze()` pass switches to block sampling. A rebuild after changes samples blocks at any size when the count is exact. `0` requires a full scan everywhere |
 | `fasttrun.max_stats_memory` | `0` | KB | user | Soft memory limit for column statistics. `0` means unlimited |
+| `fasttrun.template_stattarget` | `on` | boolean | user | Take a column's statistics target from the same-named template in `fasttrun.prewarm_schema` when the temporary table sets none |
+| `fasttrun.log_min_duration` | `-1` | ms | superuser | Write `fasttruncate()` and `fasttrun_analyze()` calls that take at least this long to the server log: the table, the time, the path of the call, and the pages and rows it published. `-1` turns the log off, `0` logs every call |
 
 With an 8 KB page size, `max_analyze_pages=100000` corresponds to approximately
 800 MB of heap data.

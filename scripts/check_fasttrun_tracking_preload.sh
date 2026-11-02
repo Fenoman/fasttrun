@@ -12,6 +12,10 @@
 # через make installcheck и требует, чтобы вывод совпал с эталоном и в нем была
 # строка основной ветки. Совпадение с запасным эталоном при предзагрузке -
 # провал.
+#
+# Тот же кластер проверяет счетчики fasttrun_counters(): при предзагрузке они
+# общие. Один сеанс вызывает fasttrun_analyze, другой должен увидеть этот вызов
+# в сумме по кластеру.
 # Расширение должно быть установлено в сборку PG_CONFIG. Скрипт печатает PASS
 # или FAIL и не требует cassert-сборки.
 #
@@ -67,7 +71,18 @@ make -C "$REPO" -s installcheck PG_CONFIG="$PG_CONFIG" REGRESS=fasttrun_tracking
 result="$OUT/results/fasttrun_tracking.out"
 main=$(grep -c "$MAIN_BRANCH" "$result" 2>/dev/null || true)
 echo "installcheck rc=$rc main branch lines=${main:-0}"
-if [ "$rc" -eq 0 ] && [ "${main:-0}" -ge 1 ]; then
+
+PSQL="$BINDIR/psql -X -A -t -q -v ON_ERROR_STOP=1 -h $SOCKET_DIR -p $PORT -d postgres"
+counters=$($PSQL -c "CREATE EXTENSION IF NOT EXISTS fasttrun" \
+	-c "SELECT fasttrun_counters_reset()" \
+	-c "CREATE TEMP TABLE ft_counter_probe (id int)" \
+	-c "INSERT INTO ft_counter_probe SELECT generate_series(1, 100)" \
+	-c "SELECT fasttrun_analyze('ft_counter_probe')" >/dev/null 2>&1 &&
+	$PSQL -c "SELECT scope || ' ' || value FROM fasttrun_counters() WHERE counter = 'analyze_calls'" 2>&1) ||
+	counters="error: $counters"
+echo "cluster counters: $counters"
+
+if [ "$rc" -eq 0 ] && [ "${main:-0}" -ge 1 ] && [ "$counters" = "cluster 1" ]; then
 	echo "tracking preload: PASS"
 	exit 0
 fi

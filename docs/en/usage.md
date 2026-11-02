@@ -96,8 +96,10 @@ Follow these rules:
 5. Do not treat fasttrun as a security boundary between clients. The application
    or pooler configuration must enforce cleanup when a backend is handed off.
 6. After `SQLSTATE 55000`, do not return the backend to the pool until the table
-   has been repaired. If the recovery outcome is uncertain, close the physical
-   connection and let the pooler create a new one.
+   has been repaired. A query of `fasttrun_blocked_tables()` after the
+   transaction ends checks it: an empty result means there are no blocks. If the
+   recovery outcome is uncertain, close the physical connection and let the
+   pooler create a new one.
 7. `DISCARD TEMP` and `DISCARD ALL` remove temporary tables. This is safe, but it
    eliminates the benefit of reusing them.
 
@@ -110,7 +112,7 @@ time a connection is handed to a client.
 
 ## Functions
 
-The public API contains 10 SQL functions.
+The public API contains 14 SQL functions.
 
 ### Main operations
 
@@ -153,6 +155,10 @@ N complete walks over the local plan list.
 | `fasttrun_relstats(text)` | Returns the current local `relpages` and `reltuples` values |
 | `fasttrun_inspect_stats(text)` | Shows stored statistics candidates in `pg_statistic` format |
 | `fasttrun_cache_stats()` | Shows entry counts and memory used by the local caches |
+| `fasttrun_cached_tables()` | Lists the relations the session keeps estimates and statistics for |
+| `fasttrun_blocked_tables()` | Lists the tables blocked in the session after an incomplete cleanup |
+| `fasttrun_counters()` | Returns the extension's event counters |
+| `fasttrun_counters_reset()` | Zeroes the event counters |
 
 For a missing table, `fasttrun_relstats()` returns `NULL`, while
 `fasttrun_inspect_stats()` returns an empty set. An empty set also means that
@@ -173,6 +179,60 @@ freshness check may temporarily hide them.
 
 `total_bytes` is the sum of `analyze_bytes` and `column_stats_bytes`. All values
 apply only to the current physical backend.
+
+`fasttrun_cached_tables()` returns a row for every relation the current backend
+knows:
+
+| Field | Meaning |
+|---|---|
+| `relid`, `relname` | The relation. `relname` is empty if the relation is already dropped |
+| `kind` | `table` or `index` |
+| `relpages`, `reltuples` | The published size estimate |
+| `count_exact` | The row count comes from a full scan or an exact delta, not from a block sample. Empty for an index |
+| `delta_state` | The next `fasttrun_analyze()` counts rows from the change counters without a pass over the table. Empty for an index |
+| `column_stats` | The number of columns with a stored sample |
+| `hidden_columns` | How many of them the freshness check hides from the planner right now |
+
+`fasttrun_blocked_tables()` returns `relid` and `relname` of the tables blocked
+in the current backend after a `fasttruncate()` error. Check it after the
+transaction ends: inside one, a `DROP` hides the table, and a rollback brings it
+back with its block. An empty result outside a transaction means the
+connection can go back to the pool.
+
+`fasttrun_counters()` returns rows of `counter`, `value`, `scope`. With
+`shared_preload_libraries` the values are shared by the instance
+(`scope = cluster`): each backend adds its events to shared memory at the end
+of every transaction. Without preloading the values belong to the current
+backend (`scope = backend`). Through a pooler in transaction mode only the
+first variant is useful. The counters start from zero after a server start and
+after `fasttrun_counters_reset()`. A reset zeroes the shared values and the
+events of the calling backend. Events of another backend from a transaction
+open during the reset enter the sum when that transaction ends.
+
+| Counter | What it counts |
+|---|---|
+| `truncate_calls` | `fasttruncate()` calls for an existing temporary table |
+| `truncate_empty_fast_path` | Calls among them where the table was already empty and no file work was needed |
+| `truncate_failed_after_change` | Errors after file changes began, that is new blocks |
+| `analyze_calls` | `fasttrun_analyze()` calls, including those from `fasttrun_analyze_bulk()` |
+| `analyze_noop` | Calls with no changes since the previous call |
+| `analyze_delta` | Calls that counted rows from the change counters |
+| `analyze_cold_scan` | Full passes over the table |
+| `analyze_cold_block_sample` | Block-sampled passes over a table larger than `fasttrun.max_analyze_pages` |
+| `storage_found_empty` | Tables found empty without the counters knowing, for example after `ON COMMIT DELETE ROWS` |
+| `column_collects` | Column statistics collections |
+| `column_collects_during_write` | Collections made while the table was being written: their sample is not served to the planner |
+| `refresh_deferred` | Rebuilds postponed because of a running write |
+| `partial_index_rescans` | `fasttrun_analyze()` calls that recounted the table's partial indexes |
+| `plan_invalidations` | Local invalidations of cached plans |
+| `stats_served` | Planner requests that got a stored column statistic |
+| `stats_hidden` | Planner requests that got default estimates instead of a column statistic fasttrun manages: the sample was stale, taken during a write, or dropped by a cleanup or a `COMMIT` |
+| `writer_registry_overflows` | Overflows of the registry of writing statements |
+| `commit_carried` | Tables whose counters `COMMIT` carried into the next transaction |
+| `tracking_rejected` | Names that did not fit into the `CREATE TEMP TABLE` tracking registry |
+
+`fasttrun.log_min_duration` writes individual slow `fasttruncate()` and
+`fasttrun_analyze()` calls to the server log with the path each call took.
 
 The tracking and prewarming functions are described in
 [tracking.md](tracking.md#functions).

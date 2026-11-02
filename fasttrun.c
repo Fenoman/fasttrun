@@ -108,6 +108,10 @@ PG_FUNCTION_INFO_V1(fasttrun_cache_stats);
 PG_FUNCTION_INFO_V1(fasttrun_hot_temp_tables);
 PG_FUNCTION_INFO_V1(fasttrun_prewarm);
 PG_FUNCTION_INFO_V1(fasttrun_reset_temp_stats);
+PG_FUNCTION_INFO_V1(fasttrun_counters);
+PG_FUNCTION_INFO_V1(fasttrun_counters_reset);
+PG_FUNCTION_INFO_V1(fasttrun_cached_tables);
+PG_FUNCTION_INFO_V1(fasttrun_blocked_tables);
 #ifdef USE_ASSERT_CHECKING
 PG_FUNCTION_INFO_V1(fasttrun_test_subxact_visits);
 PG_FUNCTION_INFO_V1(fasttrun_test_poison_locator_mismatch);
@@ -131,6 +135,10 @@ Datum	fasttrun_cache_stats(PG_FUNCTION_ARGS);
 Datum	fasttrun_hot_temp_tables(PG_FUNCTION_ARGS);
 Datum	fasttrun_prewarm(PG_FUNCTION_ARGS);
 Datum	fasttrun_reset_temp_stats(PG_FUNCTION_ARGS);
+Datum	fasttrun_counters(PG_FUNCTION_ARGS);
+Datum	fasttrun_counters_reset(PG_FUNCTION_ARGS);
+Datum	fasttrun_cached_tables(PG_FUNCTION_ARGS);
+Datum	fasttrun_blocked_tables(PG_FUNCTION_ARGS);
 
 void _PG_init(void);
 
@@ -146,6 +154,139 @@ static bool		fasttrun_use_typanalyze = true;
 static bool		fasttrun_zero_sinval_truncate = true;
 static int		fasttrun_max_analyze_pages = 100000;
 static int		fasttrun_max_stats_memory = 0;	/* KB, 0 = no cap */
+static int		fasttrun_log_min_duration = -1;	/* ms, -1 = off */
+static bool		fasttrun_template_stattarget = true;
+static char	   *fasttrun_prewarm_schema;	/* defined with the tracking GUCs */
+
+/*
+ * Activity counters.
+ *
+ * What they are.  Monotonic event counts of the extension: how calls went
+ * (delta, scan, fast path), how often the planner got cached statistics or
+ * defaults, how many local plan invalidations ran.
+ *
+ * Where they live.  Each backend increments plain local counters on the hot
+ * path and adds them to shared atomics at every transaction end, so the
+ * shared values cost one atomic add per counter that moved in a transaction.
+ * Shared memory exists only with shared_preload_libraries.  Without it the
+ * counters stay in the backend and describe that backend alone.
+ */
+typedef enum FasttrunCounter
+{
+	FTC_TRUNCATE_CALLS,
+	FTC_TRUNCATE_EMPTY_FAST_PATH,
+	FTC_TRUNCATE_FAILED_AFTER_CHANGE,
+	FTC_ANALYZE_CALLS,
+	FTC_ANALYZE_NOOP,
+	FTC_ANALYZE_DELTA,
+	FTC_ANALYZE_COLD_SCAN,
+	FTC_ANALYZE_COLD_BLOCK_SAMPLE,
+	FTC_STORAGE_FOUND_EMPTY,
+	FTC_COLUMN_COLLECTS,
+	FTC_COLUMN_COLLECTS_DURING_WRITE,
+	FTC_REFRESH_DEFERRED,
+	FTC_PARTIAL_INDEX_RESCANS,
+	FTC_PLAN_INVALIDATIONS,
+	FTC_STATS_SERVED,
+	FTC_STATS_HIDDEN,
+	FTC_WRITER_REGISTRY_OVERFLOWS,
+	FTC_COMMIT_CARRIED,
+	FTC_TRACKING_REJECTED,
+	FTC_COUNT
+} FasttrunCounter;
+
+static const char *const fasttrun_counter_names[FTC_COUNT] = {
+	"truncate_calls",
+	"truncate_empty_fast_path",
+	"truncate_failed_after_change",
+	"analyze_calls",
+	"analyze_noop",
+	"analyze_delta",
+	"analyze_cold_scan",
+	"analyze_cold_block_sample",
+	"storage_found_empty",
+	"column_collects",
+	"column_collects_during_write",
+	"refresh_deferred",
+	"partial_index_rescans",
+	"plan_invalidations",
+	"stats_served",
+	"stats_hidden",
+	"writer_registry_overflows",
+	"commit_carried",
+	"tracking_rejected"
+};
+
+typedef struct FasttrunSharedCounters
+{
+	pg_atomic_uint64 values[FTC_COUNT];
+} FasttrunSharedCounters;
+
+static uint64 fasttrun_local_counters[FTC_COUNT];
+static bool fasttrun_local_counters_dirty = false;
+static FasttrunSharedCounters *fasttrun_shared_counters = NULL;
+
+static inline void
+fasttrun_count(FasttrunCounter counter)
+{
+	fasttrun_local_counters[counter]++;
+	fasttrun_local_counters_dirty = true;
+}
+
+/* Add the local counts to shared memory.  Called at every transaction end. */
+static void
+fasttrun_counters_flush(void)
+{
+	int			i;
+
+	if (!fasttrun_local_counters_dirty || fasttrun_shared_counters == NULL)
+		return;
+	for (i = 0; i < FTC_COUNT; i++)
+	{
+		if (fasttrun_local_counters[i] == 0)
+			continue;
+		pg_atomic_fetch_add_u64(&fasttrun_shared_counters->values[i],
+								(int64) fasttrun_local_counters[i]);
+		fasttrun_local_counters[i] = 0;
+	}
+	fasttrun_local_counters_dirty = false;
+}
+
+/* The clock runs only while fasttrun.log_min_duration is on. */
+static inline void
+fasttrun_timer_start(instr_time *start)
+{
+	if (fasttrun_log_min_duration >= 0)
+		INSTR_TIME_SET_CURRENT(*start);
+	else
+		INSTR_TIME_SET_ZERO(*start);
+}
+
+/*
+ * One LOG line for a call that took at least fasttrun.log_min_duration
+ * milliseconds.  The pages and rows are what the call left published.
+ */
+static void
+fasttrun_log_if_slow(const instr_time *start, const char *operation,
+					 Relation rel, const char *path)
+{
+	instr_time	elapsed;
+	double		ms;
+
+	if (fasttrun_log_min_duration < 0 || INSTR_TIME_IS_ZERO(*start))
+		return;
+	INSTR_TIME_SET_CURRENT(elapsed);
+	INSTR_TIME_SUBTRACT(elapsed, *start);
+	ms = INSTR_TIME_GET_MILLISEC(elapsed);
+	if (ms < (double) fasttrun_log_min_duration)
+		return;
+	ereport(LOG,
+			(errmsg("fasttrun: %s of \"%s\" took %.3f ms",
+					operation, RelationGetRelationName(rel), ms),
+			 errdetail("Path: %s.  Published %d pages and %.0f rows.",
+					   path, (int) rel->rd_rel->relpages,
+					   (double) rel->rd_rel->reltuples)));
+}
 
 #ifdef USE_ASSERT_CHECKING
 static char *fasttrun_test_failpoint = "";
@@ -1139,6 +1280,7 @@ fasttrun_cache_commit_xact(void)
 													&truncdropped) &&
 			truncdropped == entry->state.cached_truncdropped)
 		{
+			fasttrun_count(FTC_COMMIT_CARRIED);
 			entry->state.cached_inserted -= ins;
 			entry->state.cached_updated -= upd;
 			entry->state.cached_deleted -= del;
@@ -1297,6 +1439,7 @@ fasttrun_xact_callback(XactEvent event, void *arg)
 	fasttrun_xact_frame_pool = NULL;
 	fasttrun_xact_frame_pool_used = 0;
 	fasttrun_xact_epoch++;
+	fasttrun_counters_flush();
 }
 
 /* Lazily allocate the analyze HTAB and its dedicated mcxt. */
@@ -1939,6 +2082,10 @@ fasttrun_reinject_relstats(Relation rel, FasttrunAnalyzeCacheEntry *entry)
 
 			if (looks_empty)
 			{
+				/* Count a table found emptied, not a known empty state. */
+				if (entry->state.heap_relid == RelationGetRelid(rel) &&
+					entry->state.cached_tuples > 0)
+					fasttrun_count(FTC_STORAGE_FOUND_EMPTY);
 				/*
 				 * Heap gives 0.  Index gives 1 -- the freshly rebuilt
 				 * btree/hash metapage stays put.  One nblocks call returns
@@ -2304,8 +2451,14 @@ fasttrun_cache_check_storage(FasttrunAnalyzeCacheEntry *entry, Relation rel)
 		rel->rd_backend != entry->state.probe_rlb.backend)
 		return;
 	if (RelationGetNumberOfBlocks(rel) == 0)
-		(void) fasttrun_cache_make_empty_storage_authoritative(entry, false,
-															   &plan_relid);
+	{
+		bool		had_rows = entry->state.cached_tuples > 0;
+
+		if (fasttrun_cache_make_empty_storage_authoritative(entry, false,
+														   &plan_relid) &&
+			had_rows)
+			fasttrun_count(FTC_STORAGE_FOUND_EMPTY);
+	}
 }
 
 /*
@@ -2789,6 +2942,8 @@ fasttrun_stats_update_in_flight(Oid relid, int delta)
 
 	if (fasttrun_in_flight_used >= FASTTRUN_IN_FLIGHT_SLOTS)
 	{
+		if (!fasttrun_in_flight_incomplete)
+			fasttrun_count(FTC_WRITER_REGISTRY_OVERFLOWS);
 		fasttrun_in_flight_incomplete = true;
 		return;
 	}
@@ -3712,7 +3867,10 @@ fasttrun_get_relation_stats_hook(PlannerInfo *root, RangeTblEntry *rte,
 	}
 	if (entry->state == FASTTRUN_COLUMN_LOCAL_NEUTRAL ||
 		entry->statsTuple == NULL)
+	{
+		fasttrun_count(FTC_STATS_HIDDEN);
 		return true;
+	}
 
 	/* Freshness check: tolerate DML churn up to stats_refresh_threshold. */
 	if (!fasttrun_read_pgstat_counters_for_hook(rte->relid, &wide_writers,
@@ -3732,10 +3890,12 @@ fasttrun_get_relation_stats_hook(PlannerInfo *root, RangeTblEntry *rte,
 	if (!fasttrun_stats_entry_usable(rte->relid, relentry, entry, ins_now, upd_now,
 									 del_now, truncdropped_now, pages_now))
 	{
+		fasttrun_count(FTC_STATS_HIDDEN);
 		fasttrun_xact_mark_dml_plan_dependency(rte->relid);
 		return true;		/* handled: deliberately hide core stats too */
 	}
 
+	fasttrun_count(FTC_STATS_SERVED);
 	vardata->statsTuple = entry->statsTuple;
 	vardata->freefunc = fasttrun_stats_noop_free;
 	vardata->acl_ok = true;
@@ -5958,8 +6118,9 @@ fasttrun_apply_attribute_options(Relation rel, AttrNumber attnum,
 	}
 }
 
+/* -1 is the default target: the attribute is missing or was never set. */
 static int
-fasttrun_get_attstattarget(Relation rel, AttrNumber attnum)
+fasttrun_read_attstattarget(Oid relid, AttrNumber attnum)
 {
 	HeapTuple	atttuple;
 	Datum		datum;
@@ -5967,7 +6128,7 @@ fasttrun_get_attstattarget(Relation rel, AttrNumber attnum)
 	int			attstattarget = -1;
 
 	atttuple = SearchSysCache2(ATTNUM,
-							   ObjectIdGetDatum(RelationGetRelid(rel)),
+							   ObjectIdGetDatum(relid),
 							   Int16GetDatum(attnum));
 	if (!HeapTupleIsValid(atttuple))
 		return -1;
@@ -5979,6 +6140,49 @@ fasttrun_get_attstattarget(Relation rel, AttrNumber attnum)
 		attstattarget = DatumGetInt16(datum);
 	ReleaseSysCache(atttuple);
 
+	return attstattarget;
+}
+
+/*
+ * CREATE TABLE ... (LIKE template) does not copy SET STATISTICS.  A column the
+ * temporary table leaves at the default takes the target of the same-named
+ * column of the same-named table in fasttrun.prewarm_schema.  The setting is
+ * then made once on the template, without an ALTER TABLE on every temporary
+ * table, which would write the catalog and send a shared invalidation.
+ */
+static int
+fasttrun_template_attstattarget(Relation rel, AttrNumber attnum)
+{
+	Oid			nspid;
+	Oid			template_relid;
+	AttrNumber	template_attnum;
+	Form_pg_attribute attr;
+
+	if (rel->rd_rel->relpersistence != RELPERSISTENCE_TEMP ||
+		fasttrun_prewarm_schema == NULL || fasttrun_prewarm_schema[0] == '\0' ||
+		attnum <= 0 || attnum > RelationGetNumberOfAttributes(rel))
+		return -1;
+	nspid = get_namespace_oid(fasttrun_prewarm_schema, true);
+	if (!OidIsValid(nspid))
+		return -1;
+	template_relid = get_relname_relid(RelationGetRelationName(rel), nspid);
+	if (!OidIsValid(template_relid))
+		return -1;
+	attr = TupleDescAttr(RelationGetDescr(rel), attnum - 1);
+	template_attnum = get_attnum(template_relid, NameStr(attr->attname));
+	if (template_attnum == InvalidAttrNumber)
+		return -1;
+	return fasttrun_read_attstattarget(template_relid, template_attnum);
+}
+
+static int
+fasttrun_get_attstattarget(Relation rel, AttrNumber attnum)
+{
+	int			attstattarget = fasttrun_read_attstattarget(RelationGetRelid(rel),
+															attnum);
+
+	if (attstattarget < 0 && fasttrun_template_stattarget)
+		attstattarget = fasttrun_template_attstattarget(rel, attnum);
 	return attstattarget;
 }
 
@@ -6949,6 +7153,9 @@ fasttrun_collect_and_store(Relation rel, HeapTuple *sample, int sample_count,
 	 * creates the entry: it is a "give me column stats now" entry point
 	 * that must not seed delta-math state.
 	 */
+	if (result.published_any)
+		fasttrun_count(result.unsafe ? FTC_COLUMN_COLLECTS_DURING_WRITE :
+					   FTC_COLUMN_COLLECTS);
 	return result;
 }
 
@@ -7985,6 +8192,7 @@ fasttrun_invalidate_local_plan_cache(Oid relid)
 
 	/* Fixed text (no OID) so regression tests can count calls. */
 	elog(DEBUG1, "fasttrun: invalidating backend-local cached plans");
+	fasttrun_count(FTC_PLAN_INVALIDATIONS);
 
 	msg.rc.id = SHAREDINVALRELCACHE_ID;
 	msg.rc.dbId = MyDatabaseId;
@@ -8075,6 +8283,7 @@ fasttruncate(PG_FUNCTION_ARGS)
 	FasttrunTruncateOperation *volatile cleanup_operation = NULL;
 	volatile uint64 cleanup_generation = 0;
 	volatile bool cleanup_pending_published = false;
+	instr_time		started;
 
 	relvar = fasttrun_make_rangevar(name);
 	relOid = RangeVarGetRelid(relvar, AccessExclusiveLock, true);
@@ -8105,9 +8314,13 @@ fasttruncate(PG_FUNCTION_ARGS)
 
 	/* An active marker permits only this repair path or DROP/recreate. */
 	fasttrun_poison_check_relation(rel, "fasttruncate", true);
+	fasttrun_count(FTC_TRUNCATE_CALLS);
+	fasttrun_timer_start(&started);
 	fasttrun_prepare_truncate_workset(rel, &opened);
 	if (fasttrun_try_empty_truncate(rel, &opened))
 	{
+		fasttrun_count(FTC_TRUNCATE_EMPTY_FAST_PATH);
+		fasttrun_log_if_slow(&started, "fasttruncate", rel, "already empty");
 		fasttrun_close_truncate_workset(&opened);
 		table_close(rel, AccessExclusiveLock);
 		PG_RETURN_VOID();
@@ -8164,6 +8377,7 @@ fasttruncate(PG_FUNCTION_ARGS)
 				fasttrun_clear_partial_publication(failed);
 				Assert(cleanup_pending_published);
 				fasttrun_poison_activate(failed);
+				fasttrun_count(FTC_TRUNCATE_FAILED_AFTER_CHANGE);
 			}
 		}
 		else
@@ -8174,6 +8388,8 @@ fasttruncate(PG_FUNCTION_ARGS)
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
+
+	fasttrun_log_if_slow(&started, "fasttruncate", rel, "storage reset");
 
 	/* Release the AccessExclusiveLock taken by RangeVarGetRelid. */
 	fasttrun_close_truncate_workset(&opened);
@@ -8291,7 +8507,11 @@ fasttrun_analyze_relation(Relation rel)
 	int64			delta_upd = 0;
 	int64			delta_del = 0;
 	FasttrunAnalyzeCacheEntry *entry = NULL;
+	instr_time		started;
+	const char	   *path;
 
+	fasttrun_count(FTC_ANALYZE_CALLS);
+	fasttrun_timer_start(&started);
 	relation_policy_changed = fasttrun_stats_set_relation_policy(rel,
 													FASTTRUN_REL_LOCAL_NEUTRAL);
 	if (relation_policy_changed && fasttrun_relation_has_core_stats(rel))
@@ -8763,6 +8983,28 @@ fasttrun_analyze_relation(Relation rel)
 	rel->rd_rel->relpages = pages_now;
 	rel->rd_rel->reltuples = (float4) tuples_count;
 	rel->rd_rel->relallvisible = (int32) allvisible_now;
+
+	if (refresh_deferred)
+		fasttrun_count(FTC_REFRESH_DEFERRED);
+	if (partial_index_sampled)
+		fasttrun_count(FTC_PARTIAL_INDEX_RESCANS);
+	if (scan_needed)
+	{
+		fasttrun_count(count_exact ? FTC_ANALYZE_COLD_SCAN :
+					   FTC_ANALYZE_COLD_BLOCK_SAMPLE);
+		path = count_exact ? "full scan" : "block sample";
+	}
+	else if (pure_delta_noop && !stats_recollected && !partial_index_sampled)
+	{
+		fasttrun_count(FTC_ANALYZE_NOOP);
+		path = "no changes";
+	}
+	else
+	{
+		fasttrun_count(FTC_ANALYZE_DELTA);
+		path = stats_recollected ? "delta with recollect" : "delta";
+	}
+	fasttrun_log_if_slow(&started, "fasttrun_analyze", rel, path);
 }
 
 /*
@@ -9067,6 +9309,270 @@ fasttrun_cache_stats(PG_FUNCTION_ARGS)
 
 	tuple = heap_form_tuple(tupdesc, values, nulls);
 	PG_RETURN_DATUM(HeapTupleGetDatum(tuple));
+}
+
+/* Materialize mode for the observability SRFs below. */
+static Tuplestorestate *
+fasttrun_begin_srf(FunctionCallInfo fcinfo, TupleDesc *tupdesc_out)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	TupleDesc	tupdesc;
+	Tuplestorestate *tupstore;
+	MemoryContext oldcxt;
+
+	if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo) ||
+		(rsinfo->allowedModes & SFRM_Materialize) == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("set-valued function called in context that cannot accept a set")));
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("function returning record called in context that cannot accept type record")));
+
+	oldcxt = MemoryContextSwitchTo(rsinfo->econtext->ecxt_per_query_memory);
+	tupdesc = CreateTupleDescCopy(tupdesc);
+	tupstore = tuplestore_begin_heap(true, false, work_mem);
+	rsinfo->returnMode = SFRM_Materialize;
+	rsinfo->setResult = tupstore;
+	rsinfo->setDesc = tupdesc;
+	MemoryContextSwitchTo(oldcxt);
+	*tupdesc_out = tupdesc;
+	return tupstore;
+}
+
+/*
+ * fasttrun_counters() RETURNS TABLE(counter text, value bigint, scope text)
+ *
+ * With shared_preload_libraries the values are cluster totals: the shared
+ * sums plus this backend's counts not yet added at a transaction end.  Other
+ * backends add theirs at their next transaction end.  Without preloading the
+ * values belong to the calling backend, and scope says which it is.
+ */
+Datum
+fasttrun_counters(PG_FUNCTION_ARGS)
+{
+	TupleDesc	tupdesc;
+	Tuplestorestate *tupstore = fasttrun_begin_srf(fcinfo, &tupdesc);
+	const char *scope = fasttrun_shared_counters != NULL ? "cluster" : "backend";
+	int			i;
+
+	for (i = 0; i < FTC_COUNT; i++)
+	{
+		Datum		values[3];
+		bool		nulls[3] = {false, false, false};
+		uint64		value = fasttrun_local_counters[i];
+
+		if (fasttrun_shared_counters != NULL)
+			value += pg_atomic_read_u64(&fasttrun_shared_counters->values[i]);
+		values[0] = CStringGetTextDatum(fasttrun_counter_names[i]);
+		values[1] = Int64GetDatum((int64) value);
+		values[2] = CStringGetTextDatum(scope);
+		tuplestore_putvalues(tupstore, tupdesc, values, nulls);
+	}
+	return (Datum) 0;
+}
+
+/* Zero the counters this function reports: shared ones and the caller's. */
+Datum
+fasttrun_counters_reset(PG_FUNCTION_ARGS)
+{
+	int			i;
+
+	for (i = 0; i < FTC_COUNT; i++)
+	{
+		fasttrun_local_counters[i] = 0;
+		if (fasttrun_shared_counters != NULL)
+			pg_atomic_write_u64(&fasttrun_shared_counters->values[i], 0);
+	}
+	fasttrun_local_counters_dirty = false;
+	PG_RETURN_VOID();
+}
+
+/*
+ * Cached column samples of relid that the planner would not get right now.
+ * Read-only: a sample from another file of the relation counts as hidden,
+ * without the forgetting the planner path does.  The relid entry is looked up
+ * after the relation is open, so nothing the open triggers can leave a stale
+ * pointer behind.
+ */
+static int
+fasttrun_count_hidden_columns(Oid relid)
+{
+	Relation	rel;
+	FasttrunStatsRelidEntry *relentry;
+	RelFileLocatorBackend rlb;
+	int64		ins = 0;
+	int64		upd = 0;
+	int64		del = 0;
+	bool		truncdropped = false;
+	bool		usable_source;
+	BlockNumber pages;
+	FasttrunUsableBaseline rel_baseline = {0};
+	ListCell   *lc;
+	int			hidden = 0;
+
+	rel = try_relation_open(relid, AccessShareLock);
+	if (rel == NULL)
+		return 0;
+	pages = RELKIND_HAS_STORAGE(rel->rd_rel->relkind) ?
+		RelationGetNumberOfBlocks(rel) : 0;
+	usable_source = fasttrun_read_pgstat_counters(rel, &ins, &upd, &del,
+												  &truncdropped);
+	rlb.locator = rel->rd_locator;
+	rlb.backend = rel->rd_backend;
+	relentry = fasttrun_stats_relid_cache == NULL ? NULL :
+		(FasttrunStatsRelidEntry *) hash_search(fasttrun_stats_relid_cache,
+												&relid, HASH_FIND, NULL);
+	if (relentry != NULL)
+	{
+		usable_source = usable_source && relentry->heap_rlb_valid &&
+			fasttrun_rlb_equals(relentry->heap_rlb, rlb);
+		foreach(lc, relentry->attkeys)
+		{
+			FasttrunStatsEntry *entry;
+
+			entry = (FasttrunStatsEntry *) hash_search(fasttrun_stats_cache,
+													   lfirst(lc), HASH_FIND, NULL);
+			if (entry == NULL || !fasttrun_stats_entry_is_candidate(entry))
+				continue;
+			if (!usable_source ||
+				!fasttrun_stats_entry_usable_ext(relid, relentry, entry, ins, upd,
+												 del, truncdropped, pages,
+												 &rel_baseline))
+				hidden++;
+		}
+	}
+	relation_close(rel, AccessShareLock);
+	return hidden;
+}
+
+/*
+ * fasttrun_cached_tables() lists the relations this backend keeps state for:
+ * the published size estimate, whether a delta state carries the row count,
+ * and how many cached column samples there are and how many of them the
+ * freshness check hides from the planner right now.
+ */
+Datum
+fasttrun_cached_tables(PG_FUNCTION_ARGS)
+{
+	TupleDesc	tupdesc;
+	Tuplestorestate *tupstore = fasttrun_begin_srf(fcinfo, &tupdesc);
+	List	   *relids = NIL;
+	HASH_SEQ_STATUS status;
+	ListCell   *lc;
+
+	if (fasttrun_analyze_cache != NULL)
+	{
+		FasttrunAnalyzeCacheEntry *entry;
+
+		hash_seq_init(&status, fasttrun_analyze_cache);
+		while ((entry = (FasttrunAnalyzeCacheEntry *) hash_seq_search(&status)) != NULL)
+			relids = lappend_oid(relids, entry->relid);
+	}
+	if (fasttrun_stats_relid_cache != NULL)
+	{
+		FasttrunStatsRelidEntry *relentry;
+
+		hash_seq_init(&status, fasttrun_stats_relid_cache);
+		while ((relentry = (FasttrunStatsRelidEntry *) hash_seq_search(&status)) != NULL)
+		{
+			/* Keys are unique per hash.  Skip the ones the first walk listed. */
+			if (fasttrun_cache_lookup(relentry->relid) == NULL)
+				relids = lappend_oid(relids, relentry->relid);
+		}
+	}
+
+	foreach(lc, relids)
+	{
+		Oid			relid = lfirst_oid(lc);
+		char	   *relname = get_rel_name(relid);
+		int			hidden = relname != NULL ? fasttrun_count_hidden_columns(relid) : 0;
+		FasttrunAnalyzeCacheEntry *entry;
+		FasttrunStatsRelidEntry *relentry = NULL;
+		bool		is_index;
+		Datum		values[9];
+		bool		nulls[9];
+
+		/* Catalog access is over: look the entries up now. */
+		entry = fasttrun_cache_lookup(relid);
+		memset(nulls, 0, sizeof(nulls));
+		if (fasttrun_stats_relid_cache != NULL)
+			relentry = (FasttrunStatsRelidEntry *)
+				hash_search(fasttrun_stats_relid_cache, &relid, HASH_FIND, NULL);
+
+		values[0] = ObjectIdGetDatum(relid);
+		if (relname != NULL)
+			values[1] = CStringGetTextDatum(relname);
+		else
+			nulls[1] = true;
+		is_index = (entry != NULL && entry->state.heap_relid != relid);
+		values[2] = CStringGetTextDatum(is_index ? "index" : "table");
+		if (entry != NULL && entry->state.has_relstats)
+		{
+			values[3] = Int64GetDatum((int64) entry->state.cached_pages);
+			values[4] = Float8GetDatum((double) entry->state.cached_tuples);
+			/* The row count and its delta belong to the table. */
+			values[5] = BoolGetDatum(entry->state.count_exact);
+			values[6] = BoolGetDatum(entry->state.has_delta_state);
+			nulls[5] = nulls[6] = is_index;
+		}
+		else
+			nulls[3] = nulls[4] = nulls[5] = nulls[6] = true;
+		values[7] = Int32GetDatum(relentry != NULL ? relentry->refcount : 0);
+		values[8] = Int32GetDatum(hidden);
+		tuplestore_putvalues(tupstore, tupdesc, values, nulls);
+	}
+	list_free(relids);
+	return (Datum) 0;
+}
+
+/*
+ * fasttrun_blocked_tables() lists the tables this backend blocks after an
+ * incomplete fasttruncate: the ones that still exist on the damaged file.
+ * A pooler can check it before it returns the connection.
+ */
+Datum
+fasttrun_blocked_tables(PG_FUNCTION_ARGS)
+{
+	TupleDesc	tupdesc;
+	Tuplestorestate *tupstore = fasttrun_begin_srf(fcinfo, &tupdesc);
+	List	   *relids = NIL;
+	HASH_SEQ_STATUS status;
+	FasttrunPoisonEntry *entry;
+	ListCell   *lc;
+
+	if (fasttrun_poison_cache == NULL)
+		return (Datum) 0;
+	hash_seq_init(&status, fasttrun_poison_cache);
+	while ((entry = (FasttrunPoisonEntry *) hash_seq_search(&status)) != NULL)
+	{
+		if (entry->active)
+			relids = lappend_oid(relids, entry->root_relid);
+	}
+	foreach(lc, relids)
+	{
+		Oid			relid = lfirst_oid(lc);
+		Relation	rel;
+		Datum		values[2];
+		bool		nulls[2] = {false, false};
+
+		rel = try_relation_open(relid, AccessShareLock);
+		if (rel == NULL)
+			continue;
+		entry = fasttrun_poison_find(relid);
+		if (entry != NULL && entry->active &&
+			RelFileLocatorEquals(entry->root_rlb.locator, rel->rd_locator) &&
+			entry->root_rlb.backend == rel->rd_backend)
+		{
+			values[0] = ObjectIdGetDatum(relid);
+			values[1] = CStringGetTextDatum(RelationGetRelationName(rel));
+			tuplestore_putvalues(tupstore, tupdesc, values, nulls);
+		}
+		relation_close(rel, AccessShareLock);
+	}
+	list_free(relids);
+	return (Datum) 0;
 }
 
 /*
@@ -9632,6 +10138,7 @@ fasttrun_shmem_request(void)
 		prev_shmem_request_hook();
 	RequestAddinShmemSpace(hash_estimate_size(FASTTRUN_TRACK_MAX,
 											  sizeof(FasttrunTrackEntry)));
+	RequestAddinShmemSpace(MAXALIGN(sizeof(FasttrunSharedCounters)));
 	RequestNamedLWLockTranche("fasttrun", 1);
 }
 
@@ -9835,6 +10342,20 @@ fasttrun_shmem_startup(void)
 
 	/* Allocate LWLock */
 	fasttrun_track_lock = (LWLockId) GetNamedLWLockTranche("fasttrun");
+
+	{
+		bool		found;
+		int			i;
+
+		fasttrun_shared_counters = (FasttrunSharedCounters *)
+			ShmemInitStruct("fasttrun counters",
+							sizeof(FasttrunSharedCounters), &found);
+		if (!found)
+		{
+			for (i = 0; i < FTC_COUNT; i++)
+				pg_atomic_init_u64(&fasttrun_shared_counters->values[i], 0);
+		}
+	}
 
 	LWLockRelease(AddinShmemInitLock);
 
@@ -10201,7 +10722,12 @@ fasttrun_attribute_target_is_analyzable(Relation rel, AttrNumber attnum)
 	attr = TupleDescAttr(RelationGetDescr(rel), attnum - 1);
 	if (!fasttrun_attribute_is_analyzable(attr))
 		return false;
-	return fasttrun_get_attstattarget(rel, attnum) != 0;
+	/*
+	 * Core ANALYZE reads the temporary table's own target only, so the
+	 * handoff must too: a template target of 0 would keep a column core
+	 * collects away from core.
+	 */
+	return fasttrun_read_attstattarget(RelationGetRelid(rel), attnum) != 0;
 }
 
 /*
@@ -10812,6 +11338,8 @@ fasttrun_utility_hook(PlannedStmt *pstmt,
 					entry->create_count++;
 					entry->last_create = GetCurrentTimestamp();
 				}
+				else
+					fasttrun_count(FTC_TRACKING_REJECTED);
 				LWLockRelease(fasttrun_track_lock);
 			}
 		}
@@ -11424,6 +11952,36 @@ _PG_init(void)
 							PGC_USERSET,
 							GUC_UNIT_KB,
 							NULL, NULL, NULL);
+
+	DefineCustomIntVariable("fasttrun.log_min_duration",
+							"Log fasttruncate and fasttrun_analyze calls that "
+							"take at least this many milliseconds",
+							"-1 (the default) turns the log off, 0 logs every "
+							"call.  The line names the relation, the time, the "
+							"path the call took and the pages and rows it "
+							"published.",
+							&fasttrun_log_min_duration,
+							-1,
+							-1,
+							INT_MAX,
+							PGC_SUSET,
+							GUC_UNIT_MS,
+							NULL, NULL, NULL);
+
+	DefineCustomBoolVariable("fasttrun.template_stattarget",
+							 "Take a column's statistics target from the "
+							 "same-named template table",
+							 "A column of a temporary table left at the default "
+							 "target takes the target of the same-named column "
+							 "of the same-named table in fasttrun.prewarm_schema. "
+							 "CREATE TABLE ... (LIKE ...) does not copy SET "
+							 "STATISTICS, so the setting is made once on the "
+							 "template.",
+							 &fasttrun_template_stattarget,
+							 true,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
 
 	/*
 	 * Register the xact + subxact callbacks once per backend, here in
