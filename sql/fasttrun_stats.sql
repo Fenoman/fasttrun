@@ -1914,6 +1914,12 @@ DROP TABLE t_ddl_cascade;
 -- ADD COLUMN ... STORED и ADD COLUMN с изменчивым DEFAULT переписывают кучу
 -- теми же строками.  Ядро сохраняет pg_statistic, и выборки переходят на
 -- новый файл, а откат точки сохранения возвращает старый файл вместе с ними.
+-- Проверяется доля строк условия: число строк переписанной таблицы ядро
+-- оценивает по плотности страниц, а скрытая статистика дает долю 0,005.
+CREATE FUNCTION pg_temp.st_share(tbl text, cond text) RETURNS numeric LANGUAGE sql AS $f$
+  SELECT pg_temp.st_rows(format('SELECT * FROM %s WHERE %s', tbl, cond))::numeric /
+         pg_temp.st_rows(format('SELECT * FROM %s', tbl))
+$f$;
 CREATE TEMP TABLE t_ddl_rewrite (id int, a int, b int);
 CREATE INDEX ON t_ddl_rewrite ((b % 2));
 INSERT INTO t_ddl_rewrite SELECT g, g % 7, g % 20 FROM generate_series(1, 7000) g;
@@ -1921,19 +1927,19 @@ SELECT fasttrun_analyze('t_ddl_rewrite');
 SELECT pg_relation_filenode('t_ddl_rewrite') AS ddl_rewrite_node \gset
 ALTER TABLE t_ddl_rewrite ADD COLUMN c int GENERATED ALWAYS AS (a + b) STORED;
 SELECT pg_relation_filenode('t_ddl_rewrite') <> :ddl_rewrite_node AS ddl_rewrite_new_file,
-       pg_temp.st_rows('SELECT * FROM t_ddl_rewrite WHERE a = 3') BETWEEN 500 AND 2000
+       pg_temp.st_share('t_ddl_rewrite', 'a = 3') BETWEEN 0.07 AND 0.29
        AS ddl_rewrite_keeps_column_stats,
-       pg_temp.st_rows('SELECT * FROM t_ddl_rewrite WHERE b % 2 = 0') BETWEEN 1750 AND 7000
+       pg_temp.st_share('t_ddl_rewrite', 'b % 2 = 0') BETWEEN 0.25 AND 1
        AS ddl_rewrite_keeps_expression_stats;
 BEGIN;
 SAVEPOINT ddl_rewrite_sp;
 SAVEPOINT ddl_rewrite_inner;
 ALTER TABLE t_ddl_rewrite ADD COLUMN d uuid DEFAULT gen_random_uuid();
 RELEASE SAVEPOINT ddl_rewrite_inner;
-SELECT pg_temp.st_rows('SELECT * FROM t_ddl_rewrite WHERE b = 5') BETWEEN 175 AND 700
+SELECT pg_temp.st_share('t_ddl_rewrite', 'b = 5') BETWEEN 0.025 AND 0.1
        AS ddl_rewrite_volatile_default_keeps;
 ROLLBACK TO ddl_rewrite_sp;
-SELECT pg_temp.st_rows('SELECT * FROM t_ddl_rewrite WHERE b = 5') BETWEEN 175 AND 700
+SELECT pg_temp.st_share('t_ddl_rewrite', 'b = 5') BETWEEN 0.025 AND 0.1
        AS ddl_rewrite_rollback_keeps;
 COMMIT;
 SELECT column_stats = 4 AND hidden_columns = 0 AS ddl_rewrite_survives_commit
@@ -1946,7 +1952,7 @@ INSERT INTO t_ddl_rewrite_shrink SELECT g, g % 7 FROM generate_series(1, 70000) 
 DELETE FROM t_ddl_rewrite_shrink WHERE id % 10 <> 0;
 SELECT fasttrun_analyze('t_ddl_rewrite_shrink');
 ALTER TABLE t_ddl_rewrite_shrink ADD COLUMN c int GENERATED ALWAYS AS (a * 2) STORED;
-SELECT pg_temp.st_rows('SELECT * FROM t_ddl_rewrite_shrink WHERE a = 3') BETWEEN 500 AND 2000
+SELECT pg_temp.st_share('t_ddl_rewrite_shrink', 'a = 3') BETWEEN 0.07 AND 0.29
        AS ddl_rewrite_shrink_keeps_column_stats;
 DROP TABLE t_ddl_rewrite_shrink;
 DROP TABLE t_ddl_ifne;

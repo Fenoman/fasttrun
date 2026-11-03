@@ -222,8 +222,8 @@ BEGIN
       EXIT;
     END IF;
   END LOOP;
-  IF expr_rows IS NULL OR expr_rows < 100 OR expr_rows > 500 THEN
-    RAISE EXCEPTION 'managed expression stats were not hidden: %', expr_rows;
+  IF expr_rows IS NULL OR expr_rows > 10 THEN
+    RAISE EXCEPTION 'managed expression stats were not served: %', expr_rows;
   END IF;
   managed_counts := pg_temp.fasttrun_hook_probe_counts();
 
