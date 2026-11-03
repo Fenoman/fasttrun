@@ -264,17 +264,16 @@ EXPLAIN (COSTS OFF) SELECT * FROM t_leak WHERE id = 12345;
 DROP TABLE t_leak;
 
 -- ----------------------------------------------------------------------
--- 11. Автоматический пересбор статистики при значимом DML.
---     Управляется порогом: если доля измененных строк
---     (insert+update+delete с момента предыдущего сбора, деленная на
---     текущий reltuples) больше fasttrun.stats_refresh_threshold
---     (значение по умолчанию 0.2 = 20%), то очередной fasttrun_analyze
---     запускает пересбор статистики. Число строк при точном счете берется
---     из дельты, строки для статистики - выборкой блоков, как у ANALYZE,
---     а при fasttrun.max_analyze_pages = 0 - полным проходом.
+-- 11. Автоматический пересбор статистики после DML.
+--     Очередной fasttrun_analyze после любого DML с момента предыдущего
+--     сбора пересобирает статистику, как ядерный ANALYZE.  Число строк при
+--     точном счете берется из дельты, строки для статистики - выборкой
+--     блоков, как у ANALYZE, а при fasttrun.max_analyze_pages = 0 - полным
+--     проходом.  fasttrun.stats_refresh_threshold задает допуск, до
+--     которого планировщик пользуется статистикой между DML и analyze.
 -- ----------------------------------------------------------------------
 
--- 11a. Значительный UPDATE (churn=1.0) -> пересбор -> план обновляется
+-- 11a. Полный UPDATE -> пересбор -> план обновляется
 CREATE TEMP TABLE t_refresh (id int, grp int);
 INSERT INTO t_refresh SELECT g, g FROM generate_series(1, 100000) g;
 CREATE INDEX ON t_refresh (grp);
@@ -283,15 +282,13 @@ BEGIN;
 SELECT fasttrun_analyze('t_refresh');
 EXPLAIN (COSTS OFF) SELECT * FROM t_refresh WHERE grp = 1;
 
-UPDATE t_refresh SET grp = 1;        -- доля изменений = 1.0 > 0.2 -> пересбор
+UPDATE t_refresh SET grp = 1;
 SELECT fasttrun_analyze('t_refresh');
 EXPLAIN (COSTS OFF) SELECT * FROM t_refresh WHERE grp = 1;
 COMMIT;
 
--- 11b. Маленький DELETE при пороге 0.2 - 0.009% ниже порога -> пересбора
---      нет, но churn в пределах толерантности, поэтому soft freshness
---      отдает кешированную стату планировщику (как ядро PG между ANALYZE).
---      После 11a grp=1 - это все строки, так что план остается Seq Scan.
+-- 11b. Маленький DELETE (0.009%) тоже пересобирает статистику.  После 11a
+--      grp=1 - это все строки, так что план остается Seq Scan.
 BEGIN;
 SELECT fasttrun_analyze('t_refresh');
 EXPLAIN (COSTS OFF) SELECT * FROM t_refresh WHERE grp = 1;
@@ -301,57 +298,56 @@ SELECT fasttrun_analyze('t_refresh');
 EXPLAIN (COSTS OFF) SELECT * FROM t_refresh WHERE grp = 1;
 COMMIT;
 
--- 11c. Порог = 0 принудительно запускает пересбор при любом DML
+-- 11c. Порог = 0 не меняет пересбор: он и так идет после любого DML
 BEGIN;
 SET LOCAL fasttrun.stats_refresh_threshold = 0;
 SELECT fasttrun_analyze('t_refresh');
 EXPLAIN (COSTS OFF) SELECT * FROM t_refresh WHERE grp = 1;
 
-DELETE FROM t_refresh WHERE id < 20; -- даже 0.018% запускает пересбор
+DELETE FROM t_refresh WHERE id < 20;
 SELECT fasttrun_analyze('t_refresh');
 EXPLAIN (COSTS OFF) SELECT * FROM t_refresh WHERE grp = 1;
 COMMIT;
 
--- 11d. Порог = 1.0 отключает пересбор и задает максимальную толерантность:
---      стата прячется только когда churn достигает 100%.  Полный UPDATE
---      (100% строк) превышает порог -> fallback к defaults.
+-- 11d. Порог = 1.0 задает максимальную толерантность для отдачи статистики
+--      до следующего analyze, но пересбор не отключает: analyze после
+--      полного UPDATE пересобирает, и grp = 999 - все строки (Seq Scan).
 BEGIN;
 SET LOCAL fasttrun.stats_refresh_threshold = 1;
 SELECT fasttrun_analyze('t_refresh');
 EXPLAIN (COSTS OFF) SELECT * FROM t_refresh WHERE grp = 1;
 
-UPDATE t_refresh SET grp = 999;     -- любой DML -> пересбор отключен
+UPDATE t_refresh SET grp = 999;
 SELECT fasttrun_analyze('t_refresh');
 EXPLAIN (COSTS OFF) SELECT * FROM t_refresh WHERE grp = 999;
 COMMIT;
 
--- 11e. Below-threshold DML внутри savepoint.  После ROLLBACK TO SAVEPOINT
---      counters откатываются к pre-savepoint -> стата точно свежая.  Без
---      rollback тот же below-threshold DML остается в пределах толерантности
---      -> soft freshness продолжает отдавать кешированную стату планировщику.
+-- 11e. DML и пересбор внутри savepoint.  После ROLLBACK TO SAVEPOINT
+--      counters откатываются к pre-savepoint, и откат возвращает прежнюю
+--      выборку -> стата точно свежая.  Без rollback тот же DML и analyze
+--      пересобирают статистику, и она видна планировщику.
 BEGIN;
 SELECT fasttrun_analyze('t_refresh');
 
 SAVEPOINT sp1;
-DELETE FROM t_refresh WHERE id < 5;  -- ниже порога
+DELETE FROM t_refresh WHERE id < 5;
 SELECT fasttrun_analyze('t_refresh');
 ROLLBACK TO sp1;
 
 -- После отката savepoint хук должен вернуть кешированную статистику
--- (counters откатились к pre-savepoint значениям, collected_* не
--- менялся внутри savepoint -> match)
+-- (counters откатились к pre-savepoint значениям, а откат вернул выборку
+-- и collected_* прежнего сбора -> match)
 EXPLAIN (COSTS OFF) SELECT * FROM t_refresh WHERE grp = 1;
 
--- Теперь тот же DML без savepoint - churn в пределах порога -> стата видна
+-- Теперь тот же DML без savepoint - analyze пересобирает -> стата видна
 DELETE FROM t_refresh WHERE id < 5;
 SELECT fasttrun_analyze('t_refresh');
 EXPLAIN (COSTS OFF) SELECT * FROM t_refresh WHERE grp = 1;
 COMMIT;
 
--- 11f. DML ниже порога внутри savepoint с последующим RELEASE.  RELEASE
---      продвигает pgstat counters в родительский subxact, а churn остается в
---      пределах толерантности, поэтому soft freshness отдает кешированную
---      стату.
+-- 11f. DML и пересбор внутри savepoint с последующим RELEASE.  RELEASE
+--      продвигает pgstat counters и новую выборку в родительский subxact,
+--      поэтому хук отдает статистику.
 --
 --      High-cardinality таблица: редкий equality-предикат на кешированной
 --      стате дает Index Scan (на defaults был бы Bitmap).
@@ -364,20 +360,20 @@ SELECT fasttrun_analyze('t_release_stats');
 EXPLAIN (COSTS OFF) SELECT * FROM t_release_stats WHERE grp = 50000;
 
 SAVEPOINT sp_release;
-DELETE FROM t_release_stats WHERE id < 10;  -- ниже порога
+DELETE FROM t_release_stats WHERE id < 10;
 SELECT fasttrun_analyze('t_release_stats');
 RELEASE SAVEPOINT sp_release;
 
--- Below-threshold churn -> soft freshness держит стату -> Index Scan.
+-- Выборка после RELEASE свежая -> Index Scan.
 EXPLAIN (COSTS OFF) SELECT * FROM t_release_stats WHERE grp = 50000;
 COMMIT;
 DROP TABLE t_release_stats;
 
 -- 11g. Targeted UPDATE концентрирует 10% строк на grp=1 - выше строгого порога
---      для high-cardinality колонки.  Cardinality-aware freshness прячет стату,
---      и planner уходит на defaults (Bitmap), а не строит Index Scan по
---      "редкому" grp=1, который на деле стал частым.  Защита сохраняется и
---      после COMMIT.
+--      для high-cardinality колонки.  Пока analyze после UPDATE не вызван,
+--      cardinality-aware freshness прячет стату, и planner уходит на
+--      defaults (Bitmap), а не строит Index Scan по "редкому" grp=1, который
+--      на деле стал частым.  Защита сохраняется и после COMMIT.
 CREATE TEMP TABLE t_commit_stale_stats (id int, grp int);
 INSERT INTO t_commit_stale_stats SELECT g, g FROM generate_series(1, 100000) g;
 CREATE INDEX ON t_commit_stale_stats (grp);
@@ -387,7 +383,6 @@ SELECT fasttrun_analyze('t_commit_stale_stats');
 EXPLAIN (COSTS OFF) SELECT * FROM t_commit_stale_stats WHERE grp = 1;
 
 UPDATE t_commit_stale_stats SET grp = 1 WHERE id <= 10000;  -- ниже порога 20%
-SELECT fasttrun_analyze('t_commit_stale_stats');
 
 -- Targeted churn выше строгого порога high-card -> стата скрыта -> defaults.
 EXPLAIN (COSTS OFF) SELECT * FROM t_commit_stale_stats WHERE grp = 1;
@@ -402,9 +397,12 @@ DROP TABLE t_commit_stale_stats;
 DROP TABLE t_refresh;
 
 -- 11h. Cardinality-aware граница: для high-cardinality (unique) колонки порог
---      толерантности ужесточен (concentrated DML может раздуть "редкое"
---      значение в катастрофический Index Scan).  Мелкий churn ниже строгого
---      порога держит стату видимой (Index Scan), churn выше - прячет ее.
+--      толерантности ужесточен (INSERT или UPDATE может сосредоточить строки
+--      на одном значении и раздуть "редкое" значение в катастрофический Index
+--      Scan).  Мелкий churn ниже строгого порога держит стату видимой (Index
+--      Scan), INSERT выше - прячет ее.  DELETE строки не сосредотачивает:
+--      доля оставшегося значения растет не больше чем в 1/(1 - доля
+--      удаленных) раз, поэтому для него действует общий порог.
 CREATE TEMP TABLE t_skew_below (id int, grp int);
 INSERT INTO t_skew_below SELECT g, g FROM generate_series(1, 100000) g;
 CREATE INDEX ON t_skew_below (grp);
@@ -420,15 +418,67 @@ INSERT INTO t_skew_above SELECT g, g FROM generate_series(1, 100000) g;
 CREATE INDEX ON t_skew_above (grp);
 BEGIN;
 SELECT fasttrun_analyze('t_skew_above');
-DELETE FROM t_skew_above WHERE id <= 10000;   -- 10% выше строгого high-card порога -> прячется
+INSERT INTO t_skew_above SELECT 100000 + g, 1 FROM generate_series(1, 10000) g;  -- 10% -> прячется
 EXPLAIN (COSTS OFF) SELECT * FROM t_skew_above WHERE grp = 50000;
 COMMIT;
 DROP TABLE t_skew_above;
 
+CREATE TEMP TABLE t_skew_delete (id int, grp int);
+INSERT INTO t_skew_delete SELECT g, g FROM generate_series(1, 100000) g;
+CREATE INDEX ON t_skew_delete (grp);
+BEGIN;
+SELECT fasttrun_analyze('t_skew_delete');
+DELETE FROM t_skew_delete WHERE id <= 10000;  -- 10% DELETE ниже общего порога -> видна
+EXPLAIN (COSTS OFF) SELECT * FROM t_skew_delete WHERE grp = 50000;
+DELETE FROM t_skew_delete WHERE id <= 25000;  -- всего 25% -> прячется
+EXPLAIN (COSTS OFF) SELECT * FROM t_skew_delete WHERE grp = 50000;
+COMMIT;
+DROP TABLE t_skew_delete;
+
+-- 11i. Явный fasttrun_analyze после любого DML пересобирает статистику, как
+--      ядерный ANALYZE.  Новый месяц (+14% строк) ниже порога допуска, но
+--      старая выборка не знает новых дат и дала бы оценку 1 строка вместо
+--      15 000.  То же для колонки, где были только NULL, и для флага,
+--      который UPDATE взвел у 15% строк.
+CREATE FUNCTION pg_temp.st_rows(q text) RETURNS int LANGUAGE plpgsql AS $f$
+DECLARE
+  plan json;
+BEGIN
+  EXECUTE 'EXPLAIN (FORMAT JSON) ' || q INTO plan;
+  RETURN (plan->0->'Plan'->>'Plan Rows')::int;
+END
+$f$;
+CREATE TEMP TABLE t_month (f_subscr int, d_date date, flag bool, note int);
+INSERT INTO t_month
+SELECT s, date '2026-10-01' + d, false, NULL
+  FROM generate_series(1, 3000) s, generate_series(0, 29) d;
+SELECT fasttrun_analyze('t_month');
+INSERT INTO t_month
+SELECT s, date '2026-11-01' + d, false, NULL
+  FROM generate_series(1, 3000) s, generate_series(0, 4) d;
+SELECT fasttrun_analyze('t_month');
+SELECT pg_temp.st_rows($$SELECT * FROM t_month WHERE d_date >= '2026-11-01'$$)
+       BETWEEN 10000 AND 20000 AS new_month_estimated;
+DROP TABLE t_month;
+CREATE TEMP TABLE t_flag (id int, flag bool, note int);
+INSERT INTO t_flag SELECT g, false, NULL FROM generate_series(1, 100000) g;
+SELECT fasttrun_analyze('t_flag');
+UPDATE t_flag SET flag = true, note = 1 WHERE id <= 15000;
+SELECT fasttrun_analyze('t_flag');
+SELECT pg_temp.st_rows($$SELECT * FROM t_flag WHERE flag$$)
+       BETWEEN 10000 AND 20000 AS updated_flag_estimated,
+       pg_temp.st_rows($$SELECT * FROM t_flag WHERE note IS NOT NULL$$)
+       BETWEEN 10000 AND 20000 AS filled_null_column_estimated;
+-- Без DML повторный analyze выборку не трогает.
+SELECT fasttrun_analyze('t_flag');
+SELECT pg_temp.st_rows($$SELECT * FROM t_flag WHERE flag$$)
+       BETWEEN 10000 AND 20000 AS estimate_kept_without_dml;
+DROP TABLE t_flag;
+
 -- ----------------------------------------------------------------------
--- 12. Порог = 0 не должен запускать пересбор, если доля изменений
---     равна нулю.  Семантика порога: "0 = пересбор при любом DML",
---     а не "при каждом теплом попадании в кэш".
+-- 12. Без DML analyze пересбор не запускает ни при каком пороге, и при
+--     нулевом тоже: пересбор запускает износ, а не каждое попадание
+--     в кэш.
 -- ----------------------------------------------------------------------
 CREATE TEMP TABLE t_thr0 (id int, v int);
 INSERT INTO t_thr0 SELECT g, g FROM generate_series(1, 10000) g;
@@ -557,8 +607,8 @@ SELECT stadistinct < -0.1 AS cold_ndistinct_high
   FROM fasttrun_inspect_stats('t_bias')
  WHERE staattnum = 2;
 
--- INSERT 20000 строк -> доля изменений 20k/73k ~ 27% > 20% порога ->
--- запускается пересбор статистики
+-- INSERT 20000 строк: любой DML с прошлого сбора запускает пересбор
+-- статистики
 INSERT INTO t_bias SELECT g, g FROM generate_series(53001, 73000) g;
 SELECT fasttrun_analyze('t_bias');
 -- После пересбора: n_distinct ВСЕ ЕЩЕ должен быть высоким.
@@ -769,7 +819,7 @@ SELECT fasttrun_analyze('t_stats_ddl');
 SELECT count(*) = 2 AS ddl_rollback_stats_before
   FROM fasttrun_inspect_stats('t_stats_ddl');
 SAVEPOINT sp_ddl_rollback;
-ALTER TABLE t_stats_ddl ADD COLUMN payload text;
+ALTER TABLE t_stats_ddl ALTER COLUMN id TYPE int;
 SELECT count(*) = 0 AS ddl_rollback_stats_evicted_inside
   FROM fasttrun_inspect_stats('t_stats_ddl');
 ROLLBACK TO SAVEPOINT sp_ddl_rollback;
@@ -1701,6 +1751,38 @@ SELECT coalesce(array_agg(staattnum ORDER BY staattnum) =
 DROP TABLE t_handoff;
 
 -- ----------------------------------------------------------------------
+-- 34b. Объекты расширенной статистики (CREATE STATISTICS) строит только
+--      ядерный ANALYZE.  fasttrun_analyze передает такую таблицу ему:
+--      оценка группировки по двум зависимым колонкам совпадает с ядром,
+--      а после очистки и заполнения объект пересчитывается заново.
+-- ----------------------------------------------------------------------
+CREATE FUNCTION pg_temp.ext_rows(q text) RETURNS int LANGUAGE plpgsql AS $f$
+DECLARE
+  plan json;
+BEGIN
+  EXECUTE 'EXPLAIN (FORMAT JSON) ' || q INTO plan;
+  RETURN (plan->0->'Plan'->>'Plan Rows')::int;
+END
+$f$;
+CREATE TEMP TABLE t_ext (a int, b int);
+INSERT INTO t_ext SELECT g % 100, (g % 100) / 10 FROM generate_series(1, 100000) g;
+CREATE STATISTICS pg_temp.t_ext_nd (ndistinct) ON a, b FROM t_ext;
+SELECT fasttrun_analyze('t_ext');
+SELECT pg_temp.ext_rows('SELECT a, b, count(*) FROM t_ext GROUP BY a, b')
+       BETWEEN 80 AND 150 AS ext_groups_estimated;
+SELECT count(*) = 1 AS ext_object_built
+  FROM pg_statistic_ext s JOIN pg_statistic_ext_data d ON d.stxoid = s.oid
+ WHERE s.stxrelid = 't_ext'::regclass;
+SELECT pg_temp.ext_rows('SELECT * FROM t_ext WHERE a = 5') BETWEEN 500 AND 2000
+       AS ext_column_stats_served;
+SELECT fasttruncate('t_ext');
+INSERT INTO t_ext SELECT g % 700, (g % 700) / 7 FROM generate_series(1, 100000) g;
+SELECT fasttrun_analyze_bulk('t_ext');
+SELECT pg_temp.ext_rows('SELECT a, b, count(*) FROM t_ext GROUP BY a, b')
+       BETWEEN 500 AND 1000 AS ext_groups_after_refill;
+DROP TABLE t_ext;
+
+-- ----------------------------------------------------------------------
 -- 35. VACUUM без ANALYZE не меняет локальную статистику.
 -- ----------------------------------------------------------------------
 CREATE TEMP TABLE t_vacuum_keep (a int, b text);
@@ -1716,6 +1798,669 @@ SELECT count(*) = 2 AND
   FULL JOIN fasttrun_inspect_stats('t_vacuum_keep') AS s USING (staattnum);
 DROP TABLE t_vacuum_snapshot;
 DROP TABLE t_vacuum_keep;
+
+-- 35b. VACUUM отрезает пустой хвост кучи, а живые строки не трогает.
+--      Планировщик делит reltuples на relpages и умножает на фактическое
+--      число страниц, поэтому после VACUUM опубликованный relpages берется из
+--      хранилища.  Запасной сигнал по размеру не принимает усечение за новое
+--      заполнение: статистика колонок остается видна.
+CREATE TEMP TABLE t_vacuum_shrink (grp int);
+INSERT INTO t_vacuum_shrink SELECT 1 FROM generate_series(1, 200);
+INSERT INTO t_vacuum_shrink SELECT 2 FROM generate_series(1, 20000);
+DELETE FROM t_vacuum_shrink WHERE grp = 2;
+SELECT fasttrun_analyze('t_vacuum_shrink');
+VACUUM t_vacuum_shrink;
+SELECT pg_temp.ext_rows('SELECT * FROM t_vacuum_shrink') BETWEEN 100 AND 400
+       AS vacuum_shrink_rows,
+       pg_temp.ext_rows('SELECT * FROM t_vacuum_shrink WHERE grp = 1') BETWEEN 100 AND 400
+       AS vacuum_shrink_column_stats;
+SELECT relpages = pg_relation_size('t_vacuum_shrink') / 8192 AS vacuum_shrink_pages
+  FROM fasttrun_relstats('t_vacuum_shrink');
+DROP TABLE t_vacuum_shrink;
+
+-- Строки, зафиксированные после analyze, VACUUM тоже не теряет: после него
+-- число строк и страниц берется у VACUUM, который только что их посчитал.
+CREATE TEMP TABLE t_vacuum_grow (id int);
+INSERT INTO t_vacuum_grow SELECT generate_series(1, 1000);
+SELECT fasttrun_analyze('t_vacuum_grow');
+INSERT INTO t_vacuum_grow SELECT generate_series(1, 100000);
+VACUUM t_vacuum_grow;
+SELECT pg_temp.ext_rows('SELECT * FROM t_vacuum_grow') BETWEEN 80000 AND 120000
+       AS vacuum_grow_rows;
+DROP TABLE t_vacuum_grow;
+
+-- 35c. CREATE INDEX и ALTER TABLE, которые не меняют строки и смысл
+--      оставшихся колонок, статистику колонок не сбрасывают: ядро тоже
+--      хранит pg_statistic через них.  DROP COLUMN убирает статистику только
+--      своей колонки, а смена типа колонки сбрасывает статистику таблицы.
+CREATE TEMP TABLE t_ddl_keep (id int, grp int, extra int);
+INSERT INTO t_ddl_keep SELECT g, g % 10, NULL FROM generate_series(1, 100000) g;
+SELECT fasttrun_analyze('t_ddl_keep');
+CREATE INDEX ON t_ddl_keep (id);
+SELECT pg_temp.ext_rows('SELECT * FROM t_ddl_keep WHERE grp = 3') BETWEEN 8000 AND 12000
+       AS ddl_keep_after_index;
+ALTER TABLE t_ddl_keep SET (fillfactor = 90);
+SELECT pg_temp.ext_rows('SELECT * FROM t_ddl_keep WHERE grp = 3') BETWEEN 8000 AND 12000
+       AS ddl_keep_after_reloptions;
+ALTER TABLE t_ddl_keep ADD COLUMN IF NOT EXISTS note numeric;
+SELECT pg_temp.ext_rows('SELECT * FROM t_ddl_keep WHERE grp = 3') BETWEEN 8000 AND 12000
+       AS ddl_keep_after_add_column;
+ALTER TABLE t_ddl_keep DROP COLUMN IF EXISTS extra;
+SELECT pg_temp.ext_rows('SELECT * FROM t_ddl_keep WHERE grp = 3') BETWEEN 8000 AND 12000
+       AS ddl_keep_after_drop_column;
+SELECT array_agg(staattnum ORDER BY staattnum) = ARRAY[1, 2]::smallint[]
+       AS ddl_keep_dropped_column_gone
+  FROM fasttrun_inspect_stats('t_ddl_keep');
+CREATE TEMP TABLE t_ddl_unique (id int);
+INSERT INTO t_ddl_unique SELECT generate_series(1, 10);
+SELECT fasttrun_analyze('t_ddl_unique');
+INSERT INTO t_ddl_unique SELECT generate_series(11, 100000);
+ALTER TABLE t_ddl_unique ADD COLUMN extra int UNIQUE;
+SELECT reltuples > 50000 AS ddl_add_unique_takes_index_relstats
+  FROM fasttrun_relstats('t_ddl_unique');
+DROP TABLE t_ddl_unique;
+-- ADD COLUMN IF NOT EXISTS для существующей колонки ядро пропускает, индекса
+-- нет, и relstats сеанса остаются.
+CREATE TEMP TABLE t_ddl_ifne (id int);
+INSERT INTO t_ddl_ifne SELECT generate_series(1, 1000);
+SELECT fasttrun_analyze('t_ddl_ifne');
+ALTER TABLE t_ddl_ifne ADD COLUMN IF NOT EXISTS id int UNIQUE;
+GRANT SELECT ON t_ddl_ifne TO PUBLIC;
+SELECT reltuples = 1000 AS ddl_add_existing_column_keeps_relstats
+  FROM fasttrun_relstats('t_ddl_ifne');
+-- DROP и ADD той же колонки в одной команде: ядро сначала удаляет колонку и
+-- потом строит индекс.
+CREATE TEMP TABLE t_ddl_redo (id int, extra int);
+INSERT INTO t_ddl_redo SELECT g, g FROM generate_series(1, 10) g;
+SELECT fasttrun_analyze('t_ddl_redo');
+INSERT INTO t_ddl_redo SELECT g, g FROM generate_series(11, 100000) g;
+ALTER TABLE t_ddl_redo DROP COLUMN extra, ADD COLUMN IF NOT EXISTS extra int UNIQUE;
+SELECT reltuples > 50000 AS ddl_drop_add_takes_index_relstats
+  FROM fasttrun_relstats('t_ddl_redo');
+DROP TABLE t_ddl_redo;
+-- То же в обратном порядке текста: ядро выполняет DROP раньше любого ADD.
+CREATE TEMP TABLE t_ddl_redo2 (id int, extra int);
+INSERT INTO t_ddl_redo2 SELECT g, g FROM generate_series(1, 10) g;
+SELECT fasttrun_analyze('t_ddl_redo2');
+INSERT INTO t_ddl_redo2 SELECT g, g FROM generate_series(11, 100000) g;
+ALTER TABLE t_ddl_redo2 ADD COLUMN IF NOT EXISTS extra int UNIQUE, DROP COLUMN extra;
+SELECT reltuples > 50000 AS ddl_add_drop_takes_index_relstats
+  FROM fasttrun_relstats('t_ddl_redo2');
+DROP TABLE t_ddl_redo2;
+-- Второй ADD COLUMN IF NOT EXISTS той же колонки ядро пропускает: первый уже
+-- добавил ее, и индекс второго не строится.
+CREATE TEMP TABLE t_ddl_readd (id int, extra int);
+INSERT INTO t_ddl_readd SELECT g, g FROM generate_series(1, 10000) g;
+ANALYZE t_ddl_readd;
+DELETE FROM t_ddl_readd WHERE id > 1000;
+SELECT fasttrun_analyze('t_ddl_readd');
+ALTER TABLE t_ddl_readd
+  ADD COLUMN IF NOT EXISTS extra int,
+  ADD COLUMN IF NOT EXISTS extra int UNIQUE,
+  DROP COLUMN extra;
+SELECT reltuples = 1000 AS ddl_repeated_add_keeps_relstats
+  FROM fasttrun_relstats('t_ddl_readd');
+DROP TABLE t_ddl_readd;
+-- Каскад удаляет generated-колонку, и ADD COLUMN IF NOT EXISTS с тем же
+-- именем строит индекс: кеш берет пару ядра.
+CREATE TEMP TABLE t_ddl_cascade (id int, a int, g int GENERATED ALWAYS AS (a * 2) STORED);
+INSERT INTO t_ddl_cascade (id, a) SELECT g, g FROM generate_series(1, 10) g;
+SELECT fasttrun_analyze('t_ddl_cascade');
+INSERT INTO t_ddl_cascade (id, a) SELECT g, g FROM generate_series(11, 100000) g;
+ALTER TABLE t_ddl_cascade DROP COLUMN a CASCADE, ADD COLUMN IF NOT EXISTS g int UNIQUE;
+SELECT reltuples > 50000 AS ddl_cascade_add_takes_index_relstats
+  FROM fasttrun_relstats('t_ddl_cascade');
+DROP TABLE t_ddl_cascade;
+-- ADD COLUMN ... STORED и ADD COLUMN с изменчивым DEFAULT переписывают кучу
+-- теми же строками.  Ядро сохраняет pg_statistic, и выборки переходят на
+-- новый файл, а откат точки сохранения возвращает старый файл вместе с ними.
+CREATE TEMP TABLE t_ddl_rewrite (id int, a int, b int);
+CREATE INDEX ON t_ddl_rewrite ((b % 2));
+INSERT INTO t_ddl_rewrite SELECT g, g % 7, g % 20 FROM generate_series(1, 7000) g;
+SELECT fasttrun_analyze('t_ddl_rewrite');
+SELECT pg_relation_filenode('t_ddl_rewrite') AS ddl_rewrite_node \gset
+ALTER TABLE t_ddl_rewrite ADD COLUMN c int GENERATED ALWAYS AS (a + b) STORED;
+SELECT pg_relation_filenode('t_ddl_rewrite') <> :ddl_rewrite_node AS ddl_rewrite_new_file,
+       pg_temp.st_rows('SELECT * FROM t_ddl_rewrite WHERE a = 3') BETWEEN 500 AND 2000
+       AS ddl_rewrite_keeps_column_stats,
+       pg_temp.st_rows('SELECT * FROM t_ddl_rewrite WHERE b % 2 = 0') BETWEEN 1750 AND 7000
+       AS ddl_rewrite_keeps_expression_stats;
+BEGIN;
+SAVEPOINT ddl_rewrite_sp;
+SAVEPOINT ddl_rewrite_inner;
+ALTER TABLE t_ddl_rewrite ADD COLUMN d uuid DEFAULT gen_random_uuid();
+RELEASE SAVEPOINT ddl_rewrite_inner;
+SELECT pg_temp.st_rows('SELECT * FROM t_ddl_rewrite WHERE b = 5') BETWEEN 175 AND 700
+       AS ddl_rewrite_volatile_default_keeps;
+ROLLBACK TO ddl_rewrite_sp;
+SELECT pg_temp.st_rows('SELECT * FROM t_ddl_rewrite WHERE b = 5') BETWEEN 175 AND 700
+       AS ddl_rewrite_rollback_keeps;
+COMMIT;
+SELECT column_stats = 4 AND hidden_columns = 0 AS ddl_rewrite_survives_commit
+  FROM fasttrun_cached_tables() WHERE relname = 't_ddl_rewrite';
+DROP TABLE t_ddl_rewrite;
+-- Перезапись без мертвых строк уменьшает файл в десять раз при тех же
+-- данных: якорь размера переходит на новый файл.
+CREATE TEMP TABLE t_ddl_rewrite_shrink (id int, a int);
+INSERT INTO t_ddl_rewrite_shrink SELECT g, g % 7 FROM generate_series(1, 70000) g;
+DELETE FROM t_ddl_rewrite_shrink WHERE id % 10 <> 0;
+SELECT fasttrun_analyze('t_ddl_rewrite_shrink');
+ALTER TABLE t_ddl_rewrite_shrink ADD COLUMN c int GENERATED ALWAYS AS (a * 2) STORED;
+SELECT pg_temp.st_rows('SELECT * FROM t_ddl_rewrite_shrink WHERE a = 3') BETWEEN 500 AND 2000
+       AS ddl_rewrite_shrink_keeps_column_stats;
+DROP TABLE t_ddl_rewrite_shrink;
+DROP TABLE t_ddl_ifne;
+ALTER TABLE t_ddl_keep ALTER COLUMN grp TYPE bigint;
+SELECT pg_temp.ext_rows('SELECT * FROM t_ddl_keep WHERE grp = 3') < 2000
+       AS ddl_type_change_drops_stats;
+DROP TABLE t_ddl_keep;
+
+-- 35d. Тело встроенной SQL-функции планировщик раскрывает уже внутри
+--      standard_planner, после обхода дерева разбора.  Число строк и
+--      скрытие устаревшей ядерной статистики выражения доходят и до него:
+--      оценки через функцию совпадают с прямым запросом, в том числе после
+--      пересборки relcache, которая возвращает в rd_rel значения pg_class.
+CREATE TEMP TABLE t_inline (id int, pad text);
+INSERT INTO t_inline SELECT g, repeat('x', 100) FROM generate_series(1, 50) g;
+SELECT fasttrun_analyze('t_inline');
+CREATE FUNCTION pg_temp.f_inline() RETURNS SETOF t_inline
+  LANGUAGE sql STABLE AS 'SELECT * FROM t_inline';
+GRANT SELECT ON t_inline TO PUBLIC;
+SELECT pg_temp.ext_rows('SELECT * FROM pg_temp.f_inline()') = 50
+       AS inline_rows_reinjected;
+DROP FUNCTION pg_temp.f_inline();
+DROP TABLE t_inline;
+
+CREATE TEMP TABLE t_inline_expr (id int, payload text);
+CREATE INDEX t_inline_expr_idx ON t_inline_expr (lower(payload));
+INSERT INTO t_inline_expr SELECT g, 'A' FROM generate_series(1, 10000) g;
+ANALYZE t_inline_expr;
+SELECT fasttruncate('t_inline_expr');
+INSERT INTO t_inline_expr SELECT g, 'b_' || g FROM generate_series(1, 10000) g;
+SELECT fasttrun_analyze('t_inline_expr');
+CREATE FUNCTION pg_temp.f_inline_expr() RETURNS SETOF t_inline_expr
+  LANGUAGE sql STABLE AS $$SELECT * FROM t_inline_expr WHERE lower(payload) = 'a'$$;
+SELECT pg_temp.ext_rows('SELECT * FROM pg_temp.f_inline_expr()') =
+       pg_temp.ext_rows($$SELECT * FROM t_inline_expr WHERE lower(payload) = 'a'$$)
+       AS inline_expr_matches_direct,
+       pg_temp.ext_rows('SELECT * FROM pg_temp.f_inline_expr()') < 1000
+       AS inline_expr_stale_hidden;
+DROP FUNCTION pg_temp.f_inline_expr();
+DROP TABLE t_inline_expr;
+
+-- Инвалидация одного индекса (ALTER INDEX ... SET) возвращает в его rd_rel
+-- значения pg_class, а heap сохраняет восстановленные.  Частичный индекс
+-- берет число строк из своего rd_rel, и стоимость через функцию совпадает с
+-- прямым запросом.
+CREATE FUNCTION pg_temp.st_cost(q text) RETURNS numeric LANGUAGE plpgsql AS $f$
+DECLARE
+  plan json;
+BEGIN
+  EXECUTE 'EXPLAIN (FORMAT JSON) ' || q INTO plan;
+  RETURN (plan->0->'Plan'->>'Total Cost')::numeric;
+END
+$f$;
+CREATE TEMP TABLE t_inline_part (id int, flag bool);
+INSERT INTO t_inline_part SELECT g, true FROM generate_series(1, 10000) g;
+CREATE INDEX t_inline_part_idx ON t_inline_part (id) WHERE flag;
+UPDATE t_inline_part SET flag = false WHERE id > 100;
+SELECT fasttrun_analyze('t_inline_part');
+CREATE FUNCTION pg_temp.f_inline_part() RETURNS SETOF t_inline_part
+  LANGUAGE sql STABLE AS 'SELECT * FROM t_inline_part WHERE flag AND id = 5';
+ALTER INDEX t_inline_part_idx SET (fillfactor = 80);
+SELECT pg_temp.st_cost('SELECT * FROM pg_temp.f_inline_part()') =
+       pg_temp.st_cost('SELECT * FROM t_inline_part WHERE flag AND id = 5')
+       AS inline_partial_index_reinjected;
+DROP FUNCTION pg_temp.f_inline_part();
+DROP TABLE t_inline_part;
+
+-- 35e. Статистика выражений индексов.  Ядерный ANALYZE считает ее по
+--      выражению каждого индекса, а планировщик берет ее по oid индекса.
+--      fasttrun считает ее так же, из той же выборки, а свежесть берет из
+--      счетчиков таблицы: после DML и следующего analyze выражение
+--      пересобирается, без analyze скрывается по допуску.  Частичный индекс
+--      описывает не всю таблицу, и его выражения остаются на оценках по
+--      умолчанию, как у ядра.
+CREATE TEMP TABLE t_expr_stats (id int, v text, area int);
+CREATE INDEX t_expr_stats_lower ON t_expr_stats (lower(v));
+CREATE INDEX t_expr_stats_area ON t_expr_stats (coalesce(area, -1));
+CREATE INDEX t_expr_stats_part ON t_expr_stats (upper(v)) WHERE id > 0;
+INSERT INTO t_expr_stats
+SELECT g, CASE WHEN g <= 9000 THEN 'Hot' ELSE 'v' || g END,
+       CASE WHEN g % 10 = 0 THEN g END
+  FROM generate_series(1, 10000) g;
+SELECT fasttrun_analyze('t_expr_stats');
+SELECT pg_temp.ext_rows($$SELECT * FROM t_expr_stats WHERE lower(v) = 'hot'$$)
+       BETWEEN 8000 AND 10000 AS expr_stats_frequent_value,
+       pg_temp.ext_rows($$SELECT * FROM t_expr_stats WHERE coalesce(area, -1) = -1$$)
+       BETWEEN 8000 AND 10000 AS expr_stats_coalesce,
+       pg_temp.ext_rows($$SELECT * FROM t_expr_stats WHERE upper(v) = 'HOT'$$) < 1000
+       AS expr_stats_partial_defaults;
+SELECT count(*) = 2 AS expr_stats_cached
+  FROM fasttrun_inspect_stats('t_expr_stats') s
+ WHERE s.starelid IN ('t_expr_stats_lower'::regclass, 't_expr_stats_area'::regclass);
+BEGIN;
+UPDATE t_expr_stats SET v = 'cold' WHERE id <= 9000;
+SELECT pg_temp.ext_rows($$SELECT * FROM t_expr_stats WHERE lower(v) = 'hot'$$) < 1000
+       AS expr_stats_hidden_after_update;
+COMMIT;
+SELECT fasttrun_analyze('t_expr_stats');
+SELECT pg_temp.ext_rows($$SELECT * FROM t_expr_stats WHERE lower(v) = 'cold'$$)
+       BETWEEN 8000 AND 10000 AS expr_stats_recollected;
+SELECT fasttruncate('t_expr_stats');
+SELECT pg_temp.ext_rows($$SELECT * FROM t_expr_stats WHERE lower(v) = 'cold'$$) < 1000
+       AS expr_stats_gone_after_truncate;
+DROP TABLE t_expr_stats;
+
+-- Цель выражения учитывается и при fasttrun.sample_rows = -1, даже когда у
+-- самих колонок таблицы сбор выключен.
+SET fasttrun.sample_rows = -1;
+CREATE TEMP TABLE t_expr_auto (v text);
+ALTER TABLE t_expr_auto ALTER COLUMN v SET STATISTICS 0;
+CREATE INDEX t_expr_auto_lower ON t_expr_auto (lower(v));
+INSERT INTO t_expr_auto
+SELECT CASE WHEN g <= 9000 THEN 'Hot' ELSE 'v' || g END FROM generate_series(1, 10000) g;
+SELECT fasttrun_analyze('t_expr_auto');
+SELECT pg_temp.ext_rows($$SELECT * FROM t_expr_auto WHERE lower(v) = 'hot'$$)
+       BETWEEN 8000 AND 10000 AS expr_stats_autosize;
+RESET fasttrun.sample_rows;
+DROP TABLE t_expr_auto;
+
+-- DROP INDEX убирает статистику выражений этого индекса и сами записи кеша,
+-- в том числе после CREATE INDEX другого индекса.
+CREATE TEMP TABLE t_expr_drop (id int, v text);
+CREATE INDEX t_expr_drop_lower ON t_expr_drop (lower(v));
+INSERT INTO t_expr_drop SELECT g, 'v' || g FROM generate_series(1, 1000) g;
+SELECT fasttrun_analyze('t_expr_drop');
+SELECT column_stats_entries AS expr_entries_before FROM fasttrun_cache_stats() \gset
+CREATE INDEX t_expr_drop_id ON t_expr_drop (id);
+DROP INDEX t_expr_drop_lower;
+SELECT count(*) = 2 AS expr_stats_dropped_with_index
+  FROM fasttrun_inspect_stats('t_expr_drop');
+SELECT column_stats = 2 AS expr_stats_dropped_from_cache
+  FROM fasttrun_cached_tables() WHERE relname = 't_expr_drop';
+SELECT column_stats_entries = :expr_entries_before - 1 AS expr_stats_entry_removed
+  FROM fasttrun_cache_stats();
+DROP TABLE t_expr_drop;
+
+-- Таблицу с объектами CREATE STATISTICS ядерный ANALYZE обрабатывает, только
+-- если вызывающий вправе ее анализировать.  Иначе ядро пропустило бы ее с
+-- предупреждением, а статистика прежнего заполнения осталась бы видна
+-- планировщику, поэтому fasttrun собирает статистику колонок сам.
+CREATE TEMP TABLE t_ext_perm (a int, b int);
+CREATE STATISTICS pg_temp.t_ext_perm_nd (ndistinct) ON a, b FROM t_ext_perm;
+INSERT INTO t_ext_perm SELECT 1, 1 FROM generate_series(1, 10000);
+ANALYZE t_ext_perm;
+SELECT fasttruncate('t_ext_perm');
+INSERT INTO t_ext_perm SELECT 2, 2 FROM generate_series(1, 10000);
+CREATE ROLE ft_ext_reader;
+GRANT SELECT ON t_ext_perm TO ft_ext_reader;
+SET ROLE ft_ext_reader;
+SELECT fasttrun_analyze('t_ext_perm');
+RESET ROLE;
+SELECT pg_temp.ext_rows('SELECT * FROM t_ext_perm WHERE a = 2') > 5000
+       AS ext_unpermitted_uses_local_stats;
+DROP TABLE t_ext_perm;
+DROP ROLE ft_ext_reader;
+
+-- Данные CREATE STATISTICS при этом остаются от прошлого заполнения, и
+-- планировщик их не берет, пока ядерный ANALYZE не построит их заново.
+CREATE TEMP TABLE t_ext_stale (a int, b int);
+CREATE STATISTICS pg_temp.t_ext_stale_nd (ndistinct) ON a, b FROM t_ext_stale;
+INSERT INTO t_ext_stale SELECT g % 100, g % 100 FROM generate_series(1, 70000) g;
+ANALYZE t_ext_stale;
+SELECT fasttruncate('t_ext_stale');
+INSERT INTO t_ext_stale SELECT g % 700, g % 700 FROM generate_series(1, 70000) g;
+CREATE ROLE ft_ext_stale_reader;
+GRANT SELECT ON t_ext_stale TO ft_ext_stale_reader;
+SET ROLE ft_ext_stale_reader;
+SELECT fasttrun_analyze('t_ext_stale');
+RESET ROLE;
+SELECT pg_temp.ext_rows('SELECT a, b FROM t_ext_stale GROUP BY a, b') > 300
+       AS ext_stale_data_not_used;
+ANALYZE t_ext_stale;
+SELECT pg_temp.ext_rows('SELECT a, b FROM t_ext_stale GROUP BY a, b')
+       BETWEEN 600 AND 800 AS ext_rebuilt_data_used;
+DROP TABLE t_ext_stale;
+DROP ROLE ft_ext_stale_reader;
+
+-- ANALYZE от роли без прав ядро пропускает с предупреждением и ничего не
+-- считает: локальная статистика остается, а данные CREATE STATISTICS
+-- по-прежнему не берутся.  Колонка с целью 0 не дает ядру построить объект, и
+-- его прежние данные тоже не берутся.
+CREATE TEMP TABLE t_ext_skip (a int, b int);
+CREATE STATISTICS pg_temp.t_ext_skip_nd (ndistinct) ON a, b FROM t_ext_skip;
+INSERT INTO t_ext_skip SELECT g % 100, g % 100 FROM generate_series(1, 70000) g;
+ANALYZE t_ext_skip;
+SELECT fasttruncate('t_ext_skip');
+INSERT INTO t_ext_skip SELECT g % 7000, g % 7000 FROM generate_series(1, 70000) g;
+CREATE ROLE ft_ext_skip_reader;
+GRANT SELECT ON t_ext_skip TO ft_ext_skip_reader;
+SET ROLE ft_ext_skip_reader;
+SELECT fasttrun_analyze('t_ext_skip');
+SET client_min_messages = error;
+ANALYZE t_ext_skip;
+RESET client_min_messages;
+RESET ROLE;
+SELECT pg_temp.ext_rows('SELECT * FROM t_ext_skip WHERE a = 5') < 50
+       AS ext_skipped_analyze_keeps_local,
+       pg_temp.ext_rows('SELECT a, b FROM t_ext_skip GROUP BY a, b') > 1000
+       AS ext_skipped_analyze_keeps_hidden;
+ALTER TABLE t_ext_skip ALTER COLUMN a SET STATISTICS 0;
+SET client_min_messages = error;
+ANALYZE t_ext_skip;
+RESET client_min_messages;
+SELECT pg_temp.ext_rows('SELECT a, b FROM t_ext_skip GROUP BY a, b') > 1000
+       AS ext_unbuilt_object_hidden;
+DROP TABLE t_ext_skip;
+DROP ROLE ft_ext_skip_reader;
+
+-- fasttrun_collect_stats на такой таблице тоже собирает локально, и данные
+-- CREATE STATISTICS после него не берутся.
+CREATE TEMP TABLE t_ext_collect (a int, b int);
+CREATE STATISTICS pg_temp.t_ext_collect_nd (ndistinct) ON a, b FROM t_ext_collect;
+INSERT INTO t_ext_collect SELECT g % 100, g % 100 FROM generate_series(1, 70000) g;
+ANALYZE t_ext_collect;
+SELECT fasttruncate('t_ext_collect');
+INSERT INTO t_ext_collect SELECT g % 700, g % 700 FROM generate_series(1, 70000) g;
+SELECT fasttrun_collect_stats('t_ext_collect');
+SELECT pg_temp.ext_rows('SELECT a, b FROM t_ext_collect GROUP BY a, b') > 300
+       AS ext_collect_stale_data_not_used;
+-- Откаченный DISCARD TEMP возвращает таблицу вместе с ее статистикой и
+-- скрытием устаревших данных объекта.
+SELECT analyze_entries AS discard_entries_before FROM fasttrun_cache_stats() \gset
+BEGIN;
+DISCARD TEMP;
+ROLLBACK;
+SELECT pg_temp.ext_rows('SELECT a, b FROM t_ext_collect GROUP BY a, b') > 300
+       AS ext_discard_rollback_keeps_hidden,
+       (SELECT analyze_entries FROM fasttrun_cache_stats()) = :discard_entries_before
+       AS discard_rollback_keeps_entries;
+DROP TABLE t_ext_collect;
+
+-- Зафиксированный DROP COLUMN убирает запись удаленной колонки, а откаченный
+-- ее возвращает. Повторные ADD и DROP не копят записи.
+CREATE TEMP TABLE t_dropcol (id int, a int, pad text);
+INSERT INTO t_dropcol SELECT g, g % 7, 'x' FROM generate_series(1, 1000) g;
+SELECT column_stats_entries AS dropcol_before, column_stats_relid_entries AS dropcol_relid_before
+  FROM fasttrun_cache_stats() \gset
+SELECT fasttrun_collect_stats('t_dropcol');
+SELECT column_stats_entries AS dropcol_collected FROM fasttrun_cache_stats() \gset
+BEGIN;
+ALTER TABLE t_dropcol DROP COLUMN a;
+ROLLBACK;
+SELECT column_stats_entries = :dropcol_collected AS dropcol_rollback_keeps_entry
+  FROM fasttrun_cache_stats();
+ALTER TABLE t_dropcol DROP COLUMN a;
+SELECT column_stats_entries = :dropcol_collected - 1 AS dropcol_commit_removes_entry
+  FROM fasttrun_cache_stats();
+DO $$
+BEGIN
+  FOR i IN 1..3 LOOP
+    ALTER TABLE t_dropcol ADD COLUMN b int;
+    UPDATE t_dropcol SET b = id % 5;
+    PERFORM fasttrun_collect_stats('t_dropcol');
+    ALTER TABLE t_dropcol DROP COLUMN b;
+  END LOOP;
+END $$;
+SELECT column_stats_entries = :dropcol_collected - 1 AS dropcol_repeated_no_growth
+  FROM fasttrun_cache_stats();
+-- Откаченный DROP нейтральной колонки не оставляет ей пометки удаления.
+SELECT fasttruncate('t_dropcol');
+SELECT column_stats_entries AS dropcol_neutral FROM fasttrun_cache_stats() \gset
+BEGIN;
+ALTER TABLE t_dropcol DROP COLUMN pad;
+ROLLBACK;
+ALTER TABLE t_dropcol DROP COLUMN id;
+SELECT column_stats_entries = :dropcol_neutral - 1 AS dropcol_neutral_rollback_unmarked
+  FROM fasttrun_cache_stats();
+DROP TABLE t_dropcol;
+
+-- Удаление колонки отмечает журнал уровня, а не запись кеша: откат внутренней
+-- очистки, стирающий undo колонок, не оставляет отметку живой колонке, и
+-- частичный ANALYZE после отката DROP отдает свою статистику.
+CREATE TEMP TABLE t_dropcol_nest (a int, b int);
+INSERT INTO t_dropcol_nest SELECT 42, 1 FROM generate_series(1, 1000);
+SELECT fasttrun_collect_stats('t_dropcol_nest');
+BEGIN;
+SAVEPOINT dropcol_outer;
+ALTER TABLE t_dropcol_nest DROP COLUMN a;
+SAVEPOINT dropcol_inner;
+SELECT fasttruncate('t_dropcol_nest');
+ROLLBACK TO dropcol_inner;
+ROLLBACK TO dropcol_outer;
+INSERT INTO t_dropcol_nest SELECT 42, 1 FROM generate_series(1, 1000);
+ANALYZE t_dropcol_nest (a);
+COMMIT;
+SELECT pg_temp.ext_rows('SELECT * FROM t_dropcol_nest WHERE a = 42')::float8 /
+       pg_temp.ext_rows('SELECT * FROM t_dropcol_nest') > 0.9
+       AS dropcol_nested_rollback_keeps_core_stats;
+DROP TABLE t_dropcol_nest;
+
+-- Составной ALTER и каскад на generated-колонку тоже убирают записи
+-- удаленных колонок.
+CREATE TEMP TABLE t_dropcol_more (id int, a int, b int, v varchar(10),
+                                  g int GENERATED ALWAYS AS (a * 2) STORED);
+INSERT INTO t_dropcol_more (id, a, b, v)
+  SELECT g, g % 7, g % 5, 'x' || (g % 9) FROM generate_series(1, 1000) g;
+SELECT fasttrun_collect_stats('t_dropcol_more');
+SELECT column_stats_entries AS dropcol_more_collected FROM fasttrun_cache_stats() \gset
+ALTER TABLE t_dropcol_more DROP COLUMN b, ALTER COLUMN v TYPE varchar(20);
+SELECT column_stats_entries = :dropcol_more_collected - 1 AS dropcol_compound_alter_removes
+  FROM fasttrun_cache_stats();
+SELECT fasttrun_collect_stats('t_dropcol_more');
+SELECT column_stats_entries AS dropcol_more_recollected FROM fasttrun_cache_stats() \gset
+ALTER TABLE t_dropcol_more DROP COLUMN a CASCADE;
+SELECT column_stats_entries = :dropcol_more_recollected - 2 AS dropcol_cascade_removes_generated
+  FROM fasttrun_cache_stats();
+-- Отметка переходит к родительскому уровню при RELEASE.
+SELECT column_stats_entries AS dropcol_more_before_release FROM fasttrun_cache_stats() \gset
+BEGIN;
+SELECT fasttrun_collect_stats('t_dropcol_more');
+SAVEPOINT dropcol_release;
+ALTER TABLE t_dropcol_more DROP COLUMN v;
+RELEASE SAVEPOINT dropcol_release;
+COMMIT;
+SELECT column_stats_entries = :dropcol_more_before_release - 1 AS dropcol_release_keeps_mark
+  FROM fasttrun_cache_stats();
+DROP TABLE t_dropcol_more;
+SELECT column_stats_entries = :dropcol_before AND
+       column_stats_relid_entries = :dropcol_relid_before AS dropcol_table_drop_clears
+  FROM fasttrun_cache_stats();
+
+-- ANALYZE по одной колонке объект на две колонки не строит: данные остаются
+-- прежними и не берутся и после того, как такие ANALYZE убрали все локальные
+-- выборки.
+CREATE TEMP TABLE t_ext_part (a int, b int);
+CREATE STATISTICS pg_temp.t_ext_part_nd (ndistinct) ON a, b FROM t_ext_part;
+INSERT INTO t_ext_part SELECT g % 100, g % 100 FROM generate_series(1, 70000) g;
+ANALYZE t_ext_part;
+SELECT fasttruncate('t_ext_part');
+INSERT INTO t_ext_part SELECT g % 700, g % 700 FROM generate_series(1, 70000) g;
+SELECT fasttrun_collect_stats('t_ext_part');
+SET client_min_messages = error;
+ANALYZE t_ext_part (a);
+ANALYZE t_ext_part (b);
+RESET client_min_messages;
+SELECT pg_temp.ext_rows('SELECT a, b FROM t_ext_part GROUP BY a, b') > 300
+       AS ext_column_list_analyze_keeps_hidden;
+DROP TABLE t_ext_part;
+
+-- Флаг снимает только ANALYZE, который действительно переписал данные каждого
+-- объекта.  Объект на одних выражениях при колонках с целью 0, пустая выборка и
+-- собственная цель объекта 0 оставляют прежние данные, и они не берутся.
+CREATE TEMP TABLE t_ext_expr (a int, b int);
+CREATE STATISTICS pg_temp.t_ext_expr_nd (ndistinct) ON (a + 0), (b + 0) FROM t_ext_expr;
+INSERT INTO t_ext_expr SELECT g % 100, g % 100 FROM generate_series(1, 70000) g;
+ANALYZE t_ext_expr;
+SELECT fasttruncate('t_ext_expr');
+INSERT INTO t_ext_expr SELECT g % 700, g % 700 FROM generate_series(1, 70000) g;
+SELECT fasttrun_collect_stats('t_ext_expr');
+ALTER TABLE t_ext_expr ALTER COLUMN a SET STATISTICS 0, ALTER COLUMN b SET STATISTICS 0;
+SET client_min_messages = error;
+ANALYZE t_ext_expr;
+RESET client_min_messages;
+SELECT pg_temp.ext_rows('SELECT a + 0, b + 0 FROM t_ext_expr GROUP BY 1, 2') > 300
+       AS ext_expression_object_kept_hidden;
+DROP TABLE t_ext_expr;
+
+CREATE TEMP TABLE t_ext_empty (a int, b int);
+CREATE STATISTICS pg_temp.t_ext_empty_nd (ndistinct) ON a, b FROM t_ext_empty;
+INSERT INTO t_ext_empty SELECT g % 100, g % 100 FROM generate_series(1, 70000) g;
+ANALYZE t_ext_empty;
+SELECT fasttruncate('t_ext_empty');
+INSERT INTO t_ext_empty SELECT g % 700, g % 700 FROM generate_series(1, 70000) g;
+SELECT fasttrun_collect_stats('t_ext_empty');
+DELETE FROM t_ext_empty;
+ANALYZE t_ext_empty;
+INSERT INTO t_ext_empty SELECT g % 700, g % 700 FROM generate_series(1, 70000) g;
+SET client_min_messages = error;
+ANALYZE t_ext_empty (a);
+ANALYZE t_ext_empty (b);
+RESET client_min_messages;
+SELECT pg_temp.ext_rows('SELECT a, b FROM t_ext_empty GROUP BY a, b') > 300
+       AS ext_empty_sample_kept_hidden;
+DROP TABLE t_ext_empty;
+
+CREATE TEMP TABLE t_ext_stx0 (a int, b int);
+CREATE STATISTICS pg_temp.t_ext_stx0_nd (ndistinct) ON a, b FROM t_ext_stx0;
+INSERT INTO t_ext_stx0 SELECT g % 100, g % 100 FROM generate_series(1, 70000) g;
+ANALYZE t_ext_stx0;
+SELECT fasttruncate('t_ext_stx0');
+INSERT INTO t_ext_stx0 SELECT g % 700, g % 700 FROM generate_series(1, 70000) g;
+SELECT fasttrun_collect_stats('t_ext_stx0');
+ALTER STATISTICS pg_temp.t_ext_stx0_nd SET STATISTICS 0;
+ANALYZE t_ext_stx0;
+SELECT pg_temp.ext_rows('SELECT a, b FROM t_ext_stx0 GROUP BY a, b') > 300
+       AS ext_object_target_zero_kept_hidden;
+DROP TABLE t_ext_stx0;
+
+-- Выборка, снятая во время записи таблицы, планировщику не отдается, и свежие
+-- данные CREATE STATISTICS остаются в силе.
+CREATE TEMP TABLE t_ext_unsafe (id int, a int, b int);
+CREATE STATISTICS pg_temp.t_ext_unsafe_nd (ndistinct) ON a, b FROM t_ext_unsafe;
+INSERT INTO t_ext_unsafe SELECT g, g % 700, g % 700 FROM generate_series(1, 70000) g;
+ANALYZE t_ext_unsafe;
+CREATE FUNCTION pg_temp.ext_collect_inside() RETURNS int LANGUAGE plpgsql AS $f$
+BEGIN
+  PERFORM fasttrun_collect_stats('t_ext_unsafe');
+  RETURN 0;
+END
+$f$;
+UPDATE t_ext_unsafe SET b = b + pg_temp.ext_collect_inside() WHERE id = 1;
+SELECT pg_temp.ext_rows('SELECT a, b FROM t_ext_unsafe GROUP BY a, b')
+       BETWEEN 600 AND 800 AS ext_unsafe_collect_keeps_data;
+DROP TABLE t_ext_unsafe;
+
+-- После DROP STATISTICS флаг ничего не прячет, и запись, которую держал только
+-- он, уходит.
+SELECT analyze_entries AS ext_drop_entries_before FROM fasttrun_cache_stats() \gset
+CREATE TEMP TABLE t_ext_drop (a int, b int);
+CREATE STATISTICS pg_temp.t_ext_drop_nd (ndistinct) ON a, b FROM t_ext_drop;
+INSERT INTO t_ext_drop SELECT g % 700, g % 700 FROM generate_series(1, 70000) g;
+ANALYZE t_ext_drop;
+SELECT fasttrun_collect_stats('t_ext_drop');
+SET client_min_messages = error;
+ANALYZE t_ext_drop (a);
+ANALYZE t_ext_drop (b);
+RESET client_min_messages;
+DROP STATISTICS pg_temp.t_ext_drop_nd;
+SELECT analyze_entries = :ext_drop_entries_before AS ext_drop_entry_gone
+  FROM fasttrun_cache_stats();
+DROP TABLE t_ext_drop;
+
+-- То же, когда объект удаляет DROP COLUMN по зависимости.
+SELECT analyze_entries AS ext_dropcol_entries_before FROM fasttrun_cache_stats() \gset
+CREATE TEMP TABLE t_ext_dropcol (a int, b int);
+CREATE STATISTICS pg_temp.t_ext_dropcol_nd (ndistinct) ON a, b FROM t_ext_dropcol;
+INSERT INTO t_ext_dropcol SELECT g % 700, g % 700 FROM generate_series(1, 70000) g;
+ANALYZE t_ext_dropcol;
+SELECT fasttrun_collect_stats('t_ext_dropcol');
+SET client_min_messages = error;
+ANALYZE t_ext_dropcol (a);
+ANALYZE t_ext_dropcol (b);
+RESET client_min_messages;
+ALTER TABLE t_ext_dropcol DROP COLUMN b;
+SELECT analyze_entries = :ext_dropcol_entries_before AS ext_dropcol_entry_gone
+  FROM fasttrun_cache_stats();
+DROP TABLE t_ext_dropcol;
+
+-- Откат точки сохранения возвращает и флаг: свежие данные CREATE STATISTICS
+-- снова в силе.
+CREATE TEMP TABLE t_ext_undo (a int, b int);
+CREATE STATISTICS pg_temp.t_ext_undo_nd (ndistinct) ON a, b FROM t_ext_undo;
+INSERT INTO t_ext_undo SELECT g % 700, g % 700 FROM generate_series(1, 70000) g;
+ANALYZE t_ext_undo;
+BEGIN;
+SAVEPOINT s;
+SELECT fasttrun_collect_stats('t_ext_undo');
+ROLLBACK TO SAVEPOINT s;
+SELECT pg_temp.ext_rows('SELECT a, b FROM t_ext_undo GROUP BY a, b')
+       BETWEEN 600 AND 800 AS ext_flag_rolled_back;
+COMMIT;
+DROP TABLE t_ext_undo;
+
+-- Холодный analyze внутри пишущего таблицу оператора снимает выборку, которая
+-- планировщику не отдается, и свежие данные CREATE STATISTICS остаются в силе.
+CREATE TEMP TABLE t_n29 (id int, a int, b int);
+CREATE STATISTICS pg_temp.t_n29_nd (ndistinct) ON a, b FROM t_n29;
+INSERT INTO t_n29 SELECT g, g % 700, g % 700 FROM generate_series(1, 70000) g;
+ANALYZE t_n29;
+CREATE FUNCTION pg_temp.n29_analyze_inside() RETURNS int LANGUAGE plpgsql AS $f$
+BEGIN
+  PERFORM fasttrun_analyze('t_n29');
+  RETURN 0;
+END
+$f$;
+CREATE ROLE ft_n29_writer;
+GRANT SELECT, UPDATE ON t_n29 TO ft_n29_writer;
+SET ROLE ft_n29_writer;
+UPDATE t_n29 SET b = b + pg_temp.n29_analyze_inside() WHERE id = 1;
+RESET ROLE;
+SELECT pg_temp.ext_rows('SELECT a, b FROM t_n29 GROUP BY a, b')
+       BETWEEN 600 AND 800 AS n29_unsafe_analyze_keeps_data;
+DROP TABLE t_n29;
+DROP ROLE ft_n29_writer;
+
+-- Снятие флага после VACUUM (ANALYZE), который работает в своих транзакциях,
+-- попадает в журнал, и запись уходит.
+SELECT analyze_entries AS m11_entries_before FROM fasttrun_cache_stats() \gset
+CREATE TEMP TABLE t_m11 (a int, b int);
+CREATE STATISTICS pg_temp.t_m11_nd (ndistinct) ON a, b FROM t_m11;
+INSERT INTO t_m11 SELECT g % 700, g % 700 FROM generate_series(1, 1000) g;
+SELECT fasttrun_collect_stats('t_m11');
+INSERT INTO t_m11 SELECT g % 700, g % 700 FROM generate_series(1, 100000) g;
+ALTER TABLE t_m11 ALTER COLUMN a SET STATISTICS 0;
+VACUUM (ANALYZE) t_m11 (a);
+SELECT analyze_entries = :m11_entries_before AS m11_flag_clear_reclaims
+  FROM fasttrun_cache_stats();
+DROP TABLE t_m11;
+
+-- На PG17 и позже ядро пускает владельца к ANALYZE только с правом MAINTAIN,
+-- и владелец может его у себя отозвать.
+SELECT current_setting('server_version_num')::int >= 170000 AS pg17plus \gset
+\if :pg17plus
+CREATE ROLE ft_ext_owner;
+GRANT CREATE ON SCHEMA public TO ft_ext_owner;
+SET ROLE ft_ext_owner;
+CREATE TEMP TABLE t_ext_own (a int, b int);
+CREATE STATISTICS pg_temp.t_ext_own_nd (ndistinct) ON a, b FROM t_ext_own;
+INSERT INTO t_ext_own SELECT 1, 1 FROM generate_series(1, 10000);
+ANALYZE t_ext_own;
+SELECT fasttruncate('t_ext_own') IS NULL AS dummy \gset
+INSERT INTO t_ext_own SELECT 2, 2 FROM generate_series(1, 10000);
+REVOKE MAINTAIN ON t_ext_own FROM ft_ext_owner;
+SELECT fasttrun_analyze('t_ext_own') IS NULL AS dummy \gset
+SELECT pg_temp.ext_rows('SELECT * FROM t_ext_own WHERE a = 2') > 5000
+       AS maintain_revoked_uses_local_stats \gset
+DROP TABLE t_ext_own;
+RESET ROLE;
+REVOKE CREATE ON SCHEMA public FROM ft_ext_owner;
+DROP ROLE ft_ext_owner;
+\else
+\set maintain_revoked_uses_local_stats t
+\endif
+\echo maintain_revoked_uses_local_stats :maintain_revoked_uses_local_stats
 
 -- ----------------------------------------------------------------------
 -- 36. VACUUM (ANALYZE) со списком колонок ведет себя как ANALYZE,
@@ -1948,9 +2693,10 @@ DROP TABLE t_inh_stats_flat;
 --     pg_statistic по OID индекса (examine_variable/btcostestimate),
 --     мимо column-хуков. После fasttruncate + refill эта каталожная
 --     стата описывает старые данные - для managed-таблицы она должна
---     скрываться, планировщик берет дефолтные оценки до ядерного
---     ANALYZE. Контроль: нетронутая fasttrun'ом таблица читает
---     expression-стату из каталога как обычно.
+--     скрываться: до fasttrun_analyze планировщик берет дефолтные оценки,
+--     после него - статистику выражения, которую собрал fasttrun.
+--     Контроль: нетронутая fasttrun'ом таблица читает expression-стату из
+--     каталога как обычно.
 -- ----------------------------------------------------------------------
 CREATE TEMP TABLE t_expr_hidden (id int, name text);
 INSERT INTO t_expr_hidden SELECT g, 'val_' || g FROM generate_series(1, 10000) g;
@@ -1958,7 +2704,6 @@ CREATE INDEX ON t_expr_hidden (lower(name));
 ANALYZE t_expr_hidden;
 SELECT fasttruncate('t_expr_hidden');
 INSERT INTO t_expr_hidden SELECT g, 'const' FROM generate_series(1, 10000) g;
-SELECT fasttrun_analyze('t_expr_hidden');
 DO $$
 DECLARE ln text; est int := NULL;
 BEGIN
@@ -1973,6 +2718,9 @@ BEGIN
   END IF;
 END$$;
 SELECT 'expression_stats_hidden_ok' AS marker;
+SELECT fasttrun_analyze('t_expr_hidden');
+SELECT pg_temp.ext_rows($$SELECT * FROM t_expr_hidden WHERE lower(name) = 'const'$$) >= 5000
+       AS expression_stats_collected;
 -- Контроль: chain работает - не-managed таблица читает expression-стату.
 CREATE TEMP TABLE t_expr_core (id int, name text);
 INSERT INTO t_expr_core

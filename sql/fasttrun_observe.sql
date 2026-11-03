@@ -146,6 +146,15 @@ SELECT array_agg(staattnum ORDER BY staattnum) AS template_off_columns
 RESET fasttrun.template_stattarget;
 DROP TABLE obs_like;
 
+-- Колонки ищутся по имени, а не по номеру: у временной таблицы другой
+-- порядок колонок, и цель 0 все равно достается колонке note.
+CREATE TEMP TABLE obs_like (note text, id int);
+INSERT INTO obs_like SELECT 'n' || g, g FROM generate_series(1, 500) g;
+SELECT fasttrun_analyze('obs_like');
+SELECT array_agg(staattnum ORDER BY staattnum) AS template_by_name_columns
+  FROM fasttrun_inspect_stats('obs_like');
+DROP TABLE obs_like;
+
 -- Цель шаблона действует только на сбор fasttrun.  Ядерный ANALYZE читает
 -- цель самой временной таблицы, и fasttrun отдает планировщику то, что ядро
 -- собрало.

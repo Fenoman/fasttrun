@@ -147,11 +147,11 @@ DEALLOCATE q_analyze_only;
 COMMIT;
 
 -- ----------------------------------------------------------------------
--- 3. Below-threshold DML без пересбора: generic plan, построенный после
---    мелкого (ниже порога) UPDATE, видит кешированную стату через soft
---    freshness и строится на ней (Index Scan по редкому grp), а не на
---    defaults.  Повторный fasttrun_analyze не инвалидирует план (дрейф ниже
---    порога), и он остаётся на стате.
+-- 3. Мелкий UPDATE без analyze: generic plan, построенный после него, видит
+--    кешированную стату через soft freshness и строится на ней (Index Scan по
+--    редкому grp), а не на defaults.  Повторный fasttrun_analyze пересобирает
+--    статистику и сбрасывает план (строка DEBUG), а новый план на свежей
+--    статистике снова Index Scan.
 -- ----------------------------------------------------------------------
 CREATE TEMP TABLE t_analyze_freshness_plan (id int, grp int);
 INSERT INTO t_analyze_freshness_plan
@@ -166,13 +166,14 @@ UPDATE t_analyze_freshness_plan SET id = id WHERE id < 10;
 PREPARE q_freshness_only AS
 SELECT * FROM t_analyze_freshness_plan WHERE grp = 50000;
 
--- План построен в окне soft freshness: churn ниже порога → стата видна.
+-- План построен в окне soft freshness: churn ниже порога -> стата видна.
 EXPLAIN (COSTS OFF) EXECUTE q_freshness_only;
 
+SET LOCAL client_min_messages = debug1;
 SELECT fasttrun_analyze('t_analyze_freshness_plan');
+RESET client_min_messages;
 
--- Below-threshold DML в пределах толерантности: стата остаётся видимой,
--- повторный EXPLAIN — тот же план на стате (Index Scan).
+-- План пересобран на свежей статистике: снова Index Scan.
 EXPLAIN (COSTS OFF) EXECUTE q_freshness_only;
 DEALLOCATE q_freshness_only;
 COMMIT;
@@ -235,13 +236,11 @@ DEALLOCATE q_collect_only;
 COMMIT;
 
 -- ----------------------------------------------------------------------
--- 6. Sub-threshold DML НЕ инвалидирует generic plan, построенный на свежих
---    column stats.  Plan, собранный когда stats видимы (Index Scan на
---    high-cardinality grp), переживает мелкий (ниже stats_refresh_threshold)
---    DML + повторный fasttrun_analyze и остаётся Index Scan: мелкое смещение
---    распределения не стоит инвалидации и потери хорошего плана ради
---    fallback к default selectivity.  DML идёт по неиндексированному id (HOT),
---    чтобы index relstats не дрейфнули и порог invalidate сработал.
+-- 6. Мелкий DML и повторный fasttrun_analyze пересобирают статистику колонок
+--    и сбрасывают generic plan (строка DEBUG), а новый план, построенный на
+--    свежей статистике, остается Index Scan по high-cardinality grp, а не
+--    fallback Bitmap/Seq.  DML идет по неиндексированному id (HOT), чтобы
+--    index relstats не дрейфнули.
 -- ----------------------------------------------------------------------
 CREATE TEMP TABLE t_subthreshold_keep_plan (id int, grp int);
 INSERT INTO t_subthreshold_keep_plan SELECT g, g FROM generate_series(1, 100000) g;
@@ -257,10 +256,12 @@ SELECT * FROM t_subthreshold_keep_plan WHERE grp = 50000;
 -- Generic plan на свежих stats: Index Scan.
 EXPLAIN (COSTS OFF) EXECUTE q_keep;
 
-UPDATE t_subthreshold_keep_plan SET id = id WHERE id <= 50;  -- мелкий churn ниже порога
+UPDATE t_subthreshold_keep_plan SET id = id WHERE id <= 50;
+SET LOCAL client_min_messages = debug1;
 SELECT fasttrun_analyze('t_subthreshold_keep_plan');
+RESET client_min_messages;
 
--- Plan не инвалидирован: остаётся Index Scan, а не fallback Bitmap/Seq.
+-- План пересобран на свежей статистике: снова Index Scan.
 EXPLAIN (COSTS OFF) EXECUTE q_keep;
 DEALLOCATE q_keep;
 COMMIT;
@@ -477,13 +478,12 @@ COMMIT;
 DROP TABLE t_inval_dedup;
 
 -- ----------------------------------------------------------------------
--- 12. Скрытая колонка запускает пересбор.  Near-unique колонка получает
---     cardinality-scaled freshness-порог (пол 5%), а общий churn таблицы
---     сравнивается с stats_refresh_threshold (20%).  Churn в полосе между
---     ними прячет стату колонки, и fasttrun_analyze, который это видит,
---     пересобирает статистику, хотя общий churn ниже порога: одна
---     инвалидация (DEBUG-строка из fasttrun_invalidate_local_plan_cache), а
---     свежая выборка ловит горячее значение grp = 1 (10000 строк).
+-- 12. Колонка, скрытая допуском, снова получает статистику после analyze.
+--     Near-unique колонка получает cardinality-scaled freshness-порог (пол
+--     5%), и UPDATE 10% строк прячет ее стату от новых планов.
+--     fasttrun_analyze после DML пересобирает статистику: одна инвалидация
+--     (DEBUG-строка из fasttrun_invalidate_local_plan_cache), а свежая выборка
+--     ловит горячее значение grp = 1 (10000 строк).
 -- ----------------------------------------------------------------------
 BEGIN;
 SET LOCAL plan_cache_mode = force_generic_plan;
@@ -508,7 +508,7 @@ END$$;
 SELECT 'vis_flip_baseline_ok' AS marker;
 
 -- 10% churn: выше 5%-пола near-unique колонки (стата прячется от новых
--- планов), ниже 20%-порога пересбора.
+-- планов).
 UPDATE t_vis_flip SET grp = 1 WHERE id <= 10000;
 
 SET client_min_messages = debug1;

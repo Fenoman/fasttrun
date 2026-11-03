@@ -119,14 +119,23 @@ The public API contains 14 SQL functions.
 | Function | Purpose | Shared invalidation messages |
 |---|---|---|
 | `fasttruncate(text)` | Clears one local temporary heap table, its indexes, TOAST table, and TOAST indexes | None with `zero_sinval_truncate=on`, while with `off`, one shared storage-manager message is sent for every cleared relation |
-| `fasttrun_analyze(text)` | Updates local size estimates and, when needed, column statistics | None |
-| `fasttrun_analyze_bulk(VARIADIC text[])` | Runs `fasttrun_analyze` sequentially for an array of tables | None |
+| `fasttrun_analyze(text)` | Updates local size estimates and, when needed, column statistics | None, except for tables with `CREATE STATISTICS` objects: regular `ANALYZE` handles them |
+| `fasttrun_analyze_bulk(VARIADIC text[])` | Runs `fasttrun_analyze` sequentially for an array of tables | As for `fasttrun_analyze` |
 | `fasttrun_collect_stats(text)` | Explicitly rebuilds local column statistics | None |
 
-`fasttruncate()` takes an `AccessExclusiveLock`. `fasttrun_analyze()` and
+`fasttruncate()` takes an `ExclusiveLock` on the table, its indexes and TOAST.
+No other session can read a temporary table, while an `AccessExclusiveLock` on
+a relation is WAL-logged by the core for standbys and assigns a transaction ID
+for that record. So `fasttruncate()` assigns no transaction ID and writes no
+WAL, neither on the fast path nor when it resets the files: the storage of
+temporary relations never reaches the WAL. `fasttrun_analyze()` and
 `fasttrun_collect_stats()` take an `AccessShareLock` while they run. An open
 cursor or active query against the table being cleared causes a regular SQL
 error before any files are changed.
+
+The cost of a cleanup grows with the number of relations in the set and with
+`temp_buffers`: for every relation the core scans the whole local buffer array,
+just as with core `TRUNCATE`.
 
 If the table and its TOAST table are physically empty and the local statistics
 of the table and its indexes already match that state, a repeated
@@ -153,7 +162,7 @@ N complete walks over the local plan list.
 | Function | Purpose |
 |---|---|
 | `fasttrun_relstats(text)` | Returns the current local `relpages` and `reltuples` values |
-| `fasttrun_inspect_stats(text)` | Shows stored statistics candidates in `pg_statistic` format |
+| `fasttrun_inspect_stats(text)` | Shows stored statistics candidates in `pg_statistic` format. A row of an index expression has the index OID in `starelid` and the index column number in `staattnum` |
 | `fasttrun_cache_stats()` | Shows entry counts and memory used by the local caches |
 | `fasttrun_cached_tables()` | Lists the relations the session keeps estimates and statistics for |
 | `fasttrun_blocked_tables()` | Lists the tables blocked in the session after an incomplete cleanup |
@@ -181,7 +190,9 @@ freshness check may temporarily hide them.
 apply only to the current physical backend.
 
 `fasttrun_cached_tables()` returns a row for every relation the current backend
-knows:
+knows. It opens every relation and reads its size, 70-100 ms for 700 tables:
+fine for periodic monitoring, too expensive for a check on every connection
+checkout by a pooler. The result fields:
 
 | Field | Meaning |
 |---|---|
@@ -190,7 +201,7 @@ knows:
 | `relpages`, `reltuples` | The published size estimate |
 | `count_exact` | The row count comes from a full scan or an exact delta, not from a block sample. Empty for an index |
 | `delta_state` | The next `fasttrun_analyze()` counts rows from the change counters without a pass over the table. Empty for an index |
-| `column_stats` | The number of columns with a stored sample |
+| `column_stats` | The number of columns and index expressions with a stored sample |
 | `hidden_columns` | How many of them the freshness check hides from the planner right now |
 
 `fasttrun_blocked_tables()` returns `relid` and `relname` of the tables blocked
@@ -201,8 +212,8 @@ connection can go back to the pool.
 
 `fasttrun_counters()` returns rows of `counter`, `value`, `scope`. With
 `shared_preload_libraries` the values are shared by the instance
-(`scope = cluster`): each backend adds its events to shared memory at the end
-of every transaction. Without preloading the values belong to the current
+(`scope = cluster`): each backend adds its events to its own part of shared
+memory at the end of every transaction, and the function sums the parts. Without preloading the values belong to the current
 backend (`scope = backend`). Through a pooler in transaction mode only the
 first variant is useful. The counters start from zero after a server start and
 after `fasttrun_counters_reset()`. A reset zeroes the shared values and the
@@ -219,6 +230,7 @@ open during the reset enter the sum when that transaction ends.
 | `analyze_delta` | Calls that counted rows from the change counters |
 | `analyze_cold_scan` | Full passes over the table |
 | `analyze_cold_block_sample` | Block-sampled passes over a table larger than `fasttrun.max_analyze_pages` |
+| `analyze_core_handoff` | Calls handed to regular `ANALYZE` because the table has `CREATE STATISTICS` objects |
 | `storage_found_empty` | Tables found empty without the counters knowing, for example after `ON COMMIT DELETE ROWS` |
 | `column_collects` | Column statistics collections |
 | `column_collects_during_write` | Collections made while the table was being written: their sample is not served to the planner |

@@ -1523,13 +1523,13 @@ SELECT pg_temp.assert_birth_cache_empty();
 
 -- ----------------------------------------------------------------------
 -- 21. Счетчики изменений переживают COMMIT.  При max_analyze_pages = 1
---     любой проход по таблице пишет DEBUG-строку о выборке блоков, так что
---     видно, где analyze сканировал.  Первый analyze новой транзакции без
---     DML не сканирует и не сбрасывает планы.  Строки, записанные в
+--     любой проход по таблице пишет DEBUG-строку: первый проход - о выборке
+--     блоков, пересбор таблицы не больше цели выборки - о полном проходе, так
+--     что видно, где analyze читал таблицу.  Первый analyze новой транзакции без
+--     DML таблицу не читает и не сбрасывает планы.  Строки, записанные в
 --     транзакциях без вызовов fasttrun, учитываются, откаченные - нет.
---     Изменения ниже порога пересбора накапливаются через COMMIT, и
---     пересбор происходит, когда сумма его достигает.  У таблицы одна
---     колонка с 10 значениями, чтобы порог колонки совпадал с общим.
+--     После изменений analyze пересобирает статистику колонок, а число строк
+--     берет из перенесенной дельты.
 -- ----------------------------------------------------------------------
 CREATE TEMP TABLE t_carry (grp int);
 INSERT INTO t_carry SELECT g % 10 FROM generate_series(1, 10000) g;
@@ -1564,6 +1564,8 @@ BEGIN;
 SET LOCAL fasttrun.max_analyze_pages = 1;
 SET LOCAL client_min_messages = debug1;
 SELECT fasttrun_analyze('t_carry');
+DEBUG:  fasttrun: full-scan resample
+DEBUG:  fasttrun: invalidating backend-local cached plans
  fasttrun_analyze 
 ------------------
  
@@ -1583,6 +1585,7 @@ BEGIN;
 SET LOCAL fasttrun.max_analyze_pages = 1;
 SET LOCAL client_min_messages = debug1;
 SELECT fasttrun_analyze('t_carry');
+DEBUG:  fasttrun: full-scan resample
 DEBUG:  fasttrun: invalidating backend-local cached plans
  fasttrun_analyze 
 ------------------
@@ -1591,13 +1594,13 @@ DEBUG:  fasttrun: invalidating backend-local cached plans
 
 RESET client_min_messages;
 COMMIT;
--- Сумма достигла порога: 3000 изменений на 13000 строк, пересбор.
+-- Еще 1000 строк: снова пересбор и точный счет из дельты.
 INSERT INTO t_carry SELECT g % 10 FROM generate_series(1, 1000) g;
 BEGIN;
 SET LOCAL fasttrun.max_analyze_pages = 1;
 SET LOCAL client_min_messages = debug1;
 SELECT fasttrun_analyze('t_carry');
-DEBUG:  fasttrun: block-sampling analyze scan
+DEBUG:  fasttrun: full-scan resample
 DEBUG:  fasttrun: invalidating backend-local cached plans
  fasttrun_analyze 
 ------------------
@@ -1991,6 +1994,14 @@ DROP TABLE t_carry_unsafe_cold;
 -- Явный fasttrun_collect_stats внутри пишущего оператора тоже дает образец,
 -- который планировщику не отдается.  Следующий analyze собирает заново и
 -- после COMMIT, и в той же транзакции.
+CREATE FUNCTION pg_temp.unsafe_rows(q text) RETURNS int LANGUAGE plpgsql AS $f$
+DECLARE
+  plan json;
+BEGIN
+  EXECUTE 'EXPLAIN (FORMAT JSON) ' || q INTO plan;
+  RETURN (plan->0->'Plan'->>'Plan Rows')::int;
+END
+$f$;
 CREATE TEMP TABLE t_carry_unsafe_explicit (id int, grp int);
 INSERT INTO t_carry_unsafe_explicit SELECT g, g % 10 FROM generate_series(1, 1000) g;
 SELECT fasttrun_analyze('t_carry_unsafe_explicit');
@@ -2020,6 +2031,13 @@ SELECT count(*) = 2 AS carry21b_unsafe_explicit_commit FROM fasttrun_inspect_sta
  t
 (1 row)
 
+SELECT pg_temp.unsafe_rows('SELECT * FROM t_carry_unsafe_explicit WHERE grp = 1') BETWEEN 50 AND 200
+       AS carry21b_unsafe_explicit_commit_served;
+ carry21b_unsafe_explicit_commit_served 
+----------------------------------------
+ t
+(1 row)
+
 BEGIN;
 WITH w AS (UPDATE t_carry_unsafe_explicit SET grp = grp RETURNING id)
 SELECT count(*) AS carry21b_unsafe_explicit_updated_inxact, fasttrun_collect_stats('t_carry_unsafe_explicit') FROM w;
@@ -2037,6 +2055,13 @@ SELECT fasttrun_analyze('t_carry_unsafe_explicit');
 SELECT count(*) = 2 AS carry21b_unsafe_explicit_inxact FROM fasttrun_inspect_stats('t_carry_unsafe_explicit');
  carry21b_unsafe_explicit_inxact 
 ---------------------------------
+ t
+(1 row)
+
+SELECT pg_temp.unsafe_rows('SELECT * FROM t_carry_unsafe_explicit WHERE grp = 1') BETWEEN 50 AND 200
+       AS carry21b_unsafe_explicit_inxact_served;
+ carry21b_unsafe_explicit_inxact_served 
+----------------------------------------
  t
 (1 row)
 
@@ -2361,4 +2386,1451 @@ DEBUG:  fasttrun: invalidating backend-local cached plans
 RESET client_min_messages;
 COMMIT;
 DROP TABLE t_carry_odr_analyze;
+-- ----------------------------------------------------------------------
+-- 22. Откаченная запись оставляет страницы в файле, а счетчики pgstat ее
+--     забывают.  Планировщик делит reltuples на relpages и умножает на
+--     фактическое число страниц, поэтому устаревший relpages раздул бы
+--     оценку во столько раз, во сколько вырос файл.  Откат сам замеряет
+--     размер хранилища, а запасной сигнал по размеру не прячет статистику
+--     колонок: данные после отката прежние.
+-- ----------------------------------------------------------------------
+CREATE FUNCTION pg_temp.an_rows(q text) RETURNS int LANGUAGE plpgsql AS $f$
+DECLARE
+  plan json;
+BEGIN
+  EXECUTE 'EXPLAIN (FORMAT JSON) ' || q INTO plan;
+  RETURN (plan->0->'Plan'->>'Plan Rows')::int;
+END
+$f$;
+CREATE TEMP TABLE t_bloat (id int, grp int, v text);
+INSERT INTO t_bloat SELECT g, g % 4, md5(g::text) FROM generate_series(1, 1000) g;
+SELECT fasttrun_analyze('t_bloat');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+DO $$ BEGIN BEGIN
+  INSERT INTO t_bloat SELECT g, 9, md5(g::text) FROM generate_series(1, 100000) g;
+  RAISE EXCEPTION 'boom';
+EXCEPTION WHEN others THEN NULL; END; END $$;
+SELECT pg_temp.an_rows('SELECT * FROM t_bloat') BETWEEN 500 AND 2000
+       AS bloat22_rows_after_exception,
+       pg_temp.an_rows('SELECT * FROM t_bloat WHERE grp = 1') BETWEEN 150 AND 400
+       AS bloat22_column_stats_after_exception;
+ bloat22_rows_after_exception | bloat22_column_stats_after_exception 
+------------------------------+--------------------------------------
+ t                            | t
+(1 row)
+
+SELECT fasttrun_analyze('t_bloat');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+SELECT relpages = pg_relation_size('t_bloat') / 8192 AS bloat22_pages_published,
+       reltuples = 1000 AS bloat22_count_kept
+  FROM fasttrun_relstats('t_bloat');
+ bloat22_pages_published | bloat22_count_kept 
+-------------------------+--------------------
+ t                       | t
+(1 row)
+
+-- Откат всей транзакции и откат к точке сохранения.
+BEGIN;
+INSERT INTO t_bloat SELECT g, 9, md5(g::text) FROM generate_series(1, 100000) g;
+ROLLBACK;
+BEGIN;
+SAVEPOINT s;
+INSERT INTO t_bloat SELECT g, 9, md5(g::text) FROM generate_series(1, 100000) g;
+SELECT fasttrun_analyze('t_bloat');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+ROLLBACK TO SAVEPOINT s;
+SELECT pg_temp.an_rows('SELECT * FROM t_bloat') BETWEEN 500 AND 2000
+       AS bloat22_rows_after_savepoint,
+       pg_temp.an_rows('SELECT * FROM t_bloat WHERE grp = 1') BETWEEN 150 AND 400
+       AS bloat22_column_stats_after_savepoint;
+ bloat22_rows_after_savepoint | bloat22_column_stats_after_savepoint 
+------------------------------+--------------------------------------
+ t                            | t
+(1 row)
+
+COMMIT;
+SELECT fasttrun_analyze('t_bloat');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+SELECT relpages = pg_relation_size('t_bloat') / 8192 AS bloat22_pages_after_rollbacks,
+       reltuples = 1000 AS bloat22_count_after_rollbacks
+  FROM fasttrun_relstats('t_bloat');
+ bloat22_pages_after_rollbacks | bloat22_count_after_rollbacks 
+-------------------------------+-------------------------------
+ t                             | t
+(1 row)
+
+SELECT pg_temp.an_rows('SELECT * FROM t_bloat') BETWEEN 500 AND 2000
+       AS bloat22_rows_after_rollbacks;
+ bloat22_rows_after_rollbacks 
+------------------------------
+ t
+(1 row)
+
+DROP TABLE t_bloat;
+-- 22b. Откат, вернувший relstats в пределах invalidate_threshold, планы не
+--      сбрасывает, как не сбрасывает их и сам analyze ниже порога.  Строка
+--      DEBUG об инвалидации появляется только там, где порог пройден.
+CREATE TEMP TABLE t_abort_inval (id int);
+INSERT INTO t_abort_inval SELECT generate_series(1, 10000);
+SET fasttrun.auto_collect_stats = off;
+SELECT fasttrun_analyze('t_abort_inval');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+BEGIN;
+SET LOCAL client_min_messages = debug1;
+SAVEPOINT s;
+INSERT INTO t_abort_inval VALUES (1);
+SELECT fasttrun_analyze('t_abort_inval');   -- ниже порога: без инвалидации
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+ROLLBACK TO SAVEPOINT s;                     -- ниже порога: без инвалидации
+SAVEPOINT s2;
+INSERT INTO t_abort_inval SELECT generate_series(1, 5000);
+SELECT fasttrun_analyze('t_abort_inval');   -- выше порога: инвалидация
+DEBUG:  fasttrun: invalidating backend-local cached plans
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+ROLLBACK TO SAVEPOINT s2;                    -- откат выше порога: инвалидация
+DEBUG:  fasttrun: invalidating backend-local cached plans
+-- Откат записи без analyze: файл вырос на половину, но откаченные страницы
+-- строк не содержат, и оценка, которую видит планировщик, не меняется, поэтому
+-- и планы не сбрасываются.
+SAVEPOINT s3;
+INSERT INTO t_abort_inval SELECT generate_series(1, 5000);
+ROLLBACK TO SAVEPOINT s3;                    -- оценка прежняя: без инвалидации
+SELECT pg_temp.an_rows('SELECT * FROM t_abort_inval') BETWEEN 9000 AND 11000
+       AS abort22b_rows_after_growth;
+ abort22b_rows_after_growth 
+----------------------------
+ t
+(1 row)
+
+RESET client_min_messages;
+COMMIT;
+SELECT fasttrun_analyze('t_abort_inval');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+SELECT relpages = pg_relation_size('t_abort_inval') / 8192 AS abort22b_pages_published
+  FROM fasttrun_relstats('t_abort_inval');
+ abort22b_pages_published 
+--------------------------
+ t
+(1 row)
+
+RESET fasttrun.auto_collect_stats;
+DROP TABLE t_abort_inval;
+-- 22c. Рост файла от строк, зафиксированных без analyze, - не откат.  Откат
+--      учитывает только прирост своего уровня, и планировщик продолжает
+--      оценивать зафиксированные строки по плотности.  Вложенные откаты не
+--      складывают один прирост несколько раз, а откат analyze не снимает
+--      обязанность следующего analyze обновить индексы.
+CREATE TEMP TABLE t_i1 (id int, pad text);
+INSERT INTO t_i1 SELECT g, repeat('x', 50) FROM generate_series(1, 1000) g;
+SELECT fasttrun_analyze('t_i1');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+INSERT INTO t_i1 SELECT g, repeat('x', 50) FROM generate_series(1, 100000) g;
+BEGIN;
+SAVEPOINT s;
+INSERT INTO t_i1 SELECT 1, 'x' WHERE false;
+ROLLBACK TO SAVEPOINT s;
+SELECT pg_temp.an_rows('SELECT * FROM t_i1') > 50000 AS i1_committed_rows_estimated;
+ i1_committed_rows_estimated 
+-----------------------------
+ t
+(1 row)
+
+COMMIT;
+DROP TABLE t_i1;
+CREATE TEMP TABLE t_i2 (id int, grp int);
+INSERT INTO t_i2 SELECT g, g % 4 FROM generate_series(1, 1000) g;
+SELECT fasttrun_analyze('t_i2');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+SET fasttrun.auto_collect_stats = off;
+BEGIN;
+SAVEPOINT a; INSERT INTO t_i2 VALUES (1, 1); SELECT fasttrun_analyze('t_i2');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+SAVEPOINT b; INSERT INTO t_i2 VALUES (1, 1); SELECT fasttrun_analyze('t_i2');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+SAVEPOINT c; INSERT INTO t_i2 VALUES (1, 1); SELECT fasttrun_analyze('t_i2');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+SAVEPOINT d; INSERT INTO t_i2 VALUES (1, 1); SELECT fasttrun_analyze('t_i2');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+INSERT INTO t_i2 SELECT g, 9 FROM generate_series(1, 100000) g;
+ROLLBACK TO SAVEPOINT a;
+SELECT pg_temp.an_rows('SELECT * FROM t_i2 WHERE grp = 1') BETWEEN 150 AND 400
+       AS i2_nested_rollback_stats_kept,
+       pg_temp.an_rows('SELECT * FROM t_i2') BETWEEN 500 AND 2000
+       AS i2_nested_rollback_rows;
+ i2_nested_rollback_stats_kept | i2_nested_rollback_rows 
+-------------------------------+-------------------------
+ t                             | t
+(1 row)
+
+COMMIT;
+RESET fasttrun.auto_collect_stats;
+DROP TABLE t_i2;
+CREATE TEMP TABLE t_i6 (id int, flag bool);
+CREATE INDEX t_i6_part ON t_i6 (id) WHERE flag;
+INSERT INTO t_i6 SELECT g, g % 10 = 0 FROM generate_series(1, 1000) g;
+SELECT fasttrun_analyze('t_i6');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+DO $$ BEGIN BEGIN
+  INSERT INTO t_i6 SELECT g, true FROM generate_series(1, 100000) g;
+  RAISE EXCEPTION 'boom';
+EXCEPTION WHEN others THEN NULL; END; END $$;
+BEGIN;
+SAVEPOINT s;
+SELECT fasttrun_analyze('t_i6');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+ROLLBACK TO SAVEPOINT s;
+SELECT fasttrun_analyze('t_i6');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+SELECT relpages = pg_relation_size('t_i6_part') / 8192 AS i6_index_pages_refreshed,
+       reltuples BETWEEN 50 AND 200 AS i6_partial_count_kept
+  FROM fasttrun_relstats('t_i6_part');
+ i6_index_pages_refreshed | i6_partial_count_kept 
+--------------------------+-----------------------
+ t                        | t
+(1 row)
+
+COMMIT;
+DROP TABLE t_i6;
+-- Откат ядерного TRUNCATE возвращает прежний файл.  Отметка уровня, снятая на
+-- новом файле, к старому не относится.
+CREATE TEMP TABLE t_n1 (id int, pad text);
+INSERT INTO t_n1 SELECT g, repeat('x', 50) FROM generate_series(1, 100000) g;
+SELECT fasttrun_analyze('t_n1');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+BEGIN;
+SAVEPOINT s;
+TRUNCATE t_n1;
+INSERT INTO t_n1 SELECT g, repeat('x', 50) FROM generate_series(1, 1000) g;
+SELECT fasttrun_analyze('t_n1');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+INSERT INTO t_n1 SELECT 1, 'x' WHERE false;
+ROLLBACK TO SAVEPOINT s;
+SELECT pg_temp.an_rows('SELECT * FROM t_n1') > 50000 AS n1_truncate_rollback_rows;
+ n1_truncate_rollback_rows 
+---------------------------
+ t
+(1 row)
+
+COMMIT;
+DROP TABLE t_n1;
+-- То же с вложенным откатом на новом файле: его мертвые страницы к старому
+-- файлу не относятся.
+CREATE TEMP TABLE t_n5 (id int, pad text);
+INSERT INTO t_n5 SELECT g, repeat('x', 50) FROM generate_series(1, 100000) g;
+SELECT fasttrun_analyze('t_n5');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+BEGIN;
+SAVEPOINT s;
+TRUNCATE t_n5;
+INSERT INTO t_n5 SELECT g, repeat('x', 50) FROM generate_series(1, 1000) g;
+SELECT fasttrun_analyze('t_n5');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+DO $$ BEGIN BEGIN
+  INSERT INTO t_n5 SELECT g, repeat('x', 50) FROM generate_series(1, 50000) g;
+  RAISE EXCEPTION 'boom';
+EXCEPTION WHEN others THEN NULL; END; END $$;
+INSERT INTO t_n5 SELECT 1, 'x' WHERE false;
+ROLLBACK TO SAVEPOINT s;
+SELECT pg_temp.an_rows('SELECT * FROM t_n5') BETWEEN 80000 AND 120000
+       AS n5_nested_rollback_rows;
+ n5_nested_rollback_rows 
+-------------------------
+ t
+(1 row)
+
+COMMIT;
+DROP TABLE t_n5;
+-- Без записи на новом файле после analyze у уровня нет отметки размера, и
+-- откат все равно возвращает счет мертвых страниц старого файла.
+CREATE TEMP TABLE t_n11 (id int, pad text);
+INSERT INTO t_n11 SELECT g, repeat('x', 50) FROM generate_series(1, 100000) g;
+SELECT fasttrun_analyze('t_n11');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+BEGIN;
+SAVEPOINT s;
+TRUNCATE t_n11;
+INSERT INTO t_n11 SELECT g, repeat('x', 50) FROM generate_series(1, 1000) g;
+SELECT fasttrun_analyze('t_n11');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+DO $$ BEGIN BEGIN
+  INSERT INTO t_n11 SELECT g, repeat('x', 50) FROM generate_series(1, 50000) g;
+  RAISE EXCEPTION 'boom';
+EXCEPTION WHEN others THEN NULL; END; END $$;
+ROLLBACK TO SAVEPOINT s;
+SELECT pg_temp.an_rows('SELECT * FROM t_n11') BETWEEN 80000 AND 120000
+       AS n11_rollback_without_level_mark_rows;
+ n11_rollback_without_level_mark_rows 
+--------------------------------------
+ t
+(1 row)
+
+COMMIT;
+DROP TABLE t_n11;
+-- Откат вернул файл, который рос на этом же уровне до ядерного TRUNCATE:
+-- рост считается от отметки уровня, снятой на этом файле.
+CREATE TEMP TABLE t_n14 (id int, pad text);
+INSERT INTO t_n14 SELECT g, repeat('x', 50) FROM generate_series(1, 1000) g;
+SELECT fasttrun_analyze('t_n14');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+BEGIN;
+SAVEPOINT s;
+INSERT INTO t_n14 SELECT g, repeat('x', 50) FROM generate_series(1, 100000) g;
+TRUNCATE t_n14;
+INSERT INTO t_n14 SELECT g, repeat('x', 50) FROM generate_series(1, 1000) g;
+SELECT fasttrun_analyze('t_n14');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+ROLLBACK TO SAVEPOINT s;
+SELECT pg_temp.an_rows('SELECT * FROM t_n14') BETWEEN 500 AND 2000
+       AS n14_growth_before_truncate_rows;
+ n14_growth_before_truncate_rows 
+---------------------------------
+ t
+(1 row)
+
+COMMIT;
+DROP TABLE t_n14;
+-- Без выборки (sample_rows = 0) DML все равно делает оценку частичного
+-- индекса верхней границей: прежнее число строк индекса уже неверно.
+CREATE TEMP TABLE t_n6 (id int, flag bool);
+CREATE INDEX t_n6_part ON t_n6 (id) WHERE flag;
+BEGIN;
+INSERT INTO t_n6 SELECT g, false FROM generate_series(1, 1000) g;
+SELECT fasttrun_analyze('t_n6');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+UPDATE t_n6 SET flag = true WHERE id <= 500;
+SET LOCAL fasttrun.sample_rows = 0;
+SELECT fasttrun_analyze('t_n6');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+SELECT reltuples >= 500 AS n6_partial_upper_bound
+  FROM fasttrun_relstats('t_n6_part');
+ n6_partial_upper_bound 
+------------------------
+ t
+(1 row)
+
+COMMIT;
+DROP TABLE t_n6;
+-- VACUUM, который кучу не обрабатывал, ничего не посчитал.
+CREATE TEMP TABLE t_n8 (id int);
+INSERT INTO t_n8 SELECT generate_series(1, 10000);
+ANALYZE t_n8;
+DELETE FROM t_n8 WHERE id > 100;
+SELECT fasttrun_analyze('t_n8');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+VACUUM (PROCESS_MAIN false) t_n8;
+SELECT reltuples = 100 AS n8_process_main_off_keeps_relstats
+  FROM fasttrun_relstats('t_n8');
+ n8_process_main_off_keeps_relstats 
+------------------------------------
+ t
+(1 row)
+
+DROP TABLE t_n8;
+-- Повторенная опция VACUUM действует последним значением, как в ядре.
+CREATE TEMP TABLE t_n13 (id int);
+INSERT INTO t_n13 SELECT generate_series(1, 10000);
+ANALYZE t_n13;
+DELETE FROM t_n13 WHERE id > 100;
+SELECT fasttrun_analyze('t_n13');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+VACUUM (PROCESS_MAIN true, PROCESS_MAIN false) t_n13;
+SELECT reltuples = 100 AS n13_repeated_process_main_keeps_relstats
+  FROM fasttrun_relstats('t_n13');
+ n13_repeated_process_main_keeps_relstats 
+------------------------------------------
+ t
+(1 row)
+
+DROP TABLE t_n13;
+CREATE TEMP TABLE t_n13b (id int);
+INSERT INTO t_n13b SELECT generate_series(1, 10000);
+SELECT fasttrun_analyze('t_n13b');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+DELETE FROM t_n13b WHERE id > 100;
+VACUUM (ONLY_DATABASE_STATS true, ONLY_DATABASE_STATS false) t_n13b;
+SELECT reltuples = 100 AS n13_repeated_database_stats_takes_vacuum
+  FROM fasttrun_relstats('t_n13b');
+ n13_repeated_database_stats_takes_vacuum 
+------------------------------------------
+ t
+(1 row)
+
+DROP TABLE t_n13b;
+-- VACUUM, который ядро пропустило из-за прав, ничего не посчитал: учет
+-- мертвых страниц и прежние relstats остаются.
+CREATE TEMP TABLE t_n3 (id int, pad text);
+INSERT INTO t_n3 SELECT g, repeat('x', 50) FROM generate_series(1, 1000) g;
+ANALYZE t_n3;
+SELECT fasttrun_analyze('t_n3');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+DO $$ BEGIN BEGIN
+  INSERT INTO t_n3 SELECT g, repeat('x', 50) FROM generate_series(1, 100000) g;
+  RAISE EXCEPTION 'boom';
+EXCEPTION WHEN others THEN NULL; END; END $$;
+CREATE ROLE ft_n3_reader;
+GRANT SELECT ON t_n3 TO ft_n3_reader;
+SET client_min_messages = error;
+SET ROLE ft_n3_reader;
+VACUUM t_n3;
+RESET ROLE;
+RESET client_min_messages;
+SELECT pg_temp.an_rows('SELECT * FROM t_n3') BETWEEN 500 AND 2000
+       AS n3_skipped_vacuum_rows;
+ n3_skipped_vacuum_rows 
+------------------------
+ t
+(1 row)
+
+DROP TABLE t_n3;
+DROP ROLE ft_n3_reader;
+-- Первая запись уровня берет размер, прочитанный при планировании, только
+-- если после чтения не стартовал другой оператор.  Здесь она идет готовым
+-- общим планом после отката вложенной записи, а последнее чтение размера было
+-- до этой записи: прирост отката посчитался бы второй раз.
+CREATE TEMP TABLE t_n9 (id int, pad text);
+INSERT INTO t_n9 SELECT g, repeat('x', 50) FROM generate_series(1, 1000) g;
+SELECT fasttrun_analyze('t_n9');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+SET plan_cache_mode = force_generic_plan;
+PREPARE n9_ins(int) AS INSERT INTO t_n9 VALUES ($1, 'x');
+EXECUTE n9_ins(0);
+BEGIN;
+SAVEPOINT s;
+INSERT INTO t_n9 SELECT g, repeat('x', 50) FROM generate_series(1, 100000) g;
+ROLLBACK TO SAVEPOINT s;
+EXECUTE n9_ins(1);
+ROLLBACK;
+SELECT pg_temp.an_rows('SELECT * FROM t_n9') BETWEEN 500 AND 2000
+       AS n9_level_mark_after_nested_rollback;
+ n9_level_mark_after_nested_rollback 
+-------------------------------------
+ t
+(1 row)
+
+DEALLOCATE n9_ins;
+RESET plan_cache_mode;
+DROP TABLE t_n9;
+-- Размер, прочитанный, пока таблицу пишет начатый оператор, отметкой уровня не
+-- становится: оператор продолжает писать без нового старта исполнителя, и
+-- откат вложенной пустой записи объявил бы его живые строки мертвыми.
+CREATE TEMP TABLE t_n10 (id int, pad text);
+INSERT INTO t_n10 SELECT g, repeat('x', 50) FROM generate_series(1, 1000) g;
+SELECT fasttrun_analyze('t_n10');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+CREATE FUNCTION pg_temp.n10_f(g int) RETURNS text LANGUAGE plpgsql AS $f$
+BEGIN
+  IF g = 1 THEN
+    BEGIN
+      PERFORM fasttrun_relstats('t_n10');
+    EXCEPTION WHEN others THEN NULL;
+    END;
+  ELSIF g = 100000 THEN
+    BEGIN
+      INSERT INTO t_n10 SELECT 0, 'x' WHERE false;
+      RAISE EXCEPTION 'boom';
+    EXCEPTION WHEN others THEN NULL;
+    END;
+  END IF;
+  RETURN repeat('x', 50);
+END
+$f$;
+SET plan_cache_mode = force_generic_plan;
+SELECT pg_temp.n10_f(100000) IS NOT NULL AS n10_plan_ready;
+ n10_plan_ready 
+----------------
+ t
+(1 row)
+
+INSERT INTO t_n10 SELECT g, pg_temp.n10_f(g) FROM generate_series(1, 100000) g;
+RESET plan_cache_mode;
+SELECT pg_temp.an_rows('SELECT * FROM t_n10') BETWEEN 50000 AND 200000
+       AS n10_probe_during_writer_rows;
+ n10_probe_during_writer_rows 
+------------------------------
+ t
+(1 row)
+
+DROP TABLE t_n10;
+-- CREATE TABLE AS пишет новую таблицу мимо реестра писателей: его исполнитель
+-- выполняет SELECT, а строки идут через DestReceiver.
+CREATE FUNCTION pg_temp.n15_f(g int) RETURNS text LANGUAGE plpgsql AS $f$
+BEGIN
+  IF g IN (1000, 100000) THEN
+    BEGIN
+      IF g = 1000 THEN
+        PERFORM fasttrun_analyze('t_n15');
+      END IF;
+      INSERT INTO t_n15 SELECT 0, 'x' WHERE false;
+      IF g = 100000 THEN
+        RAISE EXCEPTION 'boom';
+      END IF;
+    EXCEPTION WHEN others THEN NULL;
+    END;
+  ELSIF g = 1001 THEN
+    BEGIN
+      PERFORM fasttrun_relstats('t_n15');
+    EXCEPTION WHEN others THEN NULL;
+    END;
+  END IF;
+  RETURN repeat('x', 50);
+END
+$f$;
+SET plan_cache_mode = force_generic_plan;
+CREATE TEMP TABLE t_n15 AS
+  SELECT g AS id, pg_temp.n15_f(g) AS pad FROM generate_series(1, 100000) g;
+RESET plan_cache_mode;
+SELECT pg_temp.an_rows('SELECT * FROM t_n15') BETWEEN 50000 AND 200000
+       AS n15_probe_during_ctas_rows;
+ n15_probe_during_ctas_rows 
+----------------------------
+ t
+(1 row)
+
+DROP TABLE t_n15;
+-- Запись после DDL в точке сохранения оставляет отметку, и откат возвращает
+-- relstats вместе с мертвыми страницами.
+CREATE TEMP TABLE t_n17 (id int, pad text);
+INSERT INTO t_n17 SELECT g, repeat('x', 50) FROM generate_series(1, 1000) g;
+SELECT fasttrun_analyze('t_n17');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+BEGIN;
+SAVEPOINT s;
+CREATE INDEX t_n17_id ON t_n17 (id);
+INSERT INTO t_n17 SELECT g, repeat('x', 50) FROM generate_series(1, 100000) g;
+ROLLBACK TO SAVEPOINT s;
+SELECT pg_temp.an_rows('SELECT * FROM t_n17') BETWEEN 500 AND 2000
+       AS n17_ddl_savepoint_rows;
+ n17_ddl_savepoint_rows 
+------------------------
+ t
+(1 row)
+
+COMMIT;
+DROP TABLE t_n17;
+-- Счет мертвых страниц переживает построение индекса: статистика колонок,
+-- сохраненная через CREATE INDEX, по-прежнему видна.
+CREATE TEMP TABLE t_n17b (id int, grp int, pad text);
+INSERT INTO t_n17b SELECT g, g % 4, repeat('x', 50) FROM generate_series(1, 1000) g;
+SELECT fasttrun_analyze('t_n17b');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+DO $$ BEGIN BEGIN
+  INSERT INTO t_n17b SELECT g, 9, repeat('x', 50) FROM generate_series(1, 100000) g;
+  RAISE EXCEPTION 'boom';
+EXCEPTION WHEN others THEN NULL; END; END $$;
+CREATE INDEX t_n17b_id ON t_n17b (id);
+SELECT pg_temp.an_rows('SELECT * FROM t_n17b WHERE grp = 1') BETWEEN 150 AND 400
+       AS n17_column_stats_after_index;
+ n17_column_stats_after_index 
+------------------------------
+ t
+(1 row)
+
+DROP TABLE t_n17b;
+-- Статистике, собранной fasttrun_collect_stats без analyze, мертвые страницы
+-- отката тоже известны.
+CREATE TEMP TABLE t_n17c (id int, grp int, pad text);
+INSERT INTO t_n17c SELECT g, g % 4, repeat('x', 50) FROM generate_series(1, 1000) g;
+SELECT fasttrun_collect_stats('t_n17c');
+ fasttrun_collect_stats 
+------------------------
+ 
+(1 row)
+
+DO $$ BEGIN BEGIN
+  INSERT INTO t_n17c SELECT g, 9, repeat('x', 50) FROM generate_series(1, 100000) g;
+  RAISE EXCEPTION 'boom';
+EXCEPTION WHEN others THEN NULL; END; END $$;
+SELECT pg_temp.an_rows('SELECT * FROM t_n17c WHERE grp = 1')::float8 /
+       pg_temp.an_rows('SELECT * FROM t_n17c') BETWEEN 0.15 AND 0.4
+       AS n17_collected_stats_after_rollback;
+ n17_collected_stats_after_rollback 
+------------------------------------
+ t
+(1 row)
+
+DROP TABLE t_n17c;
+-- Мертвые страницы принадлежат файлу: откат потомка достается и состоянию
+-- того же файла, которое вернет более поздний откат после ядерного TRUNCATE.
+CREATE TEMP TABLE t_n18 (id int, pad text);
+INSERT INTO t_n18 SELECT g, repeat('x', 50) FROM generate_series(1, 1000) g;
+SELECT fasttrun_analyze('t_n18');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+INSERT INTO t_n18 SELECT g, repeat('x', 50) FROM generate_series(1, 1000) g;
+BEGIN;
+SAVEPOINT p;
+SELECT fasttrun_analyze('t_n18');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+SAVEPOINT c;
+INSERT INTO t_n18 SELECT g, repeat('x', 50) FROM generate_series(1, 100000) g;
+ROLLBACK TO SAVEPOINT c;
+RELEASE SAVEPOINT c;
+TRUNCATE t_n18;
+INSERT INTO t_n18 SELECT g, repeat('x', 50) FROM generate_series(1, 1000) g;
+SELECT fasttrun_analyze('t_n18');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+ROLLBACK TO SAVEPOINT p;
+SELECT pg_temp.an_rows('SELECT * FROM t_n18') BETWEEN 1000 AND 4000
+       AS n18_child_rollback_kept;
+ n18_child_rollback_kept 
+-------------------------
+ t
+(1 row)
+
+COMMIT;
+DROP TABLE t_n18;
+-- Откаченный UPDATE колонки предиката растит частичный индекс, а куча не
+-- растет: новые версии ложатся на прежние страницы.  Следующий analyze все
+-- равно обновляет число страниц индекса.
+CREATE TEMP TABLE t_n19 (id int, flag bool) WITH (fillfactor = 10);
+INSERT INTO t_n19 SELECT g, g % 100 = 0 FROM generate_series(1, 10000) g;
+CREATE INDEX t_n19_part ON t_n19 (id) WHERE flag;
+SELECT fasttrun_analyze('t_n19');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+SELECT pg_relation_size('t_n19') AS n19_heap_bytes \gset
+BEGIN;
+SAVEPOINT s;
+UPDATE t_n19 SET flag = true;
+ROLLBACK TO SAVEPOINT s;
+COMMIT;
+SELECT fasttrun_analyze('t_n19');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+SELECT pg_relation_size('t_n19') = :n19_heap_bytes AS n19_heap_same_size,
+       relpages = pg_relation_size('t_n19_part') / 8192 AS n19_index_pages_refreshed
+  FROM fasttrun_relstats('t_n19_part');
+ n19_heap_same_size | n19_index_pages_refreshed 
+--------------------+---------------------------
+ t                  | t
+(1 row)
+
+DROP TABLE t_n19;
+-- Команды, которые индекс не строят, relstats не трогают: CREATE INDEX IF NOT
+-- EXISTS с занятым именем и ограничение поверх готового индекса.
+CREATE TEMP TABLE t_n20 (id int);
+INSERT INTO t_n20 SELECT generate_series(1, 10000);
+CREATE INDEX t_n20_id ON t_n20 (id);
+CREATE UNIQUE INDEX t_n20_uidx ON t_n20 (id);
+ANALYZE t_n20;
+DELETE FROM t_n20 WHERE id > 1000;
+SELECT fasttrun_analyze('t_n20');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+CREATE INDEX IF NOT EXISTS t_n20_id ON t_n20 (id);
+NOTICE:  relation "t_n20_id" already exists, skipping
+SELECT reltuples = 1000 AS n20_existing_index_keeps_relstats
+  FROM fasttrun_relstats('t_n20');
+ n20_existing_index_keeps_relstats 
+-----------------------------------
+ t
+(1 row)
+
+ALTER TABLE t_n20 ADD CONSTRAINT t_n20_uq UNIQUE USING INDEX t_n20_uidx;
+NOTICE:  ALTER TABLE / ADD CONSTRAINT USING INDEX will rename index "t_n20_uidx" to "t_n20_uq"
+SELECT reltuples = 1000 AS n20_using_index_keeps_relstats
+  FROM fasttrun_relstats('t_n20');
+ n20_using_index_keeps_relstats 
+--------------------------------
+ t
+(1 row)
+
+DROP TABLE t_n20;
+-- Запись кеша без relstats, оставленная ради выборок колонок, уходит, когда
+-- COMMIT скрыл последние из них.
+SELECT analyze_entries AS reclaim_entries_before FROM fasttrun_cache_stats() \gset
+CREATE TEMP TABLE t_reclaim (id int, pad text);
+INSERT INTO t_reclaim SELECT g, repeat('x', 50) FROM generate_series(1, 1000) g;
+SELECT fasttrun_collect_stats('t_reclaim');
+ fasttrun_collect_stats 
+------------------------
+ 
+(1 row)
+
+BEGIN;
+INSERT INTO t_reclaim SELECT g, repeat('x', 50) FROM generate_series(1, 100000) g;
+COMMIT;
+SELECT analyze_entries = :reclaim_entries_before AS reclaim_entry_without_samples
+  FROM fasttrun_cache_stats();
+ reclaim_entry_without_samples 
+-------------------------------
+ t
+(1 row)
+
+DROP TABLE t_reclaim;
+-- VACUUM убирает строки откаченной записи и у записи без relstats: следующий
+-- откат считает мертвые страницы заново, а не поверх уже убранных.
+CREATE TEMP TABLE t_n21 (id int, grp int, pad text);
+INSERT INTO t_n21 SELECT g, g % 4, repeat('x', 50) FROM generate_series(1, 1000) g;
+SELECT fasttrun_collect_stats('t_n21');
+ fasttrun_collect_stats 
+------------------------
+ 
+(1 row)
+
+DO $$ BEGIN BEGIN
+  INSERT INTO t_n21 SELECT g, 9, repeat('x', 50) FROM generate_series(1, 100000) g;
+  RAISE EXCEPTION 'boom';
+EXCEPTION WHEN others THEN NULL; END; END $$;
+VACUUM t_n21;
+DO $$ BEGIN BEGIN
+  INSERT INTO t_n21 SELECT g, 9, repeat('x', 50) FROM generate_series(1, 2000) g;
+  RAISE EXCEPTION 'boom';
+EXCEPTION WHEN others THEN NULL; END; END $$;
+SELECT pg_temp.an_rows('SELECT * FROM t_n21 WHERE grp = 1')::float8 /
+       pg_temp.an_rows('SELECT * FROM t_n21') BETWEEN 0.15 AND 0.4
+       AS n21_vacuum_resets_dead_pages;
+ n21_vacuum_resets_dead_pages 
+------------------------------
+ t
+(1 row)
+
+DROP TABLE t_n21;
+-- Откат создания таблицы уносит и запись, которую завел fasttrun_collect_stats.
+SELECT analyze_entries AS n22_entries_before FROM fasttrun_cache_stats() \gset
+BEGIN;
+CREATE TEMP TABLE t_n22 (id int, pad text);
+INSERT INTO t_n22 SELECT g, repeat('x', 50) FROM generate_series(1, 1000) g;
+SELECT fasttrun_collect_stats('t_n22');
+ fasttrun_collect_stats 
+------------------------
+ 
+(1 row)
+
+SAVEPOINT s;
+INSERT INTO t_n22 SELECT g, repeat('x', 50) FROM generate_series(1, 100000) g;
+ROLLBACK TO SAVEPOINT s;
+ROLLBACK;
+SELECT analyze_entries = :n22_entries_before AS n22_created_table_entry_gone
+  FROM fasttrun_cache_stats();
+ n22_created_table_entry_gone 
+------------------------------
+ t
+(1 row)
+
+-- Построение индекса обновляет relstats одной кучи: свежие relstats других
+-- индексов остаются, хотя в каталоге у них прежние значения.
+CREATE TEMP TABLE t_n25 (id int, flag bool);
+INSERT INTO t_n25 SELECT g, true FROM generate_series(1, 10000) g;
+CREATE INDEX t_n25_part ON t_n25 (id) WHERE flag;
+ANALYZE t_n25;
+UPDATE t_n25 SET flag = false WHERE id > 100;
+SELECT fasttrun_analyze('t_n25');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+CREATE INDEX t_n25_other ON t_n25 (id);
+ALTER INDEX t_n25_part SET (fillfactor = 80);
+SELECT reltuples < 1000 AS n25_other_index_keeps_relstats
+  FROM fasttrun_relstats('t_n25_part');
+ n25_other_index_keeps_relstats 
+--------------------------------
+ t
+(1 row)
+
+DROP TABLE t_n25;
+-- Построение индекса не снимает relstats кучи: ядро записало точную пару, кеш
+-- ее берет, и relstats частичного индекса доходят и до тела раскрываемой
+-- SQL-функции, которое планировщик видит первым.
+CREATE FUNCTION pg_temp.an_cost(q text) RETURNS float8 LANGUAGE plpgsql AS $f$
+DECLARE
+  plan json;
+BEGIN
+  EXECUTE 'EXPLAIN (FORMAT JSON) ' || q INTO plan;
+  RETURN (plan->0->'Plan'->>'Total Cost')::float8;
+END
+$f$;
+CREATE TEMP TABLE t_n27 (id int, flag bool);
+INSERT INTO t_n27 SELECT g, true FROM generate_series(1, 10000) g;
+CREATE INDEX t_n27_part ON t_n27 (id) WHERE flag;
+ANALYZE t_n27;
+UPDATE t_n27 SET flag = false WHERE id > 100;
+SELECT fasttrun_analyze('t_n27');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+CREATE FUNCTION pg_temp.n27_rows() RETURNS SETOF t_n27 LANGUAGE sql STABLE
+  AS 'SELECT * FROM t_n27 WHERE flag AND id < 50';
+CREATE INDEX t_n27_other ON t_n27 (id);
+ALTER INDEX t_n27_part SET (fillfactor = 80);
+SELECT pg_temp.an_cost('SELECT * FROM pg_temp.n27_rows()') AS n27_inline_cost \gset
+SELECT abs(:n27_inline_cost - pg_temp.an_cost('SELECT * FROM t_n27 WHERE flag AND id < 50')) < 0.01
+       AS n27_inline_sees_index_relstats;
+ n27_inline_sees_index_relstats 
+--------------------------------
+ t
+(1 row)
+
+DROP FUNCTION pg_temp.n27_rows();
+DROP TABLE t_n27;
+-- То же, когда relstats частичного индекса опубликовал fasttrun_collect_stats, а
+-- у кучи своих нет.
+CREATE TEMP TABLE t_n28 (id int, flag bool);
+INSERT INTO t_n28 SELECT g, true FROM generate_series(1, 10000) g;
+CREATE INDEX t_n28_part ON t_n28 (id) WHERE flag;
+ANALYZE t_n28;
+UPDATE t_n28 SET flag = false WHERE id > 100;
+SELECT fasttrun_collect_stats('t_n28');
+ fasttrun_collect_stats 
+------------------------
+ 
+(1 row)
+
+CREATE FUNCTION pg_temp.n28_rows() RETURNS SETOF t_n28 LANGUAGE sql STABLE
+  AS 'SELECT * FROM t_n28 WHERE flag AND id < 50';
+CREATE INDEX t_n28_other ON t_n28 (id);
+ALTER INDEX t_n28_part SET (fillfactor = 80);
+SELECT pg_temp.an_cost('SELECT * FROM pg_temp.n28_rows()') AS n28_inline_cost \gset
+SELECT abs(:n28_inline_cost - pg_temp.an_cost('SELECT * FROM t_n28 WHERE flag AND id < 50')) < 0.01
+       AS n28_inline_sees_collected_index_relstats;
+ n28_inline_sees_collected_index_relstats 
+------------------------------------------
+ t
+(1 row)
+
+DROP FUNCTION pg_temp.n28_rows();
+DROP TABLE t_n28;
+-- Пару, взятую после построения индекса, откат точки сохранения возвращает.
+CREATE TEMP TABLE t_adopt (id int);
+INSERT INTO t_adopt SELECT generate_series(1, 1000);
+SELECT fasttrun_analyze('t_adopt');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+BEGIN;
+INSERT INTO t_adopt SELECT generate_series(1, 5000);
+SAVEPOINT s;
+CREATE INDEX t_adopt_id ON t_adopt (id);
+SELECT reltuples = 6000 AS adopt_takes_build_count FROM fasttrun_relstats('t_adopt');
+ adopt_takes_build_count 
+-------------------------
+ t
+(1 row)
+
+ROLLBACK TO SAVEPOINT s;
+SELECT reltuples = 1000 AS adopt_rolled_back FROM fasttrun_relstats('t_adopt');
+ adopt_rolled_back 
+-------------------
+ t
+(1 row)
+
+COMMIT;
+DROP TABLE t_adopt;
+-- Запись без relstats следует за текущим файлом, и откат вложенного уровня не
+-- возвращает ей файл, который заменил внешний: VACUUM обнуляет ее счет, и она
+-- уходит.
+SELECT analyze_entries AS follow_entries_before FROM fasttrun_cache_stats() \gset
+CREATE TEMP TABLE t_follow (id int, grp int, pad text);
+INSERT INTO t_follow SELECT g, g % 4, repeat('x', 50) FROM generate_series(1, 1000) g;
+SELECT fasttrun_collect_stats('t_follow');
+ fasttrun_collect_stats 
+------------------------
+ 
+(1 row)
+
+DO $$ BEGIN BEGIN
+  INSERT INTO t_follow SELECT g, 9, repeat('x', 50) FROM generate_series(1, 100000) g;
+  RAISE EXCEPTION 'boom';
+EXCEPTION WHEN others THEN NULL; END; END $$;
+BEGIN;
+ALTER TABLE t_follow ALTER COLUMN id TYPE bigint;
+SAVEPOINT s;
+SELECT fasttrun_collect_stats('t_follow');
+ fasttrun_collect_stats 
+------------------------
+ 
+(1 row)
+
+ROLLBACK TO SAVEPOINT s;
+COMMIT;
+VACUUM t_follow;
+SELECT analyze_entries = :follow_entries_before AS follow_entry_reclaimed
+  FROM fasttrun_cache_stats();
+ follow_entry_reclaimed 
+------------------------
+ t
+(1 row)
+
+DROP TABLE t_follow;
+-- После зафиксированного ядерного TRUNCATE и VACUUM записи не остается.
+SELECT analyze_entries AS m14_entries_before FROM fasttrun_cache_stats() \gset
+SET fasttrun.auto_collect_stats = off;
+CREATE TEMP TABLE t_m14 (id int, pad text);
+INSERT INTO t_m14 SELECT g, repeat('x', 50) FROM generate_series(1, 1000) g;
+SELECT fasttrun_analyze('t_m14');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+DO $$ BEGIN BEGIN
+  INSERT INTO t_m14 SELECT g, repeat('x', 50) FROM generate_series(1, 100000) g;
+  RAISE EXCEPTION 'boom';
+EXCEPTION WHEN others THEN NULL; END; END $$;
+TRUNCATE t_m14;
+VACUUM t_m14;
+SELECT analyze_entries = :m14_entries_before AS m14_truncated_file_entry_gone
+  FROM fasttrun_cache_stats();
+ m14_truncated_file_entry_gone 
+-------------------------------
+ t
+(1 row)
+
+RESET fasttrun.auto_collect_stats;
+DROP TABLE t_m14;
+-- Без VACUUM: мертвые страницы старого файла запись не держат.
+SELECT analyze_entries AS m14c_entries_before FROM fasttrun_cache_stats() \gset
+SET fasttrun.auto_collect_stats = off;
+CREATE TEMP TABLE t_m14c (id int, pad text);
+INSERT INTO t_m14c SELECT g, repeat('x', 50) FROM generate_series(1, 1000) g;
+SELECT fasttrun_analyze('t_m14c');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+DO $$ BEGIN BEGIN
+  INSERT INTO t_m14c SELECT g, repeat('x', 50) FROM generate_series(1, 100000) g;
+  RAISE EXCEPTION 'boom';
+EXCEPTION WHEN others THEN NULL; END; END $$;
+TRUNCATE t_m14c;
+SELECT analyze_entries = :m14c_entries_before AS m14c_truncated_entry_gone_without_vacuum
+  FROM fasttrun_cache_stats();
+ m14c_truncated_entry_gone_without_vacuum 
+------------------------------------------
+ t
+(1 row)
+
+RESET fasttrun.auto_collect_stats;
+DROP TABLE t_m14c;
+-- То же с индексом: TRUNCATE снимает публикации кучи и индекса, и запись кучи
+-- больше не держится ради relstats индекса.
+SELECT analyze_entries AS m14b_entries_before FROM fasttrun_cache_stats() \gset
+SET fasttrun.auto_collect_stats = off;
+CREATE TEMP TABLE t_m14b (id int, pad text);
+CREATE INDEX t_m14b_id ON t_m14b (id);
+INSERT INTO t_m14b SELECT g, repeat('x', 50) FROM generate_series(1, 1000) g;
+SELECT fasttrun_analyze('t_m14b');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+DO $$ BEGIN BEGIN
+  INSERT INTO t_m14b SELECT g, repeat('x', 50) FROM generate_series(1, 100000) g;
+  RAISE EXCEPTION 'boom';
+EXCEPTION WHEN others THEN NULL; END; END $$;
+TRUNCATE t_m14b;
+VACUUM t_m14b;
+SELECT analyze_entries = :m14b_entries_before AS m14b_indexed_entry_gone
+  FROM fasttrun_cache_stats();
+ m14b_indexed_entry_gone 
+-------------------------
+ t
+(1 row)
+
+RESET fasttrun.auto_collect_stats;
+DROP TABLE t_m14b;
+-- VACUUM, сжавший кучу, переякоривает размер выборок записи без relstats:
+-- данные те же, и проверка размера их не прячет.
+CREATE TEMP TABLE t_n21b (id int, grp int, pad text);
+INSERT INTO t_n21b SELECT g, g % 4, repeat('x', 50) FROM generate_series(1, 100000) g;
+DELETE FROM t_n21b WHERE id > 1000;
+SELECT fasttrun_collect_stats('t_n21b');
+ fasttrun_collect_stats 
+------------------------
+ 
+(1 row)
+
+VACUUM t_n21b;
+SELECT pg_temp.an_rows('SELECT * FROM t_n21b WHERE grp = 1')::float8 /
+       pg_temp.an_rows('SELECT * FROM t_n21b') BETWEEN 0.15 AND 0.4
+       AS n21_vacuum_reanchors_samples;
+ n21_vacuum_reanchors_samples 
+------------------------------
+ t
+(1 row)
+
+DROP TABLE t_n21b;
+-- Relstats индекса из fasttrun_collect_stats доходят до тела раскрываемой
+-- функции и после того, как COMMIT скрыл выборки кучи: у кучи остается
+-- запись, через которую идет реинжект.
+CREATE TEMP TABLE t_n28b (id int, flag bool);
+INSERT INTO t_n28b SELECT g, true FROM generate_series(1, 10000) g;
+CREATE INDEX t_n28b_part ON t_n28b (id) WHERE flag;
+ANALYZE t_n28b;
+UPDATE t_n28b SET flag = false WHERE id > 100;
+SELECT fasttrun_collect_stats('t_n28b');
+ fasttrun_collect_stats 
+------------------------
+ 
+(1 row)
+
+INSERT INTO t_n28b SELECT g, false FROM generate_series(10001, 110000) g;
+CREATE FUNCTION pg_temp.n28b_rows() RETURNS SETOF t_n28b LANGUAGE sql STABLE
+  AS 'SELECT * FROM t_n28b WHERE flag AND id < 50';
+CREATE INDEX t_n28b_other ON t_n28b (id);
+ALTER INDEX t_n28b_part SET (fillfactor = 80);
+SELECT pg_temp.an_cost('SELECT * FROM pg_temp.n28b_rows()') AS n28b_first_cost \gset
+SELECT relpages >= 0 AS n28b_reinjected FROM fasttrun_relstats('t_n28b_part');
+ n28b_reinjected 
+-----------------
+ t
+(1 row)
+
+SELECT abs(:n28b_first_cost - pg_temp.an_cost('SELECT * FROM pg_temp.n28b_rows()')) < 0.01
+       AS n28b_hidden_samples_index_relstats;
+ n28b_hidden_samples_index_relstats 
+------------------------------------
+ t
+(1 row)
+
+DROP FUNCTION pg_temp.n28b_rows();
+DROP TABLE t_n28b;
+-- Запись кучи без своих relstats держится, пока опубликован хотя бы один ее
+-- индекс. DROP INDEX в откаченной точке сохранения ничего не меняет, а
+-- зафиксированный DROP последнего индекса освобождает и запись кучи.
+SELECT analyze_entries AS m17_entries_before FROM fasttrun_cache_stats() \gset
+CREATE TEMP TABLE t_m17 (id int);
+CREATE INDEX t_m17_a ON t_m17 (id);
+CREATE INDEX t_m17_b ON t_m17 (id);
+SELECT fasttrun_collect_stats('t_m17');
+ fasttrun_collect_stats 
+------------------------
+ 
+(1 row)
+
+BEGIN;
+SAVEPOINT m17;
+DROP INDEX t_m17_a;
+ROLLBACK TO m17;
+COMMIT;
+SELECT analyze_entries = :m17_entries_before + 3 AS m17_rolled_back_drop_keeps_entries
+  FROM fasttrun_cache_stats();
+ m17_rolled_back_drop_keeps_entries 
+------------------------------------
+ t
+(1 row)
+
+DROP INDEX t_m17_a;
+SELECT analyze_entries = :m17_entries_before + 2 AS m17_heap_kept_for_other_index
+  FROM fasttrun_cache_stats();
+ m17_heap_kept_for_other_index 
+-------------------------------
+ t
+(1 row)
+
+DROP INDEX t_m17_b;
+SELECT analyze_entries = :m17_entries_before AS m17_last_index_releases_heap
+  FROM fasttrun_cache_stats();
+ m17_last_index_releases_heap 
+------------------------------
+ t
+(1 row)
+
+DROP TABLE t_m17;
+-- Откат первого сбора на пустой таблице оставляет relstats индекса: пустое
+-- хранилище - истина. Вместе с ними остается и запись кучи, через которую
+-- реинжект доходит до индекса.
+CREATE TEMP TABLE t_m18 (id int);
+CREATE INDEX t_m18_id ON t_m18 (id);
+SELECT analyze_entries AS m18_entries_before FROM fasttrun_cache_stats() \gset
+BEGIN;
+SELECT fasttrun_collect_stats('t_m18');
+ fasttrun_collect_stats 
+------------------------
+ 
+(1 row)
+
+ROLLBACK;
+SELECT analyze_entries = :m18_entries_before + 2 AS m18_rollback_keeps_heap_with_index
+  FROM fasttrun_cache_stats();
+ m18_rollback_keeps_heap_with_index 
+------------------------------------
+ t
+(1 row)
+
+DROP TABLE t_m18;
+CREATE TEMP TABLE t_m18b (id int);
+CREATE INDEX t_m18b_id ON t_m18b (id);
+SELECT analyze_entries AS m18b_entries_before FROM fasttrun_cache_stats() \gset
+BEGIN;
+SAVEPOINT m18b;
+SELECT fasttrun_collect_stats('t_m18b');
+ fasttrun_collect_stats 
+------------------------
+ 
+(1 row)
+
+ROLLBACK TO m18b;
+COMMIT;
+SELECT analyze_entries = :m18b_entries_before + 2 AS m18_savepoint_keeps_heap_with_index
+  FROM fasttrun_cache_stats();
+ m18_savepoint_keeps_heap_with_index 
+-------------------------------------
+ t
+(1 row)
+
+DROP TABLE t_m18b;
+-- Индекс, созданный в откаченной точке сохранения, уходит вместе со своей
+-- записью, и куча не остается его владельцем. Таблиц шесть: порядок обхода
+-- записей кучи и индекса зависит от их OID.
+DO $$
+DECLARE i int;
+BEGIN
+  FOR i IN 1..6 LOOP
+    EXECUTE format('CREATE TEMP TABLE t_m18c_%s (id int)', i);
+  END LOOP;
+END $$;
+SELECT analyze_entries AS m18c_entries_before FROM fasttrun_cache_stats() \gset
+DO $$
+DECLARE i int;
+BEGIN
+  FOR i IN 1..6 LOOP
+    BEGIN
+      EXECUTE format('CREATE INDEX ON t_m18c_%s (id)', i);
+      PERFORM fasttrun_collect_stats(format('t_m18c_%s', i));
+      RAISE EXCEPTION 'rollback';
+    EXCEPTION WHEN raise_exception THEN NULL;
+    END;
+  END LOOP;
+END $$;
+SELECT analyze_entries = :m18c_entries_before AS m18_created_index_leaves_no_owner
+  FROM fasttrun_cache_stats();
+ m18_created_index_leaves_no_owner 
+-----------------------------------
+ t
+(1 row)
+
+DO $$
+DECLARE i int;
+BEGIN
+  FOR i IN 1..6 LOOP
+    EXECUTE format('DROP TABLE t_m18c_%s', i);
+  END LOOP;
+END $$;
+-- Вложенный откат оставляет индексу пустую публикацию, повторный сбор
+-- сохраняет кучу уже владельцем, а внешний откат удаляет созданный индекс:
+-- куча не остается его владельцем. Таблиц шесть: порядок обхода зависит от
+-- их OID.
+DO $$
+DECLARE i int;
+BEGIN
+  FOR i IN 1..6 LOOP
+    EXECUTE format('CREATE TEMP TABLE t_m19_%s (id int)', i);
+  END LOOP;
+END $$;
+SELECT analyze_entries AS m19_entries_before FROM fasttrun_cache_stats() \gset
+DO $$
+DECLARE i int;
+BEGIN
+  FOR i IN 1..6 LOOP
+    BEGIN
+      EXECUTE format('CREATE INDEX ON t_m19_%s (id)', i);
+      BEGIN
+        PERFORM fasttrun_collect_stats(format('t_m19_%s', i));
+        RAISE EXCEPTION 'inner';
+      EXCEPTION WHEN raise_exception THEN NULL;
+      END;
+      PERFORM fasttrun_collect_stats(format('t_m19_%s', i));
+      RAISE EXCEPTION 'outer';
+    EXCEPTION WHEN raise_exception THEN NULL;
+    END;
+  END LOOP;
+END $$;
+SELECT analyze_entries = :m19_entries_before AS m19_nested_rollback_leaves_no_owner
+  FROM fasttrun_cache_stats();
+ m19_nested_rollback_leaves_no_owner 
+-------------------------------------
+ t
+(1 row)
+
+DO $$
+DECLARE i int;
+BEGIN
+  FOR i IN 1..6 LOOP
+    EXECUTE format('DROP TABLE t_m19_%s', i);
+  END LOOP;
+END $$;
+-- Откат передачи ядерному ANALYZE возвращает публикацию индекса вместе с
+-- записью кучи без своих relstats.
+CREATE TEMP TABLE t_m19h (id int);
+CREATE INDEX t_m19h_id ON t_m19h (id);
+SELECT fasttrun_collect_stats('t_m19h');
+ fasttrun_collect_stats 
+------------------------
+ 
+(1 row)
+
+SELECT analyze_entries AS m19h_entries_before FROM fasttrun_cache_stats() \gset
+BEGIN;
+ANALYZE t_m19h;
+ROLLBACK;
+SELECT analyze_entries = :m19h_entries_before AS m19_handoff_rollback_keeps_owner,
+       (SELECT relpages FROM fasttrun_cached_tables()
+         WHERE relid = 't_m19h_id'::regclass) = 1 AS m19_handoff_rollback_index_relstats
+  FROM fasttrun_cache_stats();
+ m19_handoff_rollback_keeps_owner | m19_handoff_rollback_index_relstats 
+----------------------------------+-------------------------------------
+ t                                | t
+(1 row)
+
+DROP TABLE t_m19h;
+-- Индекс создан во внешнем уровне, а сбор во внутреннем, откаченном. Внешний
+-- откат удаляет индекс, и куча, которой нет во внешнем фрейме, не остается
+-- его владельцем.
+CREATE TEMP TABLE t_m20 (id int);
+SELECT analyze_entries AS m20_entries_before FROM fasttrun_cache_stats() \gset
+BEGIN;
+CREATE INDEX t_m20_id ON t_m20 (id);
+SAVEPOINT m20;
+SELECT fasttrun_collect_stats('t_m20');
+ fasttrun_collect_stats 
+------------------------
+ 
+(1 row)
+
+ROLLBACK TO m20;
+RELEASE SAVEPOINT m20;
+ROLLBACK;
+SELECT analyze_entries = :m20_entries_before AS m20_outer_rollback_leaves_no_owner
+  FROM fasttrun_cache_stats();
+ m20_outer_rollback_leaves_no_owner 
+------------------------------------
+ t
+(1 row)
+
+DROP TABLE t_m20;
+-- Выборку, которую вернет внешний откат, внутренний откат не лишает счета
+-- мертвых страниц: рост файла от откаченной вставки ее не прячет.
+CREATE TEMP TABLE t_m21 (id int, pad text);
+ALTER TABLE t_m21 ALTER COLUMN pad SET STATISTICS 0;
+INSERT INTO t_m21 SELECT 42, repeat('x', 64) FROM generate_series(1, 1000);
+SELECT fasttrun_collect_stats('t_m21');
+ fasttrun_collect_stats 
+------------------------
+ 
+(1 row)
+
+BEGIN;
+SAVEPOINT m21_outer;
+ALTER TABLE t_m21 DROP COLUMN id;
+SAVEPOINT m21_inner;
+INSERT INTO t_m21 (pad) SELECT repeat('x', 64) FROM generate_series(1, 100000);
+ROLLBACK TO m21_inner;
+ROLLBACK TO m21_outer;
+SELECT column_stats = 1 AND hidden_columns = 0 AS m21_restored_sample_served
+  FROM fasttrun_cached_tables() WHERE relid = 't_m21'::regclass;
+ m21_restored_sample_served 
+----------------------------
+ t
+(1 row)
+
+SELECT pg_temp.an_rows('SELECT * FROM t_m21 WHERE id = 42')::float8 /
+       pg_temp.an_rows('SELECT * FROM t_m21') > 0.9
+       AS m21_restored_sample_selectivity;
+ m21_restored_sample_selectivity 
+---------------------------------
+ t
+(1 row)
+
+COMMIT;
+DROP TABLE t_m21;
+-- Внешний DROP INDEX держит публикацию индекса в undo. Откат внутреннего
+-- сбора не удаляет запись кучи, через которую реинжект дойдет до индекса
+-- после отката DROP.
+CREATE TEMP TABLE t_m23 (id int);
+CREATE INDEX t_m23_id ON t_m23 (id);
+SELECT fasttrun_collect_stats('t_m23');
+ fasttrun_collect_stats 
+------------------------
+ 
+(1 row)
+
+SELECT analyze_entries AS m23_entries_before FROM fasttrun_cache_stats() \gset
+BEGIN;
+DROP INDEX t_m23_id;
+SAVEPOINT m23;
+SELECT fasttrun_collect_stats('t_m23');
+ fasttrun_collect_stats 
+------------------------
+ 
+(1 row)
+
+ROLLBACK TO m23;
+ROLLBACK;
+SELECT analyze_entries = :m23_entries_before AS m23_outer_undo_keeps_heap
+  FROM fasttrun_cache_stats();
+ m23_outer_undo_keeps_heap 
+---------------------------
+ t
+(1 row)
+
+DROP TABLE t_m23;
 DROP EXTENSION fasttrun;

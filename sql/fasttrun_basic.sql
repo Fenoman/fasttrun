@@ -434,4 +434,28 @@ SELECT count(*) = 0 AS operation_context_gone
 \echo operation_context_gone :operation_context_gone
 DROP TABLE t_operation_context;
 
+-- Блокировка ExclusiveLock, а не AccessExclusiveLock.  Ядро пишет в WAL
+-- запись о каждой AccessExclusiveLock на отношение (реплика повторяет эту
+-- блокировку) и ради нее назначает транзакции xid.  Временную таблицу
+-- другой сеанс прочитать не может, поэтому более слабый режим ничего не
+-- открывает, а очистка не пишет WAL ни на быстром пути, ни на полном.
+CREATE TEMP TABLE t_lock_mode (id int PRIMARY KEY, v text);
+INSERT INTO t_lock_mode SELECT g, repeat('x', 3000) FROM generate_series(1, 100) g;
+BEGIN;
+DO $$ BEGIN PERFORM fasttruncate('t_lock_mode'); END $$;
+SELECT pg_current_xact_id_if_assigned() IS NULL AS lock_no_xid_after_reset \gset
+\echo lock_no_xid_after_reset :lock_no_xid_after_reset
+DO $$ BEGIN PERFORM fasttruncate('t_lock_mode'); END $$;
+SELECT pg_current_xact_id_if_assigned() IS NULL AS lock_no_xid_after_empty \gset
+\echo lock_no_xid_after_empty :lock_no_xid_after_empty
+SELECT count(*) = 0 AS lock_no_access_exclusive
+  FROM pg_locks
+ WHERE pid = pg_backend_pid() AND locktype = 'relation'
+   AND mode = 'AccessExclusiveLock' \gset
+\echo lock_no_access_exclusive :lock_no_access_exclusive
+COMMIT;
+SELECT count(*) = 0 AS lock_rows_gone FROM t_lock_mode \gset
+\echo lock_rows_gone :lock_rows_gone
+DROP TABLE t_lock_mode;
+
 DROP EXTENSION fasttrun;

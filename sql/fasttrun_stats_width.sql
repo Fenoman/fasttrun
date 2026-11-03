@@ -170,4 +170,19 @@ SELECT 'candidate_zero_width_uses_type_default' AS marker;
 RESET fasttrun.use_typanalyze;
 DROP TABLE t_width_fallback;
 
+-- Переопределение n_distinct из опций колонки применяется, как в ядерном
+-- ANALYZE, а опции читаются из кортежа pg_attribute, без кеша attoptions
+-- ядра: на PG16/17 каждое чужое сообщение об изменении колонок обходит этот
+-- кеш целиком, и раздувать его сбором статистики нельзя.
+\c -
+CREATE TEMP TABLE t_attopt (id int, grp int);
+ALTER TABLE t_attopt ALTER COLUMN grp SET (n_distinct = 7);
+INSERT INTO t_attopt SELECT g, g % 100 FROM generate_series(1, 10000) g;
+SELECT fasttrun_analyze('t_attopt');
+SELECT stadistinct = 7 AS attopt_n_distinct_applied
+  FROM fasttrun_inspect_stats('t_attopt') WHERE staattnum = 2;
+SELECT count(*) = 0 AS attopt_cache_untouched
+  FROM pg_backend_memory_contexts WHERE name = 'Attopt cache';
+DROP TABLE t_attopt;
+
 DROP EXTENSION fasttrun;

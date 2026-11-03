@@ -129,10 +129,10 @@ fi
 sleep 1
 
 # --- SQL одного варианта: своя сессия, свой pid ---
-# Всё в ОДНОЙ транзакции (один DO-блок без COMMIT): порог invalidate
-# срабатывает только пока column-stats не пересобираются, а через commit
-# счётчики temp обнуляются и каждый analyze становится "холодным"
-# (stats_recollected -> обход порога).  Внутри txn стата свежая.
+# Порог invalidate действует на дрейф relstats.  analyze после любого DML
+# пересобирает статистику столбцов, а пересбор сбрасывает планы мимо порога,
+# поэтому варианты идут с выключенным автосбором: остается чистый дрейф.
+# Все в одной транзакции (один DO-блок без COMMIT).
 # Таблица преднаполнена BASE_ROWS, затем добавляется по PER_ITER_ROWS:
 # дрейф relstats на вызов ~PER_ITER_ROWS/BASE_ROWS (доли %), ниже 20%.
 # threshold=0.2 не инвалидирует, threshold=0 инвалидирует на каждый вызов.
@@ -147,6 +147,7 @@ emit_variant_sql()
 			echo "CREATE TEMP TABLE ft_bt_${t} (id int, grp int, payload text);"
 		done
 		echo "SET fasttrun.invalidate_threshold = ${threshold};"
+		echo "SET fasttrun.auto_collect_stats = off;"
 		cat <<VSQL
 DO \$do\$
 DECLARE i int; j int;

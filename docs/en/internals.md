@@ -46,9 +46,32 @@ back with the level. The table is treated as empty, the pages of the rolled-back
 refill stay in the page count because a scan reads them, and the column
 statistics stay hidden until the next `fasttrun_analyze()`.
 
+Rolling back a level that wrote the table restores the saved state, while the
+pages of the rolled-back write stay in the file. The first write of a level
+marks the table size and the accumulated dead-page count before it. The size
+comes from the read the planner made for the same statement when no other
+statement has started since and no statement already running was writing the
+table at the time of the read, and is read anew otherwise. The
+rollback takes the size from storage at the smgr level, without catalog access,
+and recomputes the dead-page count from that mark: only its own level's growth
+gets in, and nested rollbacks of one growth do not add up. The published page
+count is scaled so that the planner counts live pages only, the size backstop of
+the column statistics leaves them out too, and an analyze with dead pages since
+the publication measures the size anew and refreshes the indexes. Dead pages by
+themselves do not change the estimate, and the rollback does not reset cached
+plans for them. It resets them when the forward path reset them or when a plan
+was built on statistics the rolled-back DML hid.
+
+The planner expands the body of an inlined SQL function inside
+`standard_planner`, after the parse tree walk. The `get_relation_info` hook
+brings the relstats back for relations from such bodies too and redoes the size
+estimate the core has already made from the `pg_class` values, and the estimate
+of a partial index whose rd_rel an invalidation of the index alone rebuilt.
+
 In standard mode, the main functions do not modify `pg_class`, `pg_statistic`,
-or the target table's relfilenode. Prewarming uses regular DDL and is outside
-this contract.
+or the target table's relfilenode. Two paths are outside this contract:
+prewarming uses regular DDL, and `fasttrun_analyze()` hands a table with
+`CREATE STATISTICS` objects to regular `ANALYZE`, which writes the catalog.
 
 ## Performance
 
@@ -58,7 +81,8 @@ PostgreSQL settings, and plan-cache size.
 The main expected effects are:
 
 - `fasttruncate()` avoids shared file-change messages in standard mode
-- `fasttrun_analyze()` does not write `pg_class` or `pg_statistic`
+- `fasttrun_analyze()` does not write `pg_class` or `pg_statistic`, except
+  for a table with `CREATE STATISTICS` objects
 - repeated analyze calls, in later transactions too, do not scan the table
   while the delta state is kept (the cases of a new pass are in
   [statistics](statistics.md)), and a statistics rebuild takes a block sample
@@ -129,6 +153,6 @@ extension/                    # installation and upgrade SQL files
 Makefile                      # PGXS build
 examples/                     # integration examples
 scripts/                      # checks and pre-release runner
-sql/                          # 14 pg_regress suites
+sql/                          # 15 pg_regress suites
 expected/                     # expected pg_regress output
 ```

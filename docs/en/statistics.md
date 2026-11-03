@@ -26,13 +26,29 @@ these cases:
 
 A delta to a row count taken by block sampling stays an estimate as well.
 
+The planner divides the published row count by the published page count and
+multiplies by the actual page count. A rolled-back write leaves its pages in the
+file while the counters forget it. The rollback of a subtransaction or a
+transaction counts the pages its own rolled-back write added: growth from rows
+committed without an analyze is not among them, and nested rollbacks of one
+growth do not add it twice. The planner leaves these pages out of the estimate,
+the size backstop does not take them for a refill, and the next analyze measures
+the size anew and refreshes the index estimates. After `VACUUM` the row count,
+the page count and the visibility come from `VACUUM`, which has just counted them
+in the file. A `VACUUM` the core skipped for lack of privileges or one that did
+not process the heap (`PROCESS_MAIN false`, `ONLY_DATABASE_STATS`) changes
+nothing. A repeated option takes its last value, as in the core.
+
 If the table does not exceed `fasttrun.max_analyze_pages`, the scan produces an
 exact row count. For a larger table, fasttrun takes a bounded block sample and
 produces an estimate, as regular `ANALYZE` does. A statistics rebuild after
 changes and a partial-index recount know the exact row count from the counters
-when a full scan produced the original count, and then take a block sample at
-any size instead of reading the whole table. When the original count was an
-estimate, they behave like the first pass and replace it with what they
+when a full scan produced the original count, and then take a block sample
+instead of reading the whole table. A table no larger than the sample target
+they read with a full scan at any `max_analyze_pages` but zero: a block sample
+would read all of it anyway and also take `ProcArrayLock`, walking every server
+process. When the original count was
+an estimate, they behave like the first pass and replace it with what they
 measured. `max_analyze_pages=0` brings back the full scan for them too. The
 sample seed also comes from where `ANALYZE` takes it, a generator the core
 seeds in every process separately, so backends choose blocks independently of
@@ -51,7 +67,6 @@ For the closest match to regular `ANALYZE`, use:
 ```sql
 BEGIN;
 SET LOCAL fasttrun.sample_rows = -1;
-SET LOCAL fasttrun.stats_refresh_threshold = 0;
 -- Fill the table, run fasttrun_analyze(), and execute the workload queries.
 COMMIT;
 ```
@@ -120,28 +135,35 @@ untouched columns the correlation can end up overstated - index access looks
 cheaper for them than it is. The number of distinct values, the NULL fraction
 and the MCV list stay correct.
 
-After a small amount of DML, cached statistics can remain visible, just as they
-do between regular runs of `ANALYZE`. A column's tolerance is
-`fasttrun.stats_refresh_threshold` multiplied by `1 - d`, where `d` is the
-fraction of distinct values among the rows, but no less than the smaller of the
-threshold and 5%. A column with few values gets almost the whole threshold, a
-near-unique one at most 5%. With a threshold of `0.2`, the statistics of a
-near-unique column are hidden after 5% of changes. `fasttrun_analyze()`
-rebuilds the statistics when the change ratio reaches the threshold itself or
-when the statistics of at least one column are already hidden by the
-tolerance, if automatic collection is enabled, `sample_rows` is not zero, and
-the memory limit permits collection. This way, after an analyze call the
-planner is usually not left on default estimates for a column that has a
-sample. A call inside a statement that writes the table postpones the rebuild:
+After any DML since the last collect, `fasttrun_analyze()` rebuilds the column
+statistics, as regular `ANALYZE` does, if automatic collection is enabled,
+`sample_rows` is not zero, and the memory limit permits collection. The old
+sample does not know the values the DML brought in: a new date, a flag set on
+part of the rows, or a column filled where it held only NULLs would be
+estimated at one row. A call with no changes leaves the sample alone. A rebuild
+costs more than a delta and resets the table's cached plans, see
+["Cost of a rebuild"](#cost-of-a-rebuild).
+
+A call inside a statement that writes the table postpones the rebuild:
 fasttrun never gives the planner a sample taken during a write. The next call
 after the write ends, in the same transaction or after `COMMIT`, collects
 again. Without new changes a column stays on default estimates in a few cases,
-listed in [limitations](limitations.md). Without an analyze call,
-fasttrun hides the statistics so that the planner does not use a distribution
-known to be outdated. Changes add up across `COMMIT`, so several sub-threshold
-transactions in a row hide the statistics just as one would. A write that goes
-past both the executor and `COPY` does not reach the transaction journal, see
-[limitations](limitations.md).
+listed in [limitations](limitations.md).
+
+Between DML and the next analyze call the planner uses the collected statistics
+within a tolerance, as the core does between two runs of `ANALYZE`, and beyond
+the tolerance fasttrun hides them, so that the planner does not use a
+distribution known to be outdated. For inserted and updated rows the tolerance
+is `fasttrun.stats_refresh_threshold` multiplied by `1 - d`, where `d` is the
+fraction of distinct values among the rows, but no less than the smaller of the
+threshold and 5%. A column with few values gets almost the whole threshold, a
+near-unique one at most 5%: an insert or an update can pile rows onto one value
+and turn a "rare" value into a frequent one. A delete cannot do that, the share
+of any remaining value grows by no more than `1 / (1 - deleted share)`, so
+deleted rows are compared with the threshold itself. Changes add up across
+`COMMIT`, so several small transactions in a row hide the statistics just as
+one would. A write that goes past both the executor and `COPY` does not reach
+the transaction journal, see [limitations](limitations.md).
 
 `track_counts=on` is required for column-statistics freshness checks and the
 fast delta path. With `off`, fasttrun still updates the table-size estimate by
@@ -164,8 +186,59 @@ call.
 A regular full `ANALYZE` hands statistics management for the whole table back
 to PostgreSQL core. `ANALYZE table (col1, ...)` hands back only the listed
 columns, while local statistics for the remaining columns stay in place.
-`VACUUM` without `ANALYZE` changes nothing. Commands that rewrite the table hide
-old local statistics until the next collection.
+`VACUUM` without `ANALYZE` does not change column statistics. `VACUUM FULL`,
+`CLUSTER` and a column type change rewrite the table and hide old local
+statistics until the next collection.
+
+DDL that changes neither the rows nor the meaning of the remaining columns keeps
+the column statistics, as the core keeps `pg_statistic`: `CREATE INDEX` and
+`ALTER TABLE` with storage parameters, `ADD COLUMN`, `DROP COLUMN`, constraints,
+defaults, `NOT NULL`, statistics targets and triggers. `DROP COLUMN` removes
+only its own column's statistics. `ADD COLUMN` with a `GENERATED ... STORED`
+expression or a volatile default rewrites the table with the same rows, and
+the statistics move to the new file. After an index build, including one for a
+`UNIQUE` or `PRIMARY KEY` inside `ADD COLUMN`, the row and page counts come from
+the core, which has just counted them exactly, and the other indexes keep their
+own. `REINDEX` builds no new index: the table keeps its own counts until the
+next analyze, as it would without `REINDEX`. A column type change
+and any other `ALTER TABLE` hide the table's statistics until the next collect.
+
+### Index expressions
+
+fasttrun collects the statistics of index expressions from the same row sample,
+as core `ANALYZE` does in `compute_index_stats`: each expression is evaluated
+over the sampled rows and analyzed as a column of its type. The planner gets
+them by index OID. Freshness is checked against the table's counters, as for
+its columns, and an `UPDATE` always counts for an expression, which may read any
+column. The expressions run as the table owner in a restricted security
+context, as in `ANALYZE`. Expressions of partial indexes stay on default
+estimates: the rows of such an index are only part of the table, and the
+planner takes no whole-table statistics from it. With
+`fasttrun.sample_rows = -1` the sample size accounts for the expression targets
+too. With `fasttrun.use_typanalyze = off` expressions are not collected.
+`DROP INDEX` removes the expression statistics of its index.
+
+### Extended statistics
+
+`CREATE STATISTICS` objects are built only by core `ANALYZE`, into
+`pg_statistic_ext_data`, and the planner has no hook for them. When a table has
+such an object, `fasttrun_analyze()` and `fasttrun_analyze_bulk()` run regular
+`ANALYZE` for it, and the planner gets the core statistics, multicolumn
+estimates included. The price is catalog writes and shared invalidation
+messages, as with any `ANALYZE`, and the core sample, usually larger than the
+fasttrun one. The `analyze_core_handoff` counter in `fasttrun_counters()` counts
+such calls. The core skips a table the caller may not analyze, so the handoff
+happens only for those the core lets in: on PG16 the table or database owner,
+on PG17 and later the database owner and holders of the `MAINTAIN` privilege
+(the table owner has it unless it revoked it from itself). For other callers
+fasttrun collects the
+column statistics itself, and the extended statistics objects stay as the last
+regular `ANALYZE` left them, describing an earlier fill. The planner then
+leaves them out and makes multicolumn estimates from the fresh column
+statistics until a regular `ANALYZE` builds every object again: the rows of
+their data are compared before and after the command.
+An explicit `fasttrun_collect_stats()` collects local column statistics for such
+a table too, and the objects likewise stop applying until a regular `ANALYZE`.
 
 ## Settings
 
@@ -179,11 +252,11 @@ The "user" context means that the parameter can be changed with `SET`. The
 |---|---:|---:|---|---|
 | `fasttrun.auto_collect_stats` | `on` | boolean | user | Collect column statistics inside `fasttrun_analyze()` |
 | `fasttrun.sample_rows` | `3000` | `-1..1000000` | user | `0` disables column collection. With `use_typanalyze=on`, `-1` uses the sample size requested by PostgreSQL, while with `off` it uses 3,000 rows |
-| `fasttrun.stats_refresh_threshold` | `0.2` | `0..1` | user | Fraction of DML that triggers an automatic rebuild, and the base of the statistics visibility tolerance. A column hidden by the tolerance triggers the rebuild too. `0` means a rebuild on any DML. `1` disables the DML-triggered rebuild, but statistics past the tolerance are still hidden |
+| `fasttrun.stats_refresh_threshold` | `0.2` | `0..1` | user | Tolerance up to which the planner uses column statistics between DML and the next analyze: for inserted and updated rows scaled by the fraction of distinct values, for deleted rows the threshold itself. It does not govern the rebuild: analyze rebuilds after any DML. `0` hides statistics after any DML |
 | `fasttrun.invalidate_threshold` | `0.2` | `0..1` | user | Allowed cumulative size change of the table and its indexes before local plans are invalidated |
 | `fasttrun.use_typanalyze` | `on` | boolean | user | Use PostgreSQL's built-in statistics handlers. `off` keeps only basic metrics |
 | `fasttrun.zero_sinval_truncate` | `on` | boolean | user | `on` clears files without shared messages, while `off` uses the PostgreSQL core cleanup path |
-| `fasttrun.max_analyze_pages` | `100000` | `0..2147483647` pages | user | Above this threshold, the first `fasttrun_analyze()` pass switches to block sampling. A rebuild after changes samples blocks at any size when the count is exact. `0` requires a full scan everywhere |
+| `fasttrun.max_analyze_pages` | `100000` | `0..2147483647` pages | user | Above this threshold, the first `fasttrun_analyze()` pass switches to block sampling. A rebuild after changes with an exact count does not depend on this threshold and samples blocks when the table is larger than the sample target. `0` requires a full scan everywhere |
 | `fasttrun.max_stats_memory` | `0` | KB | user | Soft memory limit for column statistics. `0` means unlimited |
 | `fasttrun.template_stattarget` | `on` | boolean | user | Take a column's statistics target from the same-named template in `fasttrun.prewarm_schema` when the temporary table sets none |
 | `fasttrun.log_min_duration` | `-1` | ms | superuser | Write `fasttruncate()` and `fasttrun_analyze()` calls that take at least this long to the server log: the table, the time, the path of the call, and the pages and rows it published. `-1` turns the log off, `0` logs every call |
@@ -210,12 +283,30 @@ limit stops automatic collection, the backend emits one `WARNING`. An explicit
 The tracking and prewarming parameters are described in
 [tracking.md](tracking.md#parameters).
 
+## Cost of a rebuild
+
+Measured on PG16 with a 3,000-row sample, time of one `fasttrun_analyze()`:
+
+| Table | No changes | Delta without rebuild | After DML, with rebuild |
+|---|---:|---:|---:|
+| 7 columns, 1k rows | ~0.001 ms | 0.008 ms | 0.72 ms |
+| 23 columns, 10k rows | ~0.001 ms | 0.007 ms | 7.8 ms |
+| 100 columns, 100k rows | ~0.001 ms | 0.3 ms | 43 ms |
+
+A call with no changes does not depend on the cache size. The delta without a
+rebuild is the price with `fasttrun.auto_collect_stats = off`. A rebuild grows
+with the number of columns and the sample size, not with the table size: rows
+are drawn from random blocks. Every rebuild resets the table's cached plans in
+this backend and leaves other backends alone.
+
 ## Memory
 
 Statistics caches belong to a physical backend and are not shared across
-connections. With 300 tables of 300 columns each, they can consume tens or
-hundreds of megabytes per backend. Wide values and a larger
-`default_statistics_target` increase memory use.
+connections. A table of 7 columns, two of them text, takes about 29 KB at
+`default_statistics_target = 100`, and 700 such tables about 20 MB. With 300
+tables of 300 columns each, the caches can consume tens or hundreds of megabytes
+per backend. Wide values and a larger `default_statistics_target` increase
+memory use.
 
 Measure the actual use on your workload:
 

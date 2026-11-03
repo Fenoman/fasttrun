@@ -10,6 +10,7 @@
 --   * UPDATE всех + повторный analyze (дельта обновлений != 0, но
 --     в формуле не участвует - число живых строк не меняется)
 --   * горячий путь маленького DML: DELETE 1000, INSERT 500, смешанный
+--     (счет строк без автосбора) и пересбор после маленького DELETE
 --   * fasttruncate в финале
 --
 -- Все замеры ленивого режима выполняются ВНУТРИ одного DO-блока,
@@ -20,7 +21,7 @@
 --
 -- Жесткие пороги внутри DO-блока (срабатывают только при регрессии):
 --   * теплый analyze (попадание через дельту) не медленнее 5 мс
---   * полный reservoir refresh после массового DML не
+--   * пересбор после массового или маленького DML не
 --     медленнее 2000 мс (строгий предел по медиане - MAX_REFRESH_MS
 --     в scripts/check_fasttrun_perf_smoke.sh)
 --   * ускорение теплый/холодный не менее 20x
@@ -129,6 +130,7 @@ DECLARE
     t_small_d       numeric;
     t_small_i       numeric;
     t_small_mix     numeric;
+    t_small_refresh numeric;
     t_trunc         numeric;
     n_pages         int;
     n_tuples        real;
@@ -271,11 +273,15 @@ BEGIN
     -- смешанная пара.  DELETE 1000 строк из 500000 (0.2%) НЕ должен
     -- стоить полного сканирования.  Дельта-математика обрабатывает
     -- его за те же ~30 микросекунд, что и пустой проход с дельтой = 0.
+    -- Статистику колонок analyze после любого DML пересобирает
+    -- выборкой, поэтому счет строк меряется с выключенным автосбором,
+    -- а пересбор после маленького DML - отдельно в конце.
     --
     -- На входе: 500000 строк (после UPDATE), все с нечетным id
     --           (1, 3, 5, ..., 999999), потому что предыдущий
     --           DELETE id%2=0 уничтожил все четные.
     -- ----------------------------------------------------------
+    PERFORM set_config('fasttrun.auto_collect_stats', 'off', true);
 
     -- Маленький DELETE: убираем 1000 строк (нечетные id 1, 3, ..., 1999).
     DELETE FROM t_bench WHERE id < 2001;
@@ -352,6 +358,22 @@ BEGIN
     IF t_small_mix > 5 THEN
         RAISE EXCEPTION 'mixed small DML delta hit too slow: % ms',
                         round(t_small_mix, 4);
+    END IF;
+
+    -- Пересбор после маленького DML читает выборку блоков, а не всю
+    -- кучу, и укладывается в предел полного пересбора.
+    PERFORM set_config('fasttrun.auto_collect_stats', 'on', true);
+    DELETE FROM t_bench WHERE id BETWEEN 2201 AND 2399;
+
+    t_start := clock_timestamp();
+    PERFORM fasttrun_analyze('t_bench');
+    t_small_refresh := EXTRACT(EPOCH FROM (clock_timestamp() - t_start)) * 1000;
+
+    RAISE NOTICE 'refresh after small DELETE 100: % ms', round(t_small_refresh, 4);
+
+    IF t_small_refresh > 2000 THEN
+        RAISE EXCEPTION 'refresh after small DELETE too slow: % ms',
+                        round(t_small_refresh, 4);
     END IF;
 
     -- ----------------------------------------------------------

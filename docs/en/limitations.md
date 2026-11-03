@@ -56,10 +56,17 @@ work without `shared_preload_libraries`.
 - `fasttruncate()` publishes `reltuples=0`. Core `TRUNCATE` uses the special
   value `-1`, so calling `fasttrun_analyze()` after a refill is especially
   important.
-- Extended statistics created with `CREATE STATISTICS`, expression-index
-  statistics, and inheritance statistics are not collected.
-- Stale catalog statistics for index expressions are hidden. Until a regular
-  `ANALYZE`, the planner uses default estimates.
+- Inheritance statistics are not collected. fasttrun does not build
+  `CREATE STATISTICS` objects itself: `fasttrun_analyze()` hands a table with
+  such objects to regular `ANALYZE`, with all its catalog writes and shared
+  invalidation messages. When a cascade from another object, such as
+  `DROP SCHEMA ... CASCADE` of its schema or `DROP TYPE ... CASCADE`, drops
+  such an object, the backend keeps the table's cache entry until the table is
+  dropped or the next `ANALYZE`: no estimate goes wrong.
+- Statistics of partial-index expressions are not collected, and with
+  `fasttrun.use_typanalyze = off` neither are the expressions of ordinary
+  indexes. Stale catalog statistics for such expressions are hidden, and until a
+  regular `ANALYZE` the planner uses default estimates.
 - ACL, RLS, and security-barrier behavior of regular `ANALYZE` is not
   reproduced.
 - The functions do not check table ownership or the privileges enforced by
@@ -114,6 +121,13 @@ work without `shared_preload_libraries`.
 - Only changes start a rebuild of column statistics. Without new DML or an
   explicit `fasttrun_collect_stats()`, a column stays on default estimates in
   these cases: after an explicit collect during a write when analyze runs
-  before `COMMIT`, with `stats_refresh_threshold = 1`, and until the
-  transaction ends after the registry of writing statements overflows.
+  before `COMMIT`, and until the transaction ends after the registry of writing
+  statements overflows.
+- Rolling back a savepoint inside which a column type change or another
+  `ALTER TABLE` other than adding a column rewrote the table does not bring the
+  previous column statistics back: the columns stay on default estimates until
+  the next DML and analyze or an explicit `fasttrun_collect_stats()`. In the
+  OmniX corpus only `ADD COLUMN ... GENERATED ... STORED` in
+  `imp_readings_integral` rewrites temporary tables, and its statistics are kept
+  and come back on rollback.
 - fasttrun is not a security boundary between connection-pooler clients.
