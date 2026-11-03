@@ -10648,7 +10648,12 @@ fasttrun_ext_data_version(Oid stxoid)
 	if (HeapTupleIsValid(tup))
 	{
 		version.present = true;
+#ifdef TANTOR_VERSION
+		/* Tantor keeps the 64-bit xmin in HeapTupleData, not in the header. */
+		version.xmin = HeapTupleGetXmin(tup);
+#else
 		version.xmin = HeapTupleHeaderGetXmin(tup->t_data);
+#endif
 		version.tid = tup->t_self;
 		ReleaseSysCache(tup);
 	}

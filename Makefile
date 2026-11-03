@@ -13,6 +13,8 @@
 
 MODULE_big = fasttrun
 OBJS = fasttrun.o
+# Вызов необъявленной функции останавливает сборку, а не загрузку сервера.
+PG_CFLAGS += -Werror=implicit-function-declaration
 
 EXTENSION = fasttrun
 DATA = extension/fasttrun--2.0.sql \
