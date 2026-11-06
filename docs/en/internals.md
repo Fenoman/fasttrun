@@ -153,6 +153,6 @@ extension/                    # installation and upgrade SQL files
 Makefile                      # PGXS build
 examples/                     # integration examples
 scripts/                      # checks and pre-release runner
-sql/                          # 15 pg_regress suites
+sql/                          # 16 pg_regress suites
 expected/                     # expected pg_regress output
 ```

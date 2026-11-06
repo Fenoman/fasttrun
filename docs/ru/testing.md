@@ -8,8 +8,8 @@
 make installcheck PG_CONFIG=/path/to/pg_config
 ```
 
-Он содержит 15 наборов `pg_regress`. На поддерживаемых PostgreSQL 16,
-PostgreSQL 17 и PostgreSQL 18 ожидается результат 15/15.
+Он содержит 16 наборов `pg_regress`. На поддерживаемых PostgreSQL 16,
+PostgreSQL 17 и PostgreSQL 18 ожидается результат 16/16.
 
 Расширенный локальный набор:
 
@@ -41,7 +41,7 @@ FT_CASSERT_TARGETS="16:/path/pg16/bin/pg_config:port:log,..." \
   scripts/check_fasttrun_prerelease.sh
 ```
 
-Обязательный набор включает cassert-сборки PostgreSQL 16/17/18, 15/15
+Обязательный набор включает cassert-сборки PostgreSQL 16/17/18, 16/16
 `pg_regress`, BRIN stress, cache-init faults, fault matrix, проверки памяти,
 планировщика, локальных инвалидаций, сброса планов при завершении backend,
 основной ветки теста трекинга с предзагрузкой, сброса реестра идущих пишущих

@@ -259,6 +259,7 @@ The "user" context means that the parameter can be changed with `SET`. The
 | `fasttrun.max_analyze_pages` | `100000` | `0..2147483647` pages | user | Above this threshold, the first `fasttrun_analyze()` pass switches to block sampling. A rebuild after changes with an exact count does not depend on this threshold and samples blocks when the table is larger than the sample target. `0` requires a full scan everywhere |
 | `fasttrun.max_stats_memory` | `0` | KB | user | Soft memory limit for column statistics. `0` means unlimited |
 | `fasttrun.template_stattarget` | `on` | boolean | user | Take a column's statistics target from the same-named template in `fasttrun.prewarm_schema` when the temporary table sets none |
+| `fasttrun.passthrough` | `off` | boolean | superuser, at connection | Hand the functions' work to the core: `TRUNCATE` and `ANALYZE` instead of the extension's own paths, with hooks and caches idle. See [usage.md](usage.md#core-passthrough-mode) |
 | `fasttrun.log_min_duration` | `-1` | ms | superuser | Write `fasttruncate()` and `fasttrun_analyze()` calls that take at least this long to the server log: the table, the time, the path of the call, and the pages and rows it published. `-1` turns the log off, `0` logs every call |
 
 With an 8 KB page size, `max_analyze_pages=100000` corresponds to approximately

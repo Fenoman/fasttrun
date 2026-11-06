@@ -153,6 +153,6 @@ extension/                    # SQL-файлы установки и обнов�
 Makefile                      # сборка через PGXS
 examples/                     # примеры интеграции
 scripts/                      # проверки и pre-release runner
-sql/                          # 15 наборов pg_regress
+sql/                          # 16 наборов pg_regress
 expected/                     # ожидаемый вывод pg_regress
 ```

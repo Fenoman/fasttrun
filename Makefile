@@ -66,7 +66,8 @@ REGRESS = fasttrun_basic \
           fasttrun_stats_width \
           fasttrun_discard \
           fasttrun_zero_sinval_catalog \
-          fasttrun_observe
+          fasttrun_observe \
+          fasttrun_passthrough
 
 PG_CONFIG ?= pg_config
 

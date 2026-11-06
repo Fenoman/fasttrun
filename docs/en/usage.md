@@ -110,6 +110,29 @@ Tracking and prewarming are separate, optional features.
 Call `fasttrun_prewarm()` when a new physical connection is created, not every
 time a connection is handed to a client.
 
+## Core passthrough mode
+
+`fasttrun.passthrough = on` turns the extension's own work off without changing
+the calling code: `fasttruncate()` runs `TRUNCATE ONLY`, while
+`fasttrun_analyze()`, `fasttrun_analyze_bulk()` and `fasttrun_collect_stats()`
+run `ANALYZE`. The hooks and session caches stay idle, and the diagnostic
+functions show empty caches. Input checks stay the same: a missing table returns
+silently, a permanent or partitioned one raises an error.
+
+The mode is an emergency switch: if the extension gets in the way on a
+particular server build, it is turned off by configuration rather than by
+changing application code. The value is taken at connection start and does not
+change for the rest of the session. A superuser sets it in `postgresql.conf`
+(it applies to sessions opened after the configuration is reloaded), with
+`ALTER ROLE ... SET`, `ALTER DATABASE ... SET`, or in connection options.
+
+The price is the core's work: `TRUNCATE` and `ANALYZE` change catalog rows and
+send shared invalidation messages. On Tantor SE 18 with
+`enable_temp_memory_catalog = on` those rows live in memory, yet the messages
+remain: in a measurement on Tantor SE 18.6.2 a core `TRUNCATE` of a table with
+three indexes sent about 26 messages and an `ANALYZE` about 7.
+`fasttruncate()` and `fasttrun_analyze()` in the normal mode send none.
+
 ## Functions
 
 The public API contains 14 SQL functions.

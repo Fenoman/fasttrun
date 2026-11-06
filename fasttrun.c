@@ -163,6 +163,8 @@ static int		fasttrun_max_analyze_pages = 100000;
 static int		fasttrun_max_stats_memory = 0;	/* KB, 0 = no cap */
 static int		fasttrun_log_min_duration = -1;	/* ms, -1 = off */
 static bool		fasttrun_template_stattarget = true;
+/* Hand the functions' work to core commands and keep the hooks out of the way. */
+static bool		fasttrun_passthrough = false;
 static char	   *fasttrun_prewarm_schema;	/* defined with the tracking GUCs */
 
 /*
@@ -878,6 +880,7 @@ static bool fasttrun_relation_has_extended_stats(Relation rel);
 static bool fasttrun_may_core_analyze(Relation rel);
 static bool fasttrun_may_maintain_relid(Oid relid, bool relisshared);
 static void fasttrun_run_core_analyze(Relation rel);
+static void fasttrun_passthrough_command(const char *command, Oid relid);
 static bool fasttrun_get_relation_stats_hook(PlannerInfo *root,
 											 RangeTblEntry *rte,
 											 AttrNumber attnum,
@@ -1924,6 +1927,8 @@ fasttrun_exit_plan_reset_register(void)
 static void
 fasttrun_xact_callback(XactEvent event, void *arg)
 {
+	if (fasttrun_passthrough)
+		return;
 	switch (event)
 	{
 		case XACT_EVENT_COMMIT:
@@ -3006,7 +3011,7 @@ static bool				fasttrun_executor_hook_installed = false;
 static void
 fasttrun_ensure_planner_hook(void)
 {
-	if (fasttrun_planner_hook_installed)
+	if (fasttrun_planner_hook_installed || fasttrun_passthrough)
 		return;
 
 	prev_planner_hook = planner_hook;
@@ -3019,7 +3024,7 @@ fasttrun_ensure_planner_hook(void)
 static void
 fasttrun_ensure_stats_hooks(void)
 {
-	if (fasttrun_stats_hooks_installed)
+	if (fasttrun_stats_hooks_installed || fasttrun_passthrough)
 		return;
 
 	prev_get_relation_stats_hook = get_relation_stats_hook;
@@ -3302,16 +3307,19 @@ fasttrun_executor_walk_targets(PlannedStmt *stmt, bool starting)
 static void
 fasttrun_executor_start(QueryDesc *queryDesc, int eflags)
 {
-	fasttrun_exit_plan_reset_register();
-	/*
-	 * A plan can run long after it was made: a SQL function in PG 16 and 17
-	 * plans all its statements before the first one runs, and that one may be
-	 * the fasttruncate that fails.
-	 */
-	if (fasttrun_poison_cache != NULL)
-		fasttrun_poison_check_plan(queryDesc->plannedstmt);
-	fasttrun_executor_walk_targets(queryDesc->plannedstmt, true);
-	fasttrun_statement_seq++;
+	if (!fasttrun_passthrough)
+	{
+		fasttrun_exit_plan_reset_register();
+		/*
+		 * A plan can run long after it was made: a SQL function in PG 16 and
+		 * 17 plans all its statements before the first one runs, and that one
+		 * may be the fasttruncate that fails.
+		 */
+		if (fasttrun_poison_cache != NULL)
+			fasttrun_poison_check_plan(queryDesc->plannedstmt);
+		fasttrun_executor_walk_targets(queryDesc->plannedstmt, true);
+		fasttrun_statement_seq++;
+	}
 
 	if (prev_ExecutorStart != NULL)
 		prev_ExecutorStart(queryDesc, eflags);
@@ -3322,7 +3330,8 @@ fasttrun_executor_start(QueryDesc *queryDesc, int eflags)
 static void
 fasttrun_executor_end(QueryDesc *queryDesc)
 {
-	fasttrun_executor_walk_targets(queryDesc->plannedstmt, false);
+	if (!fasttrun_passthrough)
+		fasttrun_executor_walk_targets(queryDesc->plannedstmt, false);
 
 	if (prev_ExecutorEnd != NULL)
 		prev_ExecutorEnd(queryDesc);
@@ -6820,7 +6829,8 @@ fasttrun_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 	HASH_SEQ_STATUS status;
 	FasttrunXactRelEntry *xentry;
 
-	if (event != SUBXACT_EVENT_ABORT_SUB && event != SUBXACT_EVENT_COMMIT_SUB)
+	if (fasttrun_passthrough ||
+		(event != SUBXACT_EVENT_ABORT_SUB && event != SUBXACT_EVENT_COMMIT_SUB))
 		return;
 	if (event == SUBXACT_EVENT_ABORT_SUB)
 		fasttrun_statement_seq++;
@@ -9854,6 +9864,12 @@ fasttruncate(PG_FUNCTION_ARGS)
 		elog(ERROR, "fasttruncate: relation \"%s\" is not heap-AM",
 			 RelationGetRelationName(rel));
 	}
+	if (fasttrun_passthrough)
+	{
+		table_close(rel, NoLock);
+		fasttrun_passthrough_command("TRUNCATE ONLY", relOid);
+		PG_RETURN_VOID();
+	}
 
 	/* An active marker permits only this repair path or DROP/recreate. */
 	fasttrun_poison_check_relation(rel, "fasttruncate", true);
@@ -10741,6 +10757,29 @@ fasttrun_run_core_analyze(Relation rel)
 }
 
 /*
+ * fasttrun.passthrough: run the core command on the table.  The caller has
+ * closed its own reference: TRUNCATE refuses a table this session holds open.
+ */
+static void
+fasttrun_passthrough_command(const char *command, Oid relid)
+{
+	char	   *sql;
+	int			rc;
+
+	sql = psprintf("%s %s", command,
+				   quote_qualified_identifier(get_namespace_name(get_rel_namespace(relid)),
+											  get_rel_name(relid)));
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "fasttrun: SPI_connect failed");
+	rc = SPI_execute(sql, false, 0);
+	if (rc != SPI_OK_UTILITY)
+		elog(ERROR, "fasttrun: \"%s\" failed: %s", sql,
+			 SPI_result_code_string(rc));
+	SPI_finish();
+	pfree(sql);
+}
+
+/*
  * fasttrun_analyze(text) -- a thin wrapper around
  * fasttrun_analyze_relation().  It resolves the relation name, takes
  * AccessShareLock, runs the helper, and emits any resulting plan-cache
@@ -10796,6 +10835,12 @@ fasttrun_analyze(PG_FUNCTION_ARGS)
 		table_close(rel, NoLock);
 		elog(ERROR, "fasttrun_analyze: relation \"%s\" is not heap-AM",
 			 RelationGetRelationName(rel));
+	}
+	if (fasttrun_passthrough)
+	{
+		table_close(rel, NoLock);
+		fasttrun_passthrough_command("ANALYZE", relOid);
+		PG_RETURN_VOID();
 	}
 	fasttrun_poison_check_relation(rel, "fasttrun_analyze", false);
 
@@ -10893,6 +10938,12 @@ fasttrun_analyze_bulk(PG_FUNCTION_ARGS)
 			table_close(rel, NoLock);
 			elog(ERROR, "fasttrun_analyze_bulk: relation \"%s\" is not heap-AM",
 				 RelationGetRelationName(rel));
+		}
+		if (fasttrun_passthrough)
+		{
+			table_close(rel, NoLock);
+			fasttrun_passthrough_command("ANALYZE", relOid);
+			continue;
 		}
 		fasttrun_poison_check_relation(rel, "fasttrun_analyze_bulk", false);
 
@@ -11381,6 +11432,12 @@ fasttrun_collect_stats(PG_FUNCTION_ARGS)
 		table_close(rel, NoLock);
 		elog(ERROR, "fasttrun_collect_stats: relation \"%s\" is not heap-AM",
 			 RelationGetRelationName(rel));
+	}
+	if (fasttrun_passthrough)
+	{
+		table_close(rel, NoLock);
+		fasttrun_passthrough_command("ANALYZE", relOid);
+		PG_RETURN_VOID();
 	}
 	fasttrun_poison_check_relation(rel, "fasttrun_collect_stats", false);
 	relation_policy_changed = fasttrun_stats_set_relation_policy(rel,
@@ -13538,7 +13595,8 @@ fasttrun_object_access_hook(ObjectAccessType access, Oid classId,
 	if (prev_object_access_hook)
 		(*prev_object_access_hook) (access, classId, objectId, subId, arg);
 
-	if (access != OAT_DROP || classId != RelationRelationId)
+	if (fasttrun_passthrough || access != OAT_DROP ||
+		classId != RelationRelationId)
 		return;
 
 	/*
@@ -13613,6 +13671,17 @@ fasttrun_utility_hook(PlannedStmt *pstmt,
 	List   *kept_ddl;
 	List   *statistics_drops;
 	Oid		copy_relid = InvalidOid;
+
+	if (fasttrun_passthrough)
+	{
+		if (prev_utility_hook)
+			prev_utility_hook(pstmt, queryString, readOnlyTree, context,
+							  params, queryEnv, dest, qc);
+		else
+			standard_ProcessUtility(pstmt, queryString, readOnlyTree, context,
+									params, queryEnv, dest, qc);
+		return;
+	}
 
 	fasttrun_statement_seq++;
 	if (IsA(parsetree, CreateTableAsStmt))
@@ -14326,6 +14395,22 @@ _PG_init(void)
 							 &fasttrun_template_stattarget,
 							 true,
 							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
+	DefineCustomBoolVariable("fasttrun.passthrough",
+							 "Run core TRUNCATE and ANALYZE instead of the "
+							 "extension's own work",
+							 "When on, fasttruncate runs TRUNCATE, and "
+							 "fasttrun_analyze, fasttrun_analyze_bulk and "
+							 "fasttrun_collect_stats run ANALYZE.  The hooks and "
+							 "session caches stay idle, as if the extension were "
+							 "not installed, while callers keep their code.  The "
+							 "value is fixed for the whole session: it is taken "
+							 "at connection start.",
+							 &fasttrun_passthrough,
+							 false,
+							 PGC_SU_BACKEND,
 							 0,
 							 NULL, NULL, NULL);
 

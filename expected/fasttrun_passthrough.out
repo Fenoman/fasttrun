@@ -1,0 +1,141 @@
+--
+-- fasttrun_passthrough - режим fasttrun.passthrough.  Функции расширения
+-- передают работу ядру: fasttruncate выполняет TRUNCATE, fasttrun_analyze,
+-- fasttrun_analyze_bulk и fasttrun_collect_stats выполняют ANALYZE.  Хуки и
+-- кеши расширения не работают.  Параметр задается при подключении, проверки
+-- смотрят на оценки планировщика и файл таблицы, а не на pg_class и
+-- pg_statistic: каталог временных таблиц может жить в памяти сервера.
+--
+CREATE EXTENSION IF NOT EXISTS fasttrun;
+CREATE FUNCTION pt_rows(q text) RETURNS int LANGUAGE plpgsql AS $f$
+DECLARE plan json;
+BEGIN
+  EXECUTE 'EXPLAIN (FORMAT JSON) ' || q INTO plan;
+  RETURN (plan->0->'Plan'->>'Plan Rows')::int;
+END
+$f$;
+CREATE TABLE pt_perm (id int);
+\connect -reuse-previous=on "options='-c fasttrun.passthrough=on'"
+SHOW fasttrun.passthrough;
+ fasttrun.passthrough 
+----------------------
+ on
+(1 row)
+
+-- fasttruncate выполняет TRUNCATE ядра: таблица получает новый файл.
+CREATE TEMP TABLE pt (id int PRIMARY KEY, grp int);
+INSERT INTO pt SELECT g, g % 10 FROM generate_series(1, 1000) g;
+SELECT pg_relation_filenode('pt') AS pt_node \gset
+SELECT fasttruncate('pt');
+ fasttruncate 
+--------------
+ 
+(1 row)
+
+SELECT pg_relation_filenode('pt') <> :pt_node AS pt_truncate_new_file,
+       count(*) = 0 AS pt_truncate_empty
+  FROM pt;
+ pt_truncate_new_file | pt_truncate_empty 
+----------------------+-------------------
+ t                    | t
+(1 row)
+
+-- fasttrun_analyze выполняет ANALYZE ядра: оценка равна числу строк, а
+-- распределение колонки известно планировщику.
+INSERT INTO pt SELECT g, g % 10 FROM generate_series(1, 1000) g;
+SELECT fasttrun_analyze('pt');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+SELECT pt_rows('SELECT * FROM pt') = 1000 AS pt_analyze_rows,
+       pt_rows('SELECT * FROM pt WHERE grp = 3') BETWEEN 50 AND 200 AS pt_analyze_column;
+ pt_analyze_rows | pt_analyze_column 
+-----------------+-------------------
+ t               | t
+(1 row)
+
+INSERT INTO pt SELECT g, 3 FROM generate_series(1001, 3000) g;
+SELECT fasttrun_collect_stats('pt');
+ fasttrun_collect_stats 
+------------------------
+ 
+(1 row)
+
+SELECT pt_rows('SELECT * FROM pt') = 3000 AS pt_collect_rows;
+ pt_collect_rows 
+-----------------
+ t
+(1 row)
+
+INSERT INTO pt SELECT g, 4 FROM generate_series(3001, 4000) g;
+SELECT fasttrun_analyze_bulk('pt', 'pt_missing', NULL);
+ fasttrun_analyze_bulk 
+-----------------------
+ 
+(1 row)
+
+SELECT pt_rows('SELECT * FROM pt') = 4000 AS pt_bulk_rows;
+ pt_bulk_rows 
+--------------
+ t
+(1 row)
+
+-- Кеши расширения пусты: работу сделало ядро.
+SELECT analyze_entries = 0 AND column_stats_relid_entries = 0 AND
+       column_stats_entries = 0 AS pt_caches_empty
+  FROM fasttrun_cache_stats();
+ pt_caches_empty 
+-----------------
+ t
+(1 row)
+
+SELECT count(*) = 0 AS pt_no_cached_tables FROM fasttrun_cached_tables();
+ pt_no_cached_tables 
+---------------------
+ t
+(1 row)
+
+-- Контракты функций прежние: отсутствующая таблица - тихий выход,
+-- постоянная - ошибка.
+SELECT fasttruncate('pt_missing');
+ fasttruncate 
+--------------
+ 
+(1 row)
+
+SELECT fasttrun_analyze('pt_missing');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+SELECT fasttrun_collect_stats('pt_missing');
+ fasttrun_collect_stats 
+------------------------
+ 
+(1 row)
+
+SELECT fasttruncate('pt_perm');
+ERROR:  fasttruncate: relation "pt_perm" is not a local temporary table
+SELECT fasttrun_analyze('pt_perm');
+ERROR:  fasttrun_analyze: relation "pt_perm" is not a local temporary table
+SELECT fasttrun_collect_stats('pt_perm');
+ERROR:  fasttrun_collect_stats: relation "pt_perm" is not a local temporary table
+SELECT fasttrun_analyze_bulk('pt_perm');
+ERROR:  fasttrun_analyze_bulk: relation "pt_perm" is not a local temporary table
+-- Режим задается на весь сеанс.
+SET fasttrun.passthrough = off;
+ERROR:  parameter "fasttrun.passthrough" cannot be set after connection start
+DROP TABLE pt;
+\connect -reuse-previous=on "options=''"
+LOAD 'fasttrun';
+SHOW fasttrun.passthrough;
+ fasttrun.passthrough 
+----------------------
+ off
+(1 row)
+
+DROP TABLE pt_perm;
+DROP FUNCTION pt_rows(text);
