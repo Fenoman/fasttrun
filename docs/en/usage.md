@@ -126,12 +126,15 @@ change for the rest of the session. A superuser sets it in `postgresql.conf`
 (it applies to sessions opened after the configuration is reloaded), with
 `ALTER ROLE ... SET`, `ALTER DATABASE ... SET`, or in connection options.
 
-The price is the core's work: `TRUNCATE` and `ANALYZE` change catalog rows and
-send shared invalidation messages. On Tantor SE 18 with
-`enable_temp_memory_catalog = on` those rows live in memory, yet the messages
-remain: in a measurement on Tantor SE 18.6.2 a core `TRUNCATE` of a table with
-three indexes sent about 26 messages and an `ANALYZE` about 7.
-`fasttruncate()` and `fasttrun_analyze()` in the normal mode send none.
+The price is the core's work. In PostgreSQL and PostgresPro a core `TRUNCATE`
+or `ANALYZE` of a temp table changes catalog rows and sends shared invalidation
+messages to every process of the cluster. Tantor SE 18.6.x keeps the messages
+of `TRUNCATE` and `ANALYZE` of a temp table inside its own process and does not
+write them to the shared queue, with `enable_temp_memory_catalog` both `on` and
+`off` (measured on 18.6.3 by the shared queue counter: 0 messages per 10 calls
+of each command). There the price is catalog writes with
+`enable_temp_memory_catalog = off` and a full `ANALYZE` instead of the delta
+update. `fasttruncate()` and `fasttrun_analyze()` in the normal mode send none.
 
 ## Functions
 
