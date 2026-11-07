@@ -8,8 +8,26 @@
 make installcheck PG_CONFIG=/path/to/pg_config
 ```
 
-Он содержит 16 наборов `pg_regress`. На поддерживаемых PostgreSQL 16,
-PostgreSQL 17 и PostgreSQL 18 ожидается результат 16/16.
+Он содержит 20 наборов `pg_regress`. На поддерживаемых PostgreSQL 16,
+PostgreSQL 17 и PostgreSQL 18 ожидается результат 20/20. `fasttrun_fresh`
+открывает второй сеанс через contrib-расширение `dblink`, на сервере оно должно
+быть установлено.
+
+На Tantor SE 18.6.3 при `enable_temp_memory_catalog = on` строк каталога
+временных таблиц SQL не видит, а ядро в этом режиме ломает временные таблицы
+при откате подтранзакции и при удалении таблицы с объектом `CREATE STATISTICS`
+(раздел ["Ограничения"](limitations.md#ограничения)). Наборы учитывают это так:
+
+- сверки с `pg_class`, `pg_stats` и `pg_statistic` временных таблиц в этом
+  режиме дают `true` без проверки, остальное в тех же наборах проверяется как
+  обычно
+- четыре набора пропускаются целиком, их ожидаемый вывод в этом режиме - файлы
+  `_1.out`: `fasttrun_zero_sinval_catalog` (наблюдает строки каталога),
+  `fasttrun_stats_ext` (`CREATE STATISTICS`), `fasttrun_fresh_rollback` и
+  `fasttrun_outer_rollback` (откат подтранзакции после смены файла или создания
+  таблицы на внешнем уровне)
+
+Результат в этом режиме: 20/20.
 
 Расширенный локальный набор:
 
@@ -41,7 +59,7 @@ FT_CASSERT_TARGETS="16:/path/pg16/bin/pg_config:port:log,..." \
   scripts/check_fasttrun_prerelease.sh
 ```
 
-Обязательный набор включает cassert-сборки PostgreSQL 16/17/18, 16/16
+Обязательный набор включает cassert-сборки PostgreSQL 16/17/18, 20/20
 `pg_regress`, BRIN stress, cache-init faults, fault matrix, проверки памяти,
 планировщика, локальных инвалидаций, сброса планов при завершении backend,
 основной ветки теста трекинга с предзагрузкой, сброса реестра идущих пишущих

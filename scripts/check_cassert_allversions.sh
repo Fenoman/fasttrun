@@ -26,6 +26,7 @@
 #   make -j8 && make install
 #   [ -x <PFX_N>/lib/postgresql/pgxs/.../pg_regress ] || \
 #       make -C src/test/regress install
+#   make -C contrib/dblink install      # fasttrun_fresh opens a second session
 #   <PFX_N>/bin/initdb -D <DATA_N> --locale=ru_RU.UTF-8 -E UTF8
 #   <PFX_N>/bin/pg_ctl -D <DATA_N> -l <SRV_N>.log \
 #       -o "-p <PORT_N> -c listen_addresses=127.0.0.1 \

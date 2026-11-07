@@ -1,0 +1,358 @@
+--
+-- fasttrun_stats_ext - таблицы с объектами расширенной статистики
+-- (CREATE STATISTICS): их строит только ядерный ANALYZE, fasttrun передает
+-- такие таблицы ему и прячет устаревшие данные объектов.
+--
+-- Tantor SE 18.6.3 при enable_temp_memory_catalog = on портит системный каталог,
+-- когда удаляется временная таблица с объектом CREATE STATISTICS. Это ошибка
+-- ядра, она воспроизводится без fasttrun. Поэтому
+-- там набор пропускается, ожидаемый вывод в этом режиме -
+-- fasttrun_stats_ext_1.out.
+--
+SELECT coalesce(current_setting('enable_temp_memory_catalog', true), 'off') = 'on'
+       AS memory_catalog \gset
+\if :memory_catalog
+\echo 'skipped: enable_temp_memory_catalog = on'
+\quit
+\endif
+
+/*
+ * Как в fasttrun_stats: поколоночный учет UPDATE работает только с
+ * предзагрузкой библиотеки, набор поднимает ее для своей базы и в конце
+ * возвращает как было.
+ */
+ALTER DATABASE :DBNAME SET session_preload_libraries = 'fasttrun';
+\connect -
+
+CREATE EXTENSION fasttrun;
+
+CREATE FUNCTION pg_temp.ext_rows(q text) RETURNS int LANGUAGE plpgsql AS $f$
+DECLARE
+  plan json;
+BEGIN
+  EXECUTE 'EXPLAIN (FORMAT JSON) ' || q INTO plan;
+  RETURN (plan->0->'Plan'->>'Plan Rows')::int;
+END
+$f$;
+
+-- ----------------------------------------------------------------------
+-- 1. Объекты расширенной статистики (CREATE STATISTICS) строит только
+--    ядерный ANALYZE.  fasttrun_analyze передает такую таблицу ему:
+--    оценка группировки по двум зависимым колонкам совпадает с ядром,
+--    а после очистки и заполнения объект пересчитывается заново.
+-- ----------------------------------------------------------------------
+CREATE TEMP TABLE t_ext (a int, b int);
+INSERT INTO t_ext SELECT g % 100, (g % 100) / 10 FROM generate_series(1, 100000) g;
+CREATE STATISTICS pg_temp.t_ext_nd (ndistinct) ON a, b FROM t_ext;
+SELECT fasttrun_analyze('t_ext');
+SELECT pg_temp.ext_rows('SELECT a, b, count(*) FROM t_ext GROUP BY a, b')
+       BETWEEN 80 AND 150 AS ext_groups_estimated;
+SELECT count(*) = 1 AS ext_object_built
+  FROM pg_statistic_ext s JOIN pg_statistic_ext_data d ON d.stxoid = s.oid
+ WHERE s.stxrelid = 't_ext'::regclass;
+SELECT pg_temp.ext_rows('SELECT * FROM t_ext WHERE a = 5') BETWEEN 500 AND 2000
+       AS ext_column_stats_served;
+SELECT fasttruncate('t_ext');
+INSERT INTO t_ext SELECT g % 700, (g % 700) / 7 FROM generate_series(1, 100000) g;
+SELECT fasttrun_analyze_bulk('t_ext');
+SELECT pg_temp.ext_rows('SELECT a, b, count(*) FROM t_ext GROUP BY a, b')
+       BETWEEN 500 AND 1000 AS ext_groups_after_refill;
+DROP TABLE t_ext;
+
+-- ----------------------------------------------------------------------
+-- 2. Права на ANALYZE, устаревшие данные объектов, сбор без ядра.
+-- ----------------------------------------------------------------------
+-- Таблицу с объектами CREATE STATISTICS ядерный ANALYZE обрабатывает, только
+-- если вызывающий вправе ее анализировать.  Иначе ядро пропустило бы ее с
+-- предупреждением, а статистика прежнего заполнения осталась бы видна
+-- планировщику, поэтому fasttrun собирает статистику колонок сам.
+CREATE TEMP TABLE t_ext_perm (a int, b int);
+CREATE STATISTICS pg_temp.t_ext_perm_nd (ndistinct) ON a, b FROM t_ext_perm;
+INSERT INTO t_ext_perm SELECT 1, 1 FROM generate_series(1, 10000);
+ANALYZE t_ext_perm;
+SELECT fasttruncate('t_ext_perm');
+INSERT INTO t_ext_perm SELECT 2, 2 FROM generate_series(1, 10000);
+CREATE ROLE ft_ext_reader;
+GRANT SELECT ON t_ext_perm TO ft_ext_reader;
+SET ROLE ft_ext_reader;
+SELECT fasttrun_analyze('t_ext_perm');
+RESET ROLE;
+SELECT pg_temp.ext_rows('SELECT * FROM t_ext_perm WHERE a = 2') > 5000
+       AS ext_unpermitted_uses_local_stats;
+DROP TABLE t_ext_perm;
+DROP ROLE ft_ext_reader;
+
+-- Данные CREATE STATISTICS при этом остаются от прошлого заполнения, и
+-- планировщик их не берет, пока ядерный ANALYZE не построит их заново.
+CREATE TEMP TABLE t_ext_stale (a int, b int);
+CREATE STATISTICS pg_temp.t_ext_stale_nd (ndistinct) ON a, b FROM t_ext_stale;
+INSERT INTO t_ext_stale SELECT g % 100, g % 100 FROM generate_series(1, 70000) g;
+ANALYZE t_ext_stale;
+SELECT fasttruncate('t_ext_stale');
+INSERT INTO t_ext_stale SELECT g % 700, g % 700 FROM generate_series(1, 70000) g;
+CREATE ROLE ft_ext_stale_reader;
+GRANT SELECT ON t_ext_stale TO ft_ext_stale_reader;
+SET ROLE ft_ext_stale_reader;
+SELECT fasttrun_analyze('t_ext_stale');
+RESET ROLE;
+SELECT pg_temp.ext_rows('SELECT a, b FROM t_ext_stale GROUP BY a, b') > 300
+       AS ext_stale_data_not_used;
+ANALYZE t_ext_stale;
+SELECT pg_temp.ext_rows('SELECT a, b FROM t_ext_stale GROUP BY a, b')
+       BETWEEN 600 AND 800 AS ext_rebuilt_data_used;
+DROP TABLE t_ext_stale;
+DROP ROLE ft_ext_stale_reader;
+
+-- ANALYZE от роли без прав ядро пропускает с предупреждением и ничего не
+-- считает: локальная статистика остается, а данные CREATE STATISTICS
+-- по-прежнему не берутся.  Колонка с целью 0 не дает ядру построить объект, и
+-- его прежние данные тоже не берутся.
+CREATE TEMP TABLE t_ext_skip (a int, b int);
+CREATE STATISTICS pg_temp.t_ext_skip_nd (ndistinct) ON a, b FROM t_ext_skip;
+INSERT INTO t_ext_skip SELECT g % 100, g % 100 FROM generate_series(1, 70000) g;
+ANALYZE t_ext_skip;
+SELECT fasttruncate('t_ext_skip');
+INSERT INTO t_ext_skip SELECT g % 7000, g % 7000 FROM generate_series(1, 70000) g;
+CREATE ROLE ft_ext_skip_reader;
+GRANT SELECT ON t_ext_skip TO ft_ext_skip_reader;
+SET ROLE ft_ext_skip_reader;
+SELECT fasttrun_analyze('t_ext_skip');
+SET client_min_messages = error;
+ANALYZE t_ext_skip;
+RESET client_min_messages;
+RESET ROLE;
+SELECT pg_temp.ext_rows('SELECT * FROM t_ext_skip WHERE a = 5') < 50
+       AS ext_skipped_analyze_keeps_local,
+       pg_temp.ext_rows('SELECT a, b FROM t_ext_skip GROUP BY a, b') > 1000
+       AS ext_skipped_analyze_keeps_hidden;
+ALTER TABLE t_ext_skip ALTER COLUMN a SET STATISTICS 0;
+SET client_min_messages = error;
+ANALYZE t_ext_skip;
+RESET client_min_messages;
+SELECT pg_temp.ext_rows('SELECT a, b FROM t_ext_skip GROUP BY a, b') > 1000
+       AS ext_unbuilt_object_hidden;
+DROP TABLE t_ext_skip;
+DROP ROLE ft_ext_skip_reader;
+
+-- fasttrun_collect_stats на такой таблице тоже собирает локально, и данные
+-- CREATE STATISTICS после него не берутся.
+CREATE TEMP TABLE t_ext_collect (a int, b int);
+CREATE STATISTICS pg_temp.t_ext_collect_nd (ndistinct) ON a, b FROM t_ext_collect;
+INSERT INTO t_ext_collect SELECT g % 100, g % 100 FROM generate_series(1, 70000) g;
+ANALYZE t_ext_collect;
+SELECT fasttruncate('t_ext_collect');
+INSERT INTO t_ext_collect SELECT g % 700, g % 700 FROM generate_series(1, 70000) g;
+SELECT fasttrun_collect_stats('t_ext_collect');
+SELECT pg_temp.ext_rows('SELECT a, b FROM t_ext_collect GROUP BY a, b') > 300
+       AS ext_collect_stale_data_not_used;
+-- Откаченный DISCARD TEMP возвращает таблицу вместе с ее статистикой и
+-- скрытием устаревших данных объекта.
+SELECT analyze_entries AS discard_entries_before FROM fasttrun_cache_stats() \gset
+BEGIN;
+DISCARD TEMP;
+ROLLBACK;
+SELECT pg_temp.ext_rows('SELECT a, b FROM t_ext_collect GROUP BY a, b') > 300
+       AS ext_discard_rollback_keeps_hidden,
+       (SELECT analyze_entries FROM fasttrun_cache_stats()) = :discard_entries_before
+       AS discard_rollback_keeps_entries;
+DROP TABLE t_ext_collect;
+
+-- ----------------------------------------------------------------------
+-- 3. Частичный ANALYZE, выражения, пустые таблицы, удаление объектов, откаты.
+-- ----------------------------------------------------------------------
+-- ANALYZE по одной колонке объект на две колонки не строит: данные остаются
+-- прежними и не берутся и после того, как такие ANALYZE убрали все локальные
+-- выборки.
+CREATE TEMP TABLE t_ext_part (a int, b int);
+CREATE STATISTICS pg_temp.t_ext_part_nd (ndistinct) ON a, b FROM t_ext_part;
+INSERT INTO t_ext_part SELECT g % 100, g % 100 FROM generate_series(1, 70000) g;
+ANALYZE t_ext_part;
+SELECT fasttruncate('t_ext_part');
+INSERT INTO t_ext_part SELECT g % 700, g % 700 FROM generate_series(1, 70000) g;
+SELECT fasttrun_collect_stats('t_ext_part');
+SET client_min_messages = error;
+ANALYZE t_ext_part (a);
+ANALYZE t_ext_part (b);
+RESET client_min_messages;
+SELECT pg_temp.ext_rows('SELECT a, b FROM t_ext_part GROUP BY a, b') > 300
+       AS ext_column_list_analyze_keeps_hidden;
+DROP TABLE t_ext_part;
+
+-- Флаг снимает только ANALYZE, который действительно переписал данные каждого
+-- объекта.  Объект на одних выражениях при колонках с целью 0, пустая выборка и
+-- собственная цель объекта 0 оставляют прежние данные, и они не берутся.
+CREATE TEMP TABLE t_ext_expr (a int, b int);
+CREATE STATISTICS pg_temp.t_ext_expr_nd (ndistinct) ON (a + 0), (b + 0) FROM t_ext_expr;
+INSERT INTO t_ext_expr SELECT g % 100, g % 100 FROM generate_series(1, 70000) g;
+ANALYZE t_ext_expr;
+SELECT fasttruncate('t_ext_expr');
+INSERT INTO t_ext_expr SELECT g % 700, g % 700 FROM generate_series(1, 70000) g;
+SELECT fasttrun_collect_stats('t_ext_expr');
+ALTER TABLE t_ext_expr ALTER COLUMN a SET STATISTICS 0, ALTER COLUMN b SET STATISTICS 0;
+SET client_min_messages = error;
+ANALYZE t_ext_expr;
+RESET client_min_messages;
+SELECT pg_temp.ext_rows('SELECT a + 0, b + 0 FROM t_ext_expr GROUP BY 1, 2') > 300
+       AS ext_expression_object_kept_hidden;
+DROP TABLE t_ext_expr;
+
+CREATE TEMP TABLE t_ext_empty (a int, b int);
+CREATE STATISTICS pg_temp.t_ext_empty_nd (ndistinct) ON a, b FROM t_ext_empty;
+INSERT INTO t_ext_empty SELECT g % 100, g % 100 FROM generate_series(1, 70000) g;
+ANALYZE t_ext_empty;
+SELECT fasttruncate('t_ext_empty');
+INSERT INTO t_ext_empty SELECT g % 700, g % 700 FROM generate_series(1, 70000) g;
+SELECT fasttrun_collect_stats('t_ext_empty');
+DELETE FROM t_ext_empty;
+ANALYZE t_ext_empty;
+INSERT INTO t_ext_empty SELECT g % 700, g % 700 FROM generate_series(1, 70000) g;
+SET client_min_messages = error;
+ANALYZE t_ext_empty (a);
+ANALYZE t_ext_empty (b);
+RESET client_min_messages;
+SELECT pg_temp.ext_rows('SELECT a, b FROM t_ext_empty GROUP BY a, b') > 300
+       AS ext_empty_sample_kept_hidden;
+DROP TABLE t_ext_empty;
+
+CREATE TEMP TABLE t_ext_stx0 (a int, b int);
+CREATE STATISTICS pg_temp.t_ext_stx0_nd (ndistinct) ON a, b FROM t_ext_stx0;
+INSERT INTO t_ext_stx0 SELECT g % 100, g % 100 FROM generate_series(1, 70000) g;
+ANALYZE t_ext_stx0;
+SELECT fasttruncate('t_ext_stx0');
+INSERT INTO t_ext_stx0 SELECT g % 700, g % 700 FROM generate_series(1, 70000) g;
+SELECT fasttrun_collect_stats('t_ext_stx0');
+ALTER STATISTICS pg_temp.t_ext_stx0_nd SET STATISTICS 0;
+ANALYZE t_ext_stx0;
+SELECT pg_temp.ext_rows('SELECT a, b FROM t_ext_stx0 GROUP BY a, b') > 300
+       AS ext_object_target_zero_kept_hidden;
+DROP TABLE t_ext_stx0;
+
+-- Выборка, снятая во время записи таблицы, планировщику не отдается, и свежие
+-- данные CREATE STATISTICS остаются в силе.
+CREATE TEMP TABLE t_ext_unsafe (id int, a int, b int);
+CREATE STATISTICS pg_temp.t_ext_unsafe_nd (ndistinct) ON a, b FROM t_ext_unsafe;
+INSERT INTO t_ext_unsafe SELECT g, g % 700, g % 700 FROM generate_series(1, 70000) g;
+ANALYZE t_ext_unsafe;
+CREATE FUNCTION pg_temp.ext_collect_inside() RETURNS int LANGUAGE plpgsql AS $f$
+BEGIN
+  PERFORM fasttrun_collect_stats('t_ext_unsafe');
+  RETURN 0;
+END
+$f$;
+UPDATE t_ext_unsafe SET b = b + pg_temp.ext_collect_inside() WHERE id = 1;
+SELECT pg_temp.ext_rows('SELECT a, b FROM t_ext_unsafe GROUP BY a, b')
+       BETWEEN 600 AND 800 AS ext_unsafe_collect_keeps_data;
+DROP TABLE t_ext_unsafe;
+
+-- После DROP STATISTICS флаг ничего не прячет, и запись, которую держал только
+-- он, уходит.
+SELECT analyze_entries AS ext_drop_entries_before FROM fasttrun_cache_stats() \gset
+CREATE TEMP TABLE t_ext_drop (a int, b int);
+CREATE STATISTICS pg_temp.t_ext_drop_nd (ndistinct) ON a, b FROM t_ext_drop;
+INSERT INTO t_ext_drop SELECT g % 700, g % 700 FROM generate_series(1, 70000) g;
+ANALYZE t_ext_drop;
+SELECT fasttrun_collect_stats('t_ext_drop');
+SET client_min_messages = error;
+ANALYZE t_ext_drop (a);
+ANALYZE t_ext_drop (b);
+RESET client_min_messages;
+DROP STATISTICS pg_temp.t_ext_drop_nd;
+SELECT analyze_entries = :ext_drop_entries_before AS ext_drop_entry_gone
+  FROM fasttrun_cache_stats();
+DROP TABLE t_ext_drop;
+
+-- То же, когда объект удаляет DROP COLUMN по зависимости.
+SELECT analyze_entries AS ext_dropcol_entries_before FROM fasttrun_cache_stats() \gset
+CREATE TEMP TABLE t_ext_dropcol (a int, b int);
+CREATE STATISTICS pg_temp.t_ext_dropcol_nd (ndistinct) ON a, b FROM t_ext_dropcol;
+INSERT INTO t_ext_dropcol SELECT g % 700, g % 700 FROM generate_series(1, 70000) g;
+ANALYZE t_ext_dropcol;
+SELECT fasttrun_collect_stats('t_ext_dropcol');
+SET client_min_messages = error;
+ANALYZE t_ext_dropcol (a);
+ANALYZE t_ext_dropcol (b);
+RESET client_min_messages;
+ALTER TABLE t_ext_dropcol DROP COLUMN b;
+SELECT analyze_entries = :ext_dropcol_entries_before AS ext_dropcol_entry_gone
+  FROM fasttrun_cache_stats();
+DROP TABLE t_ext_dropcol;
+
+-- Откат точки сохранения возвращает и флаг: свежие данные CREATE STATISTICS
+-- снова в силе.
+CREATE TEMP TABLE t_ext_undo (a int, b int);
+CREATE STATISTICS pg_temp.t_ext_undo_nd (ndistinct) ON a, b FROM t_ext_undo;
+INSERT INTO t_ext_undo SELECT g % 700, g % 700 FROM generate_series(1, 70000) g;
+ANALYZE t_ext_undo;
+BEGIN;
+SAVEPOINT s;
+SELECT fasttrun_collect_stats('t_ext_undo');
+ROLLBACK TO SAVEPOINT s;
+SELECT pg_temp.ext_rows('SELECT a, b FROM t_ext_undo GROUP BY a, b')
+       BETWEEN 600 AND 800 AS ext_flag_rolled_back;
+COMMIT;
+DROP TABLE t_ext_undo;
+
+-- Холодный analyze внутри пишущего таблицу оператора снимает выборку, которая
+-- планировщику не отдается, и свежие данные CREATE STATISTICS остаются в силе.
+CREATE TEMP TABLE t_n29 (id int, a int, b int);
+CREATE STATISTICS pg_temp.t_n29_nd (ndistinct) ON a, b FROM t_n29;
+INSERT INTO t_n29 SELECT g, g % 700, g % 700 FROM generate_series(1, 70000) g;
+ANALYZE t_n29;
+CREATE FUNCTION pg_temp.n29_analyze_inside() RETURNS int LANGUAGE plpgsql AS $f$
+BEGIN
+  PERFORM fasttrun_analyze('t_n29');
+  RETURN 0;
+END
+$f$;
+CREATE ROLE ft_n29_writer;
+GRANT SELECT, UPDATE ON t_n29 TO ft_n29_writer;
+SET ROLE ft_n29_writer;
+UPDATE t_n29 SET b = b + pg_temp.n29_analyze_inside() WHERE id = 1;
+RESET ROLE;
+SELECT pg_temp.ext_rows('SELECT a, b FROM t_n29 GROUP BY a, b')
+       BETWEEN 600 AND 800 AS n29_unsafe_analyze_keeps_data;
+DROP TABLE t_n29;
+DROP ROLE ft_n29_writer;
+
+-- Снятие флага после VACUUM (ANALYZE), который работает в своих транзакциях,
+-- попадает в журнал, и запись уходит.
+SELECT analyze_entries AS m11_entries_before FROM fasttrun_cache_stats() \gset
+CREATE TEMP TABLE t_m11 (a int, b int);
+CREATE STATISTICS pg_temp.t_m11_nd (ndistinct) ON a, b FROM t_m11;
+INSERT INTO t_m11 SELECT g % 700, g % 700 FROM generate_series(1, 1000) g;
+SELECT fasttrun_collect_stats('t_m11');
+INSERT INTO t_m11 SELECT g % 700, g % 700 FROM generate_series(1, 100000) g;
+ALTER TABLE t_m11 ALTER COLUMN a SET STATISTICS 0;
+VACUUM (ANALYZE) t_m11 (a);
+SELECT analyze_entries = :m11_entries_before AS m11_flag_clear_reclaims
+  FROM fasttrun_cache_stats();
+DROP TABLE t_m11;
+
+-- На PG17 и позже ядро пускает владельца к ANALYZE только с правом MAINTAIN,
+-- и владелец может его у себя отозвать.
+SELECT current_setting('server_version_num')::int >= 170000 AS pg17plus \gset
+\if :pg17plus
+CREATE ROLE ft_ext_owner;
+GRANT CREATE ON SCHEMA public TO ft_ext_owner;
+SET ROLE ft_ext_owner;
+CREATE TEMP TABLE t_ext_own (a int, b int);
+CREATE STATISTICS pg_temp.t_ext_own_nd (ndistinct) ON a, b FROM t_ext_own;
+INSERT INTO t_ext_own SELECT 1, 1 FROM generate_series(1, 10000);
+ANALYZE t_ext_own;
+SELECT fasttruncate('t_ext_own') IS NULL AS dummy \gset
+INSERT INTO t_ext_own SELECT 2, 2 FROM generate_series(1, 10000);
+REVOKE MAINTAIN ON t_ext_own FROM ft_ext_owner;
+SELECT fasttrun_analyze('t_ext_own') IS NULL AS dummy \gset
+SELECT pg_temp.ext_rows('SELECT * FROM t_ext_own WHERE a = 2') > 5000
+       AS maintain_revoked_uses_local_stats \gset
+DROP TABLE t_ext_own;
+RESET ROLE;
+REVOKE CREATE ON SCHEMA public FROM ft_ext_owner;
+DROP ROLE ft_ext_owner;
+\else
+\set maintain_revoked_uses_local_stats t
+\endif
+\echo maintain_revoked_uses_local_stats :maintain_revoked_uses_local_stats
+
+DROP EXTENSION fasttrun;
+ALTER DATABASE :DBNAME RESET session_preload_libraries;

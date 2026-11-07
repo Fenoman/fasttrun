@@ -130,4 +130,38 @@ work without `shared_preload_libraries`.
   OmniX corpus only `ADD COLUMN ... GENERATED ... STORED` in
   `imp_readings_integral` rewrites temporary tables, and its statistics are kept
   and come back on rollback.
+- `fasttrun_temp_is_ours()` sees core `TRUNCATE` through the pgstat counters and
+  through a mark of the extension's hook that takes effect once the `TRUNCATE`
+  statement has finished. A `TRUNCATE` run with `track_counts = off` before the
+  library was loaded is not seen, and the answer is `false`: the caller clears
+  the table again and loses the rows written after the `TRUNCATE`. Nor is a
+  `TRUNCATE` with `track_counts = off` that an extension loaded after fasttrun
+  runs in its own `ProcessUtility` hook without calling the next hook in the
+  chain, the fasttrun one.
+- A `BEFORE TRUNCATE` trigger gets `false` unless the table was created or
+  cleared earlier in this transaction. `AFTER TRUNCATE` gets `true` from the pgstat counters, and
+  `false` with `track_counts = off`: the mark takes effect only after the
+  statement.
+- After `ROLLBACK TO` a level that ran `fasttruncate()`, the clear mark is
+  tied to the cleared file. A rewrite of the table after such a rollback gives
+  it a new file, and the answer becomes `false` although the rows appeared in
+  this transaction.
+- On Tantor SE 18.6.3 with `enable_temp_memory_catalog = on`, SQL does not see
+  a temporary table of another session, so `fasttrun_temp_is_ours()` and
+  `fasttrun_temp_same_cols()` return `NULL` for it instead of an error.
+- The `enable_temp_memory_catalog = on` mode of Tantor SE 18.6.3 is
+  not reliable yet by itself, without fasttrun. A temporary table created in a
+  transaction disappears after a rollback of any subtransaction started later
+  (`ROLLBACK TO` or an error caught by an `EXCEPTION` block), and its file stays
+  on disk. An index created in the transaction disappears the same way, and a
+  unique one stops working without a message. Changes to a table from an
+  earlier transaction (`TRUNCATE`, `ADD COLUMN`) stay visible after such a
+  rollback until the transaction ends and are lost after `COMMIT`: a read after
+  `TRUNCATE` fails with `could not open file`, the added column is gone. A table
+  dropped with `DROP TABLE` comes back with its old rows after such a rollback,
+  and after `COMMIT` reading it fails with `could not open file`. A rollback of a subtransaction in which a table changed its file,
+  after a nested subtransaction finished, leaves the table on a removed file.
+  `CREATE STATISTICS` on a temporary table damages the system catalog. It is
+  better not to enable this mode until the core is fixed. How the fasttrun tests
+  work around these bugs is described in section ["Testing"](testing.md).
 - fasttrun is not a security boundary between connection-pooler clients.

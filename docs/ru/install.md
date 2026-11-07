@@ -36,7 +36,7 @@ FROM pg_extension
 WHERE extname = 'fasttrun';
 ```
 
-Версия по умолчанию - `2.6.0`.
+Версия по умолчанию - `2.7.0`.
 
 Вместо обычного `CREATE EXTENSION` расширение можно установить в отдельную
 схему. Схема с API не должна разрешать недоверенным ролям создавать объекты:
@@ -66,7 +66,7 @@ CREATE EXTENSION fasttrun WITH SCHEMA fasttrun_api;
 
 ## Права
 
-Все 14 SQL-функций после установки имеют стандартное для PostgreSQL право
+Все 16 SQL-функций после установки имеют стандартное для PostgreSQL право
 `EXECUTE` для `PUBLIC` и работают как `SECURITY INVOKER`. Внутренние проверки
 владения и ACL таблицы не выполняются. Это особенно важно в transaction
 pooling, если один backend работает под разными ролями через `SET ROLE`.
@@ -106,6 +106,8 @@ REVOKE EXECUTE ON FUNCTION public.fasttrun_counters() FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION public.fasttrun_counters_reset() FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION public.fasttrun_cached_tables() FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION public.fasttrun_blocked_tables() FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION public.fasttrun_temp_is_ours(regclass) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION public.fasttrun_temp_same_cols(regclass, regclass) FROM PUBLIC;
 
 GRANT EXECUTE ON FUNCTION public.fasttruncate(text) TO app_role;
 GRANT EXECUTE ON FUNCTION public.fasttrun_analyze(text) TO app_role;
@@ -152,7 +154,8 @@ DROP TABLE fasttrun_demo;
 ## Обновление и удаление
 
 Поддерживается обновление с версий `2.0`, `2.1`, `2.1.1`, `2.1.2`, `2.2.0`,
-`2.3.0`, `2.3.1`, `2.3.2`, `2.3.3`, `2.3.4`, `2.4.0`, `2.4.1`, `2.5.0` и `2.5.1`.
+`2.3.0`, `2.3.1`, `2.3.2`, `2.3.3`, `2.3.4`, `2.4.0`, `2.4.1`, `2.5.0`, `2.5.1`,
+`2.5.2` и `2.6.0`.
 
 Обновление C-библиотеки планируйте как обслуживание серверных процессов.
 Новая сборка и SQL-файлы должны быть установлены на всех узлах кластера.
@@ -175,7 +178,7 @@ make install PG_CONFIG=/path/to/pg_config
 владельца расширения или суперпользователя:
 
 ```sql
-ALTER EXTENSION fasttrun UPDATE TO '2.6.0';
+ALTER EXTENSION fasttrun UPDATE TO '2.7.0';
 ```
 
 При физической репликации установите файлы и на резервные узлы, но выполняйте
@@ -192,7 +195,12 @@ ALTER EXTENSION fasttrun UPDATE TO '2.6.0';
 `fasttrun_cached_tables()` и `fasttrun_blocked_tables()`. Их нет в старой
 C-библиотеке, поэтому сначала установите новую. Счетчикам по всему экземпляру
 нужен fasttrun в `shared_preload_libraries`, и новая общая память появляется
-только после перезапуска PostgreSQL.
+только после перезапуска PostgreSQL. Обновление 2.6.0 -> 2.7.0 добавляет
+`fasttrun_temp_is_ours(regclass)` и `fasttrun_temp_same_cols(regclass, regclass)`.
+Их тоже нет в старой C-библиотеке, поэтому порядок тот же: сначала новая
+сборка и новые серверные процессы, затем `ALTER EXTENSION`. Код, который
+должен работать и со старой версией, находит функции через
+`to_regprocedure('fasttrun_temp_is_ours(regclass)')`.
 Для учета износа статистики по колонкам версиям 2.5 **нужна предзагрузка
 библиотеки**, основные функции работают и без нее. Если fasttrun уже есть
 в `shared_preload_libraries`, менять ничего не нужно. Иначе для клиентских
@@ -243,8 +251,16 @@ DROP EXTENSION fasttrun;
 
 ## Совместимость
 
-| PostgreSQL | Сборка | Базовые тесты |
+| PostgreSQL | Сборка | Базовые тесты 2.7.0 |
 |---|---|---|
-| PostgreSQL 16 | да | 15/15 |
-| PostgreSQL 17 | да | 15/15 |
-| PostgreSQL 18 | да | 15/15 |
+| PostgreSQL 16 | да | 20/20 |
+| PostgreSQL 17 | да | не прогонялись |
+| PostgreSQL 18 | да | не прогонялись |
+| Tantor SE 18.6.3, `enable_temp_memory_catalog = off` | да | 20/20 |
+| Tantor SE 18.6.3, `enable_temp_memory_catalog = on` | да | 20/20 |
+
+При `enable_temp_memory_catalog = on` часть проверок и наборов пропускается
+(раздел ["Тестирование"](testing.md)). Сам режим пока ненадежен и без fasttrun:
+временные таблицы теряются при откате подтранзакции (раздел
+["Ограничения"](limitations.md#ограничения)). Включать его до исправления ядра
+не стоит.

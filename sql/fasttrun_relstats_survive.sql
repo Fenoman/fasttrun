@@ -26,6 +26,12 @@
 
 CREATE EXTENSION fasttrun;
 
+-- При enable_temp_memory_catalog = on (Tantor SE) строк каталога временных
+-- таблиц SQL не видит. Сверки с pg_class и pg_stats тогда дают true без
+-- проверки: coalesce(bool_and(условие), memory_catalog).
+SELECT coalesce(current_setting('enable_temp_memory_catalog', true), 'off') = 'on'
+       AS memory_catalog \gset
+
 -- ----------------------------------------------------------------------
 -- 1. Подготовка: временная таблица, индекс до INSERT, потом данные.
 --    Такой порядок гарантирует, что pg_class хранит (relpages=0,
@@ -36,8 +42,8 @@ CREATE INDEX ON t_survive (id);
 INSERT INTO t_survive SELECT g, 'data_' || g FROM generate_series(1, 1000) g;
 
 -- Проверяем предусловие: pg_class до сих пор показывает дефолты пустой таблицы
-SELECT relpages = 0 AS pgclass_zero_pages,
-       reltuples = -1 AS pgclass_default_tuples
+SELECT coalesce(bool_and(relpages = 0), :'memory_catalog'::boolean) AS pgclass_zero_pages,
+       coalesce(bool_and(reltuples = -1), :'memory_catalog'::boolean) AS pgclass_default_tuples
   FROM pg_class WHERE oid = 't_survive'::regclass;
 
 BEGIN;
@@ -118,8 +124,8 @@ CREATE INDEX ON t_survive_stale (id);
 
 -- Предусловие: pg_class уже хранит nonzero relstats, которые скоро
 -- станут stale.
-SELECT relpages > 0 AS pgclass_nonzero_pages,
-       reltuples = 1000 AS pgclass_old_tuples
+SELECT coalesce(bool_and(relpages > 0), :'memory_catalog'::boolean) AS pgclass_nonzero_pages,
+       coalesce(bool_and(reltuples = 1000), :'memory_catalog'::boolean) AS pgclass_old_tuples
   FROM pg_class WHERE oid = 't_survive_stale'::regclass;
 
 BEGIN;
@@ -197,7 +203,7 @@ SELECT fasttrun_analyze('t_survive_regular_analyze');
 INSERT INTO t_survive_regular_analyze SELECT generate_series(11, 100000);
 ANALYZE t_survive_regular_analyze;
 
-SELECT reltuples = 100000 AS pgclass_analyze_tuples
+SELECT coalesce(bool_and(reltuples = 100000), :'memory_catalog'::boolean) AS pgclass_analyze_tuples
   FROM pg_class WHERE oid = 't_survive_regular_analyze'::regclass;
 
 SELECT reltuples = 100000 AS fasttrun_analyze_tuples
@@ -209,7 +215,7 @@ SELECT fasttrun_analyze('t_survive_create_index');
 INSERT INTO t_survive_create_index SELECT generate_series(11, 100000);
 CREATE INDEX ON t_survive_create_index (id);
 
-SELECT reltuples = 100000 AS pgclass_create_index_tuples
+SELECT coalesce(bool_and(reltuples = 100000), :'memory_catalog'::boolean) AS pgclass_create_index_tuples
   FROM pg_class WHERE oid = 't_survive_create_index'::regclass;
 
 SELECT reltuples = 100000 AS fasttrun_create_index_tuples

@@ -36,7 +36,7 @@ FROM pg_extension
 WHERE extname = 'fasttrun';
 ```
 
-The default version is `2.6.0`.
+The default version is `2.7.0`.
 
 Instead of a plain `CREATE EXTENSION`, you can install the extension into a
 dedicated schema. Untrusted roles must not be allowed to create objects in the
@@ -67,7 +67,7 @@ in the library list.
 
 ## Privileges
 
-After installation, PostgreSQL grants `EXECUTE` on all 14 SQL functions to
+After installation, PostgreSQL grants `EXECUTE` on all 16 SQL functions to
 `PUBLIC` by default. They run as `SECURITY INVOKER`. The functions do not perform
 internal ownership or table ACL checks. This matters especially in transaction
 pooling when one backend operates under different roles through `SET ROLE`.
@@ -108,6 +108,8 @@ REVOKE EXECUTE ON FUNCTION public.fasttrun_counters() FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION public.fasttrun_counters_reset() FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION public.fasttrun_cached_tables() FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION public.fasttrun_blocked_tables() FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION public.fasttrun_temp_is_ours(regclass) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION public.fasttrun_temp_same_cols(regclass, regclass) FROM PUBLIC;
 
 GRANT EXECUTE ON FUNCTION public.fasttruncate(text) TO app_role;
 GRANT EXECUTE ON FUNCTION public.fasttrun_analyze(text) TO app_role;
@@ -154,7 +156,8 @@ The final check must return `true`.
 ## Upgrading and removing
 
 Upgrades are supported from versions `2.0`, `2.1`, `2.1.1`, `2.1.2`, `2.2.0`,
-`2.3.0`, `2.3.1`, `2.3.2`, `2.3.3`, `2.3.4`, `2.4.0`, `2.4.1`, `2.5.0`, and `2.5.1`.
+`2.3.0`, `2.3.1`, `2.3.2`, `2.3.3`, `2.3.4`, `2.4.0`, `2.4.1`, `2.5.0`, `2.5.1`,
+`2.5.2`, and `2.6.0`.
 
 Treat a C-library upgrade as maintenance on the server processes. Install the
 new build and SQL files on every cluster node.
@@ -176,7 +179,7 @@ After startup or after opening a new connection, run the following in every
 database as the extension owner or a superuser:
 
 ```sql
-ALTER EXTENSION fasttrun UPDATE TO '2.6.0';
+ALTER EXTENSION fasttrun UPDATE TO '2.7.0';
 ```
 
 With physical replication, install the files on standby nodes too, but run
@@ -194,7 +197,12 @@ adds four observability functions: `fasttrun_counters()`,
 `fasttrun_blocked_tables()`. The old C library does not have them, so install
 the new one first. Instance-wide counters need fasttrun in
 `shared_preload_libraries`, and the new shared memory appears only after a
-PostgreSQL restart. For per-column accounting of statistics
+PostgreSQL restart. The 2.6.0 -> 2.7.0 upgrade adds
+`fasttrun_temp_is_ours(regclass)` and `fasttrun_temp_same_cols(regclass, regclass)`.
+The old C library does not have them either, so the order is the same: the new
+build and new server processes first, then `ALTER EXTENSION`. Code that must
+also work with the old version finds the functions with
+`to_regprocedure('fasttrun_temp_is_ours(regclass)')`. For per-column accounting of statistics
 wear, versions 2.5 **need the library to be preloaded**, and the main functions
 work without it. If fasttrun is already in `shared_preload_libraries`, nothing needs
 to change. Otherwise, for client sessions add:
@@ -244,8 +252,16 @@ preload is already disabled, stop PostgreSQL and remove the file manually.
 
 ## Compatibility
 
-| PostgreSQL | Builds | Basic tests |
+| PostgreSQL | Builds | Basic tests 2.7.0 |
 |---|---|---|
-| PostgreSQL 16 | yes | 15/15 |
-| PostgreSQL 17 | yes | 15/15 |
-| PostgreSQL 18 | yes | 15/15 |
+| PostgreSQL 16 | yes | 20/20 |
+| PostgreSQL 17 | yes | not run |
+| PostgreSQL 18 | yes | not run |
+| Tantor SE 18.6.3, `enable_temp_memory_catalog = off` | yes | 20/20 |
+| Tantor SE 18.6.3, `enable_temp_memory_catalog = on` | yes | 20/20 |
+
+With `enable_temp_memory_catalog = on` some checks and suites are skipped
+(section ["Testing"](testing.md)). The mode itself is not reliable yet, without
+fasttrun too: temporary tables get lost on a subtransaction rollback (section
+["Limitations"](limitations.md#limitations)). It is better not to enable it
+until the core is fixed.

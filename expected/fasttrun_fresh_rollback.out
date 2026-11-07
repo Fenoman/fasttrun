@@ -1,0 +1,389 @@
+--
+-- fasttrun_fresh_rollback - fasttrun_temp_is_ours после отката уровня, в котором
+-- таблица сменила файл и завершилась вложенная подтранзакция, и после
+-- переписывания таблицы.
+--
+-- Tantor SE 18.6.3 при enable_temp_memory_catalog = on такой откат не
+-- возвращает прежний файл временной таблицы, и следующее чтение падает с
+-- "could not open file".  Это ошибка ядра, она воспроизводится без fasttrun.
+-- Поэтому там тест пропускается, ожидаемый вывод -
+-- fasttrun_fresh_rollback_1.out.
+--
+SELECT coalesce(current_setting('enable_temp_memory_catalog', true), 'off') = 'on'
+       AS memory_catalog \gset
+\if :memory_catalog
+\echo 'skipped: enable_temp_memory_catalog = on'
+\quit
+\endif
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS fasttrun;
+RESET client_min_messages;
+CREATE FUNCTION fr(t text) RETURNS boolean LANGUAGE sql AS
+$f$ SELECT fasttrun_temp_is_ours(to_regclass('pg_temp.' || t)) $f$;
+CREATE TEMP TABLE f_ft (id int PRIMARY KEY, v text);
+INSERT INTO f_ft SELECT g, 'old' FROM generate_series(1, 100) g;
+-- TRUNCATE на внешнем уровне дает новый файл, fasttruncate на вложенном
+-- очищает его, RELEASE отдает метку внешнему уровню, а ROLLBACK TO внешнего
+-- уровня возвращает прежний файл со старыми строками.
+BEGIN;
+SAVEPOINT a;
+TRUNCATE f_ft;
+SAVEPOINT b;
+SELECT fasttruncate('f_ft');
+ fasttruncate 
+--------------
+ 
+(1 row)
+
+RELEASE SAVEPOINT b;
+SELECT fr('f_ft') AS nested_reset_released;
+ nested_reset_released 
+-----------------------
+ t
+(1 row)
+
+ROLLBACK TO SAVEPOINT a;
+SELECT fr('f_ft') AS nested_reset_outer_rolled_back, count(*) AS old_rows_back FROM f_ft;
+ nested_reset_outer_rolled_back | old_rows_back 
+--------------------------------+---------------
+ f                              |           100
+(1 row)
+
+COMMIT;
+-- Метки двух уровней, отданные одному родителю, уходят вместе с его откатом:
+-- RELEASE каждого уровня передает родителю все его метки.
+CREATE TEMP TABLE f_other (id int);
+INSERT INTO f_other VALUES (1);
+BEGIN;
+SAVEPOINT o;
+TRUNCATE f_ft;
+SAVEPOINT a;
+SELECT fasttruncate('f_ft');
+ fasttruncate 
+--------------
+ 
+(1 row)
+
+SAVEPOINT b;
+SELECT fasttruncate('f_other');
+ fasttruncate 
+--------------
+ 
+(1 row)
+
+RELEASE SAVEPOINT b;
+RELEASE SAVEPOINT a;
+SELECT fr('f_ft') AS two_levels_released, fr('f_other') AS two_levels_released_other;
+ two_levels_released | two_levels_released_other 
+---------------------+---------------------------
+ t                   | t
+(1 row)
+
+ROLLBACK TO SAVEPOINT o;
+SELECT fr('f_ft') AS two_levels_outer_rolled_back, count(*) AS old_rows_back FROM f_ft;
+ two_levels_outer_rolled_back | old_rows_back 
+------------------------------+---------------
+ f                            |           100
+(1 row)
+
+SELECT fr('f_other') AS two_levels_other_same_file, count(*) AS rows_left FROM f_other;
+ two_levels_other_same_file | rows_left 
+----------------------------+-----------
+ t                          |         0
+(1 row)
+
+COMMIT;
+-- То же без счетчиков pgstat: метка из OAT_TRUNCATE.
+SET track_counts = off;
+BEGIN;
+SAVEPOINT a;
+SAVEPOINT b;
+TRUNCATE f_other;
+RELEASE SAVEPOINT b;
+SELECT fr('f_other') AS no_counters_nested_released;
+ no_counters_nested_released 
+-----------------------------
+ t
+(1 row)
+
+ROLLBACK TO SAVEPOINT a;
+SELECT fr('f_other') AS no_counters_nested_outer_rolled_back;
+ no_counters_nested_outer_rolled_back 
+--------------------------------------
+ f
+(1 row)
+
+COMMIT;
+RESET track_counts;
+-- Метка TRUNCATE, отданная родителю, уходит вместе с его откатом.
+BEGIN;
+SAVEPOINT a;
+SAVEPOINT b;
+TRUNCATE f_ft;
+RELEASE SAVEPOINT b;
+SELECT fr('f_ft') AS nested_truncate_released;
+ nested_truncate_released 
+--------------------------
+ t
+(1 row)
+
+ROLLBACK TO SAVEPOINT a;
+SELECT fr('f_ft') AS nested_truncate_outer_rolled_back, count(*) AS old_rows_back FROM f_ft;
+ nested_truncate_outer_rolled_back | old_rows_back 
+-----------------------------------+---------------
+ f                                 |           100
+(1 row)
+
+COMMIT;
+-- То же через PL/pgSQL: TRUNCATE в блоке с EXCEPTION, завершенный вложенный
+-- блок, ошибка внешнего блока.
+DO $$
+DECLARE
+    fresh_inside boolean;
+BEGIN
+    BEGIN
+        TRUNCATE f_ft;
+        BEGIN
+            PERFORM 1;
+        EXCEPTION WHEN others THEN NULL;
+        END;
+        fresh_inside := fr('f_ft');
+        RAISE EXCEPTION 'undo';
+    EXCEPTION WHEN raise_exception THEN NULL;
+    END;
+    RAISE NOTICE 'plpgsql: fresh inside %, after the outer block %, rows %',
+        fresh_inside, fr('f_ft'), (SELECT count(*) FROM f_ft);
+END
+$$;
+NOTICE:  plpgsql: fresh inside t, after the outer block f, rows 100
+-- Переписывание своих строк ответа не меняет, переписывание старых своими их не делает.
+BEGIN;
+CLUSTER f_ft USING f_ft_pkey;
+SELECT fr('f_ft') AS rewrite_old_rows;
+ rewrite_old_rows 
+------------------
+ f
+(1 row)
+
+ALTER TABLE f_ft ALTER COLUMN v TYPE varchar(20);
+SELECT fr('f_ft') AS alter_type_old_rows;
+ alter_type_old_rows 
+---------------------
+ f
+(1 row)
+
+SELECT fasttruncate('f_ft');
+ fasttruncate 
+--------------
+ 
+(1 row)
+
+INSERT INTO f_ft VALUES (2, 'new');
+CLUSTER f_ft USING f_ft_pkey;
+ALTER TABLE f_ft ALTER COLUMN v TYPE text;
+SELECT fr('f_ft') AS rewrite_after_reset;
+ rewrite_after_reset 
+---------------------
+ t
+(1 row)
+
+COMMIT;
+-- Граница: после отката уровня с fasttruncate признак держится за очищенный
+-- файл, и переписывание дает false, хотя строки записаны в этой транзакции.
+BEGIN;
+SAVEPOINT a;
+SELECT fasttruncate('f_ft');
+ fasttruncate 
+--------------
+ 
+(1 row)
+
+ROLLBACK TO SAVEPOINT a;
+INSERT INTO f_ft VALUES (4, 'new');
+SELECT fr('f_ft') AS reset_rolled_back_same_file;
+ reset_rolled_back_same_file 
+-----------------------------
+ t
+(1 row)
+
+ALTER TABLE f_ft ALTER COLUMN v TYPE varchar(30);
+SELECT fr('f_ft') AS reset_rolled_back_then_rewrite;
+ reset_rolled_back_then_rewrite 
+--------------------------------
+ f
+(1 row)
+
+COMMIT;
+-- Переписывание после TRUNCATE тоже оставляет ответ true.
+BEGIN;
+TRUNCATE f_ft;
+INSERT INTO f_ft VALUES (3, 'new');
+CLUSTER f_ft USING f_ft_pkey;
+SELECT fr('f_ft') AS rewrite_after_truncate;
+ rewrite_after_truncate 
+------------------------
+ t
+(1 row)
+
+COMMIT;
+-- Метка TRUNCATE ждет конца оператора: BEFORE TRUNCATE видит false при любом
+-- track_counts, AFTER TRUNCATE видит true по счетчикам, а без них - false до
+-- конца оператора.  Выключение счетчиков внутри триггера метку не теряет.
+CREATE TEMP TABLE f_trg (id int);
+CREATE TEMP TABLE f_trg_seen (step int, mode text, moment text, fresh boolean);
+CREATE FUNCTION pg_temp.f_trg_note() RETURNS trigger LANGUAGE plpgsql AS $f$
+BEGIN
+    IF current_setting('fasttrun_fresh.counts_off_in_trigger', true) = 'on' THEN
+        PERFORM set_config('track_counts', 'off', true);
+        PERFORM count(*) FROM f_trg;
+    END IF;
+    INSERT INTO f_trg_seen
+    SELECT coalesce(max(step), 0) + 1, current_setting('fasttrun_fresh.mode'), TG_WHEN,
+           fasttrun_temp_is_ours(TG_RELID)
+      FROM f_trg_seen;
+    RETURN NULL;
+END
+$f$;
+CREATE TRIGGER f_trg_before BEFORE TRUNCATE ON f_trg
+    FOR EACH STATEMENT EXECUTE FUNCTION pg_temp.f_trg_note();
+CREATE TRIGGER f_trg_after AFTER TRUNCATE ON f_trg
+    FOR EACH STATEMENT EXECUTE FUNCTION pg_temp.f_trg_note();
+INSERT INTO f_trg VALUES (1);
+BEGIN;
+SET LOCAL fasttrun_fresh.mode = 'counters on';
+TRUNCATE f_trg;
+SELECT fr('f_trg') AS counters_on_after_statement;
+ counters_on_after_statement 
+-----------------------------
+ t
+(1 row)
+
+COMMIT;
+BEGIN;
+SET LOCAL track_counts = off;
+SET LOCAL fasttrun_fresh.mode = 'counters off';
+TRUNCATE f_trg;
+SELECT fr('f_trg') AS counters_off_after_statement;
+ counters_off_after_statement 
+------------------------------
+ t
+(1 row)
+
+COMMIT;
+BEGIN;
+SET LOCAL fasttrun_fresh.mode = 'counters off in trigger';
+SET LOCAL fasttrun_fresh.counts_off_in_trigger = 'on';
+TRUNCATE f_trg;
+SELECT fr('f_trg') AS counters_off_in_trigger_after_statement;
+ counters_off_in_trigger_after_statement 
+-----------------------------------------
+ t
+(1 row)
+
+COMMIT;
+SELECT mode, moment, fresh FROM f_trg_seen ORDER BY step;
+          mode           | moment | fresh 
+-------------------------+--------+-------
+ counters on             | BEFORE | f
+ counters on             | AFTER  | t
+ counters off            | BEFORE | f
+ counters off            | AFTER  | f
+ counters off in trigger | BEFORE | f
+ counters off in trigger | AFTER  | f
+(6 rows)
+
+-- TRUNCATE, который падает в BEFORE TRUNCATE и пойман блоком EXCEPTION, метки
+-- не оставляет, а следующий успешный TRUNCATE ставит ее как обычно.  TRUNCATE
+-- другой таблицы из триггера получает свою метку.
+CREATE TEMP TABLE f_trg_fail (id int);
+CREATE TEMP TABLE f_trg_child (id int);
+INSERT INTO f_trg_fail VALUES (1);
+INSERT INTO f_trg_child VALUES (1);
+CREATE FUNCTION pg_temp.f_trg_fail_fn() RETURNS trigger LANGUAGE plpgsql AS $f$
+BEGIN
+    IF current_setting('fasttrun_fresh.fail', true) = 'on' THEN
+        RAISE EXCEPTION 'truncate refused';
+    END IF;
+    TRUNCATE f_trg_child;
+    RETURN NULL;
+END
+$f$;
+CREATE TRIGGER f_trg_fail_before BEFORE TRUNCATE ON f_trg_fail
+    FOR EACH STATEMENT EXECUTE FUNCTION pg_temp.f_trg_fail_fn();
+SET track_counts = off;
+BEGIN;
+SET LOCAL fasttrun_fresh.fail = 'on';
+DO $$
+BEGIN
+    FOR i IN 1..3 LOOP
+        BEGIN
+            TRUNCATE f_trg_fail;
+        EXCEPTION WHEN raise_exception THEN NULL;
+        END;
+    END LOOP;
+END
+$$;
+SELECT fr('f_trg_fail') AS refused_truncate, count(*) AS rows_left FROM f_trg_fail;
+ refused_truncate | rows_left 
+------------------+-----------
+ f                |         1
+(1 row)
+
+SET LOCAL fasttrun_fresh.fail = 'off';
+TRUNCATE f_trg_fail;
+SELECT fr('f_trg_fail') AS truncate_after_refusals, fr('f_trg_child') AS truncate_from_trigger;
+ truncate_after_refusals | truncate_from_trigger 
+-------------------------+-----------------------
+ t                       | t
+(1 row)
+
+COMMIT;
+RESET track_counts;
+-- TRUNCATE таблицы, которую очищает внешний оператор, ядро отвергает уже после
+-- OAT_TRUNCATE ("используется активными запросами").  Пойманный отказ внутри
+-- триггера не снимает метку внешнего оператора: ни из триггера этой таблицы,
+-- ни из триггера соседней таблицы того же списка.
+CREATE TEMP TABLE f_reent (id int);
+CREATE TEMP TABLE f_reent_peer (id int);
+INSERT INTO f_reent VALUES (1);
+INSERT INTO f_reent_peer VALUES (1);
+CREATE FUNCTION pg_temp.f_reent_fn() RETURNS trigger LANGUAGE plpgsql AS $f$
+BEGIN
+    BEGIN
+        TRUNCATE f_reent;
+    EXCEPTION WHEN object_in_use THEN
+        RAISE NOTICE 'nested truncate refused: fresh %, rows %',
+            fasttrun_temp_is_ours('f_reent'::regclass), (SELECT count(*) FROM f_reent);
+    END;
+    RETURN NULL;
+END
+$f$;
+CREATE TRIGGER f_reent_before BEFORE TRUNCATE ON f_reent
+    FOR EACH STATEMENT EXECUTE FUNCTION pg_temp.f_reent_fn();
+CREATE TRIGGER f_reent_peer_before BEFORE TRUNCATE ON f_reent_peer
+    FOR EACH STATEMENT EXECUTE FUNCTION pg_temp.f_reent_fn();
+SET track_counts = off;
+BEGIN;
+TRUNCATE f_reent;
+NOTICE:  nested truncate refused: fresh f, rows 1
+INSERT INTO f_reent VALUES (2);
+SELECT fr('f_reent') AS reentrant_refused, count(*) AS rows_now FROM f_reent;
+ reentrant_refused | rows_now 
+-------------------+----------
+ t                 |        1
+(1 row)
+
+COMMIT;
+BEGIN;
+TRUNCATE f_reent_peer, f_reent;
+NOTICE:  nested truncate refused: fresh f, rows 1
+NOTICE:  nested truncate refused: fresh f, rows 1
+SELECT fr('f_reent') AS peer_refused, fr('f_reent_peer') AS peer_table;
+ peer_refused | peer_table 
+--------------+------------
+ t            | t
+(1 row)
+
+COMMIT;
+RESET track_counts;
+DROP FUNCTION fr(text);

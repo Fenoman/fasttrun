@@ -18,6 +18,16 @@
 -- не вырожденно-истинна: те же наблюдения ловят каталожную запись, когда
 -- она реально происходит.
 --
+-- При enable_temp_memory_catalog = on (Tantor SE) строк каталога временных
+-- таблиц SQL не видит, и наблюдать их нечем. Там набор пропускается,
+-- ожидаемый вывод в этом режиме - fasttrun_zero_sinval_catalog_1.out.
+--
+SELECT coalesce(current_setting('enable_temp_memory_catalog', true), 'off') = 'on'
+       AS memory_catalog \gset
+\if :memory_catalog
+\echo 'skipped: enable_temp_memory_catalog = on'
+\quit
+\endif
 
 CREATE EXTENSION fasttrun;
 

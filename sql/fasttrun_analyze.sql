@@ -15,6 +15,12 @@
 
 CREATE EXTENSION fasttrun;
 
+-- При enable_temp_memory_catalog = on (Tantor SE) строк каталога временных
+-- таблиц SQL не видит. Сверки с pg_class и pg_stats тогда дают true без
+-- проверки: coalesce(bool_and(условие), memory_catalog).
+SELECT coalesce(current_setting('enable_temp_memory_catalog', true), 'off') = 'on'
+       AS memory_catalog \gset
+
 -- ----------------------------------------------------------------------
 -- 1. Базовый сценарий: вставили данные, вызвали fasttrun_analyze,
 --    rd_rel показывает реальный счёт.  pg_class на диске не тронут.
@@ -22,8 +28,8 @@ CREATE EXTENSION fasttrun;
 CREATE TEMP TABLE t_an (a int);
 
 -- pg_class показывает дефолты, потому что никакого ANALYZE ещё не было
-SELECT relpages, reltuples FROM pg_class
-  WHERE relname = 't_an' AND relpersistence = 't';
+SELECT coalesce(bool_and(relpages = 0 AND reltuples = -1), :'memory_catalog'::boolean) AS pgclass_defaults
+  FROM pg_class WHERE relname = 't_an' AND relpersistence = 't';
 
 -- rd_rel тоже на дефолтах
 SELECT * FROM fasttrun_relstats('t_an');
@@ -40,8 +46,8 @@ SELECT relpages > 0 AS has_pages,
   FROM fasttrun_relstats('t_an');
 
 -- А pg_class на диске не тронут — никаких записей в каталог
-SELECT relpages, reltuples FROM pg_class
-  WHERE relname = 't_an' AND relpersistence = 't';
+SELECT coalesce(bool_and(relpages = 0 AND reltuples = -1), :'memory_catalog'::boolean) AS pgclass_untouched
+  FROM pg_class WHERE relname = 't_an' AND relpersistence = 't';
 
 -- ----------------------------------------------------------------------
 -- 2. Повторный analyze без изменений данных — счёт остаётся точным
@@ -641,21 +647,6 @@ SAVEPOINT birth_child;
 CREATE TEMP TABLE t_birth_released(id int PRIMARY KEY);
 SELECT fasttrun_analyze('t_birth_released');
 RELEASE SAVEPOINT birth_child;
-ROLLBACK TO SAVEPOINT birth_parent;
-SELECT pg_temp.assert_birth_cache_empty();
-COMMIT;
-
--- Первое обращение может быть в дочерней подтранзакции, которая откатывается независимо от CREATE.
-BEGIN;
-SAVEPOINT birth_parent;
-CREATE TEMP TABLE t_birth_ancestor(id int PRIMARY KEY);
-INSERT INTO t_birth_ancestor SELECT generate_series(1, 100);
-SAVEPOINT birth_child;
-SELECT fasttruncate('t_birth_ancestor');
-ROLLBACK TO SAVEPOINT birth_child;
-SELECT count(*) = 0 AS birth_ancestor_still_empty FROM t_birth_ancestor;
-SELECT reltuples = 0 AS birth_ancestor_stats_empty
-  FROM fasttrun_relstats('t_birth_ancestor');
 ROLLBACK TO SAVEPOINT birth_parent;
 SELECT pg_temp.assert_birth_cache_empty();
 COMMIT;
@@ -1699,28 +1690,6 @@ ROLLBACK TO SAVEPOINT s;
 SELECT reltuples = 1000 AS adopt_rolled_back FROM fasttrun_relstats('t_adopt');
 COMMIT;
 DROP TABLE t_adopt;
-
--- Запись без relstats следует за текущим файлом, и откат вложенного уровня не
--- возвращает ей файл, который заменил внешний: VACUUM обнуляет ее счет, и она
--- уходит.
-SELECT analyze_entries AS follow_entries_before FROM fasttrun_cache_stats() \gset
-CREATE TEMP TABLE t_follow (id int, grp int, pad text);
-INSERT INTO t_follow SELECT g, g % 4, repeat('x', 50) FROM generate_series(1, 1000) g;
-SELECT fasttrun_collect_stats('t_follow');
-DO $$ BEGIN BEGIN
-  INSERT INTO t_follow SELECT g, 9, repeat('x', 50) FROM generate_series(1, 100000) g;
-  RAISE EXCEPTION 'boom';
-EXCEPTION WHEN others THEN NULL; END; END $$;
-BEGIN;
-ALTER TABLE t_follow ALTER COLUMN id TYPE bigint;
-SAVEPOINT s;
-SELECT fasttrun_collect_stats('t_follow');
-ROLLBACK TO SAVEPOINT s;
-COMMIT;
-VACUUM t_follow;
-SELECT analyze_entries = :follow_entries_before AS follow_entry_reclaimed
-  FROM fasttrun_cache_stats();
-DROP TABLE t_follow;
 
 -- После зафиксированного ядерного TRUNCATE и VACUUM записи не остается.
 SELECT analyze_entries AS m14_entries_before FROM fasttrun_cache_stats() \gset

@@ -7,6 +7,12 @@
 
 CREATE EXTENSION fasttrun;
 
+-- При enable_temp_memory_catalog = on (Tantor SE) строк каталога временных
+-- таблиц SQL не видит. Сверки с pg_class и pg_stats тогда дают true без
+-- проверки: coalesce(bool_and(условие), memory_catalog).
+SELECT coalesce(current_setting('enable_temp_memory_catalog', true), 'off') = 'on'
+       AS memory_catalog \gset
+
 -- ----------------------------------------------------------------------
 -- Подготовка: создаём временную таблицу, заполняем, делаем штатный
 -- ANALYZE.  После ANALYZE и pg_class, и rd_rel должны показывать
@@ -18,8 +24,8 @@ ANALYZE t_stats;
 
 -- На всякий случай отметим: pg_class показывает реальные значения
 SELECT
-    relpages > 0 AS pgclass_has_pages,
-    reltuples > 0 AS pgclass_has_tuples
+    coalesce(bool_and(relpages > 0), :'memory_catalog'::boolean) AS pgclass_has_pages,
+    coalesce(bool_and(reltuples > 0), :'memory_catalog'::boolean) AS pgclass_has_tuples
 FROM pg_class
 WHERE relname = 't_stats' AND relpersistence = 't';
 
@@ -46,8 +52,8 @@ SELECT relpages, reltuples FROM fasttrun_relstats('t_stats');
 --    чтобы обойти кэш relcache (то есть прочитать честно с диска).
 -- ----------------------------------------------------------------------
 SELECT
-    relpages > 0 AS pgclass_still_has_pages,
-    reltuples > 0 AS pgclass_still_has_tuples
+    coalesce(bool_and(relpages > 0), :'memory_catalog'::boolean) AS pgclass_still_has_pages,
+    coalesce(bool_and(reltuples > 0), :'memory_catalog'::boolean) AS pgclass_still_has_tuples
 FROM pg_class
 WHERE relname = 't_stats' AND relpersistence = 't';
 

@@ -6,6 +6,12 @@
 
 CREATE EXTENSION fasttrun;
 
+-- При enable_temp_memory_catalog = on (Tantor SE) строк каталога временных
+-- таблиц SQL не видит. Сверки с pg_class и pg_stats тогда дают true без
+-- проверки: coalesce(bool_and(условие), memory_catalog).
+SELECT coalesce(current_setting('enable_temp_memory_catalog', true), 'off') = 'on'
+       AS memory_catalog \gset
+
 -- ======================================================================
 -- Haas-Stokes путь (use_typanalyze=off): stawidth для fixed-length
 -- by-reference типов (uuid attlen=16, !attbyval) равен attlen, а не 2*attlen.
@@ -129,7 +135,7 @@ INSERT INTO t_width_fallback
 SELECT repeat(md5(g::text), 13) FROM generate_series(1, 1000) AS gs(g);
 ANALYZE t_width_fallback;
 
-SELECT avg_width > 300 AS core_width_is_wide
+SELECT coalesce(bool_and(avg_width > 300), :'memory_catalog'::boolean) AS core_width_is_wide
 FROM pg_stats
 WHERE tablename = 't_width_fallback' AND attname = 'v';
 

@@ -72,31 +72,23 @@ CREATE OR REPLACE FUNCTION public.create_temp_table(
 ) RETURNS boolean
 LANGUAGE plpgsql AS $_$
 DECLARE
-    _b_exists  bool;
-    _i_temp    int2;
-    _i_dummy   int2;
+    _oid_temp  regclass;
 BEGIN
     _c_temp_table := lower(_c_temp_table);
 
-    SELECT true, c.relnatts
-    INTO _b_exists, _i_temp
-    FROM pg_catalog.pg_class c
-    WHERE c.relnamespace = pg_my_temp_schema()
-      AND c.relname = _c_temp_table;
+    /* Поиск по имени и сравнение колонок через relcache: работают и там, где
+       строк каталога временных таблиц SQL не видит (Tantor SE при
+       enable_temp_memory_catalog = on). */
+    _oid_temp := to_regclass(format('pg_temp.%I', _c_temp_table));
 
-    IF _b_exists THEN
-        SELECT c.relnatts INTO _i_dummy
-        FROM pg_catalog.pg_class c
-        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
-        WHERE n.nspname = _c_dummy_schema AND c.relname = _c_temp_table;
-
-        IF _i_temp IS DISTINCT FROM _i_dummy THEN
-            EXECUTE format('DROP TABLE %I', _c_temp_table);
-            _b_exists := false;
-        END IF;
+    IF _oid_temp IS NOT NULL AND
+       fasttrun_temp_same_cols(_oid_temp,
+           to_regclass(format('%I.%I', _c_dummy_schema, _c_temp_table))) IS NOT TRUE THEN
+        EXECUTE format('DROP TABLE %I', _c_temp_table);
+        _oid_temp := NULL;
     END IF;
 
-    IF _b_exists THEN
+    IF _oid_temp IS NOT NULL THEN
         PERFORM public.fasttruncate(_c_temp_table);
         RETURN false;
     END IF;
@@ -266,8 +258,8 @@ BEGIN
 
     -- prewarm_count=0 полностью отключает прогрев
     SELECT count(*) INTO _count
-    FROM pg_class c WHERE c.relnamespace = pg_my_temp_schema()
-        AND c.relname IN ('temp_calc_main', 'temp_calc_detail');
+    FROM unnest(ARRAY['temp_calc_main', 'temp_calc_detail']) AS t(relname)
+    WHERE to_regclass(format('pg_temp.%I', t.relname)) IS NOT NULL;
     IF _count != 0 THEN
         RAISE EXCEPTION 'prewarm_count=0 setup expected 0 tables, found %', _count;
     END IF;
@@ -279,8 +271,8 @@ BEGIN
     END IF;
 
     SELECT count(*) INTO _count
-    FROM pg_class c WHERE c.relnamespace = pg_my_temp_schema()
-        AND c.relname IN ('temp_calc_main', 'temp_calc_detail');
+    FROM unnest(ARRAY['temp_calc_main', 'temp_calc_detail']) AS t(relname)
+    WHERE to_regclass(format('pg_temp.%I', t.relname)) IS NOT NULL;
     IF _count != 0 THEN
         RAISE EXCEPTION 'prewarm_count=0 created % tables', _count;
     END IF;
@@ -296,8 +288,8 @@ BEGIN
 
     -- Проверяем что таблицы реально созданы
     SELECT count(*) INTO _count
-    FROM pg_class c WHERE c.relnamespace = pg_my_temp_schema()
-        AND c.relname IN ('temp_calc_main', 'temp_calc_detail');
+    FROM unnest(ARRAY['temp_calc_main', 'temp_calc_detail']) AS t(relname)
+    WHERE to_regclass(format('pg_temp.%I', t.relname)) IS NOT NULL;
     IF _count != 2 THEN
         RAISE EXCEPTION 'prewarm tables expected 2, found %', _count;
     END IF;

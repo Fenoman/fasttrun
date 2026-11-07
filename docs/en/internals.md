@@ -123,6 +123,39 @@ does not fit in `temp_buffers` and is evicted from local buffers. If slow
 system without that mode (for example, XFS) helps, or a `temp_buffers` large
 enough for the table's working set. The latter costs memory in every backend.
 
+Clear marks for `fasttrun_temp_is_ours()` make the fast path of
+`fasttruncate()` slightly more expensive. Measured on Tantor SE 18.6.3 (release
+build, x86_64, 2 vCPU, `enable_temp_memory_catalog = off`): builds without
+clear marks (2.6.0) and with them (2.7.0), six alternating series, backend
+CPU time from `/proc/self/schedstat`, a temporary table of 4 columns with one
+index.
+
+| scenario | 2.6.0 | 2.7.0 |
+|---|---:|---:|
+| repeated clear of an empty table, `COMMIT` after each call | 4.64 us | 5.69 us |
+| repeated clear of an empty table, further calls in the same transaction | 2.67 us | 3.00 us |
+| repeated clear of 10 empty tables, `COMMIT` after each ten | 35.3 us | 41.6 us |
+| empty `EXCEPTION` block in PL/pgSQL | 0.93 us | 1.07 us |
+
+The first `fasttruncate()` call in a transaction creates two hash tables of
+marks: about 1 us and 16 kB of memory per transaction. The memory goes away
+with the transaction and does not grow with the number of subtransactions,
+checked up to 80,000 rollbacks in one transaction. Further calls look the mark
+up in the hash, about 0.3 us. The difference on an empty `EXCEPTION` block held
+in every series, although the subtransaction callback returns at once there.
+Its cost could not be told apart from a difference in code layout without
+instruction counters. A full clear of a filled table, core `TRUNCATE` of a
+temporary and a permanent table and an empty `COMMIT` showed no difference.
+`fasttrun_temp_is_ours()` itself costs about 0.2 us per call,
+`fasttrun_temp_same_cols()` about 0.45 us.
+
+Clear marks write no catalog rows and send no invalidations. Both
+functions open tables with `AccessShareLock`, like a plain read. When the
+backend has no reference to the table's statistics entry yet (for example, an
+empty table that was only cleared), `fasttrun_temp_is_ours()` looks the entry up
+in the shared statistics hash table under a shared lock of one of its
+partitions.
+
 The synthetic test is in
 [sql/fasttrun_bench.sql](../../sql/fasttrun_bench.sql). Use real plans and load tests
 for your own system.
@@ -153,6 +186,6 @@ extension/                    # installation and upgrade SQL files
 Makefile                      # PGXS build
 examples/                     # integration examples
 scripts/                      # checks and pre-release runner
-sql/                          # 16 pg_regress suites
+sql/                          # 20 pg_regress suites
 expected/                     # expected pg_regress output
 ```

@@ -233,7 +233,7 @@ SELECT extname, extversion = (SELECT default_version FROM pg_available_extension
 
 -- ----------------------------------------------------------------------
 -- 10. Обновление дает тот же набор функций, что и чистая установка,
---     включая функции наблюдаемости 2.6.0.
+--     включая функции наблюдаемости 2.6.0 и проверки для повторного использования таблицы 2.7.0.
 -- ----------------------------------------------------------------------
 CREATE TEMP TABLE mig_upgraded_funcs AS
 SELECT p.oid::regprocedure::text AS func
@@ -241,14 +241,29 @@ SELECT p.oid::regprocedure::text AS func
   JOIN pg_depend d ON d.objid = p.oid AND d.deptype = 'e'
   JOIN pg_extension e ON e.oid = d.refobjid AND e.extname = 'fasttrun';
 SELECT func FROM mig_upgraded_funcs
- WHERE func ~ '^fasttrun_(counters|counters_reset|cached_tables|blocked_tables)\('
+ WHERE func ~ '^fasttrun_(counters|counters_reset|cached_tables|blocked_tables|temp_is_ours|temp_same_cols)\('
  ORDER BY func COLLATE "C";
+-- Атрибуты функций 2.7.0 после обновления и после чистой установки совпадают.
+SELECT p.proname, p.provolatile, p.proisstrict, p.proparallel,
+       p.prorettype::regtype AS rettype, p.prosrc
+  FROM pg_proc p
+  JOIN pg_depend d ON d.objid = p.oid AND d.deptype = 'e'
+  JOIN pg_extension e ON e.oid = d.refobjid AND e.extname = 'fasttrun'
+ WHERE p.proname IN ('fasttrun_temp_is_ours', 'fasttrun_temp_same_cols')
+ ORDER BY p.proname;
 
 DROP EXTENSION fasttrun;
 SELECT to_regprocedure('public.fasttrun_cache_stats()') IS NULL
        AS cache_stats_removed_after_drop;
 
 CREATE EXTENSION fasttrun;
+SELECT p.proname, p.provolatile, p.proisstrict, p.proparallel,
+       p.prorettype::regtype AS rettype, p.prosrc
+  FROM pg_proc p
+  JOIN pg_depend d ON d.objid = p.oid AND d.deptype = 'e'
+  JOIN pg_extension e ON e.oid = d.refobjid AND e.extname = 'fasttrun'
+ WHERE p.proname IN ('fasttrun_temp_is_ours', 'fasttrun_temp_same_cols')
+ ORDER BY p.proname;
 SELECT count(*) AS functions_only_in_fresh_install
   FROM (SELECT p.oid::regprocedure::text AS func
           FROM pg_proc p

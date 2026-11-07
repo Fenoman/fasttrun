@@ -1,0 +1,17 @@
+--
+-- fasttrun_fresh_rollback - fasttrun_temp_is_ours после отката уровня, в котором
+-- таблица сменила файл и завершилась вложенная подтранзакция, и после
+-- переписывания таблицы.
+--
+-- Tantor SE 18.6.3 при enable_temp_memory_catalog = on такой откат не
+-- возвращает прежний файл временной таблицы, и следующее чтение падает с
+-- "could not open file".  Это ошибка ядра, она воспроизводится без fasttrun.
+-- Поэтому там тест пропускается, ожидаемый вывод -
+-- fasttrun_fresh_rollback_1.out.
+--
+SELECT coalesce(current_setting('enable_temp_memory_catalog', true), 'off') = 'on'
+       AS memory_catalog \gset
+\if :memory_catalog
+\echo 'skipped: enable_temp_memory_catalog = on'
+skipped: enable_temp_memory_catalog = on
+\quit

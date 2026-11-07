@@ -345,7 +345,7 @@ fasttrun|t
 (1 row)
 -- ----------------------------------------------------------------------
 -- 10. Обновление дает тот же набор функций, что и чистая установка,
---     включая функции наблюдаемости 2.6.0.
+--     включая функции наблюдаемости 2.6.0 и проверки для повторного использования таблицы 2.7.0.
 -- ----------------------------------------------------------------------
 CREATE TEMP TABLE mig_upgraded_funcs AS
 SELECT p.oid::regprocedure::text AS func
@@ -353,14 +353,28 @@ SELECT p.oid::regprocedure::text AS func
   JOIN pg_depend d ON d.objid = p.oid AND d.deptype = 'e'
   JOIN pg_extension e ON e.oid = d.refobjid AND e.extname = 'fasttrun';
 SELECT func FROM mig_upgraded_funcs
- WHERE func ~ '^fasttrun_(counters|counters_reset|cached_tables|blocked_tables)\('
+ WHERE func ~ '^fasttrun_(counters|counters_reset|cached_tables|blocked_tables|temp_is_ours|temp_same_cols)\('
  ORDER BY func COLLATE "C";
 func
 fasttrun_blocked_tables()
 fasttrun_cached_tables()
 fasttrun_counters()
 fasttrun_counters_reset()
-(4 rows)
+fasttrun_temp_is_ours(regclass)
+fasttrun_temp_same_cols(regclass,regclass)
+(6 rows)
+-- Атрибуты функций 2.7.0 после обновления и после чистой установки совпадают.
+SELECT p.proname, p.provolatile, p.proisstrict, p.proparallel,
+       p.prorettype::regtype AS rettype, p.prosrc
+  FROM pg_proc p
+  JOIN pg_depend d ON d.objid = p.oid AND d.deptype = 'e'
+  JOIN pg_extension e ON e.oid = d.refobjid AND e.extname = 'fasttrun'
+ WHERE p.proname IN ('fasttrun_temp_is_ours', 'fasttrun_temp_same_cols')
+ ORDER BY p.proname;
+proname|provolatile|proisstrict|proparallel|rettype|prosrc
+fasttrun_temp_is_ours|v|t|u|boolean|fasttrun_temp_is_ours
+fasttrun_temp_same_cols|v|t|u|boolean|fasttrun_temp_same_cols
+(2 rows)
 DROP EXTENSION fasttrun;
 SELECT to_regprocedure('public.fasttrun_cache_stats()') IS NULL
        AS cache_stats_removed_after_drop;
@@ -368,6 +382,17 @@ cache_stats_removed_after_drop
 t
 (1 row)
 CREATE EXTENSION fasttrun;
+SELECT p.proname, p.provolatile, p.proisstrict, p.proparallel,
+       p.prorettype::regtype AS rettype, p.prosrc
+  FROM pg_proc p
+  JOIN pg_depend d ON d.objid = p.oid AND d.deptype = 'e'
+  JOIN pg_extension e ON e.oid = d.refobjid AND e.extname = 'fasttrun'
+ WHERE p.proname IN ('fasttrun_temp_is_ours', 'fasttrun_temp_same_cols')
+ ORDER BY p.proname;
+proname|provolatile|proisstrict|proparallel|rettype|prosrc
+fasttrun_temp_is_ours|v|t|u|boolean|fasttrun_temp_is_ours
+fasttrun_temp_same_cols|v|t|u|boolean|fasttrun_temp_same_cols
+(2 rows)
 SELECT count(*) AS functions_only_in_fresh_install
   FROM (SELECT p.oid::regprocedure::text AS func
           FROM pg_proc p

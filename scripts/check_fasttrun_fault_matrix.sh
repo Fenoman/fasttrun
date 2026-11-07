@@ -720,6 +720,38 @@ RESET enable_seqscan;
 SELECT pg_temp.assert_operation_context_zero('successful rollback');
 DROP TABLE ft_success_abort;
 
+/*
+ * fasttrun_temp_is_ours: a table damaged by an incomplete fasttruncate is not
+ * fresh, even one created in the transaction, so the caller goes on to the
+ * repairing fasttruncate.  A failure before file changes leaves the old rows
+ * and no mark.
+ */
+BEGIN;
+SELECT pg_temp.make_fixture('ft_fresh_born');
+SELECT 1 / (fasttrun_temp_is_ours('ft_fresh_born') IS TRUE)::int;
+SELECT pg_temp.inject('ft_fresh_born', 'after_main_heap');
+SELECT 1 / (fasttrun_temp_is_ours('ft_fresh_born') IS FALSE)::int;
+SELECT fasttruncate('ft_fresh_born');
+SELECT 1 / (fasttrun_temp_is_ours('ft_fresh_born') IS TRUE)::int;
+COMMIT;
+DROP TABLE ft_fresh_born;
+SELECT pg_temp.make_fixture('ft_fresh_old');
+BEGIN;
+SELECT pg_temp.inject('ft_fresh_old', 'after_prepare');
+SELECT 1 / (fasttrun_temp_is_ours('ft_fresh_old') IS FALSE)::int;
+SELECT 1 / (count(*) = 80)::int FROM ft_fresh_old;
+SELECT pg_temp.inject('ft_fresh_old', 'after_user_index:1');
+SELECT 1 / (fasttrun_temp_is_ours('ft_fresh_old') IS FALSE)::int;
+SELECT pg_temp.inject('ft_fresh_old', 'before_publish');
+SELECT 1 / (fasttrun_temp_is_ours('ft_fresh_old') IS FALSE)::int;
+SELECT pg_temp.expect_poison('SELECT count(*) FROM ft_fresh_old');
+SELECT fasttruncate('ft_fresh_old');
+SELECT 1 / (fasttrun_temp_is_ours('ft_fresh_old') IS TRUE)::int;
+COMMIT;
+SELECT 1 / (fasttrun_temp_is_ours('ft_fresh_old') IS FALSE)::int;
+SELECT pg_temp.assert_operation_context_zero('fresh after repair');
+DROP TABLE ft_fresh_old;
+
 /* Unsupported traversal is rejected before any mutation. */
 CREATE TEMP TABLE ft_parent(id int);
 CREATE TEMP TABLE ft_child() INHERITS (ft_parent);

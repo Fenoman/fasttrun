@@ -1109,10 +1109,13 @@ CREATE INDEX t_expr_policy_analyze_idx ON t_expr_policy_analyze (lower(name));
 ANALYZE t_expr_policy_analyze;
 DO $$
 BEGIN
-  IF EXISTS (SELECT FROM pg_statistic
+  /* При enable_temp_memory_catalog = on строк pg_statistic временных таблиц SQL
+     не видит, и проверка подготовки тогда пропускается. */
+  IF coalesce(current_setting('enable_temp_memory_catalog', true), 'off') <> 'on' AND
+     (EXISTS (SELECT FROM pg_statistic
              WHERE starelid = 't_expr_policy_analyze'::regclass) OR
      NOT EXISTS (SELECT FROM pg_statistic
-                 WHERE starelid = 't_expr_policy_analyze_idx'::regclass) THEN
+                 WHERE starelid = 't_expr_policy_analyze_idx'::regclass)) THEN
     RAISE EXCEPTION 'expression-only ANALYZE fixture has wrong catalog stats';
   END IF;
 END$$;
@@ -1174,10 +1177,13 @@ CREATE INDEX t_expr_policy_collect_idx ON t_expr_policy_collect (lower(name));
 ANALYZE t_expr_policy_collect;
 DO $$
 BEGIN
-  IF EXISTS (SELECT FROM pg_statistic
+  /* При enable_temp_memory_catalog = on строк pg_statistic временных таблиц SQL
+     не видит, и проверка подготовки тогда пропускается. */
+  IF coalesce(current_setting('enable_temp_memory_catalog', true), 'off') <> 'on' AND
+     (EXISTS (SELECT FROM pg_statistic
              WHERE starelid = 't_expr_policy_collect'::regclass) OR
      NOT EXISTS (SELECT FROM pg_statistic
-                 WHERE starelid = 't_expr_policy_collect_idx'::regclass) THEN
+                 WHERE starelid = 't_expr_policy_collect_idx'::regclass)) THEN
     RAISE EXCEPTION 'expression-only ANALYZE fixture has wrong catalog stats';
   END IF;
 END$$;

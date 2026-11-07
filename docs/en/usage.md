@@ -116,7 +116,9 @@ time a connection is handed to a client.
 the calling code: `fasttruncate()` runs `TRUNCATE ONLY`, while
 `fasttrun_analyze()`, `fasttrun_analyze_bulk()` and `fasttrun_collect_stats()`
 run `ANALYZE`. The hooks and session caches stay idle, and the diagnostic
-functions show empty caches. Input checks stay the same: a missing table returns
+functions show empty caches. Only the clear marks of
+`fasttrun_temp_is_ours()` keep working: the extension's hooks set them on
+`TRUNCATE`, and the transaction callbacks keep them. Input checks stay the same: a missing table returns
 silently, a permanent or partitioned one raises an error.
 
 The mode is an emergency switch: if the extension gets in the way on a
@@ -128,7 +130,7 @@ change for the rest of the session. A superuser sets it in `postgresql.conf`
 
 The price is the core's work. In PostgreSQL and PostgresPro a core `TRUNCATE`
 or `ANALYZE` of a temp table changes catalog rows and sends shared invalidation
-messages to every process of the cluster. Tantor SE 18.6.x keeps the messages
+messages to every process of the cluster. Tantor SE 18.6.3 keeps the messages
 of `TRUNCATE` and `ANALYZE` of a temp table inside its own process and does not
 write them to the shared queue, with `enable_temp_memory_catalog` both `on` and
 `off` (measured on 18.6.3 by the shared queue counter: 0 messages per 10 calls
@@ -138,7 +140,7 @@ update. `fasttruncate()` and `fasttrun_analyze()` in the normal mode send none.
 
 ## Functions
 
-The public API contains 14 SQL functions.
+The public API contains 16 SQL functions.
 
 ### Main operations
 
@@ -182,6 +184,78 @@ a partitioned parent, or an inheritance parent.
 The bulk call does not combine local plan invalidations. They run only for
 relations whose statistics actually changed. In the worst case, N tables cause
 N complete walks over the local plan list.
+
+### Checks for reusing a table
+
+| Function | Purpose |
+|---|---|
+| `fasttrun_temp_is_ours(rel regclass)` | `true` when every row of a temporary table of this session appeared in the current transaction |
+| `fasttrun_temp_same_cols(temp regclass, template regclass)` | `true` when the live columns of the temporary table and the template match |
+
+These functions serve a function that creates a temporary table from a template
+and can be called again in the same transaction. It keeps a table holding its
+own rows as is, clears any other one, and recreates a table of a different
+structure.
+
+The functions run no SQL queries against the catalog: they take the facts
+about a table from the session's relation cache, so they also work where the
+catalog rows of temporary tables live in process memory (Tantor SE 18 with
+`enable_temp_memory_catalog = on`).
+
+`fasttrun_temp_is_ours()` returns `true` when the table:
+
+- was created in the current transaction, including a subtransaction handed to
+  its parent by `RELEASE`
+- was cleared by core `TRUNCATE` in the current transaction or a live
+  subtransaction, in any form: a list, `CASCADE`, through an inheritance parent
+  or a partitioned table, `TRUNCATE ONLY`. `ROLLBACK TO` that subtransaction
+  removes the mark
+- was cleared by `fasttruncate()` in the current transaction, including the
+  fast path for an already empty table. The mark is set only after a
+  successful cleanup. A subtransaction rollback does not bring the cleared rows
+  back, so the mark survives `ROLLBACK TO`, but only while the cleared file
+  stays current. If the rolled back subtransaction had a `TRUNCATE` or a
+  rewrite of the table before the cleanup, the rollback restores the previous
+  file with the old rows, and the answer is `false`.
+
+A rewrite of the table after the cleanup (`ALTER COLUMN TYPE`, `CLUSTER`) keeps
+the answer as long as the level of the cleanup has not rolled back since
+(section ["Limitations"](limitations.md#limitations)). The answer stays `false` after `DELETE`, a rewrite of
+old rows, `ALTER TABLE ADD COLUMN` and the `ON COMMIT DELETE ROWS` cleanup at
+the end of the previous transaction: the function does not count them as a
+clear in this transaction.
+
+A table blocked after an incomplete cleanup (section
+["Recovering from errors"](#recovering-from-errors)) also gives `false`: the
+caller goes on to `fasttruncate()`, which repairs it. `NULL` means that no table
+with this OID exists any more. The call fails for a permanent table, a
+temporary table of another session, an index, a TOAST table, a view, a
+sequence, a table that is not heap-AM, and a partitioned parent (check its
+partitions instead). An inheritance parent is accepted, and the answer covers
+its own rows.
+
+`fasttrun_temp_same_cols()` compares the live columns in `attnum` order: name, type,
+`typmod` and collation. Dropped columns are skipped on both sides, so a
+template that had columns dropped matches a table created from it with
+`LIKE`. Defaults, constraints, indexes, and the identity and generation
+properties of a column are not compared. The first argument is checked as for `fasttrun_temp_is_ours()`, the
+second may be any regular or partitioned table. The result is `NULL` when
+either table is missing.
+
+Neither function checks privileges on the tables, so they can be called from a
+`SECURITY DEFINER` function when the tables belong to other roles. They take
+an `AccessShareLock` for the duration of the call and are declared
+`PARALLEL UNSAFE`. They work the same in `fasttrun.passthrough` mode: there
+`fasttruncate()` runs core `TRUNCATE ONLY`, which sets the mark.
+
+```sql
+IF fasttrun_temp_same_cols(to_regclass('pg_temp.t_work'), 'dummy_tmp.t_work') IS NOT TRUE THEN
+    DROP TABLE IF EXISTS pg_temp.t_work;
+    CREATE TEMP TABLE t_work (LIKE dummy_tmp.t_work INCLUDING ALL);
+ELSIF NOT fasttrun_temp_is_ours('pg_temp.t_work') THEN
+    PERFORM fasttruncate('pg_temp.t_work');
+END IF;
+```
 
 ### Diagnostics
 

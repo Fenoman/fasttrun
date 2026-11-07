@@ -8,8 +8,27 @@ Basic suite:
 make installcheck PG_CONFIG=/path/to/pg_config
 ```
 
-It contains 16 `pg_regress` suites. The expected result is 16/16 on supported
-PostgreSQL 16, PostgreSQL 17, and PostgreSQL 18 installations.
+It contains 20 `pg_regress` suites. The expected result is 20/20 on supported
+PostgreSQL 16, PostgreSQL 17, and PostgreSQL 18 installations. `fasttrun_fresh`
+opens a second session through the `dblink` contrib extension, which must be
+installed on the server.
+
+On Tantor SE 18.6.3 with `enable_temp_memory_catalog = on`, SQL does not see the
+catalog rows of temporary tables, and the core breaks temporary tables on a
+subtransaction rollback and when a table with a `CREATE STATISTICS` object is
+dropped (section ["Limitations"](limitations.md#limitations)). The suites
+handle it this way:
+
+- checks against `pg_class`, `pg_stats` and `pg_statistic` of temporary tables
+  give `true` without checking in that mode, the rest of those suites runs as
+  usual
+- four suites are skipped as a whole, their expected output in that mode is the
+  `_1.out` file: `fasttrun_zero_sinval_catalog` (it watches catalog rows),
+  `fasttrun_stats_ext` (`CREATE STATISTICS`), `fasttrun_fresh_rollback` and
+  `fasttrun_outer_rollback` (a subtransaction rollback after a file change or a
+  table creation on the outer level)
+
+The result in that mode is 20/20.
 
 Extended local suite:
 
@@ -42,7 +61,7 @@ FT_CASSERT_TARGETS="16:/path/pg16/bin/pg_config:port:log,..." \
   scripts/check_fasttrun_prerelease.sh
 ```
 
-The mandatory suite includes cassert builds of PostgreSQL 16/17/18, 16/16
+The mandatory suite includes cassert builds of PostgreSQL 16/17/18, 20/20
 `pg_regress`, BRIN stress, cache-initialization faults, the fault matrix, and
 checks of memory, planning, local invalidations, the plan reset at backend exit,
 the main branch of the tracking test with preloading, the reset of the registry
