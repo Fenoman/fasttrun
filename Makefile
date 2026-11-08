@@ -95,6 +95,9 @@ ifdef PGXS
 FASTTRUN_HASH := \#
 FASTTRUN_SRCDIR := $(patsubst %/,%,$(srcdir))
 FASTTRUN_UNITY_SRCS := $(addprefix $(FASTTRUN_SRCDIR)/,$(shell sed -n 's/^$(FASTTRUN_HASH)include "\(src\/[0-9][0-9]_[a-z_]*\.c\)".*/\1/p' $(FASTTRUN_SRCDIR)/fasttrun.c))
+ifeq ($(strip $(FASTTRUN_UNITY_SRCS)),)
+$(error fasttrun.c has no lines in the format: $(FASTTRUN_HASH)include "src/NN_name.c")
+endif
 # Makefile.global PostgreSQL объявляет .SECONDARY:, поэтому без этой проверки
 # make считает fasttrun.o свежим, даже если одного из срезов нет.
 FASTTRUN_MISSING_SRCS := $(filter-out $(wildcard $(FASTTRUN_UNITY_SRCS)),$(FASTTRUN_UNITY_SRCS))
