@@ -180,7 +180,8 @@ another system.
 ## File layout
 
 ```
-fasttrun.c                    # main C source
+fasttrun.c                    # entry point: includes the src/ slices in build order
+src/                          # C code: NN_name.c slices, one translation unit
 fasttrun.control              # extension metadata
 extension/                    # installation and upgrade SQL files
 Makefile                      # PGXS build

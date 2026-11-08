@@ -208,6 +208,87 @@ def path_exists(graph: dict[str, set[str]], source: str, target: str) -> bool:
     return False
 
 
+# Срезы кода: fasttrun.c подключает src/NN_имя.c одной единицей трансляции.
+SLICE_INCLUDE_RE = re.compile(
+    r'^#include "src/([0-9][0-9])_[a-z_]*\.c"[ \t]*(?:/\*.*\*/)?[ \t]*$'
+)
+ANY_SLICE_INCLUDE_RE = re.compile(r'^\s*#\s*include\s*"src/')
+SLICE_FORBIDDEN_RE = re.compile(
+    r"^\s*#\s*(?:include\b|line\b|pragma\b|define\s+FASTTRUN_UNITY\b)"
+)
+MAX_SOURCE_LINES = 2000
+
+
+def check_unity_layout(errors: list[str]) -> None:
+    """Проверяет раскладку срезов src/ и строки их подключения в fasttrun.c.
+
+    Что проверяет:
+    - каждая строка подключения "src/" записана по формату, который читает
+      правило Makefile, номера идут подряд с 01 в порядке подключения
+    - каждый src/*.c подключен ровно один раз, лишних и пропавших нет
+    - #define FASTTRUN_UNITY стоит в корне до первого среза
+    - в срезах нет #include, #line, #pragma и #define FASTTRUN_UNITY, у
+      каждого есть проверка FASTTRUN_UNITY
+    - каждый файл, включая корень, не длиннее MAX_SOURCE_LINES строк
+    - OBJS = fasttrun.o, а дерево файлов документации перечисляет src/.
+    """
+    root_lines = read(ROOT / "fasttrun.c").splitlines()
+    included: list[str] = []
+    define_at = None
+    for number, line in enumerate(root_lines, start=1):
+        if line == "#define FASTTRUN_UNITY":
+            define_at = number
+        if not ANY_SLICE_INCLUDE_RE.match(line):
+            continue
+        match = SLICE_INCLUDE_RE.match(line)
+        if match is None:
+            errors.append(
+                f"fasttrun.c:{number}: строка подключения среза не по формату"
+                f' #include "src/NN_имя.c": {line!r}'
+            )
+            continue
+        if define_at is None:
+            errors.append(
+                f"fasttrun.c:{number}: срез подключен до #define FASTTRUN_UNITY"
+            )
+        included.append(line.split('"')[1])
+
+    expected = [f"{index:02d}" for index in range(1, len(included) + 1)]
+    numbers = [Path(name).name[:2] for name in included]
+    require(errors, numbers == expected,
+            f"fasttrun.c: номера срезов идут не подряд с 01: {numbers}")
+    duplicates = sorted({name for name in included if included.count(name) > 1})
+    require(errors, not duplicates,
+            f"fasttrun.c: срезы подключены больше одного раза: {duplicates}")
+    on_disk = sorted(f"src/{path.name}" for path in (ROOT / "src").glob("*.c"))
+    require(errors, sorted(set(included)) == on_disk,
+            "src/ и подключения в fasttrun.c расходятся: лишние "
+            f"{sorted(set(on_disk) - set(included))}, "
+            f"пропавшие {sorted(set(included) - set(on_disk))}")
+
+    require(errors, len(root_lines) <= MAX_SOURCE_LINES,
+            f"fasttrun.c: {len(root_lines)} строк, предел {MAX_SOURCE_LINES}")
+    for name in on_disk:
+        lines = read(ROOT / name).splitlines()
+        require(errors, len(lines) <= MAX_SOURCE_LINES,
+                f"{name}: {len(lines)} строк, предел {MAX_SOURCE_LINES}")
+        require(errors,
+                "#ifndef FASTTRUN_UNITY" in lines
+                and "#endif /* FASTTRUN_UNITY */" in lines,
+                f"{name}: нет проверки FASTTRUN_UNITY")
+        for number, line in enumerate(lines, start=1):
+            if SLICE_FORBIDDEN_RE.match(line):
+                errors.append(f"{name}:{number}: директива не для среза: {line!r}")
+
+    require(errors, make_variable(read(ROOT / "Makefile"), "OBJS") == ["fasttrun.o"],
+            "Makefile: OBJS должен быть ровно fasttrun.o")
+    for _, docs_dir in DOC_SETS:
+        tree = read(docs_dir / "internals.md")
+        require(errors, re.search(r"^src/\s+#", tree, re.MULTILINE) is not None,
+                f"docs/{docs_dir.name}/internals.md: каталог src/ не описан в "
+                "файловой структуре")
+
+
 def main() -> int:
     errors: list[str] = []
     makefile = read(ROOT / "Makefile")
@@ -461,6 +542,8 @@ def main() -> int:
         for pattern, description in forbidden.items():
             if re.search(pattern, content, re.IGNORECASE):
                 errors.append(f"{path.name}: {description}")
+
+    check_unity_layout(errors)
 
     if errors:
         for error in errors:

@@ -179,7 +179,7 @@ if [ "$growth" -gt "$MAX_GROWTH_BYTES" ] || \
 	echo ""
 	echo "FAIL: память fasttrun не стабилизировалась за $ITERATIONS циклов" >&2
 	echo "записи таблиц ON COMMIT DROP не удаляются при COMMIT" >&2
-	echo "См. fasttrun.c: fasttrun_object_access_hook (отметка OAT_DROP) и fasttrun_cache_commit_xact" >&2
+	echo "См. src/29_utility_hooks.c: fasttrun_object_access_hook (отметка OAT_DROP) и src/04_relstats_cache.c: fasttrun_cache_commit_xact" >&2
 	exit 1
 fi
 
