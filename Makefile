@@ -87,6 +87,23 @@ PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
 endif
 
+# fasttrun.c подключает срезы src/NN_*.c через #include, а PGXS без
+# --enable-depend об этом не знает. Список берется из самого fasttrun.c, чтобы
+# удаленный срез давал ошибку make. Знак # хранится в переменной: внутри вызова
+# функции make 3.81 считает его началом комментария, а make 4.3 - нет.
+ifdef PGXS
+FASTTRUN_HASH := \#
+FASTTRUN_SRCDIR := $(patsubst %/,%,$(srcdir))
+FASTTRUN_UNITY_SRCS := $(addprefix $(FASTTRUN_SRCDIR)/,$(shell sed -n 's/^$(FASTTRUN_HASH)include "\(src\/[0-9][0-9]_[a-z_]*\.c\)".*/\1/p' $(FASTTRUN_SRCDIR)/fasttrun.c))
+# Makefile.global PostgreSQL объявляет .SECONDARY:, поэтому без этой проверки
+# make считает fasttrun.o свежим, даже если одного из срезов нет.
+FASTTRUN_MISSING_SRCS := $(filter-out $(wildcard $(FASTTRUN_UNITY_SRCS)),$(FASTTRUN_UNITY_SRCS))
+ifneq ($(FASTTRUN_MISSING_SRCS),)
+$(error fasttrun.c includes missing slices: $(FASTTRUN_MISSING_SRCS))
+endif
+fasttrun.o fasttrun.bc: $(FASTTRUN_UNITY_SRCS)
+endif
+
 # Каталог DOCS у PGXS общий для всех расширений и плоский, а README ссылается на
 # docs/ru, docs/en и docs/images относительными путями. Поэтому плоско ставится
 # только README.fasttrun, а вся документация идет своим деревом в подкаталог
