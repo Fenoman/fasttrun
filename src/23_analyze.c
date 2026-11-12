@@ -724,8 +724,12 @@ fasttrun_ext_data_version(Oid stxoid)
 	if (HeapTupleIsValid(tup))
 	{
 		version.present = true;
-#ifdef TANTOR_VERSION
-		/* Tantor keeps the 64-bit xmin in HeapTupleData, not in the header. */
+#if defined(TANTOR_VERSION) || defined(PGPRO_EE)
+		/*
+		 * Tantor and Postgres Pro Enterprise use 64-bit xids: the full xmin
+		 * lives in HeapTupleData, and the header has no HeapTupleHeaderGetXmin.
+		 * PGPRO_STD is set in Enterprise too, only PGPRO_EE tells them apart.
+		 */
 		version.xmin = HeapTupleGetXmin(tup);
 #else
 		version.xmin = HeapTupleHeaderGetXmin(tup->t_data);
