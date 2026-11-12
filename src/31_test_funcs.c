@@ -152,3 +152,19 @@ fasttrun_test_call_attavgwidth(PG_FUNCTION_ARGS)
 }
 #endif
 
+
+/*
+ * Test helper: size of the main fork in bytes as smgr reports it.  On
+ * PostgreSQL it equals pg_relation_size.  Postgres Pro Enterprise keeps a
+ * temporary relation in local buffers until it spills, so the file size
+ * there says nothing about the relation.
+ */
+Datum
+fasttrun_test_relation_bytes(PG_FUNCTION_ARGS)
+{
+	Relation	rel = relation_open(PG_GETARG_OID(0), AccessShareLock);
+	int64		bytes = (int64) RelationGetNumberOfBlocks(rel) * BLCKSZ;
+
+	relation_close(rel, AccessShareLock);
+	PG_RETURN_INT64(bytes);
+}

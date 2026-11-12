@@ -10,6 +10,12 @@
 
 CREATE EXTENSION fasttrun;
 
+-- Размер основного слоя по данным smgr.  В PostgreSQL он равен
+-- pg_relation_size, а Postgres Pro Enterprise держит временную таблицу в
+-- локальных буферах, пока она в них помещается, и размер файла там ноль.
+CREATE FUNCTION pg_temp.rel_bytes(regclass) RETURNS bigint
+  AS '$libdir/fasttrun', 'fasttrun_test_relation_bytes' LANGUAGE C STRICT;
+
 -- ----------------------------------------------------------------------
 -- 1. Базовый сценарий: временная таблица -> вставка -> fasttruncate -> пусто
 -- ----------------------------------------------------------------------
@@ -120,7 +126,7 @@ SELECT g, repeat('x', 100) FROM generate_series(1, 50000) g;
 -- После fasttruncate физический размер должен упасть до ~1 страницы
 -- (8192 байт после smgrcreate пустого fork-файла)
 SELECT fasttruncate('t_disk');
-SELECT pg_relation_size('t_disk') < 16384 AS truncated_to_empty;
+SELECT pg_temp.rel_bytes('t_disk') < 16384 AS truncated_to_empty;
 
 -- Несколько циклов заполнения/очистки -- размер не должен расти
 INSERT INTO t_disk SELECT g, repeat('x', 100) FROM generate_series(1, 50000) g;
@@ -131,7 +137,7 @@ INSERT INTO t_disk SELECT g, repeat('x', 100) FROM generate_series(1, 50000) g;
 SELECT fasttruncate('t_disk');
 
 -- После ещё 3 циклов: всё ещё пусто
-SELECT pg_relation_size('t_disk') < 16384 AS still_empty_after_cycles;
+SELECT pg_temp.rel_bytes('t_disk') < 16384 AS still_empty_after_cycles;
 
 DROP TABLE t_disk;
 
@@ -195,7 +201,7 @@ SELECT min(id) = 51 AND max(id) = 60 AS correct_range FROM t_toast;
 
 -- Toast-хранилище тоже должно сбрасываться после truncate
 SELECT fasttruncate('t_toast');
-SELECT pg_relation_size('t_toast') < 16384 AS toast_heap_empty;
+SELECT pg_temp.rel_bytes('t_toast') < 16384 AS toast_heap_empty;
 
 DROP TABLE t_toast;
 
@@ -400,13 +406,13 @@ DELETE FROM t_bloat_idx;
 VACUUM t_bloat_idx;
 
 -- heap опустошён до 0 байт, индекс всё ещё раздут.
-SELECT pg_relation_size('t_bloat_idx') = 0 AS heap_emptied,
-       pg_relation_size('t_bloat_idx_pkey') > 1000000 AS idx_bloated;
+SELECT pg_temp.rel_bytes('t_bloat_idx') = 0 AS heap_emptied,
+       pg_temp.rel_bytes('t_bloat_idx_pkey') > 1000000 AS idx_bloated;
 
 SELECT fasttruncate('t_bloat_idx');
 
 -- Индекс сброшен, несмотря на нулевой heap.
-SELECT pg_relation_size('t_bloat_idx_pkey') < 100000 AS idx_reclaimed;
+SELECT pg_temp.rel_bytes('t_bloat_idx_pkey') < 100000 AS idx_reclaimed;
 DROP TABLE t_bloat_idx;
 
 -- ----------------------------------------------------------------------

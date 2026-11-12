@@ -121,6 +121,7 @@ PG_FUNCTION_INFO_V1(fasttrun_cached_tables);
 PG_FUNCTION_INFO_V1(fasttrun_blocked_tables);
 PG_FUNCTION_INFO_V1(fasttrun_temp_is_ours);
 PG_FUNCTION_INFO_V1(fasttrun_temp_same_cols);
+PG_FUNCTION_INFO_V1(fasttrun_test_relation_bytes);
 #ifdef USE_ASSERT_CHECKING
 PG_FUNCTION_INFO_V1(fasttrun_test_subxact_visits);
 PG_FUNCTION_INFO_V1(fasttrun_test_poison_locator_mismatch);

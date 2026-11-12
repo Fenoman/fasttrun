@@ -408,7 +408,8 @@ ANALYZE pg_temp.temp_work;
 ### Ошибка в запасном режиме
 
 При `fasttrun.zero_sinval_truncate=off` расширение вызывает ядерный
-`RelationTruncate` для каждого отношения. Ошибка в критическом участке
+`RelationTruncate` для каждого отношения, на Postgres Pro Enterprise - при любом
+значении параметра. Ошибка в критическом участке
 физической очистки PostgreSQL приводит к `PANIC`. Это завершает все серверные
 сеансы данного экземпляра, а не только текущий backend. При
 `restart_after_crash=on` postmaster заново запускает процессы и выполняет

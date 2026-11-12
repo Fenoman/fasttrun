@@ -19,6 +19,12 @@ ALTER DATABASE :DBNAME SET session_preload_libraries = 'fasttrun';
 
 CREATE EXTENSION fasttrun;
 
+-- Размер основного слоя по данным smgr.  В PostgreSQL он равен
+-- pg_relation_size, а Postgres Pro Enterprise держит временную таблицу в
+-- локальных буферах, пока она в них помещается, и размер файла там ноль.
+CREATE FUNCTION pg_temp.rel_bytes(regclass) RETURNS bigint
+  AS '$libdir/fasttrun', 'fasttrun_test_relation_bytes' LANGUAGE C STRICT;
+
 -- Узкая высокоселективная временная таблица с btree-индексом.
 -- Без статистики по колонкам планировщик берет DEFAULT_EQ_SEL=0.005
 -- и выбирает Bitmap Heap Scan.  С нашей статистикой (n_distinct ~
@@ -241,6 +247,8 @@ INSERT INTO t_trunc_evict SELECT generate_series(1, 100000) g;
 CREATE INDEX ON t_trunc_evict (id);
 
 BEGIN;
+-- Выбор плана ниже зависит от цены случайного чтения, фиксируем значение по умолчанию.
+SET LOCAL random_page_cost = 4;
 SELECT fasttrun_collect_stats('t_trunc_evict');
 EXPLAIN (COSTS OFF) SELECT * FROM t_trunc_evict WHERE id = 12345;
 SELECT fasttruncate('t_trunc_evict');
@@ -1795,7 +1803,7 @@ SELECT pg_temp.ext_rows('SELECT * FROM t_vacuum_shrink') BETWEEN 100 AND 400
        AS vacuum_shrink_rows,
        pg_temp.ext_rows('SELECT * FROM t_vacuum_shrink WHERE grp = 1') BETWEEN 100 AND 400
        AS vacuum_shrink_column_stats;
-SELECT relpages = pg_relation_size('t_vacuum_shrink') / 8192 AS vacuum_shrink_pages
+SELECT relpages = pg_temp.rel_bytes('t_vacuum_shrink') / 8192 AS vacuum_shrink_pages
   FROM fasttrun_relstats('t_vacuum_shrink');
 DROP TABLE t_vacuum_shrink;
 
@@ -2441,6 +2449,8 @@ DROP TABLE t_expr_core;
 -- ----------------------------------------------------------------------
 DISCARD TEMP;
 \pset format unaligned
+-- Размер кеша должен быть кратен килобайту, а он зависит от цели статистики.
+SET default_statistics_target = 100;
 -- Пустые кэши читаются как нули.
 SELECT * FROM fasttrun_cache_stats();
 SELECT pg_typeof(analyze_entries) = 'bigint'::regtype AS analyze_entries_bigint,
@@ -2558,6 +2568,7 @@ END$$;
 SELECT 'a_managed_refresh_ok' AS marker;
 -- Без лимита новая таблица C собирается несмотря на размер кэша.
 RESET fasttrun.max_stats_memory;
+RESET default_statistics_target;
 CREATE TEMP TABLE t44_c (id int, name text);
 INSERT INTO t44_c SELECT g, 'val_' || g FROM generate_series(1, 1000) g;
 SELECT fasttrun_analyze('t44_c');

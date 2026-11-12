@@ -259,9 +259,21 @@ preload is already disabled, stop PostgreSQL and remove the file manually.
 | PostgreSQL 18 | yes | not run |
 | Tantor SE 18.6.3, `enable_temp_memory_catalog = off` | yes | 20/20 |
 | Tantor SE 18.6.3, `enable_temp_memory_catalog = on` | yes | 20/20 |
+| Postgres Pro Enterprise 18 | yes | checked separately |
 
 With `enable_temp_memory_catalog = on` some checks and suites are skipped
 (section ["Testing"](testing.md)). The mode itself is not reliable yet, without
 fasttrun too: temporary tables get lost on a subtransaction rollback (section
 ["Limitations"](limitations.md#limitations)). It is better not to enable it
 until the core is fixed.
+
+Postgres Pro Enterprise keeps the pages of a temporary table in local buffers
+while they fit there, and tracks the size and state of its files itself. So
+there `fasttruncate()` always empties the table with the core
+`RelationTruncate`, and `fasttrun.zero_sinval_truncate` changes nothing. The
+`postgrespro-ent-18-contrib` package installs its own `fasttrun` module with the
+same `fasttrun.so` and `fasttrun.control` files: `make install` replaces them,
+and a package update brings the vendor files back, so fasttrun is installed
+again after package updates. With `enable_temp_memory_catalog = on` Enterprise
+keeps no pgstat counters for temporary tables, and fasttrun does not cache
+column statistics in such a session.

@@ -17,6 +17,7 @@
 #ifndef FASTTRUN_UNITY
 #error "src/22_truncate.c is included only from fasttrun.c"
 #endif /* FASTTRUN_UNITY */
+#ifndef PGPRO_EE
 /*
  * Unlink every segment of a relation fork file.
  *
@@ -182,6 +183,7 @@ fasttrun_smgr_bypass_truncate(Relation rel, bool buffers_already_dropped)
 		reln->smgr_cached_nblocks[forks[i]] = 0;
 	}
 }
+#endif							/* !PGPRO_EE */
 
 /*
  * An empty btree is one metapage with no root, exactly what btbuild() writes
@@ -194,6 +196,25 @@ fasttrun_smgr_bypass_truncate(Relation rel, bool buffers_already_dropped)
 static void
 fasttrun_write_empty_btree(Relation indexrel)
 {
+#ifdef PGPRO_EE
+	/*
+	 * Postgres Pro Enterprise creates the file of a temporary relation only
+	 * when its pages no longer fit into temp_buffers.  The metapage goes
+	 * through a local buffer, so an index that fits stays without a file.
+	 */
+	Buffer		buf;
+
+	Assert(RelationUsesLocalBuffers(indexrel));
+	buf = ExtendBufferedRel(BMR_REL(indexrel), MAIN_FORKNUM, NULL,
+							EB_LOCK_FIRST | EB_SKIP_EXTENSION_LOCK);
+	if (BufferGetBlockNumber(buf) != BTREE_METAPAGE)
+		elog(ERROR, "fasttrun: index \"%s\" is not empty after truncate",
+			 RelationGetRelationName(indexrel));
+	_bt_initmetapage(BufferGetPage(buf), P_NONE, 0,
+					 _bt_allequalimage(indexrel, true));
+	MarkBufferDirty(buf);
+	UnlockReleaseBuffer(buf);
+#else
 	Page		metapage = (Page) palloc_aligned(BLCKSZ, PG_IO_ALIGN_SIZE, 0);
 
 	Assert(RelationUsesLocalBuffers(indexrel));
@@ -203,6 +224,7 @@ fasttrun_write_empty_btree(Relation indexrel)
 	smgrextend(RelationGetSmgr(indexrel), MAIN_FORKNUM, BTREE_METAPAGE,
 			   metapage, true);
 	pfree(metapage);
+#endif
 }
 
 /*
@@ -244,10 +266,21 @@ static void
 fasttrun_truncate_one_storage(Relation rel, bool zero_sinval,
 								 bool buffers_already_dropped)
 {
+#ifdef PGPRO_EE
+	/*
+	 * Postgres Pro Enterprise keeps the size and the on-disk state of a
+	 * temporary relation inside smgr (lazy file creation, CFS maps), so files
+	 * must not be unlinked behind it.  Its RelationTruncate sends no shared
+	 * invalidation for a temporary relation, which makes the bypass pointless
+	 * there.  The last argument asks it to drop the local buffers.
+	 */
+	RelationTruncate(rel, 0, true);
+#else
 	if (zero_sinval)
 		fasttrun_smgr_bypass_truncate(rel, buffers_already_dropped);
 	else
 		RelationTruncate(rel, 0);
+#endif
 }
 
 static FasttrunTruncateResultSlot *

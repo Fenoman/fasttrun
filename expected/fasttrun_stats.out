@@ -16,6 +16,11 @@
 ALTER DATABASE :DBNAME SET session_preload_libraries = 'fasttrun';
 \connect -
 CREATE EXTENSION fasttrun;
+-- Размер основного слоя по данным smgr.  В PostgreSQL он равен
+-- pg_relation_size, а Postgres Pro Enterprise держит временную таблицу в
+-- локальных буферах, пока она в них помещается, и размер файла там ноль.
+CREATE FUNCTION pg_temp.rel_bytes(regclass) RETURNS bigint
+  AS '$libdir/fasttrun', 'fasttrun_test_relation_bytes' LANGUAGE C STRICT;
 -- Узкая высокоселективная временная таблица с btree-индексом.
 -- Без статистики по колонкам планировщик берет DEFAULT_EQ_SEL=0.005
 -- и выбирает Bitmap Heap Scan.  С нашей статистикой (n_distinct ~
@@ -339,6 +344,8 @@ CREATE TEMP TABLE t_trunc_evict (id int);
 INSERT INTO t_trunc_evict SELECT generate_series(1, 100000) g;
 CREATE INDEX ON t_trunc_evict (id);
 BEGIN;
+-- Выбор плана ниже зависит от цены случайного чтения, фиксируем значение по умолчанию.
+SET LOCAL random_page_cost = 4;
 SELECT fasttrun_collect_stats('t_trunc_evict');
  fasttrun_collect_stats 
 ------------------------
@@ -2845,7 +2852,7 @@ SELECT pg_temp.ext_rows('SELECT * FROM t_vacuum_shrink') BETWEEN 100 AND 400
  t                  | t
 (1 row)
 
-SELECT relpages = pg_relation_size('t_vacuum_shrink') / 8192 AS vacuum_shrink_pages
+SELECT relpages = pg_temp.rel_bytes('t_vacuum_shrink') / 8192 AS vacuum_shrink_pages
   FROM fasttrun_relstats('t_vacuum_shrink');
  vacuum_shrink_pages 
 ---------------------
@@ -3948,6 +3955,8 @@ DROP TABLE t_expr_core;
 -- ----------------------------------------------------------------------
 DISCARD TEMP;
 \pset format unaligned
+-- Размер кеша должен быть кратен килобайту, а он зависит от цели статистики.
+SET default_statistics_target = 100;
 -- Пустые кэши читаются как нули.
 SELECT * FROM fasttrun_cache_stats();
 analyze_entries|column_stats_relid_entries|column_stats_entries|analyze_bytes|column_stats_bytes|total_bytes
@@ -4139,6 +4148,7 @@ a_managed_refresh_ok
 (1 row)
 -- Без лимита новая таблица C собирается несмотря на размер кэша.
 RESET fasttrun.max_stats_memory;
+RESET default_statistics_target;
 CREATE TEMP TABLE t44_c (id int, name text);
 INSERT INTO t44_c SELECT g, 'val_' || g FROM generate_series(1, 1000) g;
 SELECT fasttrun_analyze('t44_c');

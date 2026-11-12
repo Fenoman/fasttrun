@@ -15,6 +15,12 @@
 
 CREATE EXTENSION fasttrun;
 
+-- Размер основного слоя по данным smgr.  В PostgreSQL он равен
+-- pg_relation_size, а Postgres Pro Enterprise держит временную таблицу в
+-- локальных буферах, пока она в них помещается, и размер файла там ноль.
+CREATE FUNCTION pg_temp.rel_bytes(regclass) RETURNS bigint
+  AS '$libdir/fasttrun', 'fasttrun_test_relation_bytes' LANGUAGE C STRICT;
+
 -- При enable_temp_memory_catalog = on (Tantor SE) строк каталога временных
 -- таблиц SQL не видит. Сверки с pg_class и pg_stats тогда дают true без
 -- проверки: coalesce(bool_and(условие), memory_catalog).
@@ -432,9 +438,9 @@ SELECT fasttrun_analyze('t_refill_rb');
 ROLLBACK TO SAVEPOINT sp_refill;
 
 SELECT count(*) = 0 AS refill17e_actual_empty FROM t_refill_rb;
-SELECT pg_relation_size('t_refill_rb') > 0 AS refill17e_dead_pages_left;
+SELECT pg_temp.rel_bytes('t_refill_rb') > 0 AS refill17e_dead_pages_left;
 SELECT reltuples = 0 AS refill17e_tuples_zero,
-       relpages = pg_relation_size('t_refill_rb') / current_setting('block_size')::int
+       relpages = pg_temp.rel_bytes('t_refill_rb') / current_setting('block_size')::int
          AS refill17e_pages_physical
   FROM fasttrun_relstats('t_refill_rb');
 SELECT reltuples = 0 AS refill17e_index_tuples_zero
@@ -1048,7 +1054,7 @@ DELETE FROM t_carry_vacuum WHERE grp = 2;
 SELECT fasttrun_analyze('t_carry_vacuum');
 VACUUM (TRUNCATE ON) t_carry_vacuum;
 SELECT fasttrun_analyze('t_carry_vacuum');
-SELECT relpages = pg_relation_size('t_carry_vacuum') / 8192 AND reltuples = 200
+SELECT relpages = pg_temp.rel_bytes('t_carry_vacuum') / 8192 AND reltuples = 200
   AS carry21b_vacuum_pages FROM fasttrun_relstats('t_carry_vacuum');
 DROP TABLE t_carry_vacuum;
 
@@ -1134,7 +1140,7 @@ SELECT pg_temp.an_rows('SELECT * FROM t_bloat') BETWEEN 500 AND 2000
        pg_temp.an_rows('SELECT * FROM t_bloat WHERE grp = 1') BETWEEN 150 AND 400
        AS bloat22_column_stats_after_exception;
 SELECT fasttrun_analyze('t_bloat');
-SELECT relpages = pg_relation_size('t_bloat') / 8192 AS bloat22_pages_published,
+SELECT relpages = pg_temp.rel_bytes('t_bloat') / 8192 AS bloat22_pages_published,
        reltuples = 1000 AS bloat22_count_kept
   FROM fasttrun_relstats('t_bloat');
 -- Откат всей транзакции и откат к точке сохранения.
@@ -1152,7 +1158,7 @@ SELECT pg_temp.an_rows('SELECT * FROM t_bloat') BETWEEN 500 AND 2000
        AS bloat22_column_stats_after_savepoint;
 COMMIT;
 SELECT fasttrun_analyze('t_bloat');
-SELECT relpages = pg_relation_size('t_bloat') / 8192 AS bloat22_pages_after_rollbacks,
+SELECT relpages = pg_temp.rel_bytes('t_bloat') / 8192 AS bloat22_pages_after_rollbacks,
        reltuples = 1000 AS bloat22_count_after_rollbacks
   FROM fasttrun_relstats('t_bloat');
 SELECT pg_temp.an_rows('SELECT * FROM t_bloat') BETWEEN 500 AND 2000
@@ -1187,7 +1193,7 @@ SELECT pg_temp.an_rows('SELECT * FROM t_abort_inval') BETWEEN 9000 AND 11000
 RESET client_min_messages;
 COMMIT;
 SELECT fasttrun_analyze('t_abort_inval');
-SELECT relpages = pg_relation_size('t_abort_inval') / 8192 AS abort22b_pages_published
+SELECT relpages = pg_temp.rel_bytes('t_abort_inval') / 8192 AS abort22b_pages_published
   FROM fasttrun_relstats('t_abort_inval');
 RESET fasttrun.auto_collect_stats;
 DROP TABLE t_abort_inval;
@@ -1240,7 +1246,7 @@ SAVEPOINT s;
 SELECT fasttrun_analyze('t_i6');
 ROLLBACK TO SAVEPOINT s;
 SELECT fasttrun_analyze('t_i6');
-SELECT relpages = pg_relation_size('t_i6_part') / 8192 AS i6_index_pages_refreshed,
+SELECT relpages = pg_temp.rel_bytes('t_i6_part') / 8192 AS i6_index_pages_refreshed,
        reltuples BETWEEN 50 AND 200 AS i6_partial_count_kept
   FROM fasttrun_relstats('t_i6_part');
 COMMIT;
@@ -1544,15 +1550,15 @@ CREATE TEMP TABLE t_n19 (id int, flag bool) WITH (fillfactor = 10);
 INSERT INTO t_n19 SELECT g, g % 100 = 0 FROM generate_series(1, 10000) g;
 CREATE INDEX t_n19_part ON t_n19 (id) WHERE flag;
 SELECT fasttrun_analyze('t_n19');
-SELECT pg_relation_size('t_n19') AS n19_heap_bytes \gset
+SELECT pg_temp.rel_bytes('t_n19') AS n19_heap_bytes \gset
 BEGIN;
 SAVEPOINT s;
 UPDATE t_n19 SET flag = true;
 ROLLBACK TO SAVEPOINT s;
 COMMIT;
 SELECT fasttrun_analyze('t_n19');
-SELECT pg_relation_size('t_n19') = :n19_heap_bytes AS n19_heap_same_size,
-       relpages = pg_relation_size('t_n19_part') / 8192 AS n19_index_pages_refreshed
+SELECT pg_temp.rel_bytes('t_n19') = :n19_heap_bytes AS n19_heap_same_size,
+       relpages = pg_temp.rel_bytes('t_n19_part') / 8192 AS n19_index_pages_refreshed
   FROM fasttrun_relstats('t_n19_part');
 DROP TABLE t_n19;
 

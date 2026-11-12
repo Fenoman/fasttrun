@@ -413,7 +413,8 @@ methods above for that table.
 ### Error in fallback mode
 
 With `fasttrun.zero_sinval_truncate=off`, the extension calls PostgreSQL core's
-`RelationTruncate` for every relation. An error in the critical physical-cleanup
+`RelationTruncate` for every relation, on Postgres Pro Enterprise with any value
+of the setting. An error in the critical physical-cleanup
 section causes a `PANIC`. This terminates every server session in the instance,
 not just the current backend. With `restart_after_crash=on`, the postmaster
 starts the processes again and performs crash recovery. The pooler sees a mass

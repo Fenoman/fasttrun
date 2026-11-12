@@ -258,9 +258,21 @@ DROP EXTENSION fasttrun;
 | PostgreSQL 18 | да | не прогонялись |
 | Tantor SE 18.6.3, `enable_temp_memory_catalog = off` | да | 20/20 |
 | Tantor SE 18.6.3, `enable_temp_memory_catalog = on` | да | 20/20 |
+| Postgres Pro Enterprise 18 | да | проверяются отдельно |
 
 При `enable_temp_memory_catalog = on` часть проверок и наборов пропускается
 (раздел ["Тестирование"](testing.md)). Сам режим пока ненадежен и без fasttrun:
 временные таблицы теряются при откате подтранзакции (раздел
 ["Ограничения"](limitations.md#ограничения)). Включать его до исправления ядра
 не стоит.
+
+Postgres Pro Enterprise держит страницы временной таблицы в локальных буферах,
+пока они в них помещаются, и сам ведет размер и состояние ее файлов. Поэтому
+там `fasttruncate()` всегда очищает таблицу ядерным `RelationTruncate`, а
+параметр `fasttrun.zero_sinval_truncate` ничего не меняет. Пакет
+`postgrespro-ent-18-contrib` ставит собственный модуль `fasttrun` с теми же
+файлами `fasttrun.so` и `fasttrun.control`: `make install` их заменяет, а
+обновление пакета возвращает файлы вендора, поэтому после обновления пакетов
+fasttrun ставят заново. При `enable_temp_memory_catalog = on` Enterprise не
+ведет счетчики pgstat по временным таблицам, и статистика столбцов fasttrun в
+таком сеансе не кешируется.
