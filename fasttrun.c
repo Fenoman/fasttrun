@@ -161,7 +161,7 @@ static void fasttrun_track_schedule_assign_hook(const char *newval, void *extra)
 
 /* GUCs */
 static bool		fasttrun_auto_collect_stats = true;
-static int		fasttrun_sample_rows = 3000;
+static int		fasttrun_sample_rows = 10000;
 static double	fasttrun_stats_refresh_threshold = 0.2;
 static double	fasttrun_invalidate_threshold = 0.2;
 static bool		fasttrun_use_typanalyze = true;
@@ -268,17 +268,15 @@ _PG_init(void)
 							"for across all columns of the table (this is "
 							"normally 300 * default_statistics_target - i.e. "
 							"the same sample size that core ANALYZE would "
-							"use, with full MCV / histogram parity).  "
+							"use).  "
 							"0 = disable column-stats collection entirely.  "
-							"N > 0 = explicit fixed sample size.  Default 3000 "
-							"is a deliberate trade-off - lighter than core "
-							"ANALYZE in exchange for ~10x cheaper cold scan "
-							"on wide tables, sufficient for typical "
-							"distributions but may miss MCV entries with "
-							"frequency below ~3%.  Set to -1 for full "
-							"ANALYZE-quality plans on critical workloads.",
+							"N > 0 = explicit fixed sample size.  Default 10000 "
+							"limits column-statistics collection work.  "
+							"Fixed samples can miss rare values or underestimate "
+							"distinct counts in skewed data.  Set to -1 to "
+							"match the sample size requested by core ANALYZE.",
 							&fasttrun_sample_rows,
-							3000,
+							10000,
 							-1,
 							1000000,
 							PGC_USERSET,

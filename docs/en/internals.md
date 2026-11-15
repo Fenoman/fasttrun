@@ -125,14 +125,20 @@ plans took 11.4 s instead of 20.1 s when the plans have a generic plan, and
 15.5 s instead of 17.4 s without one. The absolute saving grows with the number
 of temporary tables and saved plans.
 
-A statistics rebuild after a refill (Apple M2 Max, PostgreSQL 16) takes 47 ms
+With `sample_rows=3000`, a measured statistics rebuild after a refill
+(Apple M2 Max, PostgreSQL 16) takes 47 ms
 instead of 267 ms on 100,000 rows of 300 columns with a leading text column,
 19 ms instead of 29 ms on 300,000 rows of 30 columns, and 39 ms instead of
 94 ms on 300,000 rows of 100 columns. The gain comes from deforming the sampled
 rows once per group of columns instead of once per column and from block
 sampling instead of a full scan. A group is bounded by a 16 MB array of sample
-values, and the tables above fit in one. Narrow tables below 3,000 pages see
-no difference.
+values, and the tables above fit in one at that sample size.
+
+With default settings and a full 10,000-row sample on a 64-bit server,
+a 16 MiB group holds up to
+186 columns. A 300-column table therefore needs two groups. When the exact row
+count is known, a rebuild uses a full scan for tables up to 10,000 pages and
+block sampling above that size.
 
 The own work of `fasttruncate()` takes milliseconds, but on ext4 with
 `data=ordered` removing the file of a large, freshly filled table can wait for

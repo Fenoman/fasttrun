@@ -653,8 +653,7 @@ fasttrun_compute_max_minrows(Relation rel)
 
 /*
  * Resolve fasttrun.sample_rows GUC into the actual reservoir size.
- *   < 0 -> autosize via fasttrun_compute_max_minrows() (full ANALYZE
- *         parity, follows default_statistics_target)
+ *   < 0 -> typanalyze sample size, or 3000 when use_typanalyze=off
  *   = 0 -> caller treats as "stats collection disabled"
  *   > 0 -> explicit override.
  */
@@ -663,8 +662,7 @@ fasttrun_effective_sample_target(Relation rel)
 {
 	if (fasttrun_sample_rows < 0)
 	{
-		/* Auto sizing via typanalyze minrows. If use_typanalyze=off,
-		 * don't call typanalyze callbacks -- fall back to default. */
+		/* Without typanalyze, use the fixed 3000-row fallback. */
 		if (!fasttrun_use_typanalyze)
 			return 3000;
 		return fasttrun_compute_max_minrows(rel);

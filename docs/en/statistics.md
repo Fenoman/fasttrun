@@ -60,7 +60,7 @@ By default, fasttrun uses the same mechanism as PostgreSQL to analyze ordinary
 columns. It calculates most-common values (MCVs), a histogram, correlation,
 null fraction, average width, and number of distinct values.
 
-The default sample size is 3,000 rows. This is a compromise between speed and
+The default sample size is 10,000 rows. This is a compromise between speed and
 quality. Regular `ANALYZE` often uses a substantially larger sample.
 For the closest match to regular `ANALYZE`, use:
 
@@ -268,7 +268,7 @@ The "user" context means that the parameter can be changed with `SET`. The
 | Parameter | Default | Range | Context | Purpose |
 |---|---:|---:|---|---|
 | `fasttrun.auto_collect_stats` | `on` | boolean | user | Collect column statistics inside `fasttrun_analyze()` |
-| `fasttrun.sample_rows` | `3000` | `-1..1000000` | user | `0` disables column collection. With `use_typanalyze=on`, `-1` uses the sample size requested by PostgreSQL, while with `off` it uses 3,000 rows |
+| `fasttrun.sample_rows` | `10000` | `-1..1000000` | user | `0` disables column collection. With `use_typanalyze=on`, `-1` uses the sample size requested by PostgreSQL, while with `off` it uses 3,000 rows |
 | `fasttrun.stats_refresh_threshold` | `0.2` | `0..1` | user | Tolerance up to which the planner uses column statistics between DML and the next analyze: for inserted and updated rows scaled by the fraction of distinct values, for deleted rows the threshold itself. It does not govern the rebuild: analyze rebuilds after any DML. `0` hides statistics after any DML |
 | `fasttrun.invalidate_threshold` | `0.2` | `0..1` | user | Allowed cumulative size change of the table and its indexes before local plans are invalidated |
 | `fasttrun.use_typanalyze` | `on` | boolean | user | Use PostgreSQL's built-in statistics handlers. `off` keeps only basic metrics |

@@ -205,11 +205,10 @@ BEGIN
     RAISE NOTICE 'after DELETE 500k: 1st=% ms (full refresh), 2nd=% ms (pure delta)',
                  round(t_after_d, 4), round(t_after_d_warm, 4);
 
-    /* Полный пересбор на 1M строк x 50 колонок после DELETE и после UPDATE
-     * занимает 180-330 мс на Apple M-серии и до 670 мс на сервере с 2 vCPU
-     * и PostgreSQL 18. 2000 мс - порог регрессии, а не SLO: строгий предел
-     * по медиане нескольких прогонов проверяет check_fasttrun_perf_smoke.sh
-     * (MAX_REFRESH_MS). */
+    /* Пересбор после DELETE и UPDATE на 1M строк x 50 колонок.
+     * Порог регрессии - 2000 мс. Строгий предел по медиане нескольких
+     * прогонов проверяет check_fasttrun_perf_smoke.sh (MAX_REFRESH_MS).
+     */
     IF t_after_d > 2000 THEN
         RAISE EXCEPTION 'full refresh after DELETE 500k too slow: % ms',
                         round(t_after_d, 4);
@@ -822,7 +821,7 @@ END;
 $$;
 -- ----------------------------------------------------------------------
 -- 14. Стоимость sample_rows = -1 (auto, full ANALYZE-quality) vs
---     default 3000 на одной и той же таблице.  Auto использует
+--     фиксированной выборки 3000 на одной и той же таблице.  Auto использует
 --     std_typanalyze->minrows = 300 * default_statistics_target,
 --     при default DST=100 это ~30000 - в 10x больше.  Сравниваем
 --     cost cold scan и проверяем что auto не катастрофически
@@ -846,7 +845,7 @@ BEGIN
              'p_' || g
       FROM generate_series(1, 100000) g;
 
-    -- Прогон A: sample_rows = 3000 (default)
+    -- Прогон A: sample_rows = 3000 (fixed)
     SET LOCAL fasttrun.sample_rows = 3000;
     PERFORM fasttruncate('t_smpl_perf');
     INSERT INTO t_smpl_perf

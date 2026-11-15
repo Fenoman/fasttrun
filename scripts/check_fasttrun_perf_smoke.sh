@@ -41,9 +41,9 @@ MAX_TRUNC_WIDE_MS=${MAX_TRUNC_WIDE_MS:-500}
 # MAX_REFRESH_MS -- предел полного пересбора статистики fasttrun_analyze после
 # DELETE и после UPDATE 500 тыс. строк таблицы 1 млн строк x 50 колонок, шаги
 # sql/fasttrun_bench.sql. Бенч идет REFRESH_RUNS раз: с медианой каждого шага
-# сравнивается предел, с каждым отдельным замером - удвоенный предел. На сервере
-# с 2 vCPU медианы по PostgreSQL 16/17/18 лежат в 260-540 мс, а отдельные замеры
-# доходят до 670 мс. В самом бенче для этих шагов стоит мягкий порог 2000 мс.
+# сравнивается предел, с каждым отдельным замером - удвоенный предел.
+# Выборка соответствует дефолту sample_rows=10000. В самом бенче для этих
+# шагов стоит мягкий порог 2000 мс.
 MAX_REFRESH_MS=${MAX_REFRESH_MS:-1000}
 REFRESH_RUNS=${REFRESH_RUNS:-5}
 BENCH_SQL=${BENCH_SQL:-"$(cd "$(dirname "$0")" && pwd)/../sql/fasttrun_bench.sql"}
@@ -642,7 +642,7 @@ esac
 sed 's/^SET client_min_messages = WARNING;$/SET client_min_messages = NOTICE;\
 SET fasttrun.stats_refresh_threshold = 0.2;\
 SET fasttrun.auto_collect_stats = on;\
-SET fasttrun.sample_rows = 3000;\
+SET fasttrun.sample_rows = 10000;\
 SET fasttrun.use_typanalyze = on;\
 SET fasttrun.max_analyze_pages = 100000;\
 SET fasttrun.max_stats_memory = 0;/' \
