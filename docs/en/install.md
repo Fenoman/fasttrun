@@ -36,7 +36,7 @@ FROM pg_extension
 WHERE extname = 'fasttrun';
 ```
 
-The default version is `2.7.0`.
+The default version is `2.7.1`.
 
 Instead of a plain `CREATE EXTENSION`, you can install the extension into a
 dedicated schema. Untrusted roles must not be allowed to create objects in the
@@ -191,12 +191,16 @@ After startup or after opening a new connection, run the following in every
 database as the extension owner or a superuser:
 
 ```sql
-ALTER EXTENSION fasttrun UPDATE TO '2.7.0';
+ALTER EXTENSION fasttrun UPDATE TO '2.7.1';
 ```
 
 With physical replication, install the files on standby nodes too, but run
 `ALTER EXTENSION` only on the writable primary. The catalog changes reach the
 standbys through normal replication.
+
+The 2.7.0 -> 2.7.1 upgrade leaves SQL objects unchanged and preserves function
+OIDs and privileges. Replace the C library and restart PostgreSQL when using
+shared preload, or open new connections otherwise, before running the update.
 
 This is important for an upgrade from 2.3.4 to 2.4.0: the SQL migration adds a
 function that does not exist in the old C library.
