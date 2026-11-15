@@ -107,8 +107,7 @@ DROP TABLE obs_c;
 SELECT count(*) AS dropped_table_rows
   FROM fasttrun_cached_tables() WHERE relid = :obs_c_oid;
 
--- Образец, снятый с прежнего файла отношения, планировщик не берет:
--- ALTER TYPE через родителя наследования переписывает потомка.
+-- Recursive ALTER TYPE evicts descendant samples before replacing the file.
 CREATE TEMP TABLE obs_parent (id int);
 CREATE TEMP TABLE obs_child () INHERITS (obs_parent);
 INSERT INTO obs_child VALUES (1);

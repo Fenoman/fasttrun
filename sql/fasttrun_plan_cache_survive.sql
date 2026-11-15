@@ -1132,6 +1132,316 @@ RESET fasttrun.stats_refresh_threshold;
 RESET plan_cache_mode;
 DROP TABLE t_dml_plan_abort;
 
+-- Inlining after the parse-tree walk still records rollback dependencies.
+CREATE TEMP TABLE t_inline_abort(k int);
+INSERT INTO t_inline_abort SELECT n % 10 FROM generate_series(1, 10000) n;
+DO $$BEGIN PERFORM fasttrun_analyze('t_inline_abort'); END$$;
+CREATE FUNCTION pg_temp.inline_abort_rows(int) RETURNS SETOF t_inline_abort
+LANGUAGE sql STABLE AS 'SELECT * FROM t_inline_abort WHERE k = $1';
+SET plan_cache_mode = force_generic_plan;
+PREPARE q_inline_abort(int) AS SELECT * FROM pg_temp.inline_abort_rows($1);
+BEGIN;
+SAVEPOINT inline_write;
+UPDATE t_inline_abort SET k = (k + 1) % 10;
+DO $$DECLARE p json;
+BEGIN
+  EXECUTE 'EXPLAIN (FORMAT JSON) EXECUTE q_inline_abort(1)' INTO p;
+END$$;
+ROLLBACK TO SAVEPOINT inline_write;
+PREPARE q_inline_fresh(int) AS SELECT * FROM pg_temp.inline_abort_rows($1);
+DO $$DECLARE cached json; fresh json;
+BEGIN
+  EXECUTE 'EXPLAIN (FORMAT JSON) EXECUTE q_inline_abort(1)' INTO cached;
+  EXECUTE 'EXPLAIN (FORMAT JSON) EXECUTE q_inline_fresh(1)' INTO fresh;
+  IF (cached->0->'Plan'->>'Plan Rows')::int IS DISTINCT FROM
+     (fresh->0->'Plan'->>'Plan Rows')::int OR
+     (fresh->0->'Plan'->>'Plan Rows')::int < 500 THEN
+    RAISE EXCEPTION 'inlined cached plan survives rollback with hidden statistics';
+  END IF;
+END$$;
+ROLLBACK;
+DEALLOCATE q_inline_abort;
+DEALLOCATE q_inline_fresh;
+DROP FUNCTION pg_temp.inline_abort_rows(int);
+DROP TABLE t_inline_abort;
+
+-- Width-only inlined plans also depend on the state restored by rollback.
+CREATE TEMP TABLE t_inline_width(id int, payload text);
+INSERT INTO t_inline_width SELECT n, repeat('a', 100) FROM generate_series(1, 1000) n;
+DO $$BEGIN PERFORM fasttrun_analyze('t_inline_width'); END$$;
+CREATE FUNCTION pg_temp.inline_width_rows() RETURNS SETOF t_inline_width
+LANGUAGE sql STABLE AS 'SELECT * FROM t_inline_width';
+PREPARE q_inline_width AS SELECT * FROM pg_temp.inline_width_rows();
+BEGIN;
+SAVEPOINT inline_width_write;
+UPDATE t_inline_width SET payload = repeat('b', 2000);
+DO $$DECLARE p json;
+BEGIN
+  EXECUTE 'EXPLAIN (FORMAT JSON) EXECUTE q_inline_width' INTO p;
+END$$;
+ROLLBACK TO SAVEPOINT inline_width_write;
+PREPARE q_inline_width_fresh AS SELECT * FROM pg_temp.inline_width_rows();
+DO $$DECLARE cached json; fresh json;
+BEGIN
+  EXECUTE 'EXPLAIN (FORMAT JSON) EXECUTE q_inline_width' INTO cached;
+  EXECUTE 'EXPLAIN (FORMAT JSON) EXECUTE q_inline_width_fresh' INTO fresh;
+  IF cached->0->'Plan'->>'Plan Width' IS DISTINCT FROM fresh->0->'Plan'->>'Plan Width' THEN
+    RAISE EXCEPTION 'inlined cached plan retains width hidden by rolled-back DML';
+  END IF;
+END$$;
+ROLLBACK;
+DEALLOCATE q_inline_width;
+DEALLOCATE q_inline_width_fresh;
+DROP FUNCTION pg_temp.inline_width_rows();
+DROP TABLE t_inline_width;
+
+-- Neutral expression statistics do not require a cached index owner entry.
+CREATE TEMP TABLE t_inline_expr(id int, payload text);
+CREATE INDEX t_inline_expr_idx ON t_inline_expr(lower(payload));
+INSERT INTO t_inline_expr SELECT n, 'A' FROM generate_series(1, 10000) n;
+ANALYZE t_inline_expr;
+UPDATE t_inline_expr SET payload = 'b_' || id;
+SET fasttrun.sample_rows = 0;
+DO $$BEGIN PERFORM fasttrun_collect_stats('t_inline_expr'); END$$;
+CREATE FUNCTION pg_temp.inline_expr_rows() RETURNS SETOF t_inline_expr
+LANGUAGE sql STABLE AS $$SELECT * FROM t_inline_expr WHERE lower(payload) = 'a'$$;
+DO $$DECLARE direct json; inlined json;
+BEGIN
+  EXECUTE 'EXPLAIN (FORMAT JSON) SELECT * FROM t_inline_expr WHERE lower(payload) = ''a''' INTO direct;
+  EXECUTE 'EXPLAIN (FORMAT JSON) SELECT * FROM pg_temp.inline_expr_rows()' INTO inlined;
+  IF (direct->0->'Plan'->>'Plan Rows')::int IS DISTINCT FROM
+     (inlined->0->'Plan'->>'Plan Rows')::int THEN
+    RAISE EXCEPTION 'inlined expression reads stale core statistics';
+  END IF;
+END$$;
+DROP FUNCTION pg_temp.inline_expr_rows();
+DROP TABLE t_inline_expr;
+RESET fasttrun.sample_rows;
+
+-- Temp inheritance children are introduced after the initial query walk.
+CREATE TABLE public.ft_inh_plan_parent(k int);
+CREATE TEMP TABLE ft_inh_abort() INHERITS (public.ft_inh_plan_parent);
+INSERT INTO ft_inh_abort SELECT n % 10 FROM generate_series(1, 10000) n;
+DO $$BEGIN PERFORM fasttrun_analyze('ft_inh_abort'); END$$;
+SET fasttrun.stats_refresh_threshold = 0.01;
+SET plan_cache_mode = force_generic_plan;
+PREPARE q_inh_abort(int) AS SELECT * FROM public.ft_inh_plan_parent WHERE k = $1;
+BEGIN;
+SAVEPOINT inh_write;
+UPDATE ft_inh_abort SET k = (k + 1) % 10;
+DO $$DECLARE ln text; hidden_rows int;
+BEGIN
+  FOR ln IN EXPLAIN EXECUTE q_inh_abort(1) LOOP
+    IF ln LIKE '%on ft_inh_abort %' THEN
+      hidden_rows := substring(ln FROM 'rows=(\d+)')::int;
+      EXIT;
+    END IF;
+  END LOOP;
+  IF hidden_rows IS NULL OR hidden_rows > 100 THEN
+    RAISE EXCEPTION 'inheritance DML did not hide child statistics: rows=%', hidden_rows;
+  END IF;
+END$$;
+ROLLBACK TO SAVEPOINT inh_write;
+PREPARE q_inh_fresh(int) AS SELECT * FROM public.ft_inh_plan_parent WHERE k = $1;
+DO $$DECLARE ln text; cached_rows int; fresh_rows int;
+BEGIN
+  FOR ln IN EXPLAIN EXECUTE q_inh_abort(1) LOOP
+    IF ln LIKE '%on ft_inh_abort %' THEN
+      cached_rows := substring(ln FROM 'rows=(\d+)')::int;
+      EXIT;
+    END IF;
+  END LOOP;
+  FOR ln IN EXPLAIN EXECUTE q_inh_fresh(1) LOOP
+    IF ln LIKE '%on ft_inh_abort %' THEN
+      fresh_rows := substring(ln FROM 'rows=(\d+)')::int;
+      EXIT;
+    END IF;
+  END LOOP;
+  IF cached_rows IS NULL OR fresh_rows IS NULL OR fresh_rows < 500 OR
+     cached_rows IS DISTINCT FROM fresh_rows THEN
+    RAISE EXCEPTION 'inheritance plan retains hidden child statistics after rollback: cached=%, fresh=%', cached_rows, fresh_rows;
+  END IF;
+END$$;
+ROLLBACK;
+DEALLOCATE q_inh_abort;
+DEALLOCATE q_inh_fresh;
+DROP TABLE ft_inh_abort;
+DROP TABLE public.ft_inh_plan_parent;
+RESET fasttrun.stats_refresh_threshold;
+RESET plan_cache_mode;
+
+-- A late inheritance child also hides neutral expression statistics.
+CREATE TABLE public.ft_inh_expr_parent(id int, payload text);
+CREATE TEMP TABLE ft_inh_expr() INHERITS (public.ft_inh_expr_parent);
+CREATE INDEX ft_inh_expr_idx ON ft_inh_expr(lower(payload));
+INSERT INTO ft_inh_expr SELECT n, 'A' FROM generate_series(1, 10000) n;
+ANALYZE ft_inh_expr;
+UPDATE ft_inh_expr SET payload = 'b_' || id;
+SET fasttrun.sample_rows = 0;
+DO $$BEGIN PERFORM fasttrun_collect_stats('ft_inh_expr'); END$$;
+DO $$DECLARE ln text; direct_rows int; inherited_rows int;
+BEGIN
+  FOR ln IN EXPLAIN SELECT * FROM ft_inh_expr WHERE lower(payload) = 'a' LOOP
+    IF ln LIKE '%on ft_inh_expr %' THEN
+      direct_rows := substring(ln FROM 'rows=(\d+)')::int;
+      EXIT;
+    END IF;
+  END LOOP;
+  FOR ln IN EXPLAIN SELECT * FROM public.ft_inh_expr_parent WHERE lower(payload) = 'a' LOOP
+    IF ln LIKE '%on ft_inh_expr %' THEN
+      inherited_rows := substring(ln FROM 'rows=(\d+)')::int;
+      EXIT;
+    END IF;
+  END LOOP;
+  IF direct_rows IS NULL OR direct_rows >= 1000 OR
+     inherited_rows IS DISTINCT FROM direct_rows THEN
+    RAISE EXCEPTION 'inheritance expression reads stale core statistics: direct=%, inherited=%', direct_rows, inherited_rows;
+  END IF;
+END$$;
+DROP TABLE ft_inh_expr;
+DROP TABLE public.ft_inh_expr_parent;
+RESET fasttrun.sample_rows;
+
+-- Physical pages affect scan cost even when all added rows are rolled back.
+CREATE TEMP TABLE t_plan_bloat(id int NOT NULL, pad text);
+CREATE INDEX t_plan_bloat_idx ON t_plan_bloat(id) WHERE id < 100;
+INSERT INTO t_plan_bloat SELECT n, repeat('a', 100) FROM generate_series(1, 30) n;
+SET fasttrun.auto_collect_stats = off;
+DO $$BEGIN PERFORM fasttrun_analyze('t_plan_bloat'); END$$;
+PREPARE q_plan_bloat(int) AS SELECT pad FROM t_plan_bloat WHERE id = $1 AND id < 100;
+DO $$DECLARE p json;
+BEGIN
+  EXECUTE 'EXPLAIN (FORMAT JSON) EXECUTE q_plan_bloat(5)' INTO p;
+  IF p->0->'Plan'->>'Node Type' <> 'Seq Scan' THEN
+    RAISE EXCEPTION 'scan-cost fixture has no small-heap sequential plan';
+  END IF;
+END$$;
+BEGIN;
+SAVEPOINT bloat_write;
+INSERT INTO t_plan_bloat SELECT n, repeat('x', 500) FROM generate_series(1000, 100000) n;
+ROLLBACK TO SAVEPOINT bloat_write;
+COMMIT;
+DO $$BEGIN PERFORM fasttrun_analyze('t_plan_bloat'); END$$;
+DO $$DECLARE p json; pages int;
+BEGIN
+  EXECUTE 'EXPLAIN (ANALYZE, BUFFERS, TIMING OFF, FORMAT JSON) EXECUTE q_plan_bloat(5)' INTO p;
+  pages := coalesce((p->0->'Plan'->>'Local Hit Blocks')::int, 0) +
+           coalesce((p->0->'Plan'->>'Local Read Blocks')::int, 0);
+  IF p->0->'Plan'->>'Node Type' = 'Seq Scan' OR pages > 20 THEN
+    RAISE EXCEPTION 'cached plan ignores physical scan cost: % pages', pages;
+  END IF;
+END$$;
+DEALLOCATE q_plan_bloat;
+DROP TABLE t_plan_bloat;
+RESET fasttrun.auto_collect_stats;
+RESET plan_cache_mode;
+
+-- An empty generic plan must not survive a same-size refill after COMMIT.
+SET plan_cache_mode=force_generic_plan;
+SET fasttrun.auto_collect_stats=off;
+CREATE TEMP TABLE t_commit_empty(id int) ON COMMIT DELETE ROWS;
+CREATE INDEX t_commit_empty_idx ON t_commit_empty(id);
+BEGIN;
+INSERT INTO t_commit_empty SELECT g FROM generate_series(1,10000) g;
+DO $$BEGIN PERFORM fasttrun_analyze('t_commit_empty'); END$$;
+COMMIT;
+BEGIN;
+PREPARE q_commit_empty AS SELECT * FROM t_commit_empty;
+DO $$DECLARE p json;
+BEGIN
+ EXECUTE 'EXPLAIN (FORMAT JSON) EXECUTE q_commit_empty' INTO p;
+ IF (p->0->'Plan'->>'Plan Rows')::int <> 1 THEN
+  RAISE EXCEPTION 'empty-plan fixture is not empty: %',p;
+ END IF;
+END$$;
+INSERT INTO t_commit_empty SELECT g FROM generate_series(1,10000) g;
+DO $$BEGIN PERFORM fasttrun_analyze('t_commit_empty'); END$$;
+DO $$DECLARE p json;
+BEGIN
+ EXECUTE 'EXPLAIN (FORMAT JSON) EXECUTE q_commit_empty' INTO p;
+ IF (p->0->'Plan'->>'Plan Rows')::int <> 10000 THEN
+  RAISE EXCEPTION 'refill retained empty prepared plan: %',p;
+ END IF;
+END$$;
+DO $$DECLARE before_count bigint; after_count bigint;
+BEGIN
+ SELECT sum(value) INTO before_count FROM fasttrun_counters() WHERE counter='plan_invalidations';
+ FOR i IN 1..1000 LOOP PERFORM fasttrun_analyze('t_commit_empty'); END LOOP;
+ SELECT sum(value) INTO after_count FROM fasttrun_counters() WHERE counter='plan_invalidations';
+ IF after_count IS DISTINCT FROM before_count THEN
+  RAISE EXCEPTION 'unchanged analyze invalidates plans: % -> %',before_count,after_count;
+ END IF;
+END$$;
+DEALLOCATE q_commit_empty;
+COMMIT;
+BEGIN;
+DO $$BEGIN PERFORM fasttrun_analyze('t_commit_empty'); END$$;
+DO $$DECLARE before_count bigint; after_count bigint;
+BEGIN
+ SELECT sum(value) INTO before_count FROM fasttrun_counters() WHERE counter='plan_invalidations';
+ FOR i IN 1..1000 LOOP PERFORM fasttrun_analyze('t_commit_empty'); END LOOP;
+ SELECT sum(value) INTO after_count FROM fasttrun_counters() WHERE counter='plan_invalidations';
+ IF after_count IS DISTINCT FROM before_count THEN
+  RAISE EXCEPTION 'unchanged analyze invalidates plans: % -> %',before_count,after_count;
+ END IF;
+END$$;
+COMMIT;
+DROP TABLE t_commit_empty;
+-- The heap publication alone must invalidate a plan made for the empty fill.
+CREATE TEMP TABLE t_heap_commit_empty(id int) ON COMMIT DELETE ROWS;
+BEGIN;
+INSERT INTO t_heap_commit_empty SELECT generate_series(1,10000);
+DO $$BEGIN PERFORM fasttrun_analyze('t_heap_commit_empty'); END$$;
+COMMIT;
+BEGIN;
+PREPARE q_heap_commit_empty AS SELECT * FROM t_heap_commit_empty;
+DO $$DECLARE p json;
+BEGIN
+ EXECUTE 'EXPLAIN (FORMAT JSON) EXECUTE q_heap_commit_empty' INTO p;
+ IF (p->0->'Plan'->>'Plan Rows')::int <> 1 THEN
+  RAISE EXCEPTION 'heap-only empty-plan fixture is not empty: %',p;
+ END IF;
+END$$;
+INSERT INTO t_heap_commit_empty SELECT generate_series(1,10000);
+DO $$BEGIN PERFORM fasttrun_analyze('t_heap_commit_empty'); END$$;
+DO $$DECLARE p json;
+BEGIN
+ EXECUTE 'EXPLAIN (ANALYZE,FORMAT JSON) EXECUTE q_heap_commit_empty' INTO p;
+ IF (p->0->'Plan'->>'Plan Rows')::int <> 10000 OR
+    (p->0->'Plan'->>'Actual Rows')::numeric <> 10000 THEN
+  RAISE EXCEPTION 'heap refill retained empty prepared plan: %',p;
+ END IF;
+END$$;
+DEALLOCATE q_heap_commit_empty;
+COMMIT;
+DROP TABLE t_heap_commit_empty;
+-- Collection undo must retain an empty state adopted after COMMIT.
+CREATE TEMP TABLE h1_guard(id int) ON COMMIT DELETE ROWS;
+BEGIN;
+INSERT INTO h1_guard SELECT generate_series(1,100);
+DO $$BEGIN PERFORM fasttrun_analyze('h1_guard'); END$$;
+COMMIT;
+BEGIN;
+SAVEPOINT empty_collect;
+DO $$BEGIN PERFORM fasttrun_collect_stats('h1_guard'); END$$;
+INSERT INTO h1_guard VALUES(1);
+ROLLBACK TO empty_collect;
+DO $$DECLARE p json;
+BEGIN
+ IF (SELECT reltuples FROM fasttrun_relstats('h1_guard')) IS DISTINCT FROM 0::real THEN
+  RAISE EXCEPTION 'empty collection rollback restored pre-COMMIT cardinality';
+ END IF;
+ PERFORM fasttrun_analyze('h1_guard');
+ EXECUTE 'EXPLAIN (ANALYZE,FORMAT JSON) SELECT * FROM h1_guard' INTO p;
+ IF (p->0->'Plan'->>'Plan Rows')::int<>1 OR (p->0->'Plan'->>'Actual Rows')::numeric<>0 THEN
+  RAISE EXCEPTION 'analyze retained pre-COMMIT cardinality after collection rollback: %',p;
+ END IF;
+END$$;
+COMMIT;
+DROP TABLE h1_guard;
+RESET fasttrun.auto_collect_stats;
+RESET plan_cache_mode;
+
 DROP FUNCTION f_inner();
 DROP TABLE t_rsd_details;
 DROP TABLE t_balance_out;

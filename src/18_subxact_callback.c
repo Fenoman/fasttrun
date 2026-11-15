@@ -92,6 +92,10 @@ fasttrun_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 		fasttrun_test_subxact_visited++;
 #endif
 
+		if ((xentry->flags & FASTTRUN_TOUCH_POISON_FILE) != 0)
+			fasttrun_poison_file_subxact_end(relid, mySubid, parentSubid,
+											   event == SUBXACT_EVENT_ABORT_SUB);
+
 		/* Abort removes a newly created relation without an OAT_DROP hook.
 		 * Its still-present empty files must not override this lifetime. */
 		if (event == SUBXACT_EVENT_ABORT_SUB &&
@@ -281,53 +285,12 @@ fasttrun_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 				{
 					Oid		plan_relid;
 					bool	truncated = (xentry->flags & FASTTRUN_TOUCH_TRUNCATED) != 0;
+					bool	emptied;
 
-					if (fasttrun_cache_make_empty_storage_authoritative(aentry,
-																		truncated,
-																		&plan_relid))
-					{
-						/*
-						 * fasttruncate() is non-transactional for local
-						 * storage: after ROLLBACK TO SAVEPOINT the rows are
-						 * still gone.  Do not restore the old relstats undo
-						 * chain.  Make the observed empty storage the new
-						 * outer-subxact truth instead.
-						 */
-						fasttrun_analyze_free_undo(aentry);
-
-						aentry->state.has_stats_baseline = false;
-						aentry->state.stats_baseline_inserted = 0;
-						aentry->state.stats_baseline_updated = 0;
-						aentry->state.stats_baseline_deleted = 0;
-						aentry->state.stats_baseline_truncdropped = false;
-						fasttrun_cache_reset_partial_scan_anchor(aentry);
-
-						if (OidIsValid(plan_relid))
-							fasttrun_stats_force_neutral_relid(plan_relid);
-						aentry->state.last_inval_valid = false;
-						goto finish_entry;
-					}
-
-					if (truncated)
-					{
-						/*
-						 * Every saved state describes rows the reset
-						 * destroyed, but the storage cannot be probed: a
-						 * failed reset cleared the publication (the table
-						 * stays blocked until it is repaired) or DDL retired
-						 * the entry.  Keep nothing, so the next analyze
-						 * scans.
-						 */
-						fasttrun_analyze_free_undo(aentry);
-						aentry->state.has_relstats = false;
-						aentry->state.has_delta_state = false;
-						aentry->state.has_stats_baseline = false;
-						aentry->state.last_inval_valid = false;
-						fasttrun_cache_reset_partial_scan_anchor(aentry);
-						aentry->state_subid = InvalidSubTransactionId;
-						fasttrun_stats_force_neutral_relid(xentry->root_relid);
-					}
-					else if (aentry->undo != NULL)
+					emptied = fasttrun_cache_make_empty_storage_authoritative(aentry,
+																			truncated, &plan_relid);
+					/* Reset-file snapshots are already neutral. Other files keep undo. */
+					if (aentry->undo != NULL)
 					{
 						FasttrunAnalyzeUndo *popped = aentry->undo;
 
@@ -341,6 +304,8 @@ fasttrun_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 						restored_dead = popped->aborted_pages;
 						pfree(popped);
 					}
+					else if (emptied)
+						aentry->state_subid = InvalidSubTransactionId;
 					else
 					{
 						(void) hash_search(fasttrun_analyze_cache, &relid,

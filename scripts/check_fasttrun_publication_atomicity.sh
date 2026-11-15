@@ -275,6 +275,40 @@ BEGIN
 END
 $case$;
 
+-- A failed reset of a new file must preserve the outer file's saved samples.
+CREATE TEMP TABLE ft_column_outer(a int,b int);
+INSERT INTO ft_column_outer SELECT 0,0 FROM generate_series(1,10000);
+SELECT fasttrun_analyze('ft_column_outer');
+BEGIN;
+SAVEPOINT outer_file;
+TRUNCATE ft_column_outer;
+SAVEPOINT failed_reset;
+DO $$DECLARE caught boolean:=false;
+BEGIN
+ PERFORM set_config('fasttrun.test_failpoint','after_main_heap',true);
+ BEGIN
+  PERFORM fasttruncate('ft_column_outer');
+ EXCEPTION WHEN SQLSTATE '55000' THEN
+  IF SQLERRM<>'fasttrun test failpoint: after_main_heap' THEN RAISE; END IF;
+  caught:=true;
+ END;
+ PERFORM set_config('fasttrun.test_failpoint','',true);
+ IF NOT caught THEN RAISE EXCEPTION 'outer-file reset failpoint did not fire'; END IF;
+END$$;
+ROLLBACK TO failed_reset;
+ROLLBACK TO outer_file;
+DO $$DECLARE p json;
+BEGIN
+ IF (SELECT count(*) FROM fasttrun_inspect_stats('ft_column_outer'))<>2 THEN
+  RAISE EXCEPTION 'failed reset discarded outer-file samples';
+ END IF;
+ EXECUTE 'EXPLAIN (ANALYZE,FORMAT JSON) SELECT * FROM ft_column_outer WHERE a=0' INTO p;
+ IF (p->0->'Plan'->>'Plan Rows')::int<>10000 OR (p->0->'Plan'->>'Actual Rows')::numeric<>10000 THEN
+  RAISE EXCEPTION 'failed reset damaged outer-file statistics: %',p;
+ END IF;
+END$$;
+COMMIT;
+DROP TABLE ft_column_outer;
 SELECT 'PUBLICATION_OK column';
 SQL
 
@@ -395,6 +429,59 @@ $case$;
 SELECT 'PUBLICATION_OK miss';
 SQL
 
+cat >"$WORKDIR/cancel.sql" <<'SQL'
+\set ON_ERROR_STOP on
+SET fasttrun.use_typanalyze=off;
+SET fasttrun.sample_rows=50000;
+SELECT format('CREATE TEMP TABLE t_cancel_collect AS SELECT %s FROM generate_series(1,50000) g',string_agg(format('((g::bigint * %s) %% 100003)::int AS c%s',n*7919,n),',')) FROM generate_series(1,128) n \gexec
+CREATE TEMP TABLE t_cancel_budget(elapsed double precision);
+DO $$DECLARE started timestamptz:=clock_timestamp();
+BEGIN
+ PERFORM fasttrun_collect_stats('t_cancel_collect');
+ INSERT INTO t_cancel_budget VALUES(extract(epoch FROM clock_timestamp()-started));
+END$$;
+CREATE TEMP TABLE t_cancel_saved AS
+SELECT staattnum,to_jsonb(s) AS sample FROM fasttrun_inspect_stats('t_cancel_collect') s;
+BEGIN;
+-- Keep changed data in the parent transaction while only collection is canceled.
+UPDATE t_cancel_collect SET c1=NULL WHERE c1<200;
+SET statement_timeout='50ms';
+DO $$DECLARE started timestamptz:=clock_timestamp(); canceled boolean:=false; elapsed double precision; budget double precision;
+BEGIN
+ SELECT greatest(0.3,b.elapsed*0.5) INTO budget FROM t_cancel_budget b;
+ BEGIN
+  PERFORM fasttrun_collect_stats('t_cancel_collect');
+ EXCEPTION WHEN query_canceled THEN canceled:=true;
+ END;
+ elapsed:=extract(epoch FROM clock_timestamp()-started);
+ IF NOT canceled OR elapsed>budget THEN
+  RAISE EXCEPTION 'collection cancellation delayed: canceled=%, elapsed=%, budget=%',canceled,elapsed,budget;
+ END IF;
+END$$;
+RESET statement_timeout;
+DO $$BEGIN
+ IF (SELECT count(*) FROM fasttrun_inspect_stats('t_cancel_collect'))<>128 THEN
+  RAISE EXCEPTION 'canceled collection did not restore the previous sample';
+ END IF;
+ IF EXISTS (
+  SELECT 1 FROM fasttrun_inspect_stats('t_cancel_collect') s
+  FULL JOIN t_cancel_saved old USING(staattnum)
+  WHERE to_jsonb(s) IS DISTINCT FROM old.sample
+ ) THEN
+  RAISE EXCEPTION 'canceled collection changed stored sample contents';
+ END IF;
+ PERFORM fasttrun_collect_stats('t_cancel_collect');
+ IF (SELECT stanullfrac FROM fasttrun_inspect_stats('t_cancel_collect') WHERE staattnum=1)<=0 THEN
+  RAISE EXCEPTION 'cancellation fixture does not distinguish old and new samples';
+ END IF;
+END$$;
+ROLLBACK;
+DROP TABLE t_cancel_collect,t_cancel_budget,t_cancel_saved;
+RESET fasttrun.use_typanalyze;
+RESET fasttrun.sample_rows;
+SELECT 'PUBLICATION_OK cancel';
+SQL
+
 run_case()
 {
 	local name=$1
@@ -422,8 +509,9 @@ case "$CASE_NAME" in
 		run_case column
 		run_case policy
 		run_case miss
+		run_case cancel
 		;;
-	reserve|index|column|policy|miss)
+	reserve|index|column|policy|miss|cancel)
 		run_case "$CASE_NAME"
 		;;
 	*)

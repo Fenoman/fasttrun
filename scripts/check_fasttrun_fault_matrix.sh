@@ -37,10 +37,10 @@ cleanup()
 }
 trap cleanup EXIT
 
-mkdir -p "$SOCKET_DIR"
+mkdir -p "$SOCKET_DIR" "$WORKDIR/tablespace"
 if [ -n "$PG_RUN_AS" ]; then
 	command -v runuser >/dev/null 2>&1 || { echo "missing runuser" >&2; exit 1; }
-	chown "$PG_RUN_AS" "$WORKDIR" "$SOCKET_DIR"
+	chown "$PG_RUN_AS" "$WORKDIR" "$SOCKET_DIR" "$WORKDIR/tablespace"
 fi
 PORT=${PGPORT:-$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')}
 
@@ -1162,13 +1162,248 @@ SET fasttrun.test_failpoint = '';
 BEGIN;
 TRUNCATE ft_poison_inh_parent;
 SELECT 'POISON_LATE_TRUNCATED ' || pg_temp.ft_poison_late_probe('SELECT count(*) FROM ft_poison_inh_child');
+SELECT 'POISON_LATE_RETRY ' || pg_temp.ft_poison_late_probe('SELECT fasttruncate(''ft_poison_inh_child'')');
 ROLLBACK;
 SELECT 'POISON_LATE_ROLLBACK ' || pg_temp.ft_poison_late_probe('SELECT count(*) FROM ft_poison_inh_child');
+BEGIN;
+SAVEPOINT old_file;
+TRUNCATE ft_poison_inh_parent;
+SAVEPOINT new_file;
+SELECT 'POISON_LATE_SUBRETRY ' || pg_temp.ft_poison_late_probe('SELECT fasttruncate(''ft_poison_inh_child'')');
+ROLLBACK TO SAVEPOINT new_file;
+ROLLBACK TO SAVEPOINT old_file;
+SELECT 'POISON_LATE_SUBROLLBACK ' || pg_temp.ft_poison_late_probe('SELECT count(*) FROM ft_poison_inh_child');
+COMMIT;
+BEGIN;
+TRUNCATE ft_poison_inh_parent;
+SELECT 'POISON_LATE_COMMIT_RETRY ' || pg_temp.ft_poison_late_probe('SELECT fasttruncate(''ft_poison_inh_child'')');
+COMMIT;
 SELECT fasttruncate('ft_poison_inh_child');
+SELECT 'POISON_LATE_COMMITTED ' || count(*) FROM fasttrun_blocked_tables()
+WHERE relname = 'ft_poison_inh_child';
 SELECT 'POISON_LATE_REPAIRED ' || pg_temp.ft_poison_late_probe('SELECT count(*) FROM ft_poison_inh_child');
+
+-- An aborted replacement destroys its damaged file and restores a clean one.
+BEGIN;
+TRUNCATE ft_poison_inh_parent;
+SET LOCAL fasttrun.test_failpoint = 'after_main_heap';
+DO $case$
+BEGIN
+  PERFORM fasttruncate('ft_poison_inh_child');
+EXCEPTION WHEN OTHERS THEN
+  NULL;
+END
+$case$;
+ROLLBACK;
+SELECT fasttruncate('ft_poison_inh_child');
+SELECT 'POISON_LATE_ABORT_FILE ' || count(*) FROM fasttrun_blocked_tables()
+WHERE relname = 'ft_poison_inh_child';
+BEGIN;
+SAVEPOINT clean_file;
+TRUNCATE ft_poison_inh_parent;
+SET LOCAL fasttrun.test_failpoint = 'after_main_heap';
+DO $case$
+BEGIN
+  PERFORM fasttruncate('ft_poison_inh_child');
+EXCEPTION WHEN OTHERS THEN
+  NULL;
+END
+$case$;
+ROLLBACK TO SAVEPOINT clean_file;
+SELECT fasttruncate('ft_poison_inh_child');
+SELECT 'POISON_LATE_SUBABORT_FILE ' || count(*) FROM fasttrun_blocked_tables()
+WHERE relname = 'ft_poison_inh_child';
+COMMIT;
+
+-- A restored outer uncommitted file is healthy after nested file changes.
+CREATE FUNCTION pg_temp.ft_poison_fail(relname text) RETURNS void
+LANGUAGE plpgsql AS $fn$
+DECLARE caught boolean := false;
+BEGIN
+  PERFORM set_config('fasttrun.test_failpoint', 'after_main_heap', true);
+  BEGIN
+    PERFORM fasttruncate(relname);
+  EXCEPTION WHEN SQLSTATE '55000' THEN
+    IF SQLERRM <> 'fasttrun test failpoint: after_main_heap' THEN
+      RAISE;
+    END IF;
+    caught := true;
+  END;
+  PERFORM set_config('fasttrun.test_failpoint', '', true);
+  IF NOT caught THEN
+    RAISE EXCEPTION 'truncate failpoint did not fire';
+  END IF;
+END
+$fn$;
+BEGIN;
+CREATE TEMP TABLE ft_poison_outer_file(id int);
+INSERT INTO ft_poison_outer_file VALUES (71);
+SAVEPOINT replacement;
+TRUNCATE ft_poison_outer_file;
+SAVEPOINT forget_birth;
+TRUNCATE ft_poison_outer_file;
+ROLLBACK TO SAVEPOINT forget_birth;
+SELECT pg_temp.ft_poison_fail('ft_poison_outer_file');
+ROLLBACK TO SAVEPOINT replacement;
+SELECT 'POISON_CREATED_RESTORED ' || id FROM ft_poison_outer_file;
+SELECT fasttruncate('ft_poison_outer_file');
+SELECT 'POISON_CREATED_RETRY ' || count(*) FROM ft_poison_outer_file;
+COMMIT;
+BEGIN;
+TRUNCATE ft_poison_outer_file;
+INSERT INTO ft_poison_outer_file VALUES (72);
+SAVEPOINT replacement;
+TRUNCATE ft_poison_outer_file;
+SAVEPOINT forget_birth;
+TRUNCATE ft_poison_outer_file;
+ROLLBACK TO SAVEPOINT forget_birth;
+SELECT pg_temp.ft_poison_fail('ft_poison_outer_file');
+ROLLBACK TO SAVEPOINT replacement;
+SELECT 'POISON_OUTER_RESTORED ' || id FROM ft_poison_outer_file;
+SELECT fasttruncate('ft_poison_outer_file');
+SELECT 'POISON_OUTER_RETRY ' || count(*) FROM ft_poison_outer_file;
+COMMIT;
+
+CREATE TABLESPACE ft_n1_space LOCATION :'n1_space_dir';
+CREATE FUNCTION pg_temp.must_reject(relname text) RETURNS void LANGUAGE plpgsql AS $f$
+BEGIN
+  BEGIN
+    PERFORM fasttruncate(relname);
+  EXCEPTION WHEN SQLSTATE '55000' THEN
+    IF SQLERRM <> 'fasttrun: table files can roll back independently' THEN RAISE; END IF;
+    RETURN;
+  END;
+  RAISE EXCEPTION 'unsafe storage reset was accepted: %', relname;
+END $f$;
+CREATE FUNCTION pg_temp.must_have_rows(wanted int) RETURNS void LANGUAGE plpgsql AS $f$
+DECLARE actual int;
+BEGIN
+  PERFORM set_config('enable_seqscan', 'on', true);
+  PERFORM set_config('enable_indexscan', 'off', true);
+  PERFORM set_config('enable_bitmapscan', 'off', true);
+  SELECT count(*) INTO actual FROM n1_preflight;
+  IF actual <> wanted THEN RAISE EXCEPTION 'wrong sequential rows: %', actual; END IF;
+  PERFORM set_config('enable_seqscan', 'off', true);
+  PERFORM set_config('enable_indexscan', 'on', true);
+  SELECT count(*) INTO actual FROM n1_preflight WHERE id > 0;
+  IF actual <> wanted THEN RAISE EXCEPTION 'wrong index rows: %', actual; END IF;
+END $f$;
+CREATE TEMP TABLE n1_preflight(id int, payload text);
+CREATE UNIQUE INDEX n1_preflight_pkey ON n1_preflight(id);
+ALTER TABLE n1_preflight ALTER COLUMN payload SET STORAGE EXTERNAL;
+INSERT INTO n1_preflight SELECT n, repeat(md5(n::text),100) FROM generate_series(1,1000)n;
+BEGIN;
+SAVEPOINT moved;
+ALTER TABLE n1_preflight SET TABLESPACE ft_n1_space;
+SELECT pg_temp.must_reject('n1_preflight');
+ROLLBACK TO SAVEPOINT moved;
+SELECT pg_temp.must_have_rows(1000);
+COMMIT;
+\echo PREFLIGHT_MOVE_PASS
+BEGIN;
+SAVEPOINT reindexed;
+REINDEX INDEX n1_preflight_pkey;
+SELECT pg_temp.must_reject('n1_preflight');
+ROLLBACK TO SAVEPOINT reindexed;
+SELECT pg_temp.must_have_rows(1000);
+COMMIT;
+\echo PREFLIGHT_REINDEX_PASS
+BEGIN;
+SAVEPOINT omitted;
+DROP INDEX n1_preflight_pkey CASCADE;
+SELECT pg_temp.must_reject('n1_preflight');
+ROLLBACK TO SAVEPOINT omitted;
+SELECT pg_temp.must_have_rows(1000);
+COMMIT;
+\echo PREFLIGHT_DROPPED_PASS
+BEGIN;
+CREATE INDEX n1_preflight_new ON n1_preflight((left(payload,32)));
+SELECT fasttruncate('n1_preflight');
+ROLLBACK;
+SELECT pg_temp.must_have_rows(0);
+\echo PREFLIGHT_NEW_COMPONENT_PASS
+INSERT INTO n1_preflight SELECT n, repeat(md5(n::text),100) FROM generate_series(1,1000)n;
+BEGIN;
+CREATE INDEX n1_preflight_gone ON n1_preflight(id);
+DROP INDEX n1_preflight_gone;
+SELECT fasttruncate('n1_preflight');
+ROLLBACK;
+SELECT pg_temp.must_have_rows(0);
+\echo PREFLIGHT_NEW_DROPPED_PASS
+SELECT count(*) = 0 AS no_poison_from_preflight FROM fasttrun_blocked_tables();
+DROP TABLE n1_preflight;
+DROP TABLESPACE ft_n1_space;
+
+-- Parent utilities must reject a damaged leaf before core reads its storage.
+CREATE TEMP TABLE ft_tree_parent(id int, payload text) PARTITION BY RANGE(id);
+CREATE TEMP TABLE ft_tree_leaf PARTITION OF ft_tree_parent FOR VALUES FROM (0) TO (1000);
+ALTER TABLE ft_tree_leaf ALTER COLUMN payload SET STORAGE EXTERNAL;
+CREATE INDEX ft_tree_idx ON ft_tree_parent(id);
+INSERT INTO ft_tree_leaf SELECT n, repeat(md5(n::text),200) FROM generate_series(1,100)n;
+SELECT pg_temp.ft_poison_fail('ft_tree_leaf');
+-- Unrelated maintenance remains available while a temporary heap is blocked.
+CREATE TABLE public.ft_reindex_control(id int PRIMARY KEY);
+REINDEX SCHEMA public;
+REINDEX SYSTEM :DBNAME;
+\echo TREE_UNRELATED_REINDEX_PASS
+DO $$DECLARE detail text; blocked boolean:=false;
+BEGIN
+ BEGIN EXECUTE 'REINDEX TABLE ft_tree_leaf';
+ EXCEPTION WHEN object_not_in_prerequisite_state THEN
+  GET STACKED DIAGNOSTICS detail=PG_EXCEPTION_DETAIL;
+  blocked:=true;
+ END;
+ IF NOT blocked OR detail NOT LIKE 'A previous fasttruncate may have changed table files.%' THEN
+  RAISE EXCEPTION 'poison detail misnames the failed operation: %',detail;
+ END IF;
+END$$;
+\set ON_ERROR_STOP 0
+SELECT quote_ident(nspname) AS tmp_schema FROM pg_namespace WHERE oid=pg_my_temp_schema() \gset
+REINDEX SCHEMA :tmp_schema;
+\echo TREE_OWN_SCHEMA_REINDEX :SQLSTATE
+REINDEX DATABASE :DBNAME;
+\echo TREE_DATABASE_REINDEX :SQLSTATE
+\set ON_ERROR_STOP 1
+DROP TABLE public.ft_reindex_control;
+SELECT 'TREE_RELSTATS_HEAP ' || pg_temp.ft_poison_late_probe('SELECT count(*) FROM fasttrun_relstats(''ft_tree_leaf'')');
+SELECT 'TREE_RELSTATS_INDEX ' || pg_temp.ft_poison_late_probe(format(
+  'SELECT count(*) FROM fasttrun_relstats(%L)',
+  (SELECT indexrelid::regclass::text FROM pg_index WHERE indrelid = 'ft_tree_leaf'::regclass LIMIT 1)));
+SELECT 'TREE_ANALYZE ' || pg_temp.ft_poison_late_probe('ANALYZE ft_tree_parent');
+SELECT 'TREE_INDEX ' || pg_temp.ft_poison_late_probe('CREATE INDEX ON ft_tree_parent(payload)');
+SELECT 'TREE_ALTER ' || pg_temp.ft_poison_late_probe('ALTER TABLE ft_tree_parent ALTER COLUMN payload TYPE varchar');
+\set ON_ERROR_STOP 0
+VACUUM ft_tree_parent;
+\echo TREE_VACUUM :SQLSTATE
+REINDEX TABLE ft_tree_parent;
+\echo TREE_REINDEX :SQLSTATE
+REINDEX INDEX ft_tree_idx;
+\echo TREE_REINDEX_INDEX :SQLSTATE
+CLUSTER ft_tree_parent USING ft_tree_idx;
+\echo TREE_CLUSTER :SQLSTATE
+\set ON_ERROR_STOP 1
+TRUNCATE ft_tree_parent;
+SELECT fasttruncate('ft_tree_leaf');
+SELECT 'TREE_REPAIRED ' || count(*) FROM ft_tree_leaf;
+SELECT 'TREE_RELSTATS_REPAIRED ' || pg_temp.ft_poison_late_probe(format(
+  'SELECT count(*) FROM fasttrun_relstats(%L)',
+  (SELECT indexrelid::regclass::text FROM pg_index WHERE indrelid = 'ft_tree_leaf'::regclass LIMIT 1)));
+DROP TABLE ft_tree_parent;
+CREATE TEMP TABLE ft_default_parent(id int) PARTITION BY RANGE(id);
+CREATE TEMP TABLE ft_default_leaf PARTITION OF ft_default_parent DEFAULT;
+CREATE TEMP TABLE ft_default_new(id int);
+INSERT INTO ft_default_leaf VALUES (1);
+SELECT pg_temp.ft_poison_fail('ft_default_leaf');
+SELECT 'TREE_ATTACH_DEFAULT ' || pg_temp.ft_poison_late_probe(
+  'ALTER TABLE ft_default_parent ATTACH PARTITION ft_default_new FOR VALUES FROM (0) TO (10)');
+TRUNCATE ft_default_parent;
+SELECT fasttruncate('ft_default_leaf');
+DROP TABLE ft_default_parent;
+DROP TABLE ft_default_new;
 SQL
 
 if ! run_pg "$PSQL" -h "$SOCKET_DIR" -p "$PORT" -d "$DBNAME" -XAtq \
+	-v n1_space_dir="$WORKDIR/tablespace" \
 	-f "$WORKDIR/poison_late.sql" >"$WORKDIR/poison_late.out" \
 	2>"$WORKDIR/poison_late.err"; then
 	cat "$WORKDIR/poison_late.out" "$WORKDIR/poison_late.err" >&2
@@ -1176,7 +1411,20 @@ if ! run_pg "$PSQL" -h "$SOCKET_DIR" -p "$PORT" -d "$DBNAME" -XAtq \
 	exit 1
 fi
 for expect in 'POISON_LATE_SQLFN 55000' 'POISON_LATE_TRUNCATED readable 0' \
-	'POISON_LATE_ROLLBACK 55000' 'POISON_LATE_REPAIRED readable 0'; do
+	'POISON_LATE_RETRY 55000' 'POISON_LATE_ROLLBACK 55000' \
+	'POISON_LATE_SUBRETRY 55000' 'POISON_LATE_SUBROLLBACK 55000' \
+	'POISON_LATE_COMMIT_RETRY 55000' 'POISON_LATE_COMMITTED 0' \
+	'POISON_LATE_REPAIRED readable 0' 'POISON_LATE_ABORT_FILE 0' \
+	'POISON_LATE_SUBABORT_FILE 0' 'POISON_CREATED_RESTORED 71' \
+	'POISON_CREATED_RETRY 0' 'POISON_OUTER_RESTORED 72' \
+	'POISON_OUTER_RETRY 0' 'PREFLIGHT_MOVE_PASS' 'PREFLIGHT_REINDEX_PASS' \
+	'PREFLIGHT_DROPPED_PASS' 'PREFLIGHT_NEW_COMPONENT_PASS' \
+	'PREFLIGHT_NEW_DROPPED_PASS' 'TREE_ANALYZE 55000' 'TREE_INDEX 55000' \
+	'TREE_UNRELATED_REINDEX_PASS' 'TREE_OWN_SCHEMA_REINDEX 55000' 'TREE_DATABASE_REINDEX 55000' \
+	'TREE_ALTER 55000' 'TREE_VACUUM 55000' 'TREE_REINDEX 55000' \
+	'TREE_REINDEX_INDEX 55000' 'TREE_CLUSTER 55000' 'TREE_REPAIRED 0' \
+	'TREE_RELSTATS_HEAP 55000' 'TREE_RELSTATS_INDEX 55000' \
+	'TREE_RELSTATS_REPAIRED readable 1' 'TREE_ATTACH_DEFAULT 55000'; do
 	if ! grep -qx "$expect" "$WORKDIR/poison_late.out"; then
 		cat "$WORKDIR/poison_late.out" >&2
 		echo "FAIL: expected '$expect'" >&2
@@ -1184,6 +1432,38 @@ for expect in 'POISON_LATE_SQLFN 55000' 'POISON_LATE_TRUNCATED readable 0' \
 	fi
 done
 echo "poison late passed"
+
+# A cold first call rejects unknown history before changing files or poison.
+run_pg "$PSQL" -h "$SOCKET_DIR" -p "$PORT" -d "$DBNAME" -XAtq \
+	-v ON_ERROR_STOP=1 >"$WORKDIR/late_load.out" 2>&1 <<'SQL'
+CREATE TEMP TABLE ft_cold_history(id int);
+BEGIN;
+INSERT INTO ft_cold_history VALUES (1);
+DO $test$ DECLARE hint text; caught boolean := false;
+BEGIN
+  BEGIN
+    PERFORM fasttruncate('ft_cold_history');
+  EXCEPTION WHEN SQLSTATE '55000' THEN
+    GET STACKED DIAGNOSTICS hint = PG_EXCEPTION_HINT;
+    IF hint NOT LIKE '%Preload fasttrun%' THEN
+      RAISE EXCEPTION 'late load has no preload/retry hint: %', hint;
+    END IF;
+    caught := true;
+  END;
+  IF NOT caught OR (SELECT count(*) FROM ft_cold_history) <> 1
+     OR EXISTS (SELECT FROM fasttrun_blocked_tables()) THEN
+    RAISE EXCEPTION 'late-load preflight changed rows or poison';
+  END IF;
+END $test$;
+COMMIT;
+SELECT fasttruncate('ft_cold_history');
+DO $test$ BEGIN
+  IF EXISTS (SELECT FROM ft_cold_history) THEN
+    RAISE EXCEPTION 'late-load retry did not clear rows';
+  END IF;
+END $test$;
+SQL
+echo 'late-load preflight and retry passed'
 
 # fasttrun.log_min_duration = 0 пишет в журнал сервера строку на каждый вызов:
 # имя таблицы, время и путь, которым шел вызов.

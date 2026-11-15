@@ -1182,9 +1182,8 @@ SAVEPOINT s2;
 INSERT INTO t_abort_inval SELECT generate_series(1, 5000);
 SELECT fasttrun_analyze('t_abort_inval');   -- выше порога: инвалидация
 ROLLBACK TO SAVEPOINT s2;                    -- откат выше порога: инвалидация
--- Откат записи без analyze: файл вырос на половину, но откаченные страницы
--- строк не содержат, и оценка, которую видит планировщик, не меняется, поэтому
--- и планы не сбрасываются.
+-- Rolled-back rows do not increase cardinality. The physical pages remain,
+-- so the following analyze may invalidate a plan for its scan cost.
 SAVEPOINT s3;
 INSERT INTO t_abort_inval SELECT generate_series(1, 5000);
 ROLLBACK TO SAVEPOINT s3;                    -- оценка прежняя: без инвалидации
@@ -1969,4 +1968,28 @@ ROLLBACK;
 SELECT analyze_entries = :m23_entries_before AS m23_outer_undo_keeps_heap
   FROM fasttrun_cache_stats();
 DROP TABLE t_m23;
+-- Bulk cancellation is checked between elements, including repeated names.
+CREATE TEMP TABLE t_bulk_cancel(id int);
+INSERT INTO t_bulk_cancel SELECT generate_series(1, 20);
+DO $$BEGIN PERFORM fasttrun_analyze('t_bulk_cancel'); END$$;
+CREATE TEMP TABLE t_bulk_args(names text[]);
+INSERT INTO t_bulk_args SELECT array_fill('t_bulk_cancel'::text, ARRAY[1000000]);
+DO $$BEGIN PERFORM fasttrun_counters_reset(); END$$;
+SET statement_timeout = '25ms';
+SELECT fasttrun_analyze_bulk(VARIADIC names) FROM t_bulk_args;
+RESET statement_timeout;
+DO $cancel$
+BEGIN
+  IF (SELECT value FROM fasttrun_counters() WHERE counter = 'analyze_calls') >= 1000000 THEN
+    RAISE EXCEPTION 'bulk cancellation waited for every element';
+  END IF;
+  IF (SELECT count(*) FROM t_bulk_cancel) <> 20 OR
+     (SELECT reltuples FROM fasttrun_relstats('t_bulk_cancel')) <> 20 THEN
+    RAISE EXCEPTION 'bulk cancellation changed table state';
+  END IF;
+END
+$cancel$;
+DROP TABLE t_bulk_args;
+DROP TABLE t_bulk_cancel;
+
 DROP EXTENSION fasttrun;

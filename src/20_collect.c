@@ -16,7 +16,7 @@
 #error "src/20_collect.c is included only from fasttrun.c"
 #endif /* FASTTRUN_UNITY */
 static double
-fasttrun_estimate_index_fraction(Relation heaprel, Relation indexrel,
+fasttrun_estimate_index_fraction_as_owner(Relation heaprel, Relation indexrel,
 								 IndexInfo *indexInfo,
 								 HeapTuple *sample, int sample_count)
 {
@@ -50,6 +50,37 @@ fasttrun_estimate_index_fraction(Relation heaprel, Relation indexrel,
 	FreeExecutorState(estate);
 
 	return (double) matched / (double) sample_count;
+}
+
+static double
+fasttrun_estimate_index_fraction(Relation heaprel, Relation indexrel,
+								 IndexInfo *indexInfo,
+								 HeapTuple *sample, int sample_count)
+{
+	Oid			save_userid;
+	int			save_sec_context;
+	int			save_nestlevel;
+	double		fraction = 0.0;
+
+	GetUserIdAndSecContext(&save_userid, &save_sec_context);
+	save_nestlevel = NewGUCNestLevel();
+	PG_TRY();
+	{
+		SetUserIdAndSecContext(heaprel->rd_rel->relowner,
+							   save_sec_context | SECURITY_RESTRICTED_OPERATION);
+#if PG_VERSION_NUM >= 170000
+		RestrictSearchPath();
+#endif
+		fraction = fasttrun_estimate_index_fraction_as_owner(heaprel, indexrel,
+																indexInfo, sample, sample_count);
+	}
+	PG_FINALLY();
+	{
+		AtEOXact_GUC(false, save_nestlevel);
+		SetUserIdAndSecContext(save_userid, save_sec_context);
+	}
+	PG_END_TRY();
+	return fraction;
 }
 
 static List *
@@ -298,9 +329,9 @@ fasttrun_cmp_heap_tuples_by_tid(const void *a, const void *b)
  * with search_path restricted on PG17 and later, as in core ANALYZE.  An
  * expression that yields no statistics this time loses the old ones.
  *
- * Returns true when anything was published.
+ * Reports publication and transitions to neutral for plan invalidation.
  */
-static bool
+static FasttrunCollectResult
 fasttrun_collect_index_expressions(Relation rel, HeapTuple *sample,
 								   int sample_count, int64 totalrows,
 								   TupleDesc pg_stats_desc,
@@ -309,24 +340,13 @@ fasttrun_collect_index_expressions(Relation rel, HeapTuple *sample,
 {
 	List	   *index_oids;
 	ListCell   *lc;
-	bool		published = false;
-	Oid			save_userid;
-	int			save_sec_context;
-	int			save_nestlevel;
+	FasttrunCollectResult result = {0};
 
 	if (!rel->rd_rel->relhasindex)
-		return false;
+		return result;
 	index_oids = RelationGetIndexList(rel);
 	if (index_oids == NIL)
-		return false;
-
-	GetUserIdAndSecContext(&save_userid, &save_sec_context);
-	SetUserIdAndSecContext(rel->rd_rel->relowner,
-						   save_sec_context | SECURITY_RESTRICTED_OPERATION);
-	save_nestlevel = NewGUCNestLevel();
-#if PG_VERSION_NUM >= 170000
-	RestrictSearchPath();
-#endif
+		return result;
 
 	foreach(lc, index_oids)
 	{
@@ -432,7 +452,7 @@ fasttrun_collect_index_expressions(Relation rel, HeapTuple *sample,
 													  RelationGetRelid(indexrel),
 													  FASTTRUN_COLUMN_LOCAL_CANDIDATE,
 													  stats_tuple, snapshot);
-				published = true;
+				result.published_any = true;
 			}
 			else
 			{
@@ -446,7 +466,8 @@ fasttrun_collect_index_expressions(Relation rel, HeapTuple *sample,
 					(FasttrunStatsEntry *) hash_search(fasttrun_stats_cache, &key,
 													   HASH_FIND, NULL);
 				if (entry != NULL)
-					(void) fasttrun_stats_entry_neutralize(RelationGetRelid(rel),
+					result.became_neutral |=
+						fasttrun_stats_entry_neutralize(RelationGetRelid(rel),
 														   entry);
 			}
 		}
@@ -455,10 +476,8 @@ fasttrun_collect_index_expressions(Relation rel, HeapTuple *sample,
 		index_close(indexrel, AccessShareLock);
 	}
 
-	AtEOXact_GUC(false, save_nestlevel);
-	SetUserIdAndSecContext(save_userid, save_sec_context);
 	list_free(index_oids);
-	return published;
+	return result;
 }
 
 /*
@@ -466,7 +485,7 @@ fasttrun_collect_index_expressions(Relation rel, HeapTuple *sample,
  * Callers invalidate only when either changes planner-visible ownership.
  */
 static FasttrunCollectResult
-fasttrun_collect_and_store(Relation rel, HeapTuple *sample, int sample_count,
+fasttrun_collect_and_store_as_owner(Relation rel, HeapTuple *sample, int sample_count,
 						   int64 totalrows, bool sample_needs_tid_sort)
 {
 	FasttrunCollectResult result = {0};
@@ -611,16 +630,18 @@ fasttrun_collect_and_store(Relation rel, HeapTuple *sample, int sample_count,
 
 		{
 			FasttrunPgstatSnapshot snapshot;
+			FasttrunCollectResult expr_result;
 
 			snapshot.inserted = snap_ins;
 			snapshot.updated = snap_upd;
 			snapshot.deleted = snap_del;
 			snapshot.truncdropped = snap_truncdropped;
 			snapshot.pages = snap_pages;
-			if (fasttrun_collect_index_expressions(rel, sample, sample_count,
+			expr_result = fasttrun_collect_index_expressions(rel, sample, sample_count,
 												   totalrows, pg_stats_desc,
-												   per_col_mcxt, &snapshot))
-				result.published_any = true;
+												   per_col_mcxt, &snapshot);
+			result.published_any |= expr_result.published_any;
+			result.became_neutral |= expr_result.became_neutral;
 		}
 	}
 	else
@@ -628,6 +649,11 @@ fasttrun_collect_and_store(Relation rel, HeapTuple *sample, int sample_count,
 		Datum	   *values;
 		Datum	   *col_values;
 		bool	   *col_nulls;
+
+		if (rel->rd_rel->relhasindex)
+			result.became_neutral |=
+				fasttrun_stats_neutralize_index_expressions(RelationGetRelid(rel),
+															  InvalidOid);
 
 		/* ----------------------------------------------------------
 		 * Branch B: lightweight Haas-Stokes path.
@@ -660,6 +686,8 @@ fasttrun_collect_and_store(Relation rel, HeapTuple *sample, int sample_count,
 			int32			   stawidth;
 			float4			   stadistinct;
 			HeapTuple		   stats_tuple;
+
+			CHECK_FOR_INTERRUPTS();
 
 			if (!fasttrun_attribute_is_analyzable(attr))
 				continue;
@@ -835,6 +863,37 @@ fasttrun_collect_and_store(Relation rel, HeapTuple *sample, int sample_count,
 	if (result.published_any)
 		fasttrun_count(result.unsafe ? FTC_COLUMN_COLLECTS_DURING_WRITE :
 					   FTC_COLUMN_COLLECTS);
+	return result;
+}
+
+/* All type, comparison and index callbacks use the table owner's privileges. */
+static FasttrunCollectResult
+fasttrun_collect_and_store(Relation rel, HeapTuple *sample, int sample_count,
+						   int64 totalrows, bool sample_needs_tid_sort)
+{
+	Oid			save_userid;
+	int			save_sec_context;
+	int			save_nestlevel;
+	FasttrunCollectResult result = {0};
+
+	GetUserIdAndSecContext(&save_userid, &save_sec_context);
+	save_nestlevel = NewGUCNestLevel();
+	PG_TRY();
+	{
+		SetUserIdAndSecContext(rel->rd_rel->relowner,
+							   save_sec_context | SECURITY_RESTRICTED_OPERATION);
+#if PG_VERSION_NUM >= 170000
+		RestrictSearchPath();
+#endif
+		result = fasttrun_collect_and_store_as_owner(rel, sample, sample_count,
+														   totalrows, sample_needs_tid_sort);
+	}
+	PG_FINALLY();
+	{
+		AtEOXact_GUC(false, save_nestlevel);
+		SetUserIdAndSecContext(save_userid, save_sec_context);
+	}
+	PG_END_TRY();
 	return result;
 }
 

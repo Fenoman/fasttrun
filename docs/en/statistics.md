@@ -210,8 +210,10 @@ as core `ANALYZE` does in `compute_index_stats`: each expression is evaluated
 over the sampled rows and analyzed as a column of its type. The planner gets
 them by index OID. Freshness is checked against the table's counters, as for
 its columns, and an `UPDATE` always counts for an expression, which may read any
-column. The expressions run as the table owner in a restricted security
-context, as in `ANALYZE`. Expressions of partial indexes stay on default
+column. Statistics callbacks run as the table owner in a restricted security
+context, as in `ANALYZE`. This includes sample sizing, type analysis,
+comparisons, index expressions and partial-index predicates. The caller's
+identity and GUC settings are restored on success and error. Expressions of partial indexes stay on default
 estimates: the rows of such an index are only part of the table, and the
 planner takes no whole-table statistics from it. With
 `fasttrun.sample_rows = -1` the sample size accounts for the expression targets
@@ -239,6 +241,21 @@ statistics until a regular `ANALYZE` builds every object again: the rows of
 their data are compared before and after the command.
 An explicit `fasttrun_collect_stats()` collects local column statistics for such
 a table too, and the objects likewise stop applying until a regular `ANALYZE`.
+
+Physical cleanup and local statistics ownership hide old objects independently
+of sample publication. This also applies with `sample_rows = 0`, zero column
+targets, an empty sample, or a memory-budget refusal of a new collection.
+Collection inside an active writer does not replace core data: its sample is
+not served to the planner and does not by itself hide current core objects.
+Physical cleanup hides statistics of destroyed rows regardless of a
+conservative writer marker left by an overflowing writer registry.
+
+After all observed writers have ended, collection from a read query or with a
+cursor open can hide old objects even after a registry overflow. Unobserved
+writers or lost active counts retain the relation-reference guard. A snapshot
+older than counted writes still blocks retirement.
+The unobserved-writer guard also applies before the registry overflows, so a
+first library load inside UPDATE cannot retire that statement's core objects.
 
 ## Settings
 

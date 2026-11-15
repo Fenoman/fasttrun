@@ -100,7 +100,11 @@ trusted workloads and monitor registry occupancy.
 for the current database.
 
 `fasttrun_hot_temp_tables(0)` returns every entry. Results are sorted by attempt
-count, then by the time of the latest attempt, and then by name.
+count, then by the time of the latest attempt, and then by the stored name bytes.
+Names whose bytes are invalid in the current database encoding are displayed
+as `\x` followed by hexadecimal bytes. Counts and timestamps are preserved.
+This is a diagnostic representation, not a table identifier. The shared registry
+does not record the source encoding and cannot transcode names between databases.
 
 ## Schedule
 
@@ -184,3 +188,5 @@ recorded in the PostgreSQL log, and an incomplete temporary file is removed.
 The file is not written to WAL, is not replicated, and is not included in
 `pg_dump`. `fasttrun_reset_temp_stats()` clears the registry and removes the
 file immediately. `ROLLBACK` does not undo this reset.
+If removal fails, the function reports an error before clearing the shared
+counters. Correct the file permissions or storage error and retry the reset.

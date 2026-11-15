@@ -172,6 +172,23 @@ fasttrun_cache_store_relstats(Relation rel, BlockNumber pages, int64 tuples,
 	return entry;
 }
 
+/* Local ownership hides old extended data even without a column sample. */
+static bool
+fasttrun_cache_mark_extended_stale(Relation rel)
+{
+	FasttrunAnalyzeCacheEntry *entry;
+
+	if (!fasttrun_relation_has_extended_stats(rel) &&
+		!fasttrun_xact_statistics_can_return(RelationGetRelid(rel)))
+		return false;
+	entry = fasttrun_cache_ensure_file_entry(rel);
+	if (entry->state.ext_stats_stale)
+		return false;
+	fasttrun_analyze_save_undo(entry);
+	entry->state.ext_stats_stale = true;
+	return true;
+}
+
 /* Point an index entry's emptiness probe at its owning heap's storage. */
 static void
 fasttrun_cache_set_owning_heap(FasttrunAnalyzeCacheEntry *entry,

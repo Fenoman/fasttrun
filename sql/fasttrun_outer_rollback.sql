@@ -18,6 +18,7 @@ SELECT coalesce(current_setting('enable_temp_memory_catalog', true), 'off') = 'o
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS fasttrun;
 RESET client_min_messages;
+LOAD 'fasttrun';
 
 -- ----------------------------------------------------------------------
 -- 1. Таблица создана на внешнем уровне, первое обращение fasttrun - в

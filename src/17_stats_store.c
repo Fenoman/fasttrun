@@ -717,11 +717,21 @@ fasttrun_stats_neutralize_relation(Relation rel)
 	return changed;
 }
 
-/* Abort-time adoption after a non-transactional truncate: no allocation. */
+/*
+ * Retire samples of an emptied file without discarding other-file undo.
+ *
+ * Ownership.  A rollback cannot restore rows of this file.  Its saved samples
+ * and core fallback become neutral too.  A transactional rewrite can still
+ * restore a different file and the samples saved for it.
+ *
+ * Allocation.  The caller already owns the relation policy.  Only existing
+ * entries and snapshots are changed, including in abort callbacks.
+ */
 static void
-fasttrun_stats_force_neutral_relid(Oid relid)
+fasttrun_stats_neutralize_file(Oid relid, const RelFileLocatorBackend *rlb)
 {
 	FasttrunStatsRelidEntry *relentry;
+	FasttrunStatsRelidSavedState *policy;
 	ListCell   *lc;
 
 	if (fasttrun_stats_cache == NULL || fasttrun_stats_relid_cache == NULL)
@@ -735,51 +745,90 @@ fasttrun_stats_force_neutral_relid(Oid relid)
 	{
 		FasttrunStatsKey *key = (FasttrunStatsKey *) lfirst(lc);
 		FasttrunStatsEntry *entry;
+		FasttrunStatsSavedState *saved;
 
 		entry = (FasttrunStatsEntry *)
 			hash_search(fasttrun_stats_cache, key, HASH_FIND, NULL);
 		if (entry == NULL)
 			continue;
-		if (fasttrun_stats_entry_is_candidate(entry))
-			fasttrun_stats_relid_unref(relid);
-		fasttrun_stats_entry_free_undo(entry);
-		if (entry->statsTuple != NULL)
-			heap_freetuple(entry->statsTuple);
-		entry->statsTuple = NULL;
-		entry->state = FASTTRUN_COLUMN_LOCAL_NEUTRAL;
-		entry->state_subid = InvalidSubTransactionId;
-		entry->was_usable = false;
+		if (!entry->heap_rlb_valid || fasttrun_rlb_equals(entry->heap_rlb, *rlb))
+		{
+			if (fasttrun_stats_entry_is_candidate(entry))
+				fasttrun_stats_relid_unref(relid);
+			if (entry->statsTuple != NULL)
+				heap_freetuple(entry->statsTuple);
+			entry->statsTuple = NULL;
+			entry->state = FASTTRUN_COLUMN_LOCAL_NEUTRAL;
+			entry->was_usable = false;
+			entry->heap_rlb = *rlb;
+			entry->heap_rlb_valid = true;
+		}
+		for (saved = entry->undo; saved != NULL; saved = saved->older)
+		{
+			if (saved->heap_rlb_valid && !fasttrun_rlb_equals(saved->heap_rlb, *rlb))
+				continue;
+			if (saved->statsTuple != NULL)
+				heap_freetuple(saved->statsTuple);
+			saved->statsTuple = NULL;
+			saved->state = FASTTRUN_COLUMN_LOCAL_NEUTRAL;
+			saved->was_usable = false;
+			saved->heap_rlb = *rlb;
+			saved->heap_rlb_valid = true;
+		}
 	}
-	fasttrun_stats_relid_free_undo(relentry);
-	relentry->policy = FASTTRUN_REL_LOCAL_NEUTRAL;
-	relentry->state_subid = InvalidSubTransactionId;
+	if (!relentry->heap_rlb_valid || fasttrun_rlb_equals(relentry->heap_rlb, *rlb))
+	{
+		relentry->policy = FASTTRUN_REL_LOCAL_NEUTRAL;
+		relentry->heap_rlb = *rlb;
+		relentry->heap_rlb_valid = true;
+		if (relentry->undo == NULL)
+			relentry->state_subid = InvalidSubTransactionId;
+	}
+	for (policy = relentry->undo; policy != NULL; policy = policy->older)
+	{
+		if (policy->heap_rlb_valid && !fasttrun_rlb_equals(policy->heap_rlb, *rlb))
+			continue;
+		policy->policy = FASTTRUN_REL_LOCAL_NEUTRAL;
+		policy->heap_rlb = *rlb;
+		policy->heap_rlb_valid = true;
+		/* Keep the bottom neutral state when RELEASE collapses outer undo. */
+		if (policy->older == NULL)
+			policy->state_subid = InvalidSubTransactionId;
+	}
 }
 
-static void
+/* InvalidOid selects all expression entries, leaving heap columns alone. */
+static bool
 fasttrun_stats_neutralize_index_expressions(Oid heap_relid, Oid indexoid)
 {
 	FasttrunStatsRelidEntry *relentry;
 	List	   *keys;
 	ListCell   *lc;
+	bool		changed = false;
+
+	if (fasttrun_stats_cache == NULL || fasttrun_stats_relid_cache == NULL)
+		return false;
 
 	relentry = (FasttrunStatsRelidEntry *)
 		hash_search(fasttrun_stats_relid_cache, &heap_relid, HASH_FIND, NULL);
 	if (relentry == NULL || relentry->attkeys == NIL)
-		return;
+		return false;
 	keys = list_copy(relentry->attkeys);
 	foreach(lc, keys)
 	{
 		FasttrunStatsKey *key = (FasttrunStatsKey *) lfirst(lc);
 		FasttrunStatsEntry *entry;
 
-		if (key->indexoid != indexoid)
+		if (!OidIsValid(key->indexoid) ||
+			(OidIsValid(indexoid) && key->indexoid != indexoid))
 			continue;
 		entry = (FasttrunStatsEntry *)
 			hash_search(fasttrun_stats_cache, key, HASH_FIND, NULL);
 		if (entry != NULL)
-			(void) fasttrun_stats_entry_neutralize(heap_relid, entry);
+			changed |= fasttrun_stats_entry_neutralize(heap_relid, entry);
 	}
 	list_free(keys);
+	return changed;
 }
 
 /* VACUUM cut the heap without changing its rows: anchor the size backstop anew. */

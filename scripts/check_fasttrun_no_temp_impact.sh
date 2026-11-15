@@ -125,6 +125,74 @@ END
 $function$;
 SQL
 
+# A rejected permanent target must not wait behind a writer's compatible lock.
+lock_psql=("$PSQL" -h "$SOCKET_DIR" -p "$PORT" -d "$DBNAME" -XAtq -v ON_ERROR_STOP=1)
+run_pg "${lock_psql[@]}" -c 'CREATE TABLE ft_lock_target(id int); CREATE ROLE ft_lock_denied LOGIN' >/dev/null
+PGAPPNAME=ft_no_temp_holder run_pg "${lock_psql[@]}" \
+	-c 'BEGIN; INSERT INTO ft_lock_target VALUES(1); SELECT pg_sleep(30); COMMIT' \
+	>"$WORKDIR/lock-holder.out" 2>"$WORKDIR/lock-holder.err" &
+holder=$!
+holder_ready=0
+for _ in $(seq 1 100); do
+	if [ "$(run_pg "${lock_psql[@]}" -c "SELECT count(*) FROM pg_stat_activity WHERE application_name = 'ft_no_temp_holder' AND wait_event = 'PgSleep'")" = 1 ]; then
+		holder_ready=1
+		break
+	fi
+	sleep 0.02
+done
+if [ "$holder_ready" -ne 1 ]; then
+	echo 'FAIL: permanent lock holder did not become ready' >&2
+	exit 1
+fi
+set +e
+run_pg "${lock_psql[@]}" -U ft_lock_denied \
+	-c "SET statement_timeout = '1s'; SELECT fasttruncate('ft_lock_target')" \
+	>"$WORKDIR/lock-denied.out" 2>"$WORKDIR/lock-denied.err"
+denied_rc=$?
+set -e
+run_pg "${lock_psql[@]}" -c "SELECT pg_cancel_backend(pid) FROM pg_stat_activity WHERE application_name = 'ft_no_temp_holder'" >/dev/null
+wait "$holder" || true
+run_pg "${lock_psql[@]}" -c 'DROP TABLE ft_lock_target; DROP ROLE ft_lock_denied' >/dev/null
+if [ "$denied_rc" -eq 0 ] || ! grep -q 'is not a local temporary table' "$WORKDIR/lock-denied.err"; then
+	cat "$WORKDIR/lock-denied.err" >&2
+	echo 'FAIL: permanent target validation waited for the writer' >&2
+	exit 1
+fi
+
+# A nonrecursive parent option change must not wait for a foreign temp child.
+run_pg "${lock_psql[@]}" -c 'CREATE TABLE ft_foreign_parent(id int)' >/dev/null
+PGAPPNAME=ft_no_temp_foreign run_pg "${lock_psql[@]}" \
+	>"$WORKDIR/foreign-holder.out" 2>"$WORKDIR/foreign-holder.err" <<'SQL' &
+CREATE TEMP TABLE ft_foreign_child() INHERITS (ft_foreign_parent);
+BEGIN;
+LOCK TABLE ft_foreign_child IN ACCESS EXCLUSIVE MODE;
+SELECT pg_sleep(30);
+ROLLBACK;
+SQL
+foreign_holder=$!
+foreign_ready=0
+for _ in $(seq 1 100); do
+	if [ "$(run_pg "${lock_psql[@]}" -c "SELECT count(*) FROM pg_stat_activity WHERE application_name = 'ft_no_temp_foreign' AND wait_event = 'PgSleep'")" = 1 ]; then
+		foreign_ready=1
+		break
+	fi
+	sleep 0.02
+done
+set +e
+run_pg "${lock_psql[@]}" \
+	-c "SET statement_timeout = '1s'; ALTER TABLE ft_foreign_parent SET (autovacuum_enabled = false)" \
+	>"$WORKDIR/foreign-alter.out" 2>"$WORKDIR/foreign-alter.err"
+foreign_rc=$?
+set -e
+run_pg "${lock_psql[@]}" -c "SELECT pg_cancel_backend(pid) FROM pg_stat_activity WHERE application_name = 'ft_no_temp_foreign'" >/dev/null
+wait "$foreign_holder" || true
+run_pg "${lock_psql[@]}" -c 'DROP TABLE ft_foreign_parent' >/dev/null
+if [ "$foreign_ready" -ne 1 ] || [ "$foreign_rc" -ne 0 ]; then
+	cat "$WORKDIR/foreign-alter.err" "$WORKDIR/foreign-holder.err" >&2
+	echo 'FAIL: parent DDL observer waited for a foreign temporary child' >&2
+	exit 1
+fi
+
 run_state()
 {
 	local state=$1

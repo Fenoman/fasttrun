@@ -191,4 +191,76 @@ SELECT count(*) = 0 AS attopt_cache_untouched
   FROM pg_backend_memory_contexts WHERE name = 'Attopt cache';
 DROP TABLE t_attopt;
 
+-- Statistics callbacks use the table owner even inside a privileged wrapper.
+CREATE ROLE ft_stats_owner;
+CREATE SCHEMA ft_stats_owner AUTHORIZATION ft_stats_owner;
+CREATE TABLE public.ft_stats_canary(secret text);
+INSERT INTO public.ft_stats_canary VALUES ('synthetic-canary');
+CREATE FUNCTION public.ft_stats_definer(core boolean) RETURNS void
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, public AS $$
+BEGIN
+  IF core THEN
+    ANALYZE pg_temp.ft_stats_callback;
+  ELSE
+    PERFORM public.fasttrun_collect_stats('pg_temp.ft_stats_callback');
+  END IF;
+END$$;
+GRANT EXECUTE ON FUNCTION public.ft_stats_definer(boolean) TO ft_stats_owner;
+SET SESSION AUTHORIZATION ft_stats_owner;
+CREATE FUNCTION ft_stats_owner.predicate(i int) RETURNS boolean
+LANGUAGE plpgsql IMMUTABLE AS $$
+BEGIN
+  IF current_setting('ft_test.callback_mode', true) = 'canary' THEN
+    PERFORM secret FROM public.ft_stats_canary;
+  ELSIF current_setting('ft_test.callback_mode', true) = 'settings' THEN
+    IF current_user <> 'ft_stats_owner' THEN
+      RAISE EXCEPTION 'predicate runs as %', current_user;
+    END IF;
+    PERFORM set_config('work_mem', '1MB', false);
+    PERFORM set_config('search_path', 'pg_catalog', false);
+  END IF;
+  RETURN i > 0;
+END$$;
+CREATE TEMP TABLE ft_stats_callback(i int);
+INSERT INTO ft_stats_callback VALUES (1), (2);
+CREATE INDEX ON ft_stats_callback(i) WHERE ft_stats_owner.predicate(i);
+SET ft_test.callback_mode = 'canary';
+DO $canary$
+DECLARE use_core boolean; denied boolean;
+BEGIN
+  FOREACH use_core IN ARRAY ARRAY[true, false] LOOP
+    denied := false;
+    BEGIN
+      PERFORM public.ft_stats_definer(use_core);
+    EXCEPTION WHEN insufficient_privilege THEN
+      denied := true;
+    END;
+    IF NOT denied OR current_user <> 'ft_stats_owner' THEN
+      RAISE EXCEPTION 'callback privileges escaped, core=%', use_core;
+    END IF;
+  END LOOP;
+END
+$canary$;
+SET ft_test.callback_mode = 'settings';
+DO $restore$
+DECLARE old_work_mem text := current_setting('work_mem');
+        old_path text := current_setting('search_path');
+BEGIN
+  PERFORM public.ft_stats_definer(false);
+  IF current_user <> 'ft_stats_owner' OR
+     current_setting('work_mem') <> old_work_mem OR
+     current_setting('search_path') <> old_path THEN
+    RAISE EXCEPTION 'callback user or GUC state was not restored';
+  END IF;
+END
+$restore$;
+RESET ft_test.callback_mode;
+DROP TABLE ft_stats_callback;
+DROP FUNCTION ft_stats_owner.predicate(int);
+RESET SESSION AUTHORIZATION;
+DROP FUNCTION public.ft_stats_definer(boolean);
+DROP TABLE public.ft_stats_canary;
+DROP SCHEMA ft_stats_owner;
+DROP ROLE ft_stats_owner;
+
 DROP EXTENSION fasttrun;

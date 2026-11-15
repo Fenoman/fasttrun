@@ -87,10 +87,23 @@ make check-tracking-preload PG_CONFIG=/path/to/pg_config
 make check-block-sample-seed PG_CONFIG=/path/to/pg_config
 make check-required-suite
 make check-docs
+make check-docs-installed PG_CONFIG=/path/to/pg_config
 ```
+
+`check-docs-installed` stages the documentation through the actual install
+target and checks its local links and anchors. The mandatory cassert run also
+executes it for each PostgreSQL installation.
 
 Registry-file persistence is checked by
 `scripts/check_fasttrun_tracking_persistence.sh`.
+
+With real `pg_variables` installed for the same server, run
+`PG_CONFIG=/path/to/pg_config scripts/check_fasttrun_example.sh`. It checks the
+shipped helper with current, nested, stale and marked incoming tables at XID
+epochs 0 and 2. It changes the epoch only in its own stopped disposable cluster.
+It also checks retry after a failed cleanup. Without pg_variables it returns
+skip code 77. A vendor `pg_resetwal` without `--epoch` runs epoch 0 and then
+returns 77 for the unsupported epoch 2 check.
 
 `make check-exit-plan-reset` checks in the server log that the plan reset at
 backend exit runs before PostgreSQL core removes the temporary tables, that the

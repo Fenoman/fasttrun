@@ -116,18 +116,28 @@ DOCS_TREE = $(docdir)/$(docmoduledir)/fasttrun
 
 install: install-docs-tree
 uninstall: uninstall-docs-tree
-.PHONY: install-docs-tree uninstall-docs-tree
+.PHONY: install-docs-tree uninstall-docs-tree check-docs-installed
 
 install-docs-tree:
 	$(MKDIR_P) '$(DESTDIR)$(DOCS_TREE)/docs/ru' '$(DESTDIR)$(DOCS_TREE)/docs/en' \
-		'$(DESTDIR)$(DOCS_TREE)/docs/images'
+		'$(DESTDIR)$(DOCS_TREE)/docs/images' '$(DESTDIR)$(DOCS_TREE)/examples' \
+		'$(DESTDIR)$(DOCS_TREE)/sql' '$(DESTDIR)$(DOCS_TREE)/scripts'
 	$(INSTALL_DATA) $(srcdir)/README.md $(srcdir)/README_EN.md '$(DESTDIR)$(DOCS_TREE)/'
 	$(INSTALL_DATA) $(wildcard $(srcdir)/docs/ru/*.md) '$(DESTDIR)$(DOCS_TREE)/docs/ru/'
 	$(INSTALL_DATA) $(wildcard $(srcdir)/docs/en/*.md) '$(DESTDIR)$(DOCS_TREE)/docs/en/'
 	$(INSTALL_DATA) $(wildcard $(srcdir)/docs/images/*.png) '$(DESTDIR)$(DOCS_TREE)/docs/images/'
+	$(INSTALL_DATA) $(srcdir)/examples/create_temp_table.sql '$(DESTDIR)$(DOCS_TREE)/examples/'
+	$(INSTALL_DATA) $(srcdir)/sql/fasttrun_bench.sql '$(DESTDIR)$(DOCS_TREE)/sql/'
+	$(INSTALL_DATA) $(srcdir)/scripts/bench_percolumn.sh $(srcdir)/scripts/bench_percolumn.sql \
+		'$(DESTDIR)$(DOCS_TREE)/scripts/'
 
 uninstall-docs-tree:
 	rm -rf '$(DESTDIR)$(DOCS_TREE)'
+
+check-docs-installed:
+	@set -eu; stage=$$(mktemp -d); trap 'rm -rf "$$stage"' 0 1 2 3 15; \
+		$(MAKE) --no-print-directory install-docs-tree DESTDIR="$$stage" PG_CONFIG="$(PG_CONFIG)"; \
+		python3 $(srcdir)/scripts/check_docs_consistency.py --installed-root "$$stage$(DOCS_TREE)"
 endif
 
 .PHONY: check-parity check-soak check-perf-smoke check-hook-chain \

@@ -59,12 +59,112 @@ fasttrun_cache_file_empty(const RelFileLocatorBackend *rlb)
 	return smgrexists(reln, MAIN_FORKNUM) && smgrnblocks(reln, MAIN_FORKNUM) == 0;
 }
 
+/* Clear row-derived state without changing transactional metadata. */
+static void
+fasttrun_cache_set_empty_relstats(FasttrunAnalyzeState *state,
+								BlockNumber pages, BlockNumber dead, uint64 writes)
+{
+	if (state->cached_pages != pages || state->cached_tuples != 0 ||
+		state->cached_allvisible != 0)
+		state->last_inval_valid = false;
+	state->cached_pages = pages;
+	state->published_dead = dead;
+	state->published_aborted_writes = writes;
+	state->cached_tuples = 0;
+	state->count_exact = true;
+	state->cached_allvisible = 0;
+	state->has_delta_state = false;
+	state->cached_inserted = 0;
+	state->cached_updated = 0;
+	state->cached_deleted = 0;
+	state->cached_truncdropped = false;
+	state->has_stats_baseline = false;
+	state->stats_baseline_inserted = 0;
+	state->stats_baseline_updated = 0;
+	state->stats_baseline_deleted = 0;
+	state->stats_baseline_truncdropped = false;
+	state->partial_scan_valid = false;
+	state->partial_scan_inserted = 0;
+	state->partial_scan_updated = 0;
+	state->partial_scan_deleted = 0;
+}
+
+/*
+ * Adopt a non-transactional emptying in every saved state of the same file.
+ *
+ * Metadata.  Keep undo ownership and ext_stats_stale: a later rollback can
+ * restore a dropped statistics object, but cannot restore the vanished rows.
+ * States of another file belong to transactional rewrites and stay unchanged.
+ *
+ * Cost.  Only an observed emptying walks this relation's existing undo chain.
+ * No allocations, catalog access or additional storage probes are needed.
+ */
+static void
+fasttrun_cache_adopt_empty_relstats(FasttrunAnalyzeCacheEntry *entry,
+								  BlockNumber pages, bool truncated)
+{
+	FasttrunAnalyzeUndo *undo;
+
+	fasttrun_cache_set_empty_relstats(&entry->state, pages,
+									entry->aborted_pages, entry->aborted_writes);
+	for (undo = entry->undo; undo != NULL; undo = undo->older)
+	{
+		if (!OidIsValid(undo->state.heap_relid) ||
+			(undo->state.probe_rlb.backend == entry->state.probe_rlb.backend &&
+			 RelFileLocatorEquals(undo->state.probe_rlb.locator,
+								  entry->state.probe_rlb.locator)))
+		{
+			/* An observed empty file stays published even without an older cache. */
+			if (!undo->state.has_relstats)
+			{
+				undo->state.has_relstats = true;
+				undo->state.cached_locator = entry->state.cached_locator;
+				undo->state.probe_rlb = entry->state.probe_rlb;
+				undo->state.heap_relid = entry->state.heap_relid;
+				undo->state.heap_rlb = entry->state.heap_rlb;
+			}
+			fasttrun_cache_set_empty_relstats(&undo->state, pages,
+											entry->aborted_pages, entry->aborted_writes);
+			if (truncated)
+				undo->state.ext_stats_stale |= entry->state.ext_stats_stale;
+		}
+	}
+	if (entry->relid == entry->state.heap_relid)
+		fasttrun_stats_neutralize_file(entry->relid, &entry->state.heap_rlb);
+	entry->lazy_check_subid = InvalidSubTransactionId;
+	entry->lazy_check_epoch = 0;
+	entry->lazy_check_pages = 0;
+}
+
+/* A failed reset must not restore publications of the damaged file. */
+static void
+fasttrun_cache_retire_reset_undo(FasttrunAnalyzeCacheEntry *entry)
+{
+	FasttrunAnalyzeUndo *undo;
+
+	for (undo = entry->undo; undo != NULL; undo = undo->older)
+	{
+		if (OidIsValid(undo->state.heap_relid) &&
+			(undo->state.probe_rlb.backend != entry->state.probe_rlb.backend ||
+			 !RelFileLocatorEquals(undo->state.probe_rlb.locator,
+								  entry->state.probe_rlb.locator)))
+			continue;
+		undo->state.has_relstats = false;
+		undo->state.has_delta_state = false;
+		undo->state.has_stats_baseline = false;
+		undo->state.last_inval_valid = false;
+		undo->state.partial_scan_valid = false;
+		undo->state.ext_stats_stale |= entry->state.ext_stats_stale;
+	}
+}
+
 static bool
 fasttrun_cache_make_empty_storage_authoritative(FasttrunAnalyzeCacheEntry *entry,
 												bool truncated,
 												Oid *plan_relid)
 {
 	SMgrRelation own;
+	BlockNumber pages;
 
 	*plan_relid = entry->state.heap_relid;
 
@@ -87,19 +187,8 @@ fasttrun_cache_make_empty_storage_authoritative(FasttrunAnalyzeCacheEntry *entry
 		return false;
 
 	/* An empty heap gives 0 pages here, a rebuilt index keeps its metapage. */
-	entry->state.has_relstats = true;
-	entry->state.cached_pages = smgrnblocks(own, MAIN_FORKNUM);
-	entry->state.published_dead = entry->aborted_pages;
-	entry->state.published_aborted_writes = entry->aborted_writes;
-	entry->state.cached_tuples = 0;
-	entry->state.count_exact = true;
-	entry->state.cached_allvisible = 0;
-	entry->state_subid = InvalidSubTransactionId;
-	entry->state.has_delta_state = false;
-	/* cached_pages drifted -- drop the lazy memo. */
-	entry->lazy_check_subid = InvalidSubTransactionId;
-	entry->lazy_check_epoch = 0;
-	entry->lazy_check_pages = 0;
+	pages = smgrnblocks(own, MAIN_FORKNUM);
+	fasttrun_cache_adopt_empty_relstats(entry, pages, truncated);
 
 	return true;
 }
@@ -446,7 +535,6 @@ fasttrun_cache_anchor_abort_invalidation(Oid relid)
 		return;
 	entry->state.last_inval_pages = entry->state.cached_pages;
 	entry->state.last_inval_tuples = (float4) entry->state.cached_tuples;
-	entry->state.last_inval_dead = entry->state.published_dead;
 	entry->state.last_inval_valid = true;
 }
 
@@ -766,9 +854,7 @@ fasttrun_xact_callback(XactEvent event, void *arg)
 			fasttrun_stats_forget_in_flight();
 			break;
 		case XACT_EVENT_PREPARE:
-			/* Prepared xacts cannot retain backend-private temp statistics. */
-			fasttrun_cache_reset();
-			fasttrun_stats_cache_reset();
+			/* Core forbids temp access here. Keep committed session caches. */
 			fasttrun_stats_forget_in_flight();
 			break;
 		default:
@@ -777,10 +863,12 @@ fasttrun_xact_callback(XactEvent event, void *arg)
 
 	/* Frame contexts are children of TopTransactionContext. */
 	fasttrun_xact_frame = NULL;
+	fasttrun_xact_dropped_statext = false;
 	fasttrun_xact_frame_pool = NULL;
 	fasttrun_xact_frame_pool_used = 0;
 	fasttrun_xact_epoch++;
 	fasttrun_unobserved_writers = false;
+	fasttrun_unobserved_storage_ddl = false;
 	fasttrun_counters_flush();
 }
 

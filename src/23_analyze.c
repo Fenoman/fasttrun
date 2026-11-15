@@ -112,6 +112,7 @@ fasttrun_analyze_relation(Relation rel)
 	bool			stats_visibility_changed = false;
 	bool			index_relstats_changed = false;
 	bool			need_plan_inval = false;
+	bool			inval_pending;
 	bool			pure_delta_noop = false;
 	bool			refresh_deferred = false;
 	bool			partial_index_sampled = false;
@@ -141,9 +142,15 @@ fasttrun_analyze_relation(Relation rel)
 		fasttrun_log_if_slow(&started, "fasttrun_analyze", rel, "core ANALYZE");
 		return;
 	}
+	entry = fasttrun_cache_lookup(relOid);
+	if (entry != NULL && fasttrun_cache_storage_check_due(entry, relOid))
+		(void) fasttrun_cache_check_storage(entry, rel);
 	relation_policy_changed = fasttrun_stats_set_relation_policy(rel,
 													FASTTRUN_REL_LOCAL_NEUTRAL);
 	if (relation_policy_changed && fasttrun_relation_has_core_stats(rel))
+		stats_visibility_changed = true;
+	if (has_extended_stats && fasttrun_stats_can_hide_extended(rel) &&
+		fasttrun_cache_mark_extended_stale(rel))
 		stats_visibility_changed = true;
 	old_pages = rel->rd_rel->relpages;
 	old_allvisible = rel->rd_rel->relallvisible;
@@ -155,9 +162,6 @@ fasttrun_analyze_relation(Relation rel)
 	/* Lazy-mode delta hit: see header comment block above. */
 	if (have_counters)
 	{
-		entry = fasttrun_cache_lookup(relOid);
-		if (entry != NULL && fasttrun_cache_storage_check_due(entry, relOid))
-			(void) fasttrun_cache_check_storage(entry, rel);
 		if (entry != NULL
 			&& entry->state.has_delta_state
 			&& fasttrun_relation_has_same_locator(rel, entry)
@@ -544,7 +548,9 @@ fasttrun_analyze_relation(Relation rel)
 									   pages_now))
 		stats_visibility_changed = true;
 
-	need_plan_inval = (old_pages != pages_now ||
+	/* Lazy empty-storage adoption can publish without invalidating plans. */
+	inval_pending = entry != NULL && !entry->state.last_inval_valid;
+	need_plan_inval = (inval_pending || old_pages != pages_now ||
 					   old_tuples != (float4) tuples_count ||
 					   old_allvisible != (int32) allvisible_now ||
 					   stats_recollected ||
@@ -568,12 +574,12 @@ fasttrun_analyze_relation(Relation rel)
 	 * the per-row ratio here cannot measure.
 	 */
 	if (need_plan_inval && fasttrun_invalidate_threshold > 0.0 &&
+		!inval_pending &&
 		!stats_recollected && !stats_visibility_changed &&
 		!index_relstats_changed)
 	{
 		BlockNumber	anchor_pages = old_pages;
 		float4		anchor_tuples = old_tuples;
-		BlockNumber	live_pages = pages_now;
 		double		baseline_tuples;
 		double		ratio_tuples;
 		double		ratio_pages;
@@ -583,10 +589,6 @@ fasttrun_analyze_relation(Relation rel)
 		{
 			anchor_pages = entry->state.last_inval_pages;
 			anchor_tuples = entry->state.last_inval_tuples;
-			/* Dead pages of rolled-back writes do not move an estimate. */
-			if (entry->aborted_pages > entry->state.last_inval_dead)
-				live_pages -= Min(live_pages,
-								  entry->aborted_pages - entry->state.last_inval_dead);
 		}
 
 		baseline_tuples = (anchor_tuples > 0.0f)
@@ -594,8 +596,8 @@ fasttrun_analyze_relation(Relation rel)
 		ratio_tuples =
 			fabs((double) tuples_count - (double) anchor_tuples) / baseline_tuples;
 		ratio_pages = (anchor_pages > 0)
-			? fabs((double) live_pages - (double) anchor_pages) / (double) anchor_pages
-			: (live_pages > 0 ? 1.0 : 0.0);
+			? fabs((double) pages_now - (double) anchor_pages) / (double) anchor_pages
+			: (pages_now > 0 ? 1.0 : 0.0);
 		worst = Max(ratio_tuples, ratio_pages);
 
 		if (worst < fasttrun_invalidate_threshold)
@@ -613,7 +615,6 @@ fasttrun_analyze_relation(Relation rel)
 		{
 			entry->state.last_inval_pages = pages_now;
 			entry->state.last_inval_tuples = (float4) tuples_count;
-			entry->state.last_inval_dead = entry->aborted_pages;
 			entry->state.last_inval_valid = true;
 		}
 	}
@@ -643,20 +644,6 @@ fasttrun_analyze_relation(Relation rel)
 		path = stats_recollected ? "delta with recollect" : "delta";
 	}
 
-	/*
-	 * The caller may not run core ANALYZE, so the CREATE STATISTICS data still
-	 * describe an earlier fill, and the columns collected here are newer.  A
-	 * sample taken while the table is written never serves the planner.
-	 */
-	if (stats_recollected && !collected_unsafe && has_extended_stats)
-	{
-		entry = fasttrun_cache_lookup(relOid);
-		if (entry != NULL && !entry->state.ext_stats_stale)
-		{
-			fasttrun_analyze_save_undo(entry);
-			entry->state.ext_stats_stale = true;
-		}
-	}
 	fasttrun_log_if_slow(&started, "fasttrun_analyze", rel, path);
 }
 
@@ -894,6 +881,13 @@ fasttrun_analyze(PG_FUNCTION_ARGS)
 						RelationGetRelationName(rel)),
 				 errhint("Use core SQL ANALYZE for inheritance or partition traversal.")));
 	}
+	if (rel->rd_rel->relkind != RELKIND_RELATION)
+	{
+		table_close(rel, NoLock);
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("fasttrun_analyze: relation \"%s\" is not a heap table", relvar->relname)));
+	}
 	if (rel->rd_tableam != GetHeapamTableAmRoutine())
 	{
 		table_close(rel, NoLock);
@@ -968,6 +962,7 @@ fasttrun_analyze_bulk(PG_FUNCTION_ARGS)
 		Oid			relOid;
 		Relation	rel;
 
+		CHECK_FOR_INTERRUPTS();
 		if (nulls[i])
 			continue;
 
@@ -996,6 +991,13 @@ fasttrun_analyze_bulk(PG_FUNCTION_ARGS)
 					 errmsg("fasttrun_analyze_bulk: relation \"%s\" is partitioned or an inheritance parent",
 							RelationGetRelationName(rel)),
 					 errhint("Use core SQL ANALYZE for inheritance or partition traversal.")));
+		}
+		if (rel->rd_rel->relkind != RELKIND_RELATION)
+		{
+			table_close(rel, NoLock);
+			ereport(ERROR,
+					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+					 errmsg("fasttrun_analyze_bulk: relation \"%s\" is not a heap table", relvar->relname)));
 		}
 		if (rel->rd_tableam != GetHeapamTableAmRoutine())
 		{
@@ -1079,13 +1081,19 @@ fasttrun_relstats(PG_FUNCTION_ARGS)
 			 RelationGetRelationName(rel));
 	}
 
-	if (rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
+	if (rel->rd_rel->relkind != RELKIND_RELATION &&
+		rel->rd_rel->relkind != RELKIND_INDEX)
 	{
 		relation_close(rel, NoLock);
-		elog(ERROR, "fasttrun_relstats: relation \"%s\" is not heap-AM",
-			 RelationGetRelationName(rel));
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("fasttrun_relstats: relation \"%s\" is not a table or an index",
+						relvar->relname)));
 	}
-	fasttrun_poison_check_relation(rel, "fasttrun_relstats", false);
+	if (rel->rd_rel->relkind == RELKIND_INDEX)
+		fasttrun_poison_check_relid(relOid, "fasttrun_relstats");
+	else
+		fasttrun_poison_check_relation(rel, "fasttrun_relstats", false);
 
 	/*
 	 * Re-inject cached relstats after relcache rebuilds so direct SQL

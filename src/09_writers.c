@@ -54,7 +54,8 @@ static inline bool
 fasttrun_cache_storage_check_due(const FasttrunAnalyzeCacheEntry *entry,
 								 Oid relid)
 {
-	return entry->state.has_delta_state && entry->state.cached_pages > 0 &&
+	return ((entry->state.has_relstats && entry->state.cached_pages > 0) ||
+			(!entry->state.has_relstats && entry->state.owns_index_relstats)) &&
 		entry->state.heap_relid == relid &&
 		entry->write_check_epoch != fasttrun_xact_epoch;
 }
@@ -80,11 +81,27 @@ fasttrun_cache_check_storage(FasttrunAnalyzeCacheEntry *entry, Relation rel)
 	if (pages == 0)
 	{
 		bool		had_rows = entry->state.cached_tuples > 0;
+		List	   *indexes;
+		ListCell   *lc;
 
 		if (fasttrun_cache_make_empty_storage_authoritative(entry, false,
 														   &plan_relid) &&
 			had_rows)
 			fasttrun_count(FTC_STORAGE_FOUND_EMPTY);
+		if (!entry->state.has_relstats)
+			fasttrun_stats_neutralize_file(entry->relid, &entry->state.probe_rlb);
+
+		/* A cached write or COPY does not run planner reinjection for indexes. */
+		indexes = RelationGetIndexList(rel);
+		foreach(lc, indexes)
+		{
+			FasttrunAnalyzeCacheEntry *index = fasttrun_cache_lookup(lfirst_oid(lc));
+
+			if (index != NULL)
+				(void) fasttrun_cache_make_empty_storage_authoritative(index, false,
+																		 &plan_relid);
+		}
+		list_free(indexes);
 	}
 	return pages;
 }
@@ -296,7 +313,8 @@ fasttrun_executor_start(QueryDesc *queryDesc, int eflags)
 		 */
 		if (fasttrun_poison_cache != NULL)
 			fasttrun_poison_check_plan(queryDesc->plannedstmt);
-		fasttrun_executor_walk_targets(queryDesc->plannedstmt, true);
+		if (!(eflags & EXEC_FLAG_EXPLAIN_ONLY))
+			fasttrun_executor_walk_targets(queryDesc->plannedstmt, true);
 		fasttrun_statement_seq++;
 	}
 
@@ -309,7 +327,8 @@ fasttrun_executor_start(QueryDesc *queryDesc, int eflags)
 static void
 fasttrun_executor_end(QueryDesc *queryDesc)
 {
-	if (!fasttrun_passthrough)
+	if (!fasttrun_passthrough &&
+		!(queryDesc->estate->es_top_eflags & EXEC_FLAG_EXPLAIN_ONLY))
 		fasttrun_executor_walk_targets(queryDesc->plannedstmt, false);
 
 	if (prev_ExecutorEnd != NULL)

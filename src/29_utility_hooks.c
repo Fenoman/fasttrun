@@ -32,13 +32,21 @@ fasttrun_evict_utility_caches(Node *parsetree)
 			{
 				AlterTableStmt *stmt = (AlterTableStmt *) parsetree;
 				FasttrunDdlEffect effect = fasttrun_alter_table_effect(stmt);
+				List	   *relids = fasttrun_utility_tree(
+					RangeVarGetRelid(stmt->relation, NoLock, true),
+					fasttrun_alter_table_recurses(stmt));
+				ListCell   *lc;
 
-				if (effect == FASTTRUN_DDL_EVICTS)
-					fasttrun_evict_rangevar(stmt->relation);
-				else
-					fasttrun_keep_stats_through_ddl(stmt->relation, stmt,
+				foreach(lc, relids)
+				{
+					if (effect == FASTTRUN_DDL_EVICTS)
+						fasttrun_evict_temp_relid(lfirst_oid(lc));
+					else
+						fasttrun_keep_stats_through_ddl(lfirst_oid(lc), stmt,
 													effect == FASTTRUN_DDL_BUILDS_INDEX,
 													&kept_ddl);
+				}
+				list_free(relids);
 				break;
 			}
 		case T_CreateTrigStmt:
@@ -51,14 +59,31 @@ fasttrun_evict_utility_caches(Node *parsetree)
 				ListCell   *lc;
 
 				foreach(lc, stmt->relations)
-					fasttrun_evict_rangevar((RangeVar *) lfirst(lc));
+				{
+					RangeVar   *rv = (RangeVar *) lfirst(lc);
+					List	   *relids = fasttrun_utility_tree(
+						RangeVarGetRelid(rv, NoLock, true), rv->inh);
+					ListCell   *rlc;
+
+					foreach(rlc, relids)
+						fasttrun_evict_temp_relid(lfirst_oid(rlc));
+					list_free(relids);
+				}
 				break;
 			}
 		case T_IndexStmt:
-			fasttrun_keep_stats_through_ddl(((IndexStmt *) parsetree)->relation,
-											NULL,
-											fasttrun_index_stmt_builds((IndexStmt *) parsetree),
-											&kept_ddl);
+			{
+				IndexStmt  *stmt = (IndexStmt *) parsetree;
+				Oid			relid = RangeVarGetRelid(stmt->relation, NoLock, true);
+				bool		builds = fasttrun_index_stmt_builds(stmt);
+				List	   *relids = fasttrun_utility_tree(relid,
+					stmt->relation->inh && get_rel_relkind(relid) == RELKIND_PARTITIONED_TABLE);
+				ListCell   *lc;
+
+				foreach(lc, relids)
+					fasttrun_keep_stats_through_ddl(lfirst_oid(lc), NULL, builds, &kept_ddl);
+				list_free(relids);
+			}
 			break;
 		case T_DropStmt:
 			{
@@ -136,9 +161,45 @@ fasttrun_object_access_hook(ObjectAccessType access, Oid classId,
 		return;
 	}
 
-	if (fasttrun_passthrough || access != OAT_DROP ||
-		classId != RelationRelationId)
+	if (fasttrun_passthrough || access != OAT_DROP)
 		return;
+	if (classId == StatisticExtRelationId)
+	{
+		HeapTuple tuple = SearchSysCache1(STATEXTOID, ObjectIdGetDatum(objectId));
+
+		if (HeapTupleIsValid(tuple))
+		{
+			Oid relid = ((Form_pg_statistic_ext) GETSTRUCT(tuple))->stxrelid;
+
+			if (fasttrun_relid_is_our_temp(relid))
+			{
+				fasttrun_xact_mark_relid(relid, relid, FASTTRUN_TOUCH_DROPPED_STATEXT);
+				fasttrun_xact_dropped_statext = true;
+			}
+			ReleaseSysCache(tuple);
+		}
+		return;
+	}
+	if (classId != RelationRelationId)
+		return;
+
+	/* A dropped temp index can return even before its heap is managed. */
+	if (subId == 0 && get_rel_relkind(objectId) == RELKIND_INDEX)
+	{
+		Oid			heap_relid = IndexGetRelation(objectId, true);
+
+		if (OidIsValid(heap_relid) && fasttrun_relid_is_our_temp(heap_relid))
+		{
+			Relation	indexrel = try_relation_open(objectId, NoLock);
+
+			if (indexrel == NULL ||
+				indexrel->rd_createSubid != GetCurrentSubTransactionId())
+				fasttrun_xact_mark_relid(heap_relid, heap_relid,
+										 FASTTRUN_TOUCH_DROPPED_COMPONENT);
+			if (indexrel != NULL)
+				relation_close(indexrel, NoLock);
+		}
+	}
 
 	/*
 	 * A dropped column: DROP COLUMN, a compound ALTER TABLE or a cascade to a
@@ -280,7 +341,8 @@ fasttrun_utility_hook_body(PlannedStmt *pstmt,
 				LWLockAcquire(fasttrun_track_lock, LW_EXCLUSIVE);
 				entry = hash_search(fasttrun_track_htab,
 									stmt->relation->relname,
-									HASH_ENTER_NULL, &found);
+									hash_get_num_entries(fasttrun_track_htab) >= FASTTRUN_TRACK_MAX
+									? HASH_FIND : HASH_ENTER_NULL, &found);
 				if (entry != NULL)
 				{
 					if (!found)
@@ -317,6 +379,7 @@ fasttrun_utility_hook_body(PlannedStmt *pstmt,
 	if (OidIsValid(copy_relid))
 		fasttrun_stats_update_in_flight(copy_relid, -1);
 
+	fasttrun_note_utility_file_births(parsetree);
 	fasttrun_finish_rewrite_handoff(rewrite_relids);
 	fasttrun_finish_analyze_handoff(analyze_targets);
 	fasttrun_free_analyze_handoff(analyze_targets);

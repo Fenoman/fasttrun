@@ -555,7 +555,7 @@ fasttrun_build_pg_statistic_tuple(TupleDesc pg_stats_desc, Oid relid,
  * a non-trivial sample.
  */
 static int
-fasttrun_compute_max_minrows(Relation rel)
+fasttrun_compute_max_minrows_as_owner(Relation rel)
 {
 	TupleDesc		tupdesc = RelationGetDescr(rel);
 	int				natts = tupdesc->natts;
@@ -621,6 +621,34 @@ fasttrun_compute_max_minrows(Relation rel)
 		max_minrows = 100;
 
 	return max_minrows;
+}
+
+static int
+fasttrun_compute_max_minrows(Relation rel)
+{
+	Oid			save_userid;
+	int			save_sec_context;
+	int			save_nestlevel;
+	int			minrows = 0;
+
+	GetUserIdAndSecContext(&save_userid, &save_sec_context);
+	save_nestlevel = NewGUCNestLevel();
+	PG_TRY();
+	{
+		SetUserIdAndSecContext(rel->rd_rel->relowner,
+							   save_sec_context | SECURITY_RESTRICTED_OPERATION);
+#if PG_VERSION_NUM >= 170000
+		RestrictSearchPath();
+#endif
+		minrows = fasttrun_compute_max_minrows_as_owner(rel);
+	}
+	PG_FINALLY();
+	{
+		AtEOXact_GUC(false, save_nestlevel);
+		SetUserIdAndSecContext(save_userid, save_sec_context);
+	}
+	PG_END_TRY();
+	return minrows;
 }
 
 /*

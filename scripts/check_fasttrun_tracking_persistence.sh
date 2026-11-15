@@ -211,6 +211,58 @@ SQL
 	echo "tracking persistence passed: clean sha256=$saved_sha"
 }
 
+run_reset_error_case()
+{
+	local case_dir=$WORKDIR/reset_error
+	local data=$case_dir/data
+	local socket=$case_dir/socket
+	local track_file=$data/pg_stat/fasttrun_temp_stats
+	local port saved_snapshot saved_sha
+
+	mkdir -p "$socket"
+	if [ -n "$PG_RUN_AS" ]; then chown "$PG_RUN_AS" "$case_dir" "$socket"; fi
+	port=${PGPORT:-$($PYTHON -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')}
+	run_pg "$INITDB" -D "$data" --no-locale -E UTF8 >/dev/null
+	start_cluster "$data" "$socket" "$case_dir/save.log" "$port" ""
+	run_pg "$CREATEDB" -h "$socket" -p "$port" "$DBNAME"
+	run_pg "$PSQL" -h "$socket" -p "$port" -d "$DBNAME" -XAtq -v ON_ERROR_STOP=1 >/dev/null <<'SQL'
+CREATE EXTENSION fasttrun;
+CREATE SCHEMA dummy_tmp;
+CREATE TABLE dummy_tmp.reset_probe(id int);
+SET fasttrun.track_schedule = '';
+SET fasttrun.track_temp_creates = on;
+CREATE TEMP TABLE reset_probe(LIKE dummy_tmp.reset_probe);
+SQL
+	saved_snapshot=$(snapshot "$socket" "$port")
+	[ "$saved_snapshot" = 'SNAPSHOT reset_probe:1' ]
+	stop_cluster "$data"
+	saved_sha=$(file_sha256 "$track_file")
+	start_cluster "$data" "$socket" "$case_dir/reset.log" "$port" ""
+	chmod 500 "$data/pg_stat"
+	if run_pg "$PSQL" -h "$socket" -p "$port" -d "$DBNAME" -XAtq -v ON_ERROR_STOP=1 \
+		-c 'SELECT fasttrun_reset_temp_stats()' >"$case_dir/reset.out" 2>&1; then
+		chmod 700 "$data/pg_stat"
+		echo 'FAIL: reset reported success although the durable file could not be removed' >&2
+		return 1
+	fi
+	chmod 700 "$data/pg_stat"
+	grep -q 'could not remove tracking statistics file' "$case_dir/reset.out"
+	[ "$(snapshot "$socket" "$port")" = "$saved_snapshot" ]
+	[ "$(file_sha256 "$track_file")" = "$saved_sha" ]
+	run_pg "$PSQL" -h "$socket" -p "$port" -d "$DBNAME" -XAtq -v ON_ERROR_STOP=1 \
+		-c 'SELECT fasttrun_reset_temp_stats(); SELECT fasttrun_reset_temp_stats();' >/dev/null
+	[ ! -e "$track_file" ]
+	[ "$(snapshot "$socket" "$port")" = 'SNAPSHOT ' ]
+	stop_cluster "$data"
+	start_cluster "$data" "$socket" "$case_dir/restart.log" "$port" ""
+	[ "$(snapshot "$socket" "$port")" = 'SNAPSHOT ' ]
+	stop_cluster "$data"
+	if grep -Eq 'TRAP|Assertion|FATAL:|PANIC:|server process .*terminated' "$case_dir"/*.log; then
+		return 1
+	fi
+	echo 'tracking persistence passed: reset_error, retry, missing file and restart'
+}
+
 run_case()
 {
 	local point=$1
@@ -378,7 +430,7 @@ SQL
 }
 
 case "$CASE_NAME" in
-	all|clean|track_save_write|track_save_close|track_save_pre_rename|immediate_lock)
+	all|clean|reset_error|track_save_write|track_save_close|track_save_pre_rename|immediate_lock)
 		;;
 	*)
 		echo "unknown FASTTRUN_TRACKING_PERSISTENCE_CASE: $CASE_NAME" >&2
@@ -388,7 +440,11 @@ esac
 
 run_clean_case
 
-if [ "$CASE_NAME" = clean ]; then
+if [ "$CASE_NAME" = all ] || [ "$CASE_NAME" = reset_error ]; then
+	run_reset_error_case
+fi
+
+if [ "$CASE_NAME" = clean ] || [ "$CASE_NAME" = reset_error ]; then
 	exit 0
 fi
 if [ "$ASSERTIONS_ENABLED" != on ]; then

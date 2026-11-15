@@ -17,9 +17,9 @@
 #   C. bulk,   threshold=0    -- fasttrun_analyze_bulk, каждый инвалидирует
 #   D. bulk,   threshold=0.2  -- bulk + порог
 #
-# Pass: baseline дал видимую работу (A>0), и порог срезал инвалидации в
-# single (A->B) и в bulk (C->D) как минимум на MIN_CUT_PCT.  Амортизация
-# прохода plan-cache внутри ядра (эффект bulk) -- отдельный core-символ
+# Pass: both baselines report invalidations (A>0 and C>0). Threshold cuts in
+# single (A->B) and bulk (C->D) must each reach MIN_CUT_PCT.
+# Амортизация прохода plan-cache внутри ядра (эффект bulk) -- отдельный core-символ
 # PlanCacheRelCallback; если он резолвится (небинарь без strip / dbgsym),
 # счётчик печатается справочно, иначе секция пропускается.
 #
@@ -101,6 +101,7 @@ fi
 # bpftrace-программа: счётчики по pid.  END печатает карты при выходе.
 BPF_PROG="$WORKDIR/bulk.bt"
 {
+	echo 'BEGIN { printf("FASTTRUN_BULK_READY\n"); }'
 	echo "uprobe:$FASTTRUN_SO:fasttrun_invalidate_local_plan_cache { @ft_inval[pid] = count(); }"
 	if [ "$PLAN_CB_OK" -eq 1 ]; then
 		echo "uprobe:$PG_BINDIR/postgres:PlanCacheRelCallback { @plan_cb[pid] = count(); }"
@@ -115,11 +116,10 @@ BPF_ERR="$WORKDIR/bulk.err"
 $SUDO "$BPFTRACE" "$BPF_PROG" -o "$BPF_DUMP" 2>"$BPF_ERR" &
 BPF_PID=$!
 
-# Ждём, пока uprobes реально прицепятся (иначе первый вариант не сосчитается).
-# bpftrace с -o пишет "Attaching N probes..." в сам dump-файл.
+# Wait for the BPF program's marker after probe attachment.
 attached=0
 for _ in $(seq 1 200); do
-	if grep -qi "Attaching" "$BPF_DUMP" 2>/dev/null; then attached=1; break; fi
+	if grep -qx 'FASTTRUN_BULK_READY' "$BPF_DUMP" 2>/dev/null; then attached=1; break; fi
 	if ! kill -0 "$BPF_PID" >/dev/null 2>&1; then break; fi
 	sleep 0.1
 done
@@ -252,23 +252,22 @@ if [ "$A_inval" -le 0 ]; then
 	echo "FAIL: baseline дал ноль инвалидаций -- uprobe на fasttrun.so не подцепился?" >&2
 	exit 1
 fi
+if [ "$C_inval" -le 0 ]; then
+	echo "FAIL: bulk baseline (C) produced no invalidations" >&2
+	exit 1
+fi
 
 cut_single=$(( (A_inval - B_inval) * 100 / A_inval ))
 echo
 echo "порог срезал инвалидации single (A->B): ${cut_single}%"
-if [ "$C_inval" -gt 0 ]; then
-	cut_bulk=$(( (C_inval - D_inval) * 100 / C_inval ))
-	echo "порог срезал инвалидации bulk   (C->D): ${cut_bulk}%"
-else
-	cut_bulk=0
-	echo "bulk baseline (C) = 0 -- пропуск проверки bulk-оси"
-fi
+cut_bulk=$(( (C_inval - D_inval) * 100 / C_inval ))
+echo "порог срезал инвалидации bulk   (C->D): ${cut_bulk}%"
 
 if [ "$cut_single" -lt "$MIN_CUT_PCT" ]; then
 	echo "FAIL: порог в single срезал всего ${cut_single}% (ждали >= ${MIN_CUT_PCT}%)" >&2
 	failed=1
 fi
-if [ "$C_inval" -gt 0 ] && [ "$cut_bulk" -lt "$MIN_CUT_PCT" ]; then
+if [ "$cut_bulk" -lt "$MIN_CUT_PCT" ]; then
 	echo "FAIL: порог в bulk срезал всего ${cut_bulk}% (ждали >= ${MIN_CUT_PCT}%)" >&2
 	failed=1
 fi

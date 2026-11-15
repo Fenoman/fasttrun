@@ -17,6 +17,89 @@
 #ifndef FASTTRUN_UNITY
 #error "src/28_utility_ddl.c is included only from fasttrun.c"
 #endif /* FASTTRUN_UNITY */
+
+/* Only utility paths expand trees. Callers filter ownership before locking. */
+static List *
+fasttrun_utility_tree(Oid relid, bool recurse)
+{
+	if (!OidIsValid(relid))
+		return NIL;
+	return recurse ? find_all_inheritors(relid, NoLock, NULL) :
+		list_make1_oid(relid);
+}
+
+/*
+ * Core expands maintenance targets differently across major versions.
+ * ANALYZE also samples descendants for inherited statistics, even when those
+ * descendants are not individual maintenance targets (including ONLY in 18).
+ */
+static List *
+fasttrun_vacuum_targets(VacuumRelation *vrel, bool inherited_sample)
+{
+	Oid			relid = vrel->oid;
+	bool		recurse = inherited_sample;
+
+	if (!OidIsValid(relid) && vrel->relation != NULL)
+	{
+		relid = RangeVarGetRelid(vrel->relation, NoLock, true);
+#if PG_VERSION_NUM >= 180000
+		recurse |= vrel->relation->inh;
+#else
+		recurse |= get_rel_relkind(relid) == RELKIND_PARTITIONED_TABLE;
+#endif
+	}
+	return fasttrun_utility_tree(relid, recurse);
+}
+
+static bool fasttrun_vacuum_option_enabled(VacuumStmt *stmt, const char *name);
+static void fasttrun_stats_arm_rewrite_undo(Relation rel);
+
+/* These ALTER variants propagate column or constraint work to descendants. */
+static bool
+fasttrun_alter_table_recurses(AlterTableStmt *stmt)
+{
+	ListCell   *lc;
+
+	if (!stmt->relation->inh)
+		return false;
+	foreach(lc, stmt->cmds)
+	{
+		AlterTableCmd *cmd = (AlterTableCmd *) lfirst(lc);
+
+		switch (cmd->subtype)
+		{
+			case AT_AddColumn:
+			case AT_DropColumn:
+			case AT_ColumnDefault:
+			case AT_DropNotNull:
+			case AT_SetNotNull:
+			case AT_DropExpression:
+#if PG_VERSION_NUM >= 170000
+			case AT_SetExpression:
+#endif
+			case AT_SetStatistics:
+			case AT_SetStorage:
+			case AT_AddConstraint:
+			case AT_DropConstraint:
+			case AT_AlterConstraint:
+			case AT_ValidateConstraint:
+			case AT_AlterColumnType:
+			case AT_EnableTrig:
+			case AT_EnableAlwaysTrig:
+			case AT_EnableReplicaTrig:
+			case AT_EnableTrigAll:
+			case AT_EnableTrigUser:
+			case AT_DisableTrig:
+			case AT_DisableTrigAll:
+			case AT_DisableTrigUser:
+				return true;
+			default:
+				break;
+		}
+	}
+	return false;
+}
+
 static void
 fasttrun_evict_missing_relid(Oid relid)
 {
@@ -80,6 +163,14 @@ fasttrun_evict_temp_relid(Oid relid)
 							FASTTRUN_TOUCH_ANALYZE |
 							FASTTRUN_TOUCH_STATS |
 							FASTTRUN_TOUCH_PLAN_INVALIDATE);
+	{
+		FasttrunAnalyzeCacheEntry *entry = fasttrun_cache_lookup(relid);
+
+		/* Save DDL undo only after observing a committed storage emptying. */
+		if (entry != NULL && fasttrun_cache_storage_check_due(entry, relid))
+			(void) fasttrun_cache_check_storage(entry, rel);
+	}
+	fasttrun_stats_arm_rewrite_undo(rel);
 	(void) fasttrun_stats_neutralize_relation(rel);
 
 	if (rel->rd_rel->relkind == RELKIND_RELATION ||
@@ -249,17 +340,13 @@ fasttrun_alter_table_effect(AlterTableStmt *stmt)
  * takes the exact heap relstats an index build writes to pg_class.
  */
 static void
-fasttrun_keep_stats_through_ddl(RangeVar *rv, AlterTableStmt *alter,
+fasttrun_keep_stats_through_ddl(Oid relid, AlterTableStmt *alter,
 								bool builds_index, List **kept)
 {
-	Oid			relid;
 	Relation	rel;
 	HeapTuple	tp;
 	bool		is_our_temp;
 
-	if (rv == NULL)
-		return;
-	relid = RangeVarGetRelid(rv, NoLock, true);
 	if (!OidIsValid(relid) || !fasttrun_manages_relid(relid))
 		return;
 	tp = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
@@ -277,8 +364,11 @@ fasttrun_keep_stats_through_ddl(RangeVar *rv, AlterTableStmt *alter,
 	if (alter != NULL)
 	{
 		ListCell   *lc;
+		FasttrunStatsRelidEntry *entry = fasttrun_stats_relid_cache == NULL ? NULL :
+			hash_search(fasttrun_stats_relid_cache, &relid, HASH_FIND, NULL);
 
-		fasttrun_stats_note_wide_writer_ddl(rv);
+		if (entry != NULL)
+			entry->updated_cols_exact = false;
 		foreach(lc, alter->cmds)
 		{
 			AlterTableCmd *cmd = (AlterTableCmd *) lfirst(lc);
@@ -367,6 +457,20 @@ fasttrun_poison_check_rangevar(RangeVar *rv, const char *operation)
 	fasttrun_poison_check_relid(relid, operation);
 }
 
+static void
+fasttrun_poison_check_tree(RangeVar *rv, bool recurse, const char *operation)
+{
+	List	   *relids;
+	ListCell   *lc;
+
+	if (rv == NULL)
+		return;
+	relids = fasttrun_utility_tree(RangeVarGetRelid(rv, NoLock, true), recurse);
+	foreach(lc, relids)
+		fasttrun_poison_check_relid(lfirst_oid(lc), operation);
+	list_free(relids);
+}
+
 /*
  * Check every blocked table, not only the first one: a blocked table dropped
  * earlier in this transaction keeps its entry until COMMIT and passes the
@@ -422,14 +526,15 @@ fasttrun_poison_check_utility(Node *parsetree)
 			{
 				foreach(lc, ((VacuumStmt *) parsetree)->rels)
 				{
+					VacuumStmt *stmt = (VacuumStmt *) parsetree;
 					VacuumRelation *vrel = (VacuumRelation *) lfirst(lc);
+					List	   *relids = fasttrun_vacuum_targets(vrel,
+						!stmt->is_vacuumcmd || fasttrun_vacuum_option_enabled(stmt, "analyze"));
+					ListCell   *rlc;
 
-					if (OidIsValid(vrel->oid))
-						fasttrun_poison_check_relid(vrel->oid,
-												 "VACUUM/ANALYZE");
-					else
-						fasttrun_poison_check_rangevar(vrel->relation,
-													 "VACUUM/ANALYZE");
+					foreach(rlc, relids)
+						fasttrun_poison_check_relid(lfirst_oid(rlc), "VACUUM/ANALYZE");
+					list_free(relids);
 				}
 			}
 			break;
@@ -437,23 +542,74 @@ fasttrun_poison_check_utility(Node *parsetree)
 			if (((ClusterStmt *) parsetree)->relation == NULL)
 				fasttrun_poison_check_any("CLUSTER");
 			else
-				fasttrun_poison_check_rangevar(
-					((ClusterStmt *) parsetree)->relation, "CLUSTER");
+			{
+				RangeVar *rv = ((ClusterStmt *) parsetree)->relation;
+
+				fasttrun_poison_check_tree(rv,
+					get_rel_relkind(RangeVarGetRelid(rv, NoLock, true)) ==
+					RELKIND_PARTITIONED_TABLE, "CLUSTER");
+			}
 			break;
 		case T_AlterTableStmt:
-			fasttrun_poison_check_rangevar(
-				((AlterTableStmt *) parsetree)->relation, "ALTER TABLE");
+			{
+				AlterTableStmt *stmt = (AlterTableStmt *) parsetree;
+
+				fasttrun_poison_check_tree(stmt->relation,
+					fasttrun_alter_table_recurses(stmt), "ALTER TABLE");
+				foreach(lc, stmt->cmds)
+				{
+					AlterTableCmd *cmd = (AlterTableCmd *) lfirst(lc);
+
+					if (cmd->subtype == AT_AttachPartition)
+					{
+						Oid			parent = RangeVarGetRelid(stmt->relation, NoLock, true);
+						List	   *defaults = fasttrun_utility_tree(
+							get_default_partition_oid(parent), true);
+						ListCell   *dlc;
+
+						fasttrun_poison_check_tree(((PartitionCmd *) cmd->def)->name,
+							true, "ATTACH PARTITION");
+						/* Core can scan the default partition to validate new bounds. */
+						foreach(dlc, defaults)
+							fasttrun_poison_check_relid(lfirst_oid(dlc), "ATTACH PARTITION");
+						list_free(defaults);
+					}
+				}
+			}
 			break;
 		case T_IndexStmt:
-			fasttrun_poison_check_rangevar(
-				((IndexStmt *) parsetree)->relation, "CREATE INDEX");
+			{
+				RangeVar *rv = ((IndexStmt *) parsetree)->relation;
+
+				fasttrun_poison_check_tree(rv, rv->inh &&
+					get_rel_relkind(RangeVarGetRelid(rv, NoLock, true)) ==
+					RELKIND_PARTITIONED_TABLE, "CREATE INDEX");
+			}
 			break;
 		case T_ReindexStmt:
-			if (((ReindexStmt *) parsetree)->relation == NULL)
-				fasttrun_poison_check_any("REINDEX");
-			else
-				fasttrun_poison_check_rangevar(
-					((ReindexStmt *) parsetree)->relation, "REINDEX");
+			{
+				ReindexStmt *stmt = (ReindexStmt *) parsetree;
+
+				if (stmt->relation != NULL)
+				{
+					RangeVar *rv = stmt->relation;
+					char kind = get_rel_relkind(RangeVarGetRelid(rv, NoLock, true));
+
+					fasttrun_poison_check_tree(rv,
+						kind == RELKIND_PARTITIONED_TABLE || kind == RELKIND_PARTITIONED_INDEX,
+						"REINDEX");
+				}
+				else if (stmt->kind == REINDEX_OBJECT_DATABASE)
+					fasttrun_poison_check_any("REINDEX");
+				else if (stmt->kind == REINDEX_OBJECT_SCHEMA)
+				{
+					Oid nspid = get_namespace_oid(stmt->name, true);
+
+					/* Other schemas and system catalogs cannot contain our heap. */
+					if (OidIsValid(nspid) && isTempNamespace(nspid))
+						fasttrun_poison_check_any("REINDEX");
+				}
+			}
 			break;
 		default:
 			break;
@@ -536,7 +692,8 @@ fasttrun_try_open_managed_heap(Oid relid)
 {
 	Relation	rel;
 
-	if (!OidIsValid(relid))
+	if (!OidIsValid(relid) || !fasttrun_manages_relid(relid) ||
+		!fasttrun_relid_is_our_temp(relid))
 		return NULL;
 	rel = try_relation_open(relid, AccessShareLock);
 	if (rel == NULL)
@@ -706,6 +863,13 @@ fasttrun_prepare_relation_handoff(Relation rel, Bitmapset *attnums,
 	if (!fasttrun_may_core_analyze(rel))
 		return;
 
+	{
+		FasttrunAnalyzeCacheEntry *entry = fasttrun_cache_lookup(relid);
+
+		/* Observe committed emptying before core handoff saves local undo. */
+		if (entry != NULL && fasttrun_cache_storage_check_due(entry, relid))
+			(void) fasttrun_cache_check_storage(entry, rel);
+	}
 	if (do_rewrite)
 	{
 		fasttrun_stats_arm_rewrite_undo(rel);
@@ -761,12 +925,8 @@ fasttrun_vacuum_drop_delta(VacuumStmt *stmt)
 		foreach(lc, stmt->rels)
 		{
 			VacuumRelation *vrel = (VacuumRelation *) lfirst(lc);
-			Oid			relid = vrel->oid;
 
-			if (!OidIsValid(relid) && vrel->relation != NULL)
-				relid = RangeVarGetRelid(vrel->relation, NoLock, true);
-			if (OidIsValid(relid))
-				relids = lappend_oid(relids, relid);
+			relids = list_concat(relids, fasttrun_vacuum_targets(vrel, false));
 		}
 	}
 	foreach(lc, relids)
@@ -786,8 +946,12 @@ fasttrun_vacuum_drop_delta(VacuumStmt *stmt)
 	{
 		foreach(lc, relids)
 		{
-			if (fasttrun_may_maintain_relid(lfirst_oid(lc), false))
-				permitted = lappend_oid(permitted, lfirst_oid(lc));
+			Oid			relid = lfirst_oid(lc);
+
+			if (fasttrun_cache_lookup(relid) != NULL &&
+				fasttrun_relid_is_our_temp(relid) &&
+				fasttrun_may_maintain_relid(relid, false))
+				permitted = lappend_oid(permitted, relid);
 		}
 	}
 	list_free(relids);
@@ -855,7 +1019,6 @@ fasttrun_finish_vacuum(List *relids)
 				entry->aborted_pages = 0;
 				entry->state.published_dead = 0;
 				entry->state.published_aborted_writes = entry->aborted_writes;
-				entry->state.last_inval_dead = 0;
 				entry->lazy_check_subid = InvalidSubTransactionId;
 				entry->lazy_check_epoch = 0;
 				entry->lazy_check_pages = 0;
@@ -917,23 +1080,25 @@ fasttrun_prepare_vacuum_handoff(VacuumStmt *stmt,
 	foreach(lc, stmt->rels)
 	{
 		VacuumRelation *vrel = (VacuumRelation *) lfirst(lc);
-		Oid			relid = vrel->oid;
-		Relation	rel;
-		Bitmapset  *attnums = NULL;
+		List	   *relids = fasttrun_vacuum_targets(vrel, false);
+		ListCell   *rlc;
 
-		if (!OidIsValid(relid) && vrel->relation != NULL)
-			relid = RangeVarGetRelid(vrel->relation, NoLock, true);
-		if (!OidIsValid(relid) || !fasttrun_manages_relid(relid))
-			continue;
-		rel = fasttrun_try_open_managed_heap(relid);
-		if (rel == NULL)
-			continue;
-		if (do_analyze)
-			attnums = fasttrun_analyze_target_attnums(rel, vrel->va_cols);
-		fasttrun_prepare_relation_handoff(rel, attnums, do_analyze,
-									  do_rewrite, analyze_targets,
-									  rewrite_relids);
-		relation_close(rel, AccessShareLock);
+		foreach(rlc, relids)
+		{
+			Oid			relid = lfirst_oid(rlc);
+			Relation	rel = fasttrun_try_open_managed_heap(relid);
+			Bitmapset  *attnums = NULL;
+
+			if (rel == NULL)
+				continue;
+			if (do_analyze)
+				attnums = fasttrun_analyze_target_attnums(rel, vrel->va_cols);
+			fasttrun_prepare_relation_handoff(rel, attnums, do_analyze,
+										  do_rewrite, analyze_targets,
+										  rewrite_relids);
+			relation_close(rel, AccessShareLock);
+		}
+		list_free(relids);
 	}
 }
 
@@ -969,9 +1134,8 @@ fasttrun_prepare_cluster_handoff(ClusterStmt *stmt, List **rewrite_relids)
 	{
 		Oid			relid = RangeVarGetRelid(stmt->relation, NoLock, true);
 
-		if (!OidIsValid(relid) || !fasttrun_manages_relid(relid))
-			return;
-		relids = list_make1_oid(relid);
+		relids = fasttrun_utility_tree(relid,
+			get_rel_relkind(relid) == RELKIND_PARTITIONED_TABLE);
 	}
 
 	foreach(lc, relids)
@@ -989,16 +1153,25 @@ fasttrun_prepare_cluster_handoff(ClusterStmt *stmt, List **rewrite_relids)
 }
 
 static void
-fasttrun_remember_managed_rebind(RangeVar *relation, List **rewrite_relids)
+fasttrun_remember_managed_rebind(RangeVar *relation, bool recurse,
+								 List **rewrite_relids)
 {
 	Oid			relid;
+	List	   *relids;
+	ListCell   *lc;
 
 	if (relation == NULL)
 		return;
 	relid = RangeVarGetRelid(relation, NoLock, true);
-	if (OidIsValid(relid) && fasttrun_manages_relid(relid) &&
-		!list_member_oid(*rewrite_relids, relid))
-		*rewrite_relids = lappend_oid(*rewrite_relids, relid);
+	relids = fasttrun_utility_tree(relid, recurse);
+	foreach(lc, relids)
+	{
+		relid = lfirst_oid(lc);
+		if (fasttrun_manages_relid(relid) &&
+			!list_member_oid(*rewrite_relids, relid))
+			*rewrite_relids = lappend_oid(*rewrite_relids, relid);
+	}
+	list_free(relids);
 }
 
 static void
@@ -1021,13 +1194,15 @@ fasttrun_prepare_utility_handoff(Node *parsetree,
 			 fasttrun_alter_table_effect((AlterTableStmt *) parsetree) ==
 			 FASTTRUN_DDL_EVICTS)
 		fasttrun_remember_managed_rebind(
-			((AlterTableStmt *) parsetree)->relation, rewrite_relids);
+			((AlterTableStmt *) parsetree)->relation,
+			fasttrun_alter_table_recurses((AlterTableStmt *) parsetree), rewrite_relids);
 	else if (IsA(parsetree, TruncateStmt))
 	{
 		ListCell   *lc;
 
 		foreach(lc, ((TruncateStmt *) parsetree)->relations)
 			fasttrun_remember_managed_rebind((RangeVar *) lfirst(lc),
+										 ((RangeVar *) lfirst(lc))->inh,
 										 rewrite_relids);
 	}
 }
@@ -1203,7 +1378,6 @@ fasttrun_finish_kept_ddl(List *kept)
 				/* The plans were reset before the build. */
 				entry->state.last_inval_pages = entry->state.cached_pages;
 				entry->state.last_inval_tuples = (float4) entry->state.cached_tuples;
-				entry->state.last_inval_dead = entry->aborted_pages;
 				entry->state.last_inval_valid = true;
 				entry->lazy_check_subid = InvalidSubTransactionId;
 				entry->lazy_check_epoch = 0;
@@ -1235,7 +1409,7 @@ fasttrun_statistics_drop_relids(Node *parsetree)
 		Oid			relid = alter->relation == NULL ? InvalidOid :
 			RangeVarGetRelid(alter->relation, NoLock, true);
 
-		return OidIsValid(relid) ? list_make1_oid(relid) : NIL;
+		return fasttrun_utility_tree(relid, fasttrun_alter_table_recurses(alter));
 	}
 	if (!IsA(parsetree, DropStmt))
 		return NIL;
@@ -1285,5 +1459,63 @@ fasttrun_finish_statistics_drop(List *relids)
 		}
 		relation_close(rel, AccessShareLock);
 	}
+}
+
+/* Observe explicit DDL targets before a later rollback clears core markers. */
+static void
+fasttrun_note_utility_file_births(Node *parsetree)
+{
+	RangeVar   *target = NULL;
+	bool		recurse = false;
+	Oid			relid;
+	List	   *relids;
+	ListCell   *lc;
+
+	if (fasttrun_passthrough || parsetree == NULL)
+		return;
+	if (IsA(parsetree, AlterTableStmt))
+	{
+		target = ((AlterTableStmt *) parsetree)->relation;
+		recurse = fasttrun_alter_table_recurses((AlterTableStmt *) parsetree);
+	}
+	else if (IsA(parsetree, ClusterStmt))
+		target = ((ClusterStmt *) parsetree)->relation;
+	else if (IsA(parsetree, ReindexStmt))
+		target = ((ReindexStmt *) parsetree)->relation;
+	else if (IsA(parsetree, IndexStmt))
+		target = ((IndexStmt *) parsetree)->relation;
+	if (target == NULL)
+		return;
+	relid = RangeVarGetRelid(target, NoLock, true);
+	if (!OidIsValid(relid))
+		return;
+	if (!IsA(parsetree, AlterTableStmt))
+	{
+		char kind = get_rel_relkind(relid);
+
+		recurse = kind == RELKIND_PARTITIONED_TABLE || kind == RELKIND_PARTITIONED_INDEX;
+		if (IsA(parsetree, IndexStmt))
+			recurse &= target->inh;
+	}
+	relids = fasttrun_utility_tree(relid, recurse);
+	foreach(lc, relids)
+	{
+		Relation	rel;
+
+		relid = lfirst_oid(lc);
+		if (get_rel_relkind(relid) == RELKIND_INDEX)
+			relid = IndexGetRelation(relid, true);
+		if (!fasttrun_relid_is_our_temp(relid))
+			continue;
+		rel = try_relation_open(relid, AccessShareLock);
+		if (rel == NULL)
+			continue;
+		if (isTempNamespace(RelationGetNamespace(rel)) &&
+			(rel->rd_rel->relkind == RELKIND_RELATION ||
+			 rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE))
+			fasttrun_note_workset_birth(rel);
+		relation_close(rel, AccessShareLock);
+	}
+	list_free(relids);
 }
 

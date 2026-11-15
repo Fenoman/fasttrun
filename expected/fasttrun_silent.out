@@ -70,6 +70,114 @@ SELECT 1 AS still_alive;
            1
 (1 row)
 
+-- Bare, qualified and quoted names share core identifier truncation.
+DO $names$
+DECLARE
+  name text;
+  target text;
+  style int;
+  rows_left bigint;
+BEGIN
+  SET LOCAL client_min_messages = warning;
+  FOREACH name IN ARRAY ARRAY[
+    repeat('a', 63), repeat('b', 64), repeat('c', 72),
+    'a' || repeat('я', 31), 'aa' || repeat('я', 31),
+    'aa' || repeat('я', 35), 'MiX_' || repeat('d', 68)
+  ] LOOP
+    FOR style IN 1..3 LOOP
+      EXECUTE format('CREATE TEMP TABLE %I (id int)', name);
+      EXECUTE format('INSERT INTO %I VALUES (1), (2), (3)', name);
+      target := CASE style
+        WHEN 1 THEN CASE WHEN name LIKE 'MiX_%' THEN '"' || name || '"' ELSE name END
+        WHEN 2 THEN 'pg_temp."' || name || '"'
+        ELSE '"' || name || '"'
+      END;
+      PERFORM fasttrun_analyze(target);
+      IF (SELECT reltuples FROM fasttrun_relstats(target)) <> 3 THEN
+        RAISE EXCEPTION 'analyze did not resolve identifier: %', target;
+      END IF;
+      PERFORM fasttrun_collect_stats(target);
+      PERFORM fasttruncate(target);
+      EXECUTE format('SELECT count(*) FROM %I', name) INTO rows_left;
+      IF rows_left <> 0 THEN
+        RAISE EXCEPTION 'truncate did not resolve identifier: %', target;
+      END IF;
+      EXECUTE format('DROP TABLE %I', name);
+    END LOOP;
+  END LOOP;
+  PERFORM fasttruncate(repeat('missing_', 10));
+END
+$names$;
+-- Non-table heap relations are rejected before reading or changing storage.
+CREATE TEMP SEQUENCE ft_kind_seq;
+DO $kinds$
+DECLARE command text; rejected boolean; expected_value bigint := 1;
+BEGIN
+  FOREACH command IN ARRAY ARRAY[
+    'SELECT fasttruncate(''ft_kind_seq'')',
+    'SELECT fasttrun_analyze(''ft_kind_seq'')',
+    'SELECT fasttrun_analyze_bulk(''ft_kind_seq'')',
+    'SELECT fasttrun_collect_stats(''ft_kind_seq'')',
+    'SELECT * FROM fasttrun_relstats(''ft_kind_seq'')',
+    'SELECT * FROM fasttrun_inspect_stats(''ft_kind_seq'')'
+  ] LOOP
+    IF nextval('ft_kind_seq') <> expected_value THEN
+      RAISE EXCEPTION 'sequence fixture has an unexpected value';
+    END IF;
+    expected_value := expected_value + 1;
+    rejected := false;
+    BEGIN
+      EXECUTE command;
+    EXCEPTION WHEN wrong_object_type THEN
+      rejected := true;
+    END;
+    IF NOT rejected THEN
+      RAISE EXCEPTION 'sequence accepted by %', command;
+    END IF;
+    IF nextval('ft_kind_seq') <> expected_value THEN
+      RAISE EXCEPTION 'rejected call changed sequence storage';
+    END IF;
+    expected_value := expected_value + 1;
+  END LOOP;
+END
+$kinds$;
+DROP SEQUENCE ft_kind_seq;
+-- Diagnostic inputs distinguish unsupported objects from absent statistics.
+CREATE TEMP TABLE ft_diag_table(id int);
+CREATE INDEX ft_diag_index ON ft_diag_table(id);
+CREATE TEMP VIEW ft_diag_view AS SELECT id FROM ft_diag_table;
+DO $diagnostics$
+DECLARE command text; rejected boolean;
+BEGIN
+  FOREACH command IN ARRAY ARRAY[
+    'SELECT * FROM fasttrun_relstats(''ft_diag_view'')',
+    'SELECT * FROM fasttrun_inspect_stats(''ft_diag_view'')',
+    'SELECT * FROM fasttrun_inspect_stats(''ft_diag_index'')'
+  ] LOOP
+    rejected := false;
+    BEGIN
+      EXECUTE command;
+    EXCEPTION WHEN wrong_object_type THEN
+      rejected := true;
+    END;
+    IF NOT rejected THEN
+      RAISE EXCEPTION 'unsupported diagnostic target accepted by %', command;
+    END IF;
+  END LOOP;
+  IF (SELECT count(*) FROM fasttrun_relstats('ft_diag_index')) <> 1 THEN
+    RAISE EXCEPTION 'index relstats are not available';
+  END IF;
+  IF EXISTS (SELECT FROM fasttrun_inspect_stats('ft_diag_table')) THEN
+    RAISE EXCEPTION 'uncollected table has cached column statistics';
+  END IF;
+  IF fasttrun_relstats('ft_diag_missing') IS NOT NULL OR
+     EXISTS (SELECT FROM fasttrun_inspect_stats('ft_diag_missing')) THEN
+    RAISE EXCEPTION 'missing diagnostic target changed its empty result';
+  END IF;
+END
+$diagnostics$;
+DROP VIEW ft_diag_view;
+DROP TABLE ft_diag_table;
 -- Очистка
 DROP TABLE t_silent;
 DROP TABLE t_persistent;

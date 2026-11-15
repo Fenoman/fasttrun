@@ -40,7 +40,14 @@ fasttrun_track_snapshot(int limit)
 			continue;
 		if (!bounded)
 		{
-			Assert(snapshot.count < FASTTRUN_TRACK_MAX);
+			if (snapshot.count >= capacity)
+			{
+				hash_seq_term(&status);
+				LWLockRelease(fasttrun_track_lock);
+				ereport(ERROR,
+						(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+						 errmsg("fasttrun: tracking registry exceeds its capacity")));
+			}
 			snapshot.entries[snapshot.count++] = *entry;
 		}
 		else if (snapshot.count < capacity)
@@ -175,8 +182,30 @@ fasttrun_hot_temp_tables(PG_FUNCTION_ARGS)
 	{
 		Datum		values[3];
 		bool		nulls[3] = {false, false, false};
+		const char *name = sorted[i].relname;
+		int			len = strnlen(name, NAMEDATALEN);
+		char		escaped[2 * NAMEDATALEN + 3];
 
-		values[0] = CStringGetTextDatum(sorted[i].relname);
+		/* The shared registry can contain names from another database encoding. */
+		if (!pg_verify_mbstr(GetDatabaseEncoding(), name, len, true))
+		{
+			static const char hex[] = "0123456789abcdef";
+			int			j;
+
+			escaped[0] = '\\';
+			escaped[1] = 'x';
+			for (j = 0; j < len; j++)
+			{
+				unsigned char byte = (unsigned char) name[j];
+
+				escaped[2 + 2 * j] = hex[byte >> 4];
+				escaped[3 + 2 * j] = hex[byte & 15];
+			}
+			escaped[2 + 2 * len] = '\0';
+			name = escaped;
+			len = 2 + 2 * len;
+		}
+		values[0] = PointerGetDatum(cstring_to_text_with_len(name, len));
 		values[1] = Int64GetDatum(sorted[i].create_count);
 		values[2] = TimestampTzGetDatum(sorted[i].last_create);
 
@@ -282,14 +311,19 @@ fasttrun_reset_temp_stats(PG_FUNCTION_ARGS)
 	if (fasttrun_track_htab == NULL)
 		PG_RETURN_VOID();
 
+	/* Fail before clearing shared state, without holding an LWLock over I/O. */
+	if (unlink(FASTTRUN_TRACK_FILE) != 0 && errno != ENOENT)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("fasttrun: could not remove tracking statistics file \"%s\": %m",
+						FASTTRUN_TRACK_FILE),
+				 errdetail("Tracking counters have not been reset.")));
+
 	LWLockAcquire(fasttrun_track_lock, LW_EXCLUSIVE);
 	hash_seq_init(&status, fasttrun_track_htab);
 	while ((entry = hash_seq_search(&status)) != NULL)
 		hash_search(fasttrun_track_htab, entry->relname, HASH_REMOVE, NULL);
 	LWLockRelease(fasttrun_track_lock);
-
-	/* Remove the on-disk file too. */
-	(void) unlink(FASTTRUN_TRACK_FILE);
 
 	PG_RETURN_VOID();
 }

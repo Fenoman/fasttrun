@@ -634,7 +634,7 @@ SELECT fasttrun_analyze('t_part');
 ERROR:  fasttrun_analyze: relation "t_part" is partitioned or an inheritance parent
 HINT:  Use core SQL ANALYZE for inheritance or partition traversal.
 SELECT * FROM fasttrun_relstats('t_part');
-ERROR:  fasttrun_relstats: relation "t_part" is not heap-AM
+ERROR:  fasttrun_relstats: relation "t_part" is not a table or an index
 SELECT fasttrun_collect_stats('t_part');
 ERROR:  fasttrun_collect_stats: relation "t_part" is partitioned or an inheritance parent
 HINT:  Use core SQL ANALYZE for inheritance or partition traversal.

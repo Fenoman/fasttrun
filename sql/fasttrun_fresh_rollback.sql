@@ -18,6 +18,7 @@ SELECT coalesce(current_setting('enable_temp_memory_catalog', true), 'off') = 'o
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS fasttrun;
 RESET client_min_messages;
+LOAD 'fasttrun';
 CREATE FUNCTION fr(t text) RETURNS boolean LANGUAGE sql AS
 $f$ SELECT fasttrun_temp_is_ours(to_regclass('pg_temp.' || t)) $f$;
 

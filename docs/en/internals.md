@@ -39,6 +39,24 @@ of the vanishing table and its indexes are freed. Empty files of a table that
 PostgreSQL core has not removed yet do not keep its cache in memory. When a
 level ends, only the relations marked in that level are walked.
 
+The journal records observed file births after core TRUNCATE and rewrites.
+Rolling back that birth retires an incomplete truncate on the discarded file,
+so a healthy outer file can be truncated immediately. A nested rollback can
+clear core's latest-file marker, so the journal matches the captured locator.
+A replacement of an older damaged file keeps the block until commit or repair
+of that damaged file. Cleanup uses the captured lifetime without catalog access.
+
+Before changing storage, `fasttruncate()` checks that rollback cannot restore
+only part of the heap, index and TOAST workset. Independently replaced files
+and a dropped index that can return above the heap's file lifetime are rejected
+with SQLSTATE 55000. New components that disappear completely on that rollback
+are allowed. Commit or roll back the storage DDL before retrying.
+
+If the library first loads after temporary objects were accessed in the same
+transaction, earlier dropped components are unknown. A file born at the current
+level is safe, while older files require ending that transaction. Preload the
+library, or load it before starting the transaction, to keep that history.
+
 The journal also records the level at which `fasttruncate()` reset the files.
 Rolling back such a level does not restore the statistics saved before the
 reset: the old rows are gone, and the rows written after the reset are rolled
@@ -57,10 +75,12 @@ and recomputes the dead-page count from that mark: only its own level's growth
 gets in, and nested rollbacks of one growth do not add up. The published page
 count is scaled so that the planner counts live pages only, the size backstop of
 the column statistics leaves them out too, and an analyze with dead pages since
-the publication measures the size anew and refreshes the indexes. Dead pages by
-themselves do not change the estimate, and the rollback does not reset cached
-plans for them. It resets them when the forward path reset them or when a plan
-was built on statistics the rolled-back DML hid.
+the publication measures the size anew and refreshes the indexes. Dead pages
+do not increase the estimated live row count, but a Seq Scan still reads them.
+Analyze compares physical pages with the last invalidation anchor and resets
+plans when the cost drift exceeds the threshold. Rollback itself resets plans
+when the forward path reset them or when a plan was built on statistics the
+rolled-back DML hid.
 
 The planner expands the body of an inlined SQL function inside
 `standard_planner`, after the parse tree walk. The `get_relation_info` hook

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from collections import deque
+import argparse
 import hashlib
 import re
 import sys
@@ -143,16 +144,23 @@ def markdown_outline(text: str) -> tuple[set[str], list[str]]:
     return anchors, targets
 
 
-def check_doc_structure(errors: list[str]) -> None:
+def check_doc_structure(errors: list[str], root: Path = ROOT) -> None:
     """Пары документов на двух языках, ссылки README на них и целые ссылки."""
+    readmes = (root / "README.md", root / "README_EN.md")
+    doc_sets = ((readmes[0], root / "docs" / "ru"),
+                (readmes[1], root / "docs" / "en"))
+    for readme in readmes:
+        require(errors, readme.is_file(), f"{readme.name}: file is missing")
+    if not all(readme.is_file() for readme in readmes):
+        return
     names = [
         sorted(path.name for path in docs_dir.glob("*.md"))
-        for _, docs_dir in DOC_SETS
+        for _, docs_dir in doc_sets
     ]
     require(errors, all(names), "docs/ru и docs/en не должны быть пустыми")
     require(errors, names[0] == names[1],
             f"docs/ru и docs/en расходятся по составу: {names[0]} != {names[1]}")
-    for readme, docs_dir in DOC_SETS:
+    for readme, docs_dir in doc_sets:
         _, readme_targets = markdown_outline(read(readme))
         linked = {unquote(target.partition("#")[0]) for target in readme_targets}
         for path in sorted(docs_dir.glob("*.md")):
@@ -160,16 +168,16 @@ def check_doc_structure(errors: list[str]) -> None:
                     f"{readme.name}: нет ссылки на docs/{docs_dir.name}/{path.name}")
 
     pages = [
-        *README_PATHS,
-        *(path for _, docs_dir in DOC_SETS for path in sorted(docs_dir.glob("*.md"))),
+        *readmes,
+        *(path for _, docs_dir in doc_sets for path in sorted(docs_dir.glob("*.md"))),
     ]
     outlines = {path.resolve(): markdown_outline(read(path)) for path in pages}
     for path in pages:
         _, targets = outlines[path.resolve()]
         for target in targets:
-            where = f"{path.relative_to(ROOT)}: ссылка {target}"
+            where = f"{path.relative_to(root)}: ссылка {target}"
             if target.startswith("\0undefined-reference:"):
-                errors.append(f"{path.relative_to(ROOT)}: сноска "
+                errors.append(f"{path.relative_to(root)}: сноска "
                               f"[{target.split(':', 1)[1]}] не определена")
                 continue
             if re.match(r"^[a-z][a-z0-9+.-]*:", target):
@@ -177,6 +185,9 @@ def check_doc_structure(errors: list[str]) -> None:
             file_part, _, anchor = target.partition("#")
             file_part, anchor = unquote(file_part), unquote(anchor)
             dest = (path.parent / file_part).resolve() if file_part else path.resolve()
+            if not dest.is_relative_to(root.resolve()):
+                errors.append(f"{where}: target is outside the documentation tree")
+                continue
             if not dest.exists():
                 errors.append(f"{where} ведет на несуществующий файл")
                 continue
@@ -290,7 +301,19 @@ def check_unity_layout(errors: list[str]) -> None:
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--installed-root", type=Path,
+                        help="check links in the installed documentation tree only")
+    args = parser.parse_args()
     errors: list[str] = []
+    if args.installed_root is not None:
+        check_doc_structure(errors, args.installed_root.resolve())
+        for error in errors:
+            print(f"installed docs: {error}", file=sys.stderr)
+        if errors:
+            return 1
+        print("installed docs: PASS")
+        return 0
     makefile = read(ROOT / "Makefile")
     control = read(ROOT / "fasttrun.control")
     code = read(ROOT / "fasttrun.c")

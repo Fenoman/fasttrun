@@ -85,10 +85,23 @@ make check-tracking-preload PG_CONFIG=/path/to/pg_config
 make check-block-sample-seed PG_CONFIG=/path/to/pg_config
 make check-required-suite
 make check-docs
+make check-docs-installed PG_CONFIG=/path/to/pg_config
 ```
+
+`check-docs-installed` устанавливает документацию штатной целью Makefile во
+временный каталог и проверяет локальные ссылки и якоря. Обязательный cassert
+набор запускает его для каждой установки PostgreSQL.
 
 Сохранение файла учета проверяет
 `scripts/check_fasttrun_tracking_persistence.sh`.
+
+Если для того же сервера установлен настоящий `pg_variables`, запустите
+`PG_CONFIG=/path/to/pg_config scripts/check_fasttrun_example.sh`. Скрипт проверяет
+пример с текущими, вложенными, старыми и помеченными входящими таблицами при
+эпохах XID 0 и 2. Эпоха меняется только в собственном остановленном временном
+кластере. Также проверяется повтор после неудачной очистки. Без pg_variables
+скрипт возвращает код пропуска 77. Если вендорский `pg_resetwal` не поддерживает
+`--epoch`, скрипт проверяет эпоху 0 и возвращает 77 для недоступной проверки эпохи 2.
 
 `make check-exit-plan-reset` проверяет по журналу сервера, что сброс планов при
 завершении backend выполняется раньше удаления временных таблиц ядром, что

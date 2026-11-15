@@ -39,6 +39,7 @@
 #include "catalog/pg_attribute.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_inherits.h"
+#include "catalog/partition.h"
 #include "catalog/pg_statistic.h"
 #include "catalog/pg_type.h"
 #include "catalog/storage.h"
@@ -49,6 +50,7 @@
 #include "common/relpath.h"
 #include "executor/executor.h"
 #include "miscadmin.h"
+#include "mb/pg_wchar.h"
 #include "storage/proc.h"
 #include "nodes/makefuncs.h"
 #include "parser/parse_relation.h"
@@ -350,9 +352,10 @@ _PG_init(void)
 							 "TOAST relations "
 							 "with unlink and smgrcreate, without calling "
 							 "CacheInvalidateSmgr.  When off, it calls "
-							 "RelationTruncate for each relation, and every "
-							 "successful call sends one shared SMGR "
-							 "invalidation.  Both modes rebuild indexes and "
+							 "RelationTruncate for each relation, using core "
+							 "storage invalidation.  Postgres Pro Enterprise "
+							 "uses RelationTruncate in both settings.  "
+							 "Both modes rebuild indexes and "
 							 "block access if cleanup is interrupted.",
 							 &fasttrun_zero_sinval_truncate,
 							 true,
@@ -361,20 +364,15 @@ _PG_init(void)
 							 NULL, NULL, NULL);
 
 	DefineCustomIntVariable("fasttrun.max_analyze_pages",
-							"Heap page count above which fasttrun_analyze scans "
-							"switch to bounded block sampling",
-							"Default 100000 (~800 MB).  Every heap scan of "
-							"fasttrun_analyze (cold pass, stats refresh, "
-							"partial-index rescan) normally reads the whole temp "
-							"table for an exact row count.  Above this many heap "
-							"pages it instead reads a bounded random block sample "
-							"and ESTIMATES the row count from tuple density (like "
-							"a regular ANALYZE), keeping cost O(sample) instead "
-							"of O(table) on anomalously giant temp tables.  "
-							"Column statistics are collected from the same "
-							"sample.  Set to 0 to always do the exact full scan.  "
-							"The explicit fasttrun_collect_stats ignores this "
-							"limit and always reads the whole heap.",
+							"Page limit for an initial fasttrun_analyze full scan",
+							"Default 100000 (~800 MB).  Initial scans and recounts "
+							"above this size sample blocks and estimate row count "
+							"from tuple density.  Refreshes and partial-index "
+							"rescans with an exact cached row count can sample "
+							"above the sample's block target even below this limit.  "
+							"Set to 0 to force full scans on all these paths.  "
+							"Explicit fasttrun_collect_stats always reads the "
+							"whole heap regardless of this limit.",
 							&fasttrun_max_analyze_pages,
 							100000,
 							0,
@@ -496,6 +494,8 @@ _PG_init(void)
 	 */
 	fasttrun_lazy_loaded = (ActiveSnapshotSet() || ActivePortal != NULL);
 	fasttrun_unobserved_writers = fasttrun_lazy_loaded;
+	fasttrun_unobserved_storage_ddl = fasttrun_lazy_loaded &&
+		(MyXactFlags & XACT_FLAGS_ACCESSEDTEMPNAMESPACE) != 0;
 
 	/*
 	 * Planner/stats hooks are installed lazily on first use of the local

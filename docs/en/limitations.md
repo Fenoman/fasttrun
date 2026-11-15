@@ -115,6 +115,10 @@ work without `shared_preload_libraries`.
   modifying CTE does not see the outer statement, and the first pass over the
   table may keep a row count from the old snapshot. Preloading through
   `shared_preload_libraries` or `session_preload_libraries` rules this out.
+- A first `fasttruncate()` call loaded during a transaction can reject with
+  SQLSTATE `55000` because earlier storage changes were not observed. This
+  preflight rejection changes no files and creates no blocked-table entry.
+  Commit or roll back, then retry. Preload fasttrun to observe the whole transaction.
 - A function that turns `track_counts` off inside a writing statement (a
   superuser parameter) stops counting for an already open table, and such a
   write is not carried over `COMMIT`.
@@ -123,13 +127,10 @@ work without `shared_preload_libraries`.
   these cases: after an explicit collect during a write when analyze runs
   before `COMMIT`, and until the transaction ends after the registry of writing
   statements overflows.
-- Rolling back a savepoint inside which a column type change or another
-  `ALTER TABLE` other than adding a column rewrote the table does not bring the
-  previous column statistics back: the columns stay on default estimates until
-  the next DML and analyze or an explicit `fasttrun_collect_stats()`. In the
-  OmniX corpus only `ADD COLUMN ... GENERATED ... STORED` in
-  `imp_readings_integral` rewrites temporary tables, and its statistics are kept
-  and come back on rollback.
+- A column type change discards samples for the rewritten table, including
+  descendants changed through a parent. Rolling back the savepoint restores
+  the previous samples with the original storage. After a committed rewrite,
+  collect new samples with `fasttrun_collect_stats()` or subsequent DML and analyze.
 - `fasttrun_temp_is_ours()` sees core `TRUNCATE` through the pgstat counters and
   through a mark of the extension's hook that takes effect once the `TRUNCATE`
   statement has finished. A `TRUNCATE` run with `track_counts = off` before the

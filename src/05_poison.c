@@ -150,6 +150,12 @@ fasttrun_poison_activate(FasttrunTruncateOperation *operation)
 	Assert(entry != NULL);
 	Assert(entry->pending_operation == operation);
 	old_active = entry->active_operation;
+	/* A later relcache rebuild can forget this same file's known birth. */
+	if (old_active != NULL &&
+		operation->root_file_subid == InvalidSubTransactionId &&
+		RelFileLocatorEquals(old_active->root_rlb.locator, operation->root_rlb.locator) &&
+		old_active->root_rlb.backend == operation->root_rlb.backend)
+		operation->root_file_subid = old_active->root_file_subid;
 	entry->pending_operation = NULL;
 	entry->active_operation = operation;
 	entry->active = true;
@@ -224,6 +230,20 @@ fasttrun_poison_check_relation(Relation rel, const char *operation,
 	if (!RelFileLocatorEquals(entry->root_rlb.locator, rel->rd_locator) ||
 		entry->root_rlb.backend != rel->rd_backend)
 	{
+		/* A committed file cannot roll back to the damaged one. */
+		if (rel->rd_createSubid == InvalidSubTransactionId &&
+			rel->rd_firstRelfilelocatorSubid == InvalidSubTransactionId)
+		{
+			fasttrun_poison_forget_relid(root_relid);
+			return;
+		}
+		if (allow_repair)
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("fasttrun: cannot repair relation \"%s\" on a replacement file",
+							RelationGetRelationName(rel)),
+					 errdetail("The damaged file can return if the storage replacement is rolled back."),
+					 errhint("Commit the storage replacement, or roll it back and retry fasttruncate on the damaged file.")));
 		fasttrun_xact_mark_relid(root_relid, root_relid,
 								 FASTTRUN_TOUCH_POISON_RETIRE);
 		return;
@@ -235,14 +255,30 @@ fasttrun_poison_check_relation(Relation rel, const char *operation,
 			(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 			 errmsg("fasttrun: relation \"%s\" is unavailable after an incomplete truncate",
 					RelationGetRelationName(rel)),
-			 errdetail("The failed %s had already changed table files.",
+			 errdetail("A previous fasttruncate may have changed table files. %s is blocked.",
 					   operation),
 			 errhint("Retry fasttruncate, or DROP and recreate the temporary table.")));
 }
 
+/* Use only a captured file lifetime, without catalog access during cleanup. */
+static void
+fasttrun_poison_file_subxact_end(Oid relid, SubTransactionId mySubid,
+								SubTransactionId parentSubid, bool aborted)
+{
+	FasttrunPoisonEntry *entry = fasttrun_poison_find(relid);
+
+	if (entry == NULL || !entry->active || entry->active_operation == NULL ||
+		entry->active_operation->root_file_subid != mySubid)
+		return;
+	if (aborted)
+		fasttrun_poison_forget_relid(relid);
+	else
+		entry->active_operation->root_file_subid = parentSubid;
+}
+
 /*
- * DROP and a change of the relation's file are transactional, so only COMMIT
- * removes an active block.
+ * COMMIT retires files that cannot return and makes surviving file births
+ * independent of subtransaction IDs reused by the next transaction.
  */
 static void
 fasttrun_poison_commit_xact(void)
@@ -259,6 +295,10 @@ fasttrun_poison_commit_xact(void)
 			 (xentry->flags & FASTTRUN_TOUCH_POISON_RETIRE) != 0) &&
 			fasttrun_poison_find(xentry->relid) != NULL)
 			fasttrun_poison_forget_relid(xentry->relid);
+		else if ((xentry->flags & FASTTRUN_TOUCH_POISON_FILE) != 0)
+			fasttrun_poison_file_subxact_end(xentry->relid,
+											   fasttrun_xact_frame->subid,
+											   InvalidSubTransactionId, false);
 	}
 }
 

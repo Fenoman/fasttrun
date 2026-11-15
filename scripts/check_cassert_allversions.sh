@@ -326,7 +326,7 @@ for t in "${TARGET_ARR[@]}"; do
 	fi
 	warns=$(grep -ci 'warning:' "$OUTDIR/build${ver}.log")
 	echo "  сборка ok, warnings: $warns"
-	if ! env "${HARNESS_ENV_ARGS[@]}" make install PG_CONFIG="$pgcfg" \
+	if ! env "${HARNESS_ENV_ARGS[@]}" make install check-docs-installed PG_CONFIG="$pgcfg" \
 		>> "$OUTDIR/build${ver}.log" 2>&1; then
 		echo "  не удалось установить расширение (см. $OUTDIR/build${ver}.log)" >&2
 		overall_rc=1

@@ -82,9 +82,72 @@ counters=$($PSQL -c "CREATE EXTENSION IF NOT EXISTS fasttrun" \
 	counters="error: $counters"
 echo "cluster counters: $counters"
 
+capacity=$($PSQL <<'SQL'
+SET fasttrun.track_schedule = '';
+SET fasttrun.track_temp_creates = on;
+CREATE SCHEMA dummy_tmp;
+CREATE TABLE dummy_tmp.ft_capacity_template (id int);
+SELECT fasttrun_reset_temp_stats();
+SELECT fasttrun_counters_reset();
+\o /dev/null
+SELECT format('CREATE TEMP TABLE ft_capacity_%s (LIKE dummy_tmp.ft_capacity_template); DROP TABLE ft_capacity_%s;', n, n)
+FROM generate_series(1, 8400) n
+\gexec
+CREATE TEMP TABLE ft_capacity_1 (LIKE dummy_tmp.ft_capacity_template);
+DROP TABLE ft_capacity_1;
+\o
+SELECT 'capacity ' ||
+       (SELECT count(*) FROM fasttrun_hot_temp_tables(0)) || ' ' ||
+       (SELECT value FROM fasttrun_counters() WHERE counter = 'tracking_rejected') || ' ' ||
+       (SELECT count(*) FROM fasttrun_hot_temp_tables(32)) || ' ' ||
+       (SELECT count(*) FROM fasttrun_hot_temp_tables(8192)) || ' ' ||
+       (SELECT create_count FROM fasttrun_hot_temp_tables(0) WHERE relname = 'ft_capacity_1');
+SQL
+) || capacity="error: $capacity"
+echo "$capacity"
+
+"$BINDIR/pg_ctl" -D "$DATA" -l "$LOG" -m fast -w restart >/dev/null
+restored=$($PSQL -c "SELECT count(*) || ' ' || max(create_count) FROM fasttrun_hot_temp_tables(0)") ||
+	restored="error: $restored"
+echo "capacity restored: $restored"
+
+$PSQL -c 'SELECT fasttrun_reset_temp_stats()' >/dev/null
+"$BINDIR/createdb" -h "$SOCKET_DIR" -p "$PORT" -T template0 -E LATIN1 --locale=C ft_tracking_latin1
+$PSQL -d ft_tracking_latin1 <<'SQL'
+CREATE EXTENSION fasttrun;
+CREATE SCHEMA dummy_tmp;
+CREATE TABLE dummy_tmp.encoding_template(id int);
+SET fasttrun.track_schedule = '';
+SET fasttrun.track_temp_creates = on;
+DO $test$ DECLARE name text := 'ft_encoded_' || convert_from(decode('e9','hex'),'LATIN1');
+BEGIN
+  EXECUTE format('CREATE TEMP TABLE %I(LIKE dummy_tmp.encoding_template)', name);
+END $test$;
+SQL
+encoding=$($PSQL <<'SQL'
+SET fasttrun.track_schedule = '';
+SET fasttrun.track_temp_creates = on;
+CREATE TEMP TABLE ft_ascii(LIKE dummy_tmp.ft_capacity_template);
+DO $test$ DECLARE name text := 'ft_utf8_' || convert_from(decode('c3a9','hex'),'UTF8');
+BEGIN
+  EXECUTE format('CREATE TEMP TABLE %I(LIKE dummy_tmp.ft_capacity_template)', name);
+END $test$;
+SELECT 'encoding ' || (count(*) = 3 AND sum(create_count) = 3
+  AND bool_and(octet_length(convert_to(relname, 'LATIN1')) > 0)
+  AND bool_or(relname = E'\\x66745f656e636f6465645fe9')
+  AND bool_or(relname = 'ft_ascii')
+  AND bool_or(relname = 'ft_utf8_' || convert_from(decode('c3a9','hex'),'UTF8')))
+FROM fasttrun_hot_temp_tables(0);
+SQL
+) || encoding="error: $encoding"
+echo "$encoding"
+
 if [ "$rc" -eq 0 ] && [ "${main:-0}" -ge 1 ] && [ "$counters" = "cluster 1" ]; then
-	echo "tracking preload: PASS"
-	exit 0
+	if [ "$(printf '%s\n' "$capacity" | tail -1)" = "capacity 8192 208 32 8192 2" ] &&
+		[ "$restored" = "8192 2" ] && [ "$encoding" = 'encoding true' ]; then
+		echo "tracking preload: PASS"
+		exit 0
+	fi
 fi
 echo "tracking preload: FAIL"
 tail -5 "$WORKDIR/installcheck.log" || true

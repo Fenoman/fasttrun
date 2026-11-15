@@ -1,7 +1,7 @@
 --
 -- Пример функции create_temp_table для использования с fasttrun.
 --
--- Это продакшн-версия, проверенная под высокой нагрузкой. Обрабатывает:
+-- Creates and reuses temporary tables from templates. Handles:
 --   * создание temp table из таблицы-шаблона ("чучела")
 --   * быструю очистку через fasttruncate (ноль sinval)
 --   * "входящие" таблицы (данные заполнены выше по стеку вызовов)
@@ -9,7 +9,7 @@
 --   * смену владельца через SET LOCAL ROLE (без ALTER TABLE OWNER = без sinval)
 --
 -- Зависимости:
---   * расширение fasttrun (fasttruncate / fasttruncate_c)
+--   * fasttrun >= 2.7.0 (fasttruncate / fasttrun_temp_same_cols)
 --   * расширение pg_variables (pgv_set / pgv_exists) — сессионные переменные
 --     для отслеживания "наших" данных при работе через пулер
 --     https://github.com/postgrespro/pg_variables
@@ -37,17 +37,14 @@ LANGUAGE plpgsql
 AS $_$
 DECLARE
     _b_exists_table       bool;
-    _XMIN                 xid8;
-    _current_xact_id      xid8;
     _temp_table_hash      text;
-    _i_temp_relnatts      int2;
-    _i_dummy_relnatts     int2;
+    _oid_temp_table       regclass;
     _c_actual_dummy_table text;
+    _saved_role           text;
 BEGIN
     -- Приводим к нижнему регистру
     _c_temp_table = LOWER(_c_temp_table);
     _temp_table_hash = MD5(_c_temp_table)::text;
-    _current_xact_id = pg_current_xact_id_if_assigned();
 
     -- Имя шаблона: если не задано явно, совпадает с именем temp table
     _c_actual_dummy_table = CASE
@@ -62,58 +59,35 @@ BEGIN
         Поэтому порядок условий важен.
     */
 
-    SELECT
-        TRUE,
-        c.XMIN,
-        c.relnatts
-    INTO _b_exists_table, _XMIN, _i_temp_relnatts
-    FROM pg_catalog.pg_class c
-    WHERE c.relnamespace = PG_MY_TEMP_SCHEMA()
-      AND c.relname = _c_temp_table;
+    _oid_temp_table := pg_catalog.to_regclass(
+        pg_catalog.format('pg_temp.%I', _c_temp_table));
+    _b_exists_table := _oid_temp_table IS NOT NULL;
 
 
-    /*------------------------------------------------------------------------------------
-        Проверяем количество атрибутов в шаблоне через relnatts.
-
-        ВАЖНО: relnatts включает ВСЕ атрибуты, в том числе удалённые (dropped).
-        При DROP COLUMN PostgreSQL физически не удаляет колонку, а помечает
-        attisdropped = true, и relnatts не уменьшается.
-
-        Поэтому при удалении колонки из шаблона нужно ПЕРЕСОЗДАТЬ его,
-        а не использовать ALTER TABLE ... DROP COLUMN.
-    -------------------------------------------------------------------------------------*/
+    -- Compare live column names, types, typmods and collations through relcache.
+    -- Dropped attributes do not affect descriptor equality.
     IF _b_exists_table AND NOT _b_in
     THEN
-        SELECT
-            c.relnatts
-        INTO _i_dummy_relnatts
-        FROM pg_catalog.pg_class c
-             INNER JOIN pg_catalog.pg_namespace n
-                        ON n.oid = c.relnamespace
-        WHERE n.nspname = _c_dummy_schema
-          AND c.relname = _c_actual_dummy_table;
-
-        -- Структура изменилась — пересоздаём
-        IF _i_temp_relnatts IS DISTINCT FROM _i_dummy_relnatts
+        IF public.fasttrun_temp_same_cols(
+            _oid_temp_table,
+            pg_catalog.to_regclass(pg_catalog.format('%I.%I',
+                _c_dummy_schema, _c_actual_dummy_table))) IS NOT TRUE
         THEN
-            EXECUTE pg_catalog.format('DROP TABLE %I', _c_temp_table);
+            EXECUTE pg_catalog.format('DROP TABLE pg_temp.%I', _c_temp_table);
 
             _b_exists_table = FALSE;
         END IF;
     END IF;
 
 
-    /*------------------------------------------------------------------------------------
-        Входящая таблица (_b_in = true):
-        Данные заполнены выше по стеку вызовов (другая функция в той же
-        транзакции). Если данные "наши" (есть запись в pgv или таблица
-        создана в текущей транзакции) — выходим без очистки.
-    -------------------------------------------------------------------------------------*/
+    /*
+     * Incoming rows belong to this transaction only while their current
+     * storage does. A nontransactional pgv mark can outlive storage rollback.
+     */
     IF _b_in
        AND _b_exists_table
     THEN
-        IF pgv_exists('tx_info', _temp_table_hash)
-            OR _XMIN >= _current_xact_id
+        IF public.fasttrun_temp_is_ours(_oid_temp_table) IS TRUE
         THEN
             -- Данные наши — ничего не трогаем
             RETURN FALSE;
@@ -127,9 +101,8 @@ BEGIN
             * в транзакционном режиме — при завершении транзакции
             * в сессионном — при отсоединении клиента
         */
+        PERFORM public.fasttruncate(pg_catalog.format('pg_temp.%I', _c_temp_table));
         PERFORM pgv_set('tx_info', _temp_table_hash, TRUE);
-
-        PERFORM public.fasttruncate(_c_temp_table);
 
         RETURN NULL;
     END IF;
@@ -141,9 +114,8 @@ BEGIN
     IF NOT _b_in
        AND _b_exists_table
     THEN
+        PERFORM public.fasttruncate(pg_catalog.format('pg_temp.%I', _c_temp_table));
         PERFORM pgv_set('tx_info', _temp_table_hash, TRUE);
-
-        PERFORM public.fasttruncate(_c_temp_table);
 
         RETURN FALSE;
     END IF;
@@ -155,13 +127,13 @@ BEGIN
         SET LOCAL ROLE — чтобы таблица сразу принадлежала нужному пользователю,
         без дополнительного ALTER TABLE OWNER (который генерит sinval).
     -------------------------------------------------------------------------------------*/
+    _saved_role := pg_catalog.current_setting('role');
     EXECUTE
         pg_catalog.format
         (
             $str$
             SET LOCAL ROLE _client;
-            CREATE TEMP TABLE %s (LIKE %s.%s %s);
-            RESET ROLE;
+            CREATE TEMP TABLE %I (LIKE %I.%I %s);
             $str$,
             _c_temp_table,
             _c_dummy_schema,
@@ -172,6 +144,8 @@ BEGIN
                 ELSE ''
             END
         );
+
+    PERFORM pg_catalog.set_config('role', _saved_role, true);
 
     PERFORM pgv_set('tx_info', _temp_table_hash, TRUE);
 

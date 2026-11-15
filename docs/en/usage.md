@@ -73,9 +73,13 @@ $plpgsql$;
 A more elaborate `create_temp_table()` example is available in
 [examples/create_temp_table.sql](../../examples/create_temp_table.sql). It is an
 integration example, not part of the extension API. It depends on
-`pg_variables`, a template schema, and the `_client` role. It interpolates text
-names into dynamic SQL without `%I`, so do not pass untrusted values to it, and
-adapt the function to your project before using it in production.
+`pg_variables`, a template schema, and the `_client` role. Dynamic identifiers
+use `%I`, existing layouts use `fasttrun_temp_same_cols()`, and incoming-table
+ownership uses `fasttrun_temp_is_ours()` without comparing 32-bit and 64-bit XIDs.
+The pgv mark is retained for integrations but does not establish ownership after
+storage rollback. Creation preserves the caller's role, and lookup through
+`to_regclass()` supports temporary memory catalogs.
+Adapt the template permissions and pooler cleanup of pg_variables to your project.
 
 `CREATE TEMP TABLE IF NOT EXISTS` does not update the layout of an existing
 table. When a template changes after a deployment, check the layout version and
@@ -95,11 +99,11 @@ Follow these rules:
 4. Statement pooling is not suitable for this workflow.
 5. Do not treat fasttrun as a security boundary between clients. The application
    or pooler configuration must enforce cleanup when a backend is handed off.
-6. After `SQLSTATE 55000`, do not return the backend to the pool until the table
-   has been repaired. A query of `fasttrun_blocked_tables()` after the
-   transaction ends checks it: an empty result means there are no blocks. If the
-   recovery outcome is uncertain, close the physical connection and let the
-   pooler create a new one.
+6. After `SQLSTATE 55000`, finish the transaction and inspect
+   `fasttrun_blocked_tables()`. An incomplete truncate requires recovery before
+   returning the backend to the pool. A preflight rejection for unknown storage
+   history changes no files and creates no block: end the transaction and retry,
+   or preload the library. If recovery is uncertain, close the physical connection.
 7. `DISCARD TEMP` and `DISCARD ALL` remove temporary tables. This is safe, but it
    eliminates the benefit of reusing them.
 
@@ -273,6 +277,17 @@ For a missing table, `fasttrun_relstats()` returns `NULL`, while
 `fasttrun_inspect_stats()` returns an empty set. An empty set also means that
 local column statistics have not been collected yet.
 
+`fasttrun_relstats()` accepts ordinary local temporary tables and their ordinary
+indexes. `fasttrun_inspect_stats()` accepts ordinary local temporary tables,
+including statistics of their index expressions. Pass the table name to
+inspect those expressions.
+
+Other object kinds in the session's temporary schema, including sequences,
+views, partitioned tables and partitioned indexes, raise SQLSTATE `42809`.
+Passing an ordinary index to `fasttrun_inspect_stats()` also raises `42809`.
+Permanent objects and other sessions' temporary objects are rejected by the
+preceding check for a relation in the current session's temporary schema.
+
 `fasttrun_inspect_stats()` is a diagnostic function. A row in its result does
 not guarantee that the planner is using those statistics at that moment: the
 freshness check may temporarily hide them.
@@ -358,6 +373,12 @@ operation back normally and the old data remains intact.
 
 ### SQLSTATE 55000
 
+This code also covers preflight refusals, including late loading and an
+uncommitted storage replacement. Check the error detail and hint and
+`fasttrun_blocked_tables()`. If the table has no blocked entry, the refusal
+changed no files and does not require discarding the connection. End the
+transaction and follow the hint before retrying.
+
 If an error occurs after cleanup begins, the old files can no longer be safely
 restored. fasttrun blocks the table in the current backend. `SELECT`, DML,
 `COPY`, planning, and extension functions for that table return
@@ -370,6 +391,11 @@ while the table itself exists. If the creation of the table is rolled back, the
 extension removes the table's unfinished-operation record together with its
 local caches. This also holds when the first fasttrun call is made inside a
 nested block.
+
+If core has replaced the damaged table's file, a `fasttruncate()` retry is
+rejected until that replacement commits. A rollback can restore the damaged
+file, so this call does not clear its block. Commit the replacement first,
+or roll it back and retry cleanup on the original file.
 
 First end the failed transaction:
 

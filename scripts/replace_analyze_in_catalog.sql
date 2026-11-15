@@ -1,120 +1,128 @@
+-- Replace simple ANALYZE temp_* statements in PL/pgSQL function bodies.
 --
--- Замена ANALYZE temp_xxx → PERFORM fasttrun_analyze('temp_xxx')
--- прямо в системном каталоге (pg_proc.prosrc).
+-- Usage:
+--   1. Run STEP 1 and inspect both the original and proposed bodies.
+--   2. Uncomment STEP 2 and run it as a superuser.
+--   3. Inspect APPLIED/SKIP results, then COMMIT or ROLLBACK.
 --
--- ВНИМАНИЕ: выполнять под суперпользователем.
--- Скрипт работает в транзакции — если что-то не так, ROLLBACK.
+-- Safety:
+--   Bodies containing single quotes, dollar signs, or comment delimiters are
+--   skipped in full. Review their function DDL manually. Double-quoted
+--   identifiers are supported unless they contain a semicolon or are unclosed.
+--   These restrictions keep statement matches out of literals and comments.
 --
--- Порядок:
---   1. Запустить секцию "ШАГ 1" — покажет список функций и замен (dry run),
---      отдельно — функции, которые будут ПРОПУЩЕНЫ (ручная правка)
---   2. Проверить глазами что всё верно
---   3. Запустить секцию "ШАГ 2" — применить замены
---   4. COMMIT или ROLLBACK
---
--- Замена срабатывает только на ANALYZE в позиции стейтмента: после ';'
--- или ключевых слов BEGIN/THEN/ELSE/LOOP (плюс начало тела).  Вхождения
--- внутри строковых литералов (EXECUTE 'ANALYZE temp_x;') и комментариев
--- не трогаются: вставка кавычек ломала бы литерал, а PERFORM невалиден
--- в динамическом SQL.  Функции, где паттерн замечен внутри литерала,
--- целиком исключаются из UPDATE и попадают в список ручной правки.
---
+-- Matching:
+--   A statement starts after BEGIN/THEN/ELSE/LOOP, ';', or the start of the body.
+--   Its final ';' is a lookahead, so adjacent ANALYZE statements all match.
+--   Identifier quotes remain inside the fasttrun_analyze argument. Bodies with
+--   a remaining ANALYZE temp_* candidate are skipped instead of partly changed.
 
--- ======================================================================
--- ШАГ 1: DRY RUN — показать что будет заменено
--- ======================================================================
+-- STEP 1: DRY RUN
+WITH candidates AS MATERIALIZED (
+    SELECT p.oid AS function_oid,
+           p.oid::regprocedure::text AS function_name,
+           p.prosrc AS original_body,
+           CASE
+               WHEN strpos(p.prosrc, chr(39)) > 0 THEN 'single quote'
+               WHEN strpos(p.prosrc, '$') > 0 THEN 'dollar sign'
+               WHEN strpos(p.prosrc, '--') > 0 THEN 'line comment'
+               WHEN strpos(p.prosrc, '/*') > 0 THEN 'block comment'
+               WHEN EXISTS (
+                   SELECT 1
+                   FROM regexp_matches(p.prosrc, '"(?:[^"]|"")*"', 'g') AS q(parts)
+                   WHERE strpos(q.parts[1], ';') > 0
+               ) THEN 'semicolon in quoted identifier'
+               WHEN regexp_replace(p.prosrc, '"(?:[^"]|"")*"', '', 'g') ~ '"'
+                   THEN 'unclosed quoted identifier'
+           END AS skip_reason
+    FROM pg_proc p
+    JOIN pg_namespace n ON n.oid = p.pronamespace
+    JOIN pg_language l ON l.oid = p.prolang
+    WHERE l.lanname = 'plpgsql'
+      AND p.prosrc ~* '\mANALYZE\s+"?temp[ _]'
+      AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+), proposals AS (
+    SELECT *, CASE WHEN skip_reason IS NULL THEN regexp_replace(
+        original_body,
+        '(^|;|\m(?:BEGIN|THEN|ELSE|LOOP)\M)(\s*)ANALYZE\s+("temp[ _](?:[^"]|"")+"|temp_\w+)(?=\s*;)',
+        E'\\1\\2PERFORM fasttrun_analyze(''\\3'')',
+        'gi'
+    ) ELSE original_body END AS proposed_body
+    FROM candidates
+), assessed AS (
+    SELECT *, coalesce(skip_reason,
+        CASE WHEN proposed_body ~* '\mANALYZE\s+"?temp[ _]'
+             THEN 'unsupported ANALYZE statement position or identifier' END
+    ) AS reason
+    FROM proposals
+)
+SELECT function_oid, function_name,
+       CASE WHEN reason IS NULL THEN 'READY' ELSE 'SKIP' END AS status,
+       reason, original_body,
+       CASE WHEN reason IS NULL THEN proposed_body ELSE original_body END AS proposed_body
+FROM assessed
+ORDER BY function_name;
 
--- Все функции, содержащие ANALYZE temp_
-SELECT
-    n.nspname || '.' || p.proname AS function_name,
-    -- Сколько замен в этой функции
-    (length(p.prosrc) - length(
-        regexp_replace(p.prosrc, 'ANALYZE\s+(temp_\w+)', '', 'gi')
-    )) > 0 AS has_matches,
-    -- Функция будет пропущена: паттерн внутри строкового литерала
-    p.prosrc ~* '''[^'']*ANALYZE\s+temp_' AS skipped_manual_review,
-    -- Показать строки с ANALYZE
-    (SELECT string_agg(line, E'\n' ORDER BY rn)
-     FROM (
-         SELECT row_number() OVER () AS rn, line
-         FROM unnest(string_to_array(p.prosrc, E'\n')) WITH ORDINALITY AS t(line, rn)
-         WHERE line ~* 'ANALYZE\s+temp_'
-           AND line !~* '^\s*--'  -- пропускаем закомментированные
-     ) sub
-    ) AS matching_lines
-FROM pg_proc p
-JOIN pg_namespace n ON n.oid = p.pronamespace
-JOIN pg_language l ON l.oid = p.prolang
-WHERE l.lanname = 'plpgsql'
-  AND p.prosrc ~* 'ANALYZE\s+temp_'
-ORDER BY n.nspname, p.proname;
-
--- Функции, которые UPDATE не тронет — править руками:
--- паттерн замечен внутри одинарных кавычек (динамический SQL).
-SELECT
-    n.nspname || '.' || p.proname AS function_name,
-    'ANALYZE temp_ внутри строкового литерала — заменить вручную' AS reason
-FROM pg_proc p
-JOIN pg_namespace n ON n.oid = p.pronamespace
-JOIN pg_language l ON l.oid = p.prolang
-WHERE l.lanname = 'plpgsql'
-  AND p.prosrc ~* '''[^'']*ANALYZE\s+temp_'
-ORDER BY 1;
-
--- Превью: как будет выглядеть замена (statement-позиция)
-SELECT
-    n.nspname || '.' || p.proname AS function_name,
-    regexp_matches(p.prosrc,
-                   '(^|;|\m(?:BEGIN|THEN|ELSE|LOOP)\M)\s*(ANALYZE\s+temp_\w+\s*;)',
-                   'gi') AS original
-FROM pg_proc p
-JOIN pg_namespace n ON n.oid = p.pronamespace
-JOIN pg_language l ON l.oid = p.prolang
-WHERE l.lanname = 'plpgsql'
-  AND p.prosrc ~* 'ANALYZE\s+temp_\w+\s*;'
-LIMIT 20;
-
-
--- ======================================================================
--- ШАГ 2: ПРИМЕНИТЬ ЗАМЕНЫ (раскомментировать и выполнить)
--- ======================================================================
+-- STEP 2: APPLY (uncomment this block)
 -- APPLY_BEGIN
 -- BEGIN;
 --
--- UPDATE pg_proc p
--- SET prosrc = regexp_replace(
---     prosrc,
---     '(^|;|\m(?:BEGIN|THEN|ELSE|LOOP)\M)(\s*)ANALYZE\s+(temp_\w+)\s*;',
---     E'\\1\\2PERFORM fasttrun_analyze(''\\3'');',
---     'gi'
+-- WITH candidates AS MATERIALIZED (
+--     SELECT p.oid AS function_oid,
+--            p.oid::regprocedure::text AS function_name,
+--            p.prosrc AS original_body,
+--            CASE
+--                WHEN strpos(p.prosrc, chr(39)) > 0 THEN 'single quote'
+--                WHEN strpos(p.prosrc, '$') > 0 THEN 'dollar sign'
+--                WHEN strpos(p.prosrc, '--') > 0 THEN 'line comment'
+--                WHEN strpos(p.prosrc, '/*') > 0 THEN 'block comment'
+--                WHEN EXISTS (
+--                    SELECT 1
+--                    FROM regexp_matches(p.prosrc, '"(?:[^"]|"")*"', 'g') AS q(parts)
+--                    WHERE strpos(q.parts[1], ';') > 0
+--                ) THEN 'semicolon in quoted identifier'
+--                WHEN regexp_replace(p.prosrc, '"(?:[^"]|"")*"', '', 'g') ~ '"'
+--                    THEN 'unclosed quoted identifier'
+--            END AS skip_reason
+--     FROM pg_proc p
+--     JOIN pg_namespace n ON n.oid = p.pronamespace
+--     JOIN pg_language l ON l.oid = p.prolang
+--     WHERE l.lanname = 'plpgsql'
+--       AND p.prosrc ~* '\mANALYZE\s+"?temp[ _]'
+--       AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+-- ), proposals AS (
+--     SELECT *, CASE WHEN skip_reason IS NULL THEN regexp_replace(
+--         original_body,
+--         '(^|;|\m(?:BEGIN|THEN|ELSE|LOOP)\M)(\s*)ANALYZE\s+("temp[ _](?:[^"]|"")+"|temp_\w+)(?=\s*;)',
+--         E'\\1\\2PERFORM fasttrun_analyze(''\\3'')',
+--         'gi'
+--     ) ELSE original_body END AS proposed_body
+--     FROM candidates
+-- ), assessed AS (
+--     SELECT *, coalesce(skip_reason,
+--         CASE WHEN proposed_body ~* '\mANALYZE\s+"?temp[ _]'
+--              THEN 'unsupported ANALYZE statement position or identifier' END
+--     ) AS reason
+--     FROM proposals
+-- ), updated AS (
+--     UPDATE pg_proc p
+--     SET prosrc = a.proposed_body
+--     FROM assessed a
+--     WHERE p.oid = a.function_oid
+--       AND p.prosrc = a.original_body
+--       AND a.reason IS NULL
+--       AND a.proposed_body != a.original_body
+--     RETURNING p.oid AS function_oid
 -- )
--- FROM pg_namespace n
--- JOIN pg_language l ON l.lanname = 'plpgsql'
--- WHERE n.oid = p.pronamespace
---   AND l.oid = p.prolang
---   AND p.prosrc ~* 'ANALYZE\s+temp_\w+\s*;'
---   -- Паттерн внутри строкового литерала: функцию не трогаем (ручная правка)
---   AND p.prosrc !~* '''[^'']*ANALYZE\s+temp_'
---   -- Не трогаем системные схемы
---   AND n.nspname NOT IN ('pg_catalog', 'information_schema');
---
--- -- Проверяем результат: still_has_analyze = t означает остатки —
--- -- либо пропущенные литералы (ручная правка), либо нестандартная
--- -- позиция стейтмента; смотреть глазами.
--- SELECT
---     n.nspname || '.' || p.proname AS function_name,
---     p.prosrc ~* 'ANALYZE\s+temp_' AS still_has_analyze,
---     p.prosrc ~* 'fasttrun_analyze' AS has_fasttrun
--- FROM pg_proc p
--- JOIN pg_namespace n ON n.oid = p.pronamespace
--- JOIN pg_language l ON l.oid = p.prolang
--- WHERE l.lanname = 'plpgsql'
---   AND (p.prosrc ~* 'ANALYZE\s+temp_' OR p.prosrc ~* 'fasttrun_analyze')
---   AND n.nspname NOT IN ('pg_catalog', 'information_schema')
--- ORDER BY 1;
+-- SELECT a.function_oid, a.function_name,
+--        CASE WHEN u.function_oid IS NOT NULL THEN 'APPLIED' ELSE 'SKIP' END AS status,
+--        coalesce(a.reason,
+--            CASE WHEN u.function_oid IS NULL THEN 'source changed during apply. Re-run preview' END
+--        ) AS reason
+-- FROM assessed a
+-- LEFT JOIN updated u USING (function_oid)
+-- ORDER BY a.function_name;
 -- APPLY_END
 --
--- -- Если всё ок:
--- -- COMMIT;
--- -- Если что-то не так:
--- -- ROLLBACK;
+-- COMMIT;
+-- ROLLBACK;

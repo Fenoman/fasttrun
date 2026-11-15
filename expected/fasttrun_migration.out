@@ -417,3 +417,271 @@ DROP EXTENSION fasttrun;
 DROP TABLE mig_upgraded_funcs;
 \pset format aligned
 -- Конец прямого пути обновления.
+-- ----------------------------------------------------------------------
+-- 11. A non-public extension preserves an independent public text function.
+-- ----------------------------------------------------------------------
+DO $test_foreign_function$
+DECLARE
+    foreign_before pg_catalog.pg_proc;
+    canonical_before pg_catalog.pg_proc;
+BEGIN
+    CREATE SCHEMA ft_mig_api;
+    CREATE EXTENSION fasttrun WITH SCHEMA ft_mig_api VERSION '2.0';
+    CREATE FUNCTION public.fasttruncate(text) RETURNS void
+        LANGUAGE plpgsql AS $fn$ BEGIN NULL; END; $fn$;
+    REVOKE EXECUTE ON FUNCTION public.fasttruncate(text) FROM PUBLIC;
+    SELECT * INTO STRICT foreign_before FROM pg_catalog.pg_proc
+     WHERE oid = 'public.fasttruncate(text)'::regprocedure;
+    SELECT * INTO STRICT canonical_before FROM pg_catalog.pg_proc
+     WHERE oid = 'ft_mig_api.fasttruncate(text)'::regprocedure;
+
+    ALTER EXTENSION fasttrun UPDATE;
+
+    IF (SELECT pg_catalog.to_jsonb(p) FROM pg_catalog.pg_proc p WHERE p.oid = foreign_before.oid)
+           IS DISTINCT FROM pg_catalog.to_jsonb(foreign_before) THEN
+        RAISE EXCEPTION 'upgrade changed an independent public function';
+    END IF;
+    IF (SELECT pg_catalog.to_jsonb(p) FROM pg_catalog.pg_proc p WHERE p.oid = canonical_before.oid)
+           IS DISTINCT FROM pg_catalog.to_jsonb(canonical_before) THEN
+        RAISE EXCEPTION 'upgrade recreated the canonical C function';
+    END IF;
+    IF NOT EXISTS (SELECT FROM pg_catalog.pg_extension
+                    WHERE extname = 'fasttrun'
+                      AND extnamespace = 'ft_mig_api'::regnamespace
+                      AND extversion = (SELECT default_version
+                            FROM pg_catalog.pg_available_extensions
+                           WHERE name = 'fasttrun')) THEN
+        RAISE EXCEPTION 'non-public extension did not reach the latest version';
+    END IF;
+    DROP EXTENSION fasttrun;
+    PERFORM public.fasttruncate('ignored');
+    DROP FUNCTION public.fasttruncate(text);
+    DROP SCHEMA ft_mig_api;
+END
+$test_foreign_function$;
+-- ----------------------------------------------------------------------
+-- 12. An integer overload cannot stand in for a missing legacy text wrapper.
+-- ----------------------------------------------------------------------
+DO $test_renamed_overload$
+DECLARE
+    alias_before pg_catalog.pg_proc;
+    overload_before pg_catalog.pg_proc;
+BEGIN
+    CREATE EXTENSION fasttrun VERSION '2.0';
+    ALTER FUNCTION public.fasttruncate(text) RENAME TO fasttruncate_c;
+    CREATE FUNCTION public.fasttruncate(integer) RETURNS void
+        LANGUAGE plpgsql AS $fn$ BEGIN NULL; END; $fn$;
+    REVOKE EXECUTE ON FUNCTION public.fasttruncate_c(text) FROM PUBLIC;
+    CREATE VIEW mig_alias_dependent AS
+        SELECT public.fasttruncate_c(NULL::text) IS NULL AS is_null;
+    SELECT * INTO STRICT alias_before FROM pg_catalog.pg_proc
+     WHERE oid = 'public.fasttruncate_c(text)'::regprocedure;
+    SELECT * INTO STRICT overload_before FROM pg_catalog.pg_proc
+     WHERE oid = 'public.fasttruncate(integer)'::regprocedure;
+
+    ALTER EXTENSION fasttrun UPDATE;
+
+    IF (SELECT pg_catalog.to_jsonb(p) FROM pg_catalog.pg_proc p WHERE p.oid = alias_before.oid)
+           IS DISTINCT FROM pg_catalog.to_jsonb(alias_before) THEN
+        RAISE EXCEPTION 'upgrade changed the legacy C alias OID or attributes';
+    END IF;
+    IF (SELECT pg_catalog.to_jsonb(p) FROM pg_catalog.pg_proc p WHERE p.oid = overload_before.oid)
+           IS DISTINCT FROM pg_catalog.to_jsonb(overload_before) THEN
+        RAISE EXCEPTION 'upgrade changed the independent integer overload';
+    END IF;
+    IF NOT EXISTS (SELECT FROM pg_catalog.pg_depend d
+                    JOIN pg_catalog.pg_extension e ON e.oid = d.refobjid
+                   WHERE d.classid = 'pg_catalog.pg_proc'::regclass
+                     AND d.objid = alias_before.oid AND d.objsubid = 0
+                     AND d.refclassid = 'pg_catalog.pg_extension'::regclass
+                     AND d.deptype = 'e' AND e.extname = 'fasttrun') THEN
+        RAISE EXCEPTION 'legacy C alias lost extension membership';
+    END IF;
+    PERFORM * FROM mig_alias_dependent;
+    DROP VIEW mig_alias_dependent;
+    DROP EXTENSION fasttrun;
+    IF to_regprocedure('public.fasttruncate_c(text)') IS NOT NULL THEN
+        RAISE EXCEPTION 'DROP EXTENSION left the legacy C alias behind';
+    END IF;
+    DROP FUNCTION public.fasttruncate(integer);
+END
+$test_renamed_overload$;
+-- ----------------------------------------------------------------------
+-- 13. A canonical C text function and a non-C integer overload can coexist.
+-- ----------------------------------------------------------------------
+DO $test_canonical_overload$
+DECLARE
+    canonical_before pg_catalog.pg_proc;
+    overload_before pg_catalog.pg_proc;
+BEGIN
+    CREATE EXTENSION fasttrun VERSION '2.0';
+    CREATE FUNCTION public.fasttruncate(integer) RETURNS void
+        LANGUAGE plpgsql AS $fn$ BEGIN NULL; END; $fn$;
+    SELECT * INTO STRICT canonical_before FROM pg_catalog.pg_proc
+     WHERE oid = 'public.fasttruncate(text)'::regprocedure;
+    SELECT * INTO STRICT overload_before FROM pg_catalog.pg_proc
+     WHERE oid = 'public.fasttruncate(integer)'::regprocedure;
+
+    ALTER EXTENSION fasttrun UPDATE;
+
+    IF (SELECT pg_catalog.to_jsonb(p) FROM pg_catalog.pg_proc p WHERE p.oid = canonical_before.oid)
+           IS DISTINCT FROM pg_catalog.to_jsonb(canonical_before) OR
+       (SELECT pg_catalog.to_jsonb(p) FROM pg_catalog.pg_proc p WHERE p.oid = overload_before.oid)
+           IS DISTINCT FROM pg_catalog.to_jsonb(overload_before) THEN
+        RAISE EXCEPTION 'upgrade changed the canonical C function or overload';
+    END IF;
+    DROP EXTENSION fasttrun;
+    DROP FUNCTION public.fasttruncate(integer);
+END
+$test_canonical_overload$;
+-- ----------------------------------------------------------------------
+-- 14. A schema-qualified legacy wrapper migrates while its C alias survives.
+-- ----------------------------------------------------------------------
+DO $test_schema_wrapper$
+DECLARE
+    alias_before pg_catalog.pg_proc;
+BEGIN
+    CREATE SCHEMA "ft mig api";
+    CREATE EXTENSION fasttrun WITH SCHEMA "ft mig api" VERSION '2.0';
+    ALTER FUNCTION "ft mig api".fasttruncate(text) RENAME TO fasttruncate_c;
+    CREATE FUNCTION "ft mig api".fasttruncate(_c_temp_table text) RETURNS void
+        LANGUAGE plpgsql AS $fn$
+        BEGIN
+            PERFORM "ft mig api".fasttruncate_c(_c_temp_table);
+        END;
+        $fn$;
+    CREATE VIEW mig_alias_dependent AS
+        SELECT "ft mig api".fasttruncate_c(NULL::text) IS NULL AS is_null;
+    SELECT * INTO STRICT alias_before FROM pg_catalog.pg_proc
+     WHERE oid = '"ft mig api".fasttruncate_c(text)'::regprocedure;
+
+    ALTER EXTENSION fasttrun UPDATE;
+
+    IF (SELECT pg_catalog.to_jsonb(p) FROM pg_catalog.pg_proc p WHERE p.oid = alias_before.oid)
+           IS DISTINCT FROM pg_catalog.to_jsonb(alias_before) THEN
+        RAISE EXCEPTION 'schema-qualified legacy alias was recreated';
+    END IF;
+    IF NOT EXISTS (SELECT FROM pg_catalog.pg_proc p
+                    JOIN pg_catalog.pg_language l ON l.oid = p.prolang
+                    JOIN pg_catalog.pg_depend d ON d.objid = p.oid
+                    JOIN pg_catalog.pg_extension e ON e.oid = d.refobjid
+                   WHERE p.oid = '"ft mig api".fasttruncate(text)'::regprocedure
+                     AND l.lanname = 'c' AND p.prosrc = 'fasttruncate'
+                     AND d.classid = 'pg_catalog.pg_proc'::regclass
+                     AND d.objsubid = 0
+                     AND d.refclassid = 'pg_catalog.pg_extension'::regclass
+                     AND d.deptype = 'e' AND e.extname = 'fasttrun') THEN
+        RAISE EXCEPTION 'schema-qualified wrapper did not become canonical C';
+    END IF;
+    CREATE TEMP TABLE mig_schema_table (id integer);
+    INSERT INTO mig_schema_table VALUES (1);
+    PERFORM "ft mig api".fasttruncate('mig_schema_table');
+    IF EXISTS (SELECT FROM mig_schema_table) THEN
+        RAISE EXCEPTION 'migrated schema-qualified truncate left rows';
+    END IF;
+    DROP TABLE mig_schema_table;
+    PERFORM * FROM mig_alias_dependent;
+    DROP VIEW mig_alias_dependent;
+    DROP EXTENSION fasttrun;
+    DROP SCHEMA "ft mig api";
+END
+$test_schema_wrapper$;
+-- ----------------------------------------------------------------------
+-- 15. An unknown same-schema text function blocks upgrade without mutation.
+-- ----------------------------------------------------------------------
+DO $test_unknown_wrapper$
+DECLARE
+    foreign_before pg_catalog.pg_proc;
+    alias_before pg_catalog.pg_proc;
+    blocked boolean := false;
+BEGIN
+    CREATE EXTENSION fasttrun VERSION '2.0';
+    ALTER FUNCTION public.fasttruncate(text) RENAME TO fasttruncate_c;
+    CREATE FUNCTION public.fasttruncate(text) RETURNS void
+        LANGUAGE sql AS 'SELECT pg_catalog.pg_sleep(0)';
+    REVOKE EXECUTE ON FUNCTION public.fasttruncate(text) FROM PUBLIC;
+    SELECT * INTO STRICT foreign_before FROM pg_catalog.pg_proc
+     WHERE oid = 'public.fasttruncate(text)'::regprocedure;
+    SELECT * INTO STRICT alias_before FROM pg_catalog.pg_proc
+     WHERE oid = 'public.fasttruncate_c(text)'::regprocedure;
+
+    BEGIN
+        ALTER EXTENSION fasttrun UPDATE;
+    EXCEPTION WHEN object_not_in_prerequisite_state THEN
+        blocked := true;
+    END;
+    IF NOT blocked THEN
+        RAISE EXCEPTION 'upgrade accepted an unrecognized independent function';
+    END IF;
+    IF (SELECT pg_catalog.to_jsonb(p) FROM pg_catalog.pg_proc p WHERE p.oid = foreign_before.oid)
+           IS DISTINCT FROM pg_catalog.to_jsonb(foreign_before) OR
+       (SELECT pg_catalog.to_jsonb(p) FROM pg_catalog.pg_proc p WHERE p.oid = alias_before.oid)
+           IS DISTINCT FROM pg_catalog.to_jsonb(alias_before) OR
+       (SELECT extversion FROM pg_catalog.pg_extension WHERE extname = 'fasttrun')
+           IS DISTINCT FROM '2.0' THEN
+        RAISE EXCEPTION 'rejected upgrade changed functions or extension version';
+    END IF;
+    DROP FUNCTION public.fasttruncate(text);
+    DROP EXTENSION fasttrun;
+END
+$test_unknown_wrapper$;
+-- Restricted or security-modified forwarding wrappers require explicit migration.
+DO $test_wrapper_security$
+DECLARE
+    variant int;
+    wrapper_before pg_catalog.pg_proc;
+    alias_before pg_catalog.pg_proc;
+    blocked boolean;
+BEGIN
+    CREATE ROLE ft_mig_security;
+    CREATE ROLE ft_mig_member IN ROLE ft_mig_security;
+    FOR variant IN 0..8 LOOP
+        CREATE EXTENSION fasttrun VERSION '2.0';
+        ALTER FUNCTION public.fasttruncate(text) RENAME TO fasttruncate_c;
+        CREATE FUNCTION public.fasttruncate(text) RETURNS void LANGUAGE plpgsql AS $fn$
+        BEGIN
+            PERFORM public.fasttruncate_c($1);
+        END;
+        $fn$;
+        CASE variant
+          WHEN 0 THEN REVOKE EXECUTE ON FUNCTION public.fasttruncate_c(text) FROM PUBLIC;
+          WHEN 1 THEN REVOKE EXECUTE ON FUNCTION public.fasttruncate(text) FROM PUBLIC;
+          WHEN 2 THEN ALTER FUNCTION public.fasttruncate(text) SECURITY DEFINER;
+          WHEN 3 THEN ALTER FUNCTION public.fasttruncate_c(text) SECURITY DEFINER;
+          WHEN 4 THEN ALTER FUNCTION public.fasttruncate(text) SET search_path = public;
+          WHEN 5 THEN ALTER FUNCTION public.fasttruncate_c(text) SET statement_timeout = '1s';
+          WHEN 6 THEN ALTER FUNCTION public.fasttruncate(text) OWNER TO ft_mig_security;
+          WHEN 7 THEN ALTER FUNCTION public.fasttruncate_c(text) OWNER TO ft_mig_security;
+          WHEN 8 THEN
+            REVOKE EXECUTE ON FUNCTION public.fasttruncate(text) FROM PUBLIC;
+            GRANT EXECUTE ON FUNCTION public.fasttruncate(text) TO ft_mig_security WITH GRANT OPTION;
+            REVOKE EXECUTE ON FUNCTION public.fasttruncate_c(text) FROM PUBLIC;
+            GRANT EXECUTE ON FUNCTION public.fasttruncate_c(text) TO ft_mig_member;
+        END CASE;
+        SELECT * INTO STRICT wrapper_before FROM pg_catalog.pg_proc
+         WHERE oid = to_regprocedure('public.fasttruncate(text)');
+        SELECT * INTO STRICT alias_before FROM pg_catalog.pg_proc
+         WHERE oid = to_regprocedure('public.fasttruncate_c(text)');
+        blocked := false;
+        BEGIN
+            ALTER EXTENSION fasttrun UPDATE;
+        EXCEPTION WHEN object_not_in_prerequisite_state THEN
+            blocked := true;
+        END;
+        IF NOT blocked THEN
+            RAISE EXCEPTION 'upgrade accepted security-modified wrapper variant %', variant;
+        END IF;
+        IF (SELECT to_jsonb(p) FROM pg_catalog.pg_proc p WHERE p.oid = wrapper_before.oid)
+               IS DISTINCT FROM to_jsonb(wrapper_before) OR
+           (SELECT to_jsonb(p) FROM pg_catalog.pg_proc p WHERE p.oid = alias_before.oid)
+               IS DISTINCT FROM to_jsonb(alias_before) OR
+           (SELECT extversion FROM pg_catalog.pg_extension WHERE extname = 'fasttrun') <> '2.0' THEN
+            RAISE EXCEPTION 'rejected migration changed security state for variant %', variant;
+        END IF;
+        DROP FUNCTION public.fasttruncate(text);
+        DROP EXTENSION fasttrun;
+    END LOOP;
+    DROP ROLE ft_mig_member;
+    DROP ROLE ft_mig_security;
+END
+$test_wrapper_security$;

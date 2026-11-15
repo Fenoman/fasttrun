@@ -69,6 +69,13 @@ fasttrun_collect_stats(PG_FUNCTION_ARGS)
 				 errhint("Use core SQL ANALYZE for inheritance or partition traversal.")));
 	}
 
+	if (rel->rd_rel->relkind != RELKIND_RELATION)
+	{
+		table_close(rel, NoLock);
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("fasttrun_collect_stats: relation \"%s\" is not a heap table", relvar->relname)));
+	}
 	if (rel->rd_tableam != GetHeapamTableAmRoutine())
 	{
 		table_close(rel, NoLock);
@@ -82,10 +89,26 @@ fasttrun_collect_stats(PG_FUNCTION_ARGS)
 		PG_RETURN_VOID();
 	}
 	fasttrun_poison_check_relation(rel, "fasttrun_collect_stats", false);
+
+	/* Follow the current file and adopt empty storage before saving undo. */
+	{
+		FasttrunAnalyzeCacheEntry *aentry = fasttrun_cache_lookup(relOid);
+
+		if (aentry != NULL)
+		{
+			fasttrun_cache_follow_file(aentry, rel);
+			if (fasttrun_cache_storage_check_due(aentry, relOid))
+				(void) fasttrun_cache_check_storage(aentry, rel);
+		}
+	}
+
 	relation_policy_changed = fasttrun_stats_set_relation_policy(rel,
 													FASTTRUN_REL_LOCAL_NEUTRAL);
 	planner_fallback_changed = relation_policy_changed &&
 		fasttrun_relation_has_core_stats(rel);
+	if (fasttrun_stats_can_hide_extended(rel) &&
+		fasttrun_cache_mark_extended_stale(rel))
+		planner_fallback_changed = true;
 
 	/*
 	 * Register for per-xact bookkeeping -- callbacks walk this list only.
@@ -94,18 +117,6 @@ fasttrun_collect_stats(PG_FUNCTION_ARGS)
 	fasttrun_xact_mark_relid(relOid, relOid,
 							FASTTRUN_TOUCH_ANALYZE |
 							FASTTRUN_TOUCH_STATS);
-
-	/*
-	 * An entry without relstats follows the current file before anything
-	 * below saves its state: a rollback of this level must not bring back a
-	 * file an outer level already replaced.
-	 */
-	{
-		FasttrunAnalyzeCacheEntry *aentry = fasttrun_cache_lookup(relOid);
-
-		if (aentry != NULL)
-			fasttrun_cache_follow_file(aentry, rel);
-	}
 
 	{
 		sample_target = fasttrun_effective_sample_target(rel);
@@ -188,21 +199,10 @@ fasttrun_collect_stats(PG_FUNCTION_ARGS)
 
 	/*
 	 * The stored statistics read the dead pages of the file through an entry
-	 * that knows only the file, so the contract above holds.  They are newer
-	 * than the core's CREATE STATISTICS data of the table.
+	 * that knows only the file, so the contract above holds.
 	 */
 	if (collect_result.published_any)
-	{
-		FasttrunAnalyzeCacheEntry *entry = fasttrun_cache_ensure_file_entry(rel);
-
-		/* A sample taken while the table is written never serves the planner. */
-		if (!collect_result.unsafe && !entry->state.ext_stats_stale &&
-			fasttrun_relation_has_extended_stats(rel))
-		{
-			fasttrun_analyze_save_undo(entry);
-			entry->state.ext_stats_stale = true;
-		}
-	}
+		(void) fasttrun_cache_ensure_file_entry(rel);
 
 	table_close(rel, AccessShareLock);
 
@@ -220,8 +220,8 @@ fasttrun_collect_stats(PG_FUNCTION_ARGS)
  *   SELECT staattnum, stadistinct, stakind1, stanumbers1, stavalues1
  *   FROM   fasttrun_inspect_stats('temp_xxx');
  *
- * and see exactly what fasttrun_get_relation_stats_hook would feed
- * the planner on the next query against that table.
+ * and inspect the stored sample. Planner freshness checks can hide it from
+ * a later query even while this function still returns the cached tuple.
  *
  * Implementation notes:
  *   * Materialize-mode SRF (we expect a small handful of rows per
@@ -288,6 +288,14 @@ fasttrun_inspect_stats(PG_FUNCTION_ARGS)
 	{
 		relation_close(rel, NoLock);
 		elog(ERROR, "fasttrun_inspect_stats: relation is not a temporary table");
+	}
+	if (rel->rd_rel->relkind != RELKIND_RELATION)
+	{
+		relation_close(rel, NoLock);
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("fasttrun_inspect_stats: relation \"%s\" is not a table",
+						relvar->relname)));
 	}
 	fasttrun_poison_check_relation(rel, "fasttrun_inspect_stats", false);
 	relation_close(rel, AccessShareLock);

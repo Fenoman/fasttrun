@@ -298,8 +298,64 @@ run_pg "$PSQL" -h "$SOCKET_DIR" -p "$PORT" -d "$DBNAME" -XAtq \
 
 value()
 {
-	awk -v key="$1" '$1 == key {print $2}' "$WORKDIR/check.out" | tail -1
+	awk -v key="$1" '$1 == key {print $2}' "${2:-$WORKDIR/check.out}" | tail -1
 }
+
+# Compare identical committed subtransactions with and without the observer.
+# Core retains its own transaction metadata until COMMIT.
+cat >"$WORKDIR/fresh_memory.sql" <<'SQL'
+\set ON_ERROR_STOP 1
+\if :load_fasttrun
+LOAD 'fasttrun';
+\else
+DO $check$ BEGIN
+  IF current_setting('fasttrun.sample_rows', true) IS NOT NULL THEN
+    RAISE EXCEPTION 'core memory control has fasttrun loaded';
+  END IF;
+END $check$;
+\endif
+CREATE TEMP TABLE ft_fresh_memory(id int);
+BEGIN;
+DO $warm$ BEGIN
+  FOR i IN 1..100 LOOP
+    BEGIN TRUNCATE ft_fresh_memory; EXCEPTION WHEN OTHERS THEN RAISE; END;
+  END LOOP;
+END $warm$;
+SELECT 'FRESH_WARM_USED ' || used_bytes
+FROM pg_backend_memory_contexts WHERE name = 'TopTransactionContext';
+DO $repeat$ BEGIN
+  FOR i IN 1..2000 LOOP
+    BEGIN TRUNCATE ft_fresh_memory; EXCEPTION WHEN OTHERS THEN RAISE; END;
+  END LOOP;
+END $repeat$;
+SELECT 'FRESH_FINAL_USED ' || used_bytes
+FROM pg_backend_memory_contexts WHERE name = 'TopTransactionContext';
+COMMIT;
+SQL
+for load_fasttrun in 0 1; do
+	PGOPTIONS='-c session_preload_libraries= -c local_preload_libraries=' \
+		run_pg "$PSQL" -h "$SOCKET_DIR" -p "$PORT" -d "$DBNAME" -XAtq \
+		-v load_fasttrun="$load_fasttrun" -f "$WORKDIR/fresh_memory.sql" \
+		>"$WORKDIR/fresh_$load_fasttrun.out" 2>"$WORKDIR/fresh_$load_fasttrun.err" || {
+		cat "$WORKDIR/fresh_$load_fasttrun.err" >&2
+		exit 1
+	}
+done
+fresh_core_warm=$(value FRESH_WARM_USED "$WORKDIR/fresh_0.out")
+fresh_core_final=$(value FRESH_FINAL_USED "$WORKDIR/fresh_0.out")
+fresh_local_warm=$(value FRESH_WARM_USED "$WORKDIR/fresh_1.out")
+fresh_local_final=$(value FRESH_FINAL_USED "$WORKDIR/fresh_1.out")
+for metric in "$fresh_core_warm" "$fresh_core_final" "$fresh_local_warm" "$fresh_local_final"; do
+	case "$metric" in
+		''|*[!0-9]*) echo "invalid fresh-memory metric: $metric" >&2; exit 1 ;;
+	esac
+done
+fresh_extra=$((fresh_local_final - fresh_local_warm - fresh_core_final + fresh_core_warm))
+echo "fresh markers: core_growth=$((fresh_core_final-fresh_core_warm)) local_growth=$((fresh_local_final-fresh_local_warm)) extra=$fresh_extra"
+if [ "$fresh_extra" -gt 16384 ]; then
+	echo 'FAIL: repeated core TRUNCATE retains fresh marks by call count' >&2
+	exit 1
+fi
 
 warm_used=$(value WARM_USED)
 warm_total=$(value WARM_TOTAL)

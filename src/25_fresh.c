@@ -270,12 +270,50 @@ fasttrun_fresh_note_core_truncate(Oid relid)
 	if (!fasttrun_relid_is_temp(relid))
 		return;
 	entry = fasttrun_fresh_find(relid);
-	if (entry != NULL && entry->sql_subid != InvalidSubTransactionId)
+	if (entry == NULL || entry->sql_subid == InvalidSubTransactionId)
+		(void) fasttrun_fresh_prepare(relid);
+	else if (fasttrun_passthrough)
 		return;
-	(void) fasttrun_fresh_prepare(relid);
 	old_mcxt = MemoryContextSwitchTo(TopTransactionContext);
 	fasttrun_fresh_pending = lappend_oid(fasttrun_fresh_pending, relid);
 	MemoryContextSwitchTo(old_mcxt);
+}
+
+/* Each component keeps its own birth, including an index truncated in place. */
+static void
+fasttrun_note_relation_files_birth(Relation rel)
+{
+	List	   *indexes = RelationGetIndexList(rel);
+	ListCell   *lc;
+
+	fasttrun_xact_note_file_birth(rel);
+	foreach(lc, indexes)
+	{
+		Relation	indexrel = try_relation_open(lfirst_oid(lc), AccessShareLock);
+
+		if (indexrel != NULL)
+		{
+			fasttrun_xact_note_file_birth(indexrel);
+			relation_close(indexrel, AccessShareLock);
+		}
+	}
+	list_free(indexes);
+}
+
+static void
+fasttrun_note_workset_birth(Relation rel)
+{
+	fasttrun_note_relation_files_birth(rel);
+	if (OidIsValid(rel->rd_rel->reltoastrelid))
+	{
+		Relation	toastrel = try_relation_open(rel->rd_rel->reltoastrelid, AccessShareLock);
+
+		if (toastrel != NULL)
+		{
+			fasttrun_note_relation_files_birth(toastrel);
+			relation_close(toastrel, AccessShareLock);
+		}
+	}
 }
 
 /*
@@ -291,12 +329,23 @@ fasttrun_fresh_confirm_pending(SubTransactionId stmt_subid)
 	foreach(lc, fasttrun_fresh_pending)
 	{
 		FasttrunFreshEntry *entry = fasttrun_fresh_find(lfirst_oid(lc));
+		Relation	rel;
 
 		if (entry == NULL)
 			continue;
 		Assert(entry->sql_subid <= stmt_subid);
 		if (entry->sql_subid == InvalidSubTransactionId)
 			entry->sql_subid = stmt_subid;
+		if (!fasttrun_passthrough)
+		{
+			/* TRUNCATE still holds its lock.  AFTER triggers may drop a target. */
+			rel = try_relation_open(entry->relid, NoLock);
+			if (rel != NULL)
+			{
+				fasttrun_note_workset_birth(rel);
+				relation_close(rel, NoLock);
+			}
+		}
 	}
 	list_free(fasttrun_fresh_pending);
 	fasttrun_fresh_pending = NIL;

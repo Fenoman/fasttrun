@@ -372,6 +372,7 @@ fasttrun_try_empty_truncate(Relation heaprel, FasttrunOpenedWorkset *opened)
 	int64		ins, upd, del;
 	bool		truncdropped;
 	bool		have_counters;
+	bool		adopt_undo;
 
 	/* A physically empty heap can still need repair after a failed rebuild. */
 	if (fasttrun_poison_find(relid) != NULL || heapentry == NULL ||
@@ -382,6 +383,10 @@ fasttrun_try_empty_truncate(Relation heaprel, FasttrunOpenedWorkset *opened)
 		heapentry->state.last_inval_pages != 0 ||
 		heapentry->state.last_inval_tuples != 0 ||
 		RelationGetNumberOfBlocks(heaprel) != 0)
+		return false;
+	if (!heapentry->state.ext_stats_stale &&
+		(fasttrun_relation_has_extended_stats(heaprel) ||
+		 fasttrun_xact_statistics_can_return(relid)))
 		return false;
 
 	/* Keep the delta seed valid for a later refill in this transaction. */
@@ -405,6 +410,8 @@ fasttrun_try_empty_truncate(Relation heaprel, FasttrunOpenedWorkset *opened)
 		relentry->heap_rlb.backend != heaprel->rd_backend)
 		return false;
 
+	adopt_undo = relentry->state_subid != InvalidSubTransactionId ||
+		relentry->undo != NULL;
 	/* Partial core ANALYZE can leave CORE_ALLOWED column overrides. */
 	foreach(lc, relentry->attkeys)
 	{
@@ -434,6 +441,27 @@ fasttrun_try_empty_truncate(Relation heaprel, FasttrunOpenedWorkset *opened)
 			rel->rd_rel->reltuples != 0 || rel->rd_rel->relallvisible != 0 ||
 			RelationGetNumberOfBlocks(rel) != entry->state.cached_pages)
 			return false;
+		adopt_undo |= entry->state_subid != InvalidSubTransactionId ||
+			entry->undo != NULL;
+	}
+
+	/* An empty reset survives rollback even when its publication does not. */
+	if (adopt_undo)
+	{
+		for (i = 0; i < opened->nslots; i++)
+		{
+			Oid			slot_relid = RelationGetRelid(opened->slot_relations[i]);
+
+			fasttrun_xact_mark_relid(slot_relid, relid,
+									 FASTTRUN_TOUCH_ANALYZE | FASTTRUN_TOUCH_TRUNCATED);
+		}
+		for (i = 0; i < opened->nslots; i++)
+		{
+			FasttrunAnalyzeCacheEntry *entry =
+				fasttrun_cache_lookup(RelationGetRelid(opened->slot_relations[i]));
+
+			fasttrun_cache_adopt_empty_relstats(entry, entry->state.cached_pages, true);
+		}
 	}
 
 	/* Anchors lost at a COMMIT without counters are reseeded, relstats kept. */
@@ -486,11 +514,42 @@ fasttrun_allocate_truncate_operation(Relation heaprel,
 	int			toast_index_end;
 	int			toast_heap_index = -1;
 	RelFileLocatorBackend root_rlb;
+	SubTransactionId root_file_subid;
+	bool		birth_known;
 
 	/* Journal every birth before allocating an operation not yet owned by
 	 * the caller's error cleanup.  No catalog access is needed on abort. */
 	for (i = 0; i < opened->nslots; i++)
 		fasttrun_xact_mark_created_relation(opened->slot_relations[i]);
+	root_file_subid = fasttrun_xact_file_birth(heaprel, &birth_known);
+	if (!birth_known)
+		goto independent_files;
+	if (fasttrun_unobserved_storage_ddl &&
+		root_file_subid != GetCurrentSubTransactionId())
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("fasttrun: storage history is incomplete after late loading"),
+				 errdetail("This transaction started before fasttrun could observe storage-changing commands. No table files have been changed by this call."),
+				 errhint("Commit or roll back the current transaction, then retry. Preload fasttrun with session_preload_libraries or shared_preload_libraries to observe the complete transaction.")));
+	if (fasttrun_xact_component_can_return(RelationGetRelid(heaprel), root_file_subid))
+		goto independent_files;
+	for (i = 0; i < opened->nslots; i++)
+	{
+		Relation	component = opened->slot_relations[i];
+		SubTransactionId component_subid;
+
+		component_subid = fasttrun_xact_file_birth(component, &birth_known);
+		if (!birth_known)
+			goto independent_files;
+		if (component_subid == root_file_subid)
+			continue;
+		/* A new component disappears instead of restoring an older file. */
+		if (component->rd_createSubid != InvalidSubTransactionId &&
+			component_subid == component->rd_createSubid &&
+			component_subid >= root_file_subid)
+			continue;
+		goto independent_files;
+	}
 
 	fasttrun_operation_init();
 	size = offsetof(FasttrunTruncateOperation, slots) +
@@ -501,6 +560,7 @@ fasttrun_allocate_truncate_operation(Relation heaprel,
 	root_rlb.backend = heaprel->rd_backend;
 	operation->root_relid = RelationGetRelid(heaprel);
 	operation->root_rlb = root_rlb;
+	operation->root_file_subid = root_file_subid;
 	operation->generation = generation;
 	operation->phase = FASTTRUN_TRUNCATE_PREPARED;
 	operation->nuser_indexes = list_length(opened->user_indexes);
@@ -546,6 +606,14 @@ fasttrun_allocate_truncate_operation(Relation heaprel,
 		}
 	}
 	return operation;
+
+independent_files:
+	ereport(ERROR,
+			(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+			 errmsg("fasttrun: table files can roll back independently"),
+			 errdetail("The heap and its indexes or TOAST do not share a known storage lifetime."),
+			 errhint("Commit or roll back the storage-changing DDL before calling fasttruncate.")));
+	return NULL;
 }
 
 /* Save complete undo and switch every result slot to neutral ownership. */
@@ -570,6 +638,10 @@ fasttrun_reserve_empty_publication(FasttrunTruncateOperation *operation,
 		entry = fasttrun_cache_enter(slot->relid);
 
 		fasttrun_analyze_save_undo(entry);
+		entry->state.cached_locator = slot->rlb.locator;
+		entry->state.probe_rlb = slot->rlb;
+		entry->state.heap_relid = slot->heap_relid;
+		entry->state.heap_rlb = slot->heap_rlb;
 		entry->state.has_relstats = false;
 		entry->state.has_delta_state = false;
 		entry->state.has_stats_baseline = false;
@@ -581,6 +653,7 @@ fasttrun_reserve_empty_publication(FasttrunTruncateOperation *operation,
 		slot->analyze_entry = entry;
 		FASTTRUN_TEST_FAILPOINT("reserve_after_state", i + 1);
 	}
+	(void) fasttrun_cache_mark_extended_stale(heaprel);
 	(void) fasttrun_stats_neutralize_relation(heaprel);
 	operation->have_pgstat_seed = fasttrun_read_pgstat_counters(heaprel,
 													&operation->seed_inserted,
@@ -602,8 +675,13 @@ fasttrun_execute_truncate_storage(FasttrunTruncateOperation *operation,
 
 	/* The rows are gone from here on, whatever the level's outcome. */
 	for (i = 0; i < operation->nslots; i++)
+	{
 		fasttrun_xact_flag_marked_relid(operation->slots[i].relid,
 										FASTTRUN_TOUCH_TRUNCATED);
+		fasttrun_cache_retire_reset_undo(operation->slots[i].analyze_entry);
+	}
+	fasttrun_stats_neutralize_file(operation->root_relid,
+								 &operation->root_rlb);
 	operation->phase = FASTTRUN_TRUNCATE_MUTATED;
 
 	foreach(lc, opened->user_indexes)
@@ -681,7 +759,6 @@ fasttrun_publish_empty_workset(FasttrunTruncateOperation *operation,
 		entry->aborted_pages = 0;
 		entry->state.published_dead = 0;
 		entry->state.published_aborted_writes = entry->aborted_writes;
-		entry->state.last_inval_dead = 0;
 		entry->state.cached_tuples = 0;
 		entry->state.count_exact = true;
 		entry->state.cached_allvisible = 0;
@@ -698,6 +775,7 @@ fasttrun_publish_empty_workset(FasttrunTruncateOperation *operation,
 		entry->lazy_check_subid = InvalidSubTransactionId;
 		entry->lazy_check_epoch = 0;
 		entry->lazy_check_pages = 0;
+		fasttrun_cache_adopt_empty_relstats(entry, slot->rebuilt_pages, true);
 
 		if (slot->kind == FASTTRUN_TRUNCATE_MAIN_HEAP)
 		{
@@ -807,6 +885,29 @@ fasttrun_invalidate_local_plan_cache(Oid relid)
 	LocalExecuteInvalidationMessage(&msg);
 }
 
+/* Reject an invalid target before its ExclusiveLock can queue behind writers. */
+static void
+fasttrun_truncate_check_target(const RangeVar *relation, Oid relid,
+							   Oid old_relid, void *arg)
+{
+	HeapTuple	tuple;
+	Form_pg_class form;
+	bool		local_temp;
+
+	if (!OidIsValid(relid))
+		return;
+	tuple = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
+	if (!HeapTupleIsValid(tuple))
+		return;
+	form = (Form_pg_class) GETSTRUCT(tuple);
+	local_temp = form->relpersistence == RELPERSISTENCE_TEMP &&
+		isTempNamespace(form->relnamespace);
+	ReleaseSysCache(tuple);
+	if (!local_temp)
+		elog(ERROR, "fasttruncate: relation \"%s\" is not a local temporary table",
+			 relation->relname);
+}
+
 /*
  * fasttruncate(text)
  *
@@ -898,7 +999,8 @@ fasttruncate(PG_FUNCTION_ARGS)
 
 	fasttrun_statement_seq++;
 	relvar = fasttrun_make_rangevar(name);
-	relOid = RangeVarGetRelid(relvar, ExclusiveLock, true);
+	relOid = RangeVarGetRelidExtended(relvar, ExclusiveLock, RVR_MISSING_OK,
+									 fasttrun_truncate_check_target, NULL);
 
 	/*
 	 * Missing table -- silently bail out (see function header).
@@ -914,6 +1016,15 @@ fasttruncate(PG_FUNCTION_ARGS)
 		table_close(rel, NoLock);
 		elog(ERROR, "fasttruncate: relation \"%s\" is not a local temporary table",
 			 RelationGetRelationName(rel));
+	}
+
+	if (rel->rd_rel->relkind != RELKIND_RELATION &&
+		rel->rd_rel->relkind != RELKIND_PARTITIONED_TABLE)
+	{
+		table_close(rel, NoLock);
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("fasttruncate: relation \"%s\" is not a heap table", relvar->relname)));
 	}
 
 	/* Heap-AM only. */

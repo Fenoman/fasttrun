@@ -1,99 +1,127 @@
 \echo Use "ALTER EXTENSION fasttrun UPDATE TO '2.1'" to load this file. \quit
 
--- ======================================================================
--- Миграция fasttrun 2.0 -> 2.1
+-- Restore the canonical C API and retain the extension-owned legacy alias.
 --
--- Что меняется в API:
---   * fasttruncate(text) — снова становится канонической C-функцией
---     расширения, если ранее была подменена внешней PL/pgSQL обёрткой;
---   * добавляется fasttrun_analyze(text) — in-memory ANALYZE без
---     записи в pg_class и без sinval-сообщений;
---   * добавляется fasttrun_relstats(text) — инспекционный helper.
+-- Cleanup. Only a schema-qualified, single-call PL/pgSQL forwarding wrapper
+-- is removable. Its text signature and C alias must use the extension schema.
+-- The alias must already belong to fasttrun and use this library and symbol.
+-- Both functions must retain default ACLs, ownership and invoker security.
 --
--- Что не меняется:
---   * семантика fasttruncate (этот аспект — вопрос самой .so, а не
---     SQL-обёртки);
---   * существующий fasttruncate_c, если он есть в БД, не удаляется
---     и не пересоздаётся.  Подробности и причина см. в комментарии
---     к шагу 3 ниже.
--- ======================================================================
-
-
--- ----------------------------------------------------------------------
--- Шаг 1: если ранее в БД была создана внешняя PL/pgSQL обёртка
--- public.fasttruncate(text) поверх fasttruncate_c (этот паттерн
--- встречается в инсталляциях, где extension прошёл через rename
--- C-функции и подмену её PL/pgSQL функцией с тем же именем), —
--- дропаем эту обёртку.  Она не принадлежит расширению, поэтому
--- plain DROP FUNCTION срабатывает без ALTER EXTENSION DROP.
--- Освобождение имени нужно для шага 2: мы хотим видеть в роли
--- public.fasttruncate(text) каноническую C-функцию.
--- ----------------------------------------------------------------------
+-- Conflicts. Other external text functions abort the upgrade unchanged.
+-- DROP without CASCADE also protects objects that depend on the wrapper.
 DO $cleanup_wrapper$
 DECLARE
-    _is_wrapper boolean;
+    _extension oid;
+    _owner oid;
+    _namespace oid;
+    _schema text;
+    _wrapper pg_catalog.pg_proc;
+    _alias pg_catalog.pg_proc;
+    _call text;
+    _is_legacy_alias boolean;
 BEGIN
-    SELECT (l.lanname <> 'c')
-      INTO _is_wrapper
-      FROM pg_proc p
-      JOIN pg_namespace n ON n.oid = p.pronamespace
-      JOIN pg_language  l ON l.oid = p.prolang
-     WHERE n.nspname = 'public'
-       AND p.proname = 'fasttruncate'
-       AND p.pronargs = 1
-     LIMIT 1;
+    SELECT e.oid, e.extowner, e.extnamespace, n.nspname
+      INTO STRICT _extension, _owner, _namespace, _schema
+      FROM pg_catalog.pg_extension e
+      JOIN pg_catalog.pg_namespace n ON n.oid = e.extnamespace
+     WHERE e.extname = 'fasttrun';
 
-    IF _is_wrapper THEN
-        DROP FUNCTION public.fasttruncate(text);
-        RAISE NOTICE 'fasttrun 2.0->2.1: дропнута внешняя PL/pgSQL обёртка public.fasttruncate(text)';
+    SELECT p.* INTO _wrapper
+      FROM pg_catalog.pg_proc p
+     WHERE p.pronamespace = _namespace
+       AND p.proname = 'fasttruncate' AND p.prokind = 'f'
+       AND p.pronargs = 1
+       AND p.proargtypes[0] = 'pg_catalog.text'::pg_catalog.regtype;
+
+    IF NOT FOUND THEN
+        RETURN;
+    END IF;
+
+    IF EXISTS (SELECT FROM pg_catalog.pg_depend d
+                WHERE d.classid = 'pg_catalog.pg_proc'::pg_catalog.regclass
+                  AND d.objid = _wrapper.oid AND d.objsubid = 0
+                  AND d.refclassid = 'pg_catalog.pg_extension'::pg_catalog.regclass
+                  AND d.refobjid = _extension AND d.deptype = 'e') THEN
+        RETURN;
+    END IF;
+
+    SELECT EXISTS (
+        SELECT FROM pg_catalog.pg_proc a
+        JOIN pg_catalog.pg_language l ON l.oid = a.prolang
+        JOIN pg_catalog.pg_depend d ON d.objid = a.oid
+         WHERE a.pronamespace = _namespace
+           AND a.proname = 'fasttruncate_c' AND a.prokind = 'f'
+           AND a.pronargs = 1
+           AND a.proargtypes[0] = 'pg_catalog.text'::pg_catalog.regtype
+           AND a.prorettype = 'pg_catalog.void'::pg_catalog.regtype
+           AND NOT a.proretset AND l.lanname = 'c'
+           AND a.probin = 'MODULE_PATHNAME' AND a.prosrc = 'fasttruncate'
+           AND d.classid = 'pg_catalog.pg_proc'::pg_catalog.regclass
+           AND d.objsubid = 0
+           AND d.refclassid = 'pg_catalog.pg_extension'::pg_catalog.regclass
+           AND d.refobjid = _extension AND d.deptype = 'e'
+    ) INTO _is_legacy_alias;
+
+    IF _wrapper.prolang = (SELECT oid FROM pg_catalog.pg_language
+                           WHERE lanname = 'plpgsql')
+       AND _wrapper.prorettype = 'pg_catalog.void'::pg_catalog.regtype
+       AND NOT _wrapper.proretset THEN
+        _call := (pg_catalog.regexp_match(_wrapper.prosrc,
+            '^[[:space:]]*BEGIN[[:space:]]+PERFORM[[:space:]]+(.+);[[:space:]]*END[[:space:]]*;[[:space:]]*$',
+            'i'))[1];
+    END IF;
+
+    IF _is_legacy_alias
+       AND _call IN (
+           pg_catalog.format('%I.fasttruncate_c($1)', _schema),
+           pg_catalog.format('%I.fasttruncate_c(%s)', _schema,
+               COALESCE(pg_catalog.quote_ident(_wrapper.proargnames[1]), '$1')))
+       AND NOT EXISTS (SELECT FROM pg_catalog.pg_depend d
+                        WHERE d.classid = 'pg_catalog.pg_proc'::pg_catalog.regclass
+                          AND d.objid = _wrapper.oid AND d.objsubid = 0
+                          AND d.refclassid = 'pg_catalog.pg_extension'::pg_catalog.regclass
+                          AND d.deptype = 'e') THEN
+        SELECT p.* INTO STRICT _alias FROM pg_catalog.pg_proc p
+         WHERE p.pronamespace = _namespace AND p.proname = 'fasttruncate_c'
+           AND p.pronargs = 1 AND p.proargtypes[0] = 'pg_catalog.text'::pg_catalog.regtype;
+        IF _wrapper.proowner <> _owner OR _alias.proowner <> _owner
+           OR _wrapper.prosecdef OR _alias.prosecdef
+           OR _wrapper.proconfig IS NOT NULL OR _alias.proconfig IS NOT NULL
+           OR _wrapper.proleakproof OR _alias.proleakproof
+           OR COALESCE(_wrapper.proacl, pg_catalog.acldefault('f', _owner))
+                <> pg_catalog.acldefault('f', _owner)
+           OR COALESCE(_alias.proacl, pg_catalog.acldefault('f', _owner))
+                <> pg_catalog.acldefault('f', _owner) THEN
+            RAISE EXCEPTION USING
+                ERRCODE = '55000',
+                MESSAGE = 'fasttrun upgrade cannot preserve legacy wrapper security automatically',
+                DETAIL = 'The wrapper and C alias have nondefault ACLs, owners, security attributes or function settings. Replacing two permission checks with one can change effective access.',
+                HINT = 'Migrate the wrapper explicitly in a transaction, preserving the intended owner, effective EXECUTE permissions and function settings, then run ALTER EXTENSION fasttrun UPDATE. Do not grant PUBLIC access just to bypass this check.';
+        END IF;
+        EXECUTE pg_catalog.format('DROP FUNCTION %I.fasttruncate(pg_catalog.text)',
+                                  _schema);
+    ELSE
+        RAISE EXCEPTION USING
+            ERRCODE = '55000',
+            MESSAGE = pg_catalog.format(
+                'fasttrun upgrade cannot replace independent function %I.fasttruncate(text)',
+                _schema),
+            DETAIL = 'The function is not the recognized legacy wrapper over the extension-owned C alias.',
+            HINT = 'Resolve the function name conflict before retrying ALTER EXTENSION fasttrun UPDATE.';
     END IF;
 END
 $cleanup_wrapper$;
 
-
--- ----------------------------------------------------------------------
--- Шаг 2: восстанавливаем (или подтверждаем) каноническую C-функцию
--- fasttruncate(text).  CREATE OR REPLACE покрывает оба сценария:
---
---   (a) обёртка только что была дропнута на шаге 1, функции с таким
---       именем сейчас нет — CREATE создаёт её;
---
---   (b) расширение upstream 2.0 никогда не проходило через rename,
---       и C-функция fasttruncate уже на месте — REPLACE подтверждает
---       её определение (фактически no-op, потому что мы пишем то же
---       самое: тот же C-символ в том же $libdir/fasttrun).
---
--- В обоих случаях, поскольку CREATE OR REPLACE выполняется внутри
--- ALTER EXTENSION UPDATE, PostgreSQL автоматически поддерживает
--- запись в pg_depend, делающую функцию owned by fasttrun.
--- ----------------------------------------------------------------------
+-- CREATE OR REPLACE retains the OID and grants of an existing C function.
 CREATE OR REPLACE FUNCTION fasttruncate(text)
 RETURNS void AS 'MODULE_PATHNAME', 'fasttruncate'
 LANGUAGE C RETURNS NULL ON NULL INPUT VOLATILE;
 
-
--- ----------------------------------------------------------------------
--- Шаг 3: backward-compat алиас fasttruncate_c(text).
---
--- В установках, прошедших через rename C-функции (см. шаг 1), уже
--- существует fasttruncate_c — функция, на которую ссылается
--- какой-то клиентский PL/pgSQL код.  CREATE OR REPLACE здесь
--- идемпотентен:
---   * если функция уже существует и её определение совпадает —
---     операция почти бесплатная;
---   * если её нет (вариант, когда rename вообще не запускался) —
---     создаётся как чистый алиас на тот же C-символ "fasttruncate".
---
--- Алиас намеренно НЕ включён в fasttrun--2.1.sql (full install
--- для свежих БД): свежим установкам он не нужен, новый код должен
--- вызывать каноническое имя fasttruncate.  Он есть только здесь,
--- в migration-скрипте, чтобы существующий код, ссылавшийся на
--- legacy-имя, не сломался при обновлении.
--- ----------------------------------------------------------------------
+-- Existing callers and dependencies keep the renamed extension-owned C alias.
+-- Fresh installs omit the alias because only upgrade clients need it.
 CREATE OR REPLACE FUNCTION fasttruncate_c(text)
 RETURNS void AS 'MODULE_PATHNAME', 'fasttruncate'
 LANGUAGE C RETURNS NULL ON NULL INPUT VOLATILE;
-
 
 -- ----------------------------------------------------------------------
 -- Шаг 4: новые в 2.1

@@ -346,10 +346,8 @@ fasttrun_get_index_stats_hook(PlannerInfo *root, Oid indexOid,
 	vardata->freefunc = NULL;
 
 	/*
-	 * Outside the planner frame the query names no managed relation, but an
-	 * inlined SQL function body may still reach one.  There only an index the
-	 * analyze cache already links to its heap goes on: a hash lookup, so a
-	 * query over permanent tables opens no relation here.
+	 * Resolve only cached owners outside the planner frame. Function RTEs and
+	 * inheritance parents keep a frame for managed relations introduced later.
 	 */
 	if (fasttrun_stats_cache != NULL && fasttrun_stats_relid_cache != NULL &&
 		(fasttrun_in_planner || fasttrun_index_is_cached(indexOid)))
@@ -382,6 +380,22 @@ fasttrun_get_index_stats_hook(PlannerInfo *root, Oid indexOid,
 }
 
 /*
+ * Inheritance expansion can introduce cached temp children during planning.
+ * ONLY and non-parent relation kinds need no catalog probe. For an unchecked
+ * ordinary/foreign table, has_subclass reads one RELOID syscache entry.
+ */
+static bool
+fasttrun_rte_can_expand_stats(RangeTblEntry *rte)
+{
+	if (!rte->inh)
+		return false;
+	if (rte->relkind == RELKIND_PARTITIONED_TABLE)
+		return true;
+	return (rte->relkind == RELKIND_RELATION ||
+			rte->relkind == RELKIND_FOREIGN_TABLE) && has_subclass(rte->relid);
+}
+
+/*
  * planner hook -- re-inject cached relpages/reltuples into rd_rel for any
  * temp relation whose rd_rel was reset to the on-disk pg_class values
  * by a relcache rebuild (typically triggered by a sinval message from a
@@ -397,9 +411,9 @@ fasttrun_get_index_stats_hook(PlannerInfo *root, Oid indexOid,
  *
  * We walk the current query's rangetable (recursing into subquery RTEs,
  * CTEs and, when hasSubLinks is set, SubLink subselects) and re-inject
- * cached stats for those temp heaps plus their indexes.  This keeps
- * unrelated cached temp tables at zero cost for plans that don't
- * reference them.
+ * cached stats for those temp heaps plus their indexes. Inheritance parents
+ * also keep a frame for managed children added inside standard_planner.
+ * Unrelated cached temp tables are not visited.
  */
 static bool
 fasttrun_query_contains_stats_relid(Query *query)
@@ -415,8 +429,14 @@ fasttrun_query_contains_stats_relid(Query *query)
 
 		if (rte->rtekind == RTE_RELATION)
 		{
-			if (fasttrun_stats_relid_exists(rte->relid))
+			if (fasttrun_stats_relid_exists(rte->relid) ||
+				fasttrun_rte_can_expand_stats(rte))
 				return true;
+		}
+		else if (rte->rtekind == RTE_FUNCTION)
+		{
+			/* An inlined body can introduce managed heaps during planning. */
+			return true;
 		}
 		else if (rte->rtekind == RTE_SUBQUERY)
 		{
@@ -495,9 +515,12 @@ fasttrun_reinject_query_relstats(Query *query, bool detect_stats)
 		{
 			fasttrun_reinject_rte_relstats(rte);
 			if (detect_stats && !found &&
-				fasttrun_stats_relid_exists(rte->relid))
+				(fasttrun_stats_relid_exists(rte->relid) ||
+				 fasttrun_rte_can_expand_stats(rte)))
 				found = true;
 		}
+		else if (rte->rtekind == RTE_FUNCTION && detect_stats)
+			found = true;
 		else if (rte->rtekind == RTE_SUBQUERY)
 		{
 			if (fasttrun_reinject_query_relstats(rte->subquery, detect_stats))

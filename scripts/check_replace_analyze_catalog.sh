@@ -81,6 +81,17 @@ BEGIN
 END
 $body$;
 
+CREATE FUNCTION f_adjacent() RETURNS void LANGUAGE plpgsql AS $body$
+BEGIN ANALYZE temp_a; ANALYZE temp_b; END
+$body$;
+
+CREATE FUNCTION f_quoted() RETURNS void LANGUAGE plpgsql AS $body$
+BEGIN
+    ANALYZE "temp name";
+    ANALYZE "temp ""quoted""";
+END
+$body$;
+
 CREATE FUNCTION f_exec() RETURNS void LANGUAGE plpgsql AS $body$
 BEGIN
     EXECUTE 'ANALYZE temp_d;';
@@ -93,16 +104,38 @@ BEGIN
     PERFORM 1;
 END
 $body$;
+
+CREATE FUNCTION f_dollar() RETURNS text LANGUAGE plpgsql AS $body$
+BEGIN
+    RETURN $q$BEGIN ANALYZE temp_a; END$q$;
+END
+$body$;
+
+CREATE FUNCTION f_block() RETURNS void LANGUAGE plpgsql AS $body$
+BEGIN
+    /* BEGIN ANALYZE temp_a; END */
+    RETURN;
+END
+$body$;
+
+CREATE FUNCTION f_quoted_carrier() RETURNS integer LANGUAGE plpgsql AS $body$
+DECLARE
+    "temp BEGIN ANALYZE temp_a; END" integer := 7;
+BEGIN
+    RETURN "temp BEGIN ANALYZE temp_a; END";
+END
+$body$;
 SQL
 
 snapshot()
 {
 	"$PSQL" -h "$WORKDIR" -p "$PORT" -d "$DBNAME" -X -qAt \
-		-c "SELECT prosrc FROM pg_proc WHERE proname = '$1'"
+		-c "SELECT oid::text || E'\n' || prosrc FROM pg_proc WHERE proname = '$1'"
 }
 
-exec_before=$(snapshot f_exec)
-comment_before=$(snapshot f_comment)
+for fixture in f_exec f_comment f_dollar f_block f_quoted_carrier; do
+	snapshot "$fixture" >"$WORKDIR/before.$fixture"
+done
 
 "$PSQL" -h "$WORKDIR" -p "$PORT" -d "$DBNAME" -X -q -v ON_ERROR_STOP=1 \
 	-f "$WORKDIR/apply.sql" >"$WORKDIR/apply.out" 2>&1
@@ -125,22 +158,48 @@ assert "f_plain: обе замены выполнены" \
 	"(SELECT prosrc !~* 'ANALYZE\s+temp_' AND prosrc LIKE '%fasttrun_analyze(''temp_a'')%' AND prosrc LIKE '%fasttrun_analyze(''temp_b'')%' FROM pg_proc WHERE proname='f_plain')"
 assert "f_then: замена после THEN" \
 	"(SELECT prosrc LIKE '%fasttrun_analyze(''temp_f'')%' FROM pg_proc WHERE proname='f_then')"
+assert "f_adjacent: both adjacent statements are replaced" \
+	"(SELECT prosrc !~* 'ANALYZE\s+temp_' AND prosrc LIKE '%fasttrun_analyze(''temp_a'')%' AND prosrc LIKE '%fasttrun_analyze(''temp_b'')%' FROM pg_proc WHERE proname='f_adjacent')"
+assert "f_quoted: identifier quotes reach the relation parser" \
+	"(SELECT position(\$want\$fasttrun_analyze('\"temp name\"')\$want\$ in prosrc) > 0 AND position(\$want\$fasttrun_analyze('\"temp \"\"quoted\"\"\"')\$want\$ in prosrc) > 0 FROM pg_proc WHERE proname='f_quoted')"
 
-exec_after=$(snapshot f_exec)
-comment_after=$(snapshot f_comment)
-if [ "$exec_after" = "$exec_before" ]; then
-	echo "ok: f_exec: литерал EXECUTE не тронут"
-else
-	echo "FAIL: f_exec: литерал повреждён:" >&2
-	printf '%s\n' "$exec_after" >&2
-	failed=1
-fi
-if [ "$comment_after" = "$comment_before" ]; then
-	echo "ok: f_comment: комментарий не тронут"
-else
-	echo "FAIL: f_comment: комментарий изменён" >&2
-	failed=1
-fi
+for fixture in f_exec f_comment f_dollar f_block f_quoted_carrier; do
+	snapshot "$fixture" >"$WORKDIR/after.$fixture"
+	if cmp -s "$WORKDIR/before.$fixture" "$WORKDIR/after.$fixture"; then
+		echo "ok: $fixture: skipped body and OID are unchanged"
+	else
+		echo "FAIL: $fixture: skipped body or OID changed" >&2
+		failed=1
+	fi
+done
+
+for skipped in 'f_exec:single quote' 'f_comment:line comment' \
+	'f_dollar:dollar sign' 'f_block:block comment' \
+	'f_quoted_carrier:semicolon in quoted identifier'; do
+	fixture=${skipped%%:*}
+	reason=${skipped#*:}
+	if grep -Eq "$fixture.*SKIP.*$reason" "$WORKDIR/apply.out"; then
+		echo "ok: $fixture: explicit skip reason"
+	else
+		echo "FAIL: $fixture: missing skip reason: $reason" >&2
+		failed=1
+	fi
+done
+
+for fixture in f_plain f_then f_adjacent f_quoted; do
+	snapshot "$fixture" >"$WORKDIR/first.$fixture"
+done
+"$PSQL" -h "$WORKDIR" -p "$PORT" -d "$DBNAME" -X -q -v ON_ERROR_STOP=1 \
+	-f "$WORKDIR/apply.sql" >"$WORKDIR/reapply.out" 2>&1
+for fixture in f_plain f_then f_adjacent f_quoted; do
+	snapshot "$fixture" >"$WORKDIR/second.$fixture"
+	if cmp -s "$WORKDIR/first.$fixture" "$WORKDIR/second.$fixture"; then
+		echo "ok: $fixture: reapplying preserves body and OID"
+	else
+		echo "FAIL: $fixture: reapplying changes body or OID" >&2
+		failed=1
+	fi
+done
 
 # Все функции остаются исполнимыми (plpgsql-валидность после правки prosrc).
 if ! "$PSQL" -h "$WORKDIR" -p "$PORT" -d "$DBNAME" -X -qAt \
@@ -150,10 +209,17 @@ CREATE TEMP TABLE temp_a (x int);
 CREATE TEMP TABLE temp_b (x int);
 CREATE TEMP TABLE temp_d (x int);
 CREATE TEMP TABLE temp_f (x int);
+CREATE TEMP TABLE "temp name" (x int);
+CREATE TEMP TABLE "temp ""quoted""" (x int);
 SELECT f_plain();
 SELECT f_then();
+SELECT f_adjacent();
+SELECT f_quoted();
 SELECT f_exec();
 SELECT f_comment();
+SELECT f_dollar();
+SELECT f_block();
+SELECT f_quoted_carrier();
 SQL
 then
 	echo "FAIL: функции не исполняются после замены:" >&2

@@ -33,7 +33,7 @@ static void fasttrun_stats_cache_reset(void);
 static void fasttrun_stats_cache_commit_xact(void);
 static bool fasttrun_stats_cache_evict_relid(Oid relid);
 static void fasttrun_stats_relid_set_size_anchor(Oid relid, BlockNumber pages);
-static void fasttrun_stats_neutralize_index_expressions(Oid heap_relid,
+static bool fasttrun_stats_neutralize_index_expressions(Oid heap_relid,
 														Oid indexoid);
 static void fasttrun_stats_forget_relid(Oid relid);
 static void fasttrun_subxact_callback(SubXactEvent event,
@@ -83,6 +83,8 @@ static void fasttrun_executor_start(QueryDesc *queryDesc, int eflags);
 static bool fasttrun_stats_relid_exists(Oid relid);
 static bool fasttrun_stats_relid_has_samples(Oid relid);
 static bool fasttrun_stats_relid_has_saved_samples(Oid relid);
+static void fasttrun_stats_neutralize_file(Oid relid,
+										const RelFileLocatorBackend *rlb);
 /* Defined with the session-local stats cache in src/08_stats_types.c. */
 struct FasttrunStatsRelidEntry;
 struct FasttrunStatsEntry;
@@ -94,11 +96,13 @@ static void fasttrun_stats_update_in_flight(Oid relid, int delta);
 static bool fasttrun_stats_relid_in_flight(Oid relid);
 static bool fasttrun_probe_size_stays(Relation rel);
 static bool fasttrun_stats_relation_written_now(Relation rel);
+static bool fasttrun_stats_can_hide_extended(Relation rel);
 static void fasttrun_stats_forget_in_flight(void);
 static void fasttrun_stats_in_flight_subxact_end(SubTransactionId mySubid,
 									 SubTransactionId parentSubid,
 									 bool aborted);
 static void fasttrun_stats_note_wide_writer_ddl(RangeVar *rv);
+static List *fasttrun_utility_tree(Oid relid, bool recurse);
 static void fasttrun_executor_end(QueryDesc *queryDesc);
 static void fasttrun_executor_walk_targets(PlannedStmt *stmt, bool starting);
 static bool fasttrun_stats_column_was_updated(struct FasttrunStatsRelidEntry *relentry,
@@ -145,7 +149,7 @@ fasttrun_make_rangevar(text *name)
 		}
 	}
 
-	if (fast_path && namelen > 0)
+	if (fast_path && namelen > 0 && namelen < NAMEDATALEN)
 		return makeRangeVar(NULL, relname, -1);
 
 #if PG_VERSION_NUM >= 160000
@@ -188,13 +192,11 @@ typedef struct FasttrunAnalyzeState
 	BlockNumber	last_inval_pages;
 	float4		last_inval_tuples;
 	bool		last_inval_valid;
-	BlockNumber	last_inval_dead;	/* aborted_pages at the last invalidation */
 	BlockNumber	published_dead;	/* aborted_pages when cached_pages was
 								 * published */
 	uint64		published_aborted_writes;	/* aborted_writes at that time */
-	bool		ext_stats_stale;	/* columns were collected here while the
-									 * CREATE STATISTICS objects keep the
-									 * core's earlier fill */
+	bool		ext_stats_stale;	/* core CREATE STATISTICS data may describe
+									 * an earlier fill */
 	bool		owns_index_relstats;	/* relstats of this heap's indexes are
 										 * published: reinjection reaches them
 										 * through this entry */
@@ -291,6 +293,8 @@ static uint64 fasttrun_statement_seq = 1;
  * registry is complete again from the next one.
  */
 static bool fasttrun_unobserved_writers = false;
+/* A late load cannot reconstruct earlier temporary-object DDL. */
+static bool fasttrun_unobserved_storage_ddl = false;
 
 static HTAB			   *fasttrun_analyze_cache = NULL;
 static MemoryContext	fasttrun_analyze_mcxt = NULL;
@@ -339,6 +343,7 @@ typedef struct FasttrunTruncateOperation
 {
 	Oid			root_relid;
 	RelFileLocatorBackend root_rlb;
+	SubTransactionId root_file_subid;
 	uint64		generation;
 	FasttrunTruncatePhase phase;
 	int			nuser_indexes;

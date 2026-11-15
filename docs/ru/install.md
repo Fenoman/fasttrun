@@ -58,6 +58,9 @@ CREATE EXTENSION fasttrun WITH SCHEMA fasttrun_api;
 Для `fasttruncate()`, `fasttrun_analyze()` и остальных основных функций не
 нужны ни рестарт PostgreSQL, ни `shared_preload_libraries`, ни
 `session_preload_libraries`. Библиотека загрузится при первом вызове функции.
+Первый `fasttruncate()`, загрузивший библиотеку посреди транзакции, может вернуть
+`55000`, если предыдущие изменения файлов не наблюдались. Завершите транзакцию
+и повторите вызов либо предзагрузите библиотеку до начала транзакции.
 
 `shared_preload_libraries` требуется для общего реестра учета и
 `fasttrun_prewarm()`, а в фоновых воркерах - и для учета `UPDATE` по колонкам
@@ -116,6 +119,14 @@ GRANT EXECUTE ON FUNCTION public.fasttrun_analyze(text) TO app_role;
 Остальные права выдайте отдельно ролям приложения, пулера, мониторинга и DBA.
 После обновления старой установки проверьте также права у старой функции
 `fasttruncate_c(text)`, если она осталась.
+
+Автоматическая миграция внешней legacy-обертки требует стандартных ACL,
+владельца расширения, режима invoker и отсутствия настроек функций у обертки
+и ее C-алиаса. Иначе обновление завершается с SQLSTATE `55000` до замены функций.
+
+Такую обертку переносите явно в одной транзакции, сохраняя фактические права
+доступа, затем обновляйте расширение. Выдача прав PUBLIC ради обхода проверки
+может открыть доступ к API.
 
 `trusted=true` также позволяет роли с правом `CREATE` на базу самостоятельно
 установить расширение. Реестр учета общий для всего экземпляра PostgreSQL,
@@ -251,14 +262,23 @@ DROP EXTENSION fasttrun;
 
 ## Совместимость
 
+Зафиксированные проверки снимков исходников на 2026-11-14/15 не гарантируют
+работу каждой минорной версии поставщика или любой продуктивной нагрузки:
+
 | PostgreSQL | Сборка | Базовые тесты 2.7.0 |
 |---|---|---|
-| PostgreSQL 16 | да | 20/20 |
-| PostgreSQL 17 | да | не прогонялись |
-| PostgreSQL 18 | да | не прогонялись |
-| Tantor SE 18.6.3, `enable_temp_memory_catalog = off` | да | 20/20 |
-| Tantor SE 18.6.3, `enable_temp_memory_catalog = on` | да | 20/20 |
-| Postgres Pro Enterprise 18 | да | проверяются отдельно |
+| PostgreSQL 16.16 | cassert/debug | 20/20 |
+| PostgreSQL 17.12 | cassert/debug | 20/20 |
+| PostgreSQL 18.7 | cassert/debug | 20/20 |
+| Postgres Pro Standard 16.15.2 | native release | 20/20 |
+| Postgres Pro Standard 18 | native release | 20/20 |
+| Postgres Pro Enterprise 18.6-TRIAL | native release | 20/20 |
+| Tantor SE 18.6.3, `enable_temp_memory_catalog = off` | native release | 20/20 |
+| Tantor SE 18.6.3, `enable_temp_memory_catalog = on` | native release | 20 совпадений с эталонами, включая четыре пропущенных набора |
+
+Проверка upstream cassert включает BRIN stress и аварийные сценарии tracking.
+Native Standard 16 с серверными assertions не проверен: cassert-сборка и
+исходники поставщика недоступны. Одних dev-заголовков для assertions недостаточно.
 
 При `enable_temp_memory_catalog = on` часть проверок и наборов пропускается
 (раздел ["Тестирование"](testing.md)). Сам режим пока ненадежен и без fasttrun:

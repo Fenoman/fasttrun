@@ -522,7 +522,7 @@ fasttrun_shmem_startup(void)
 										FASTTRUN_TRACK_MAX,
 										FASTTRUN_TRACK_MAX,
 										&ctl,
-										HASH_ELEM | HASH_STRINGS);
+										HASH_ELEM | HASH_STRINGS | HASH_FIXED_SIZE);
 
 	/* Allocate LWLock */
 	fasttrun_track_lock = (LWLockId) GetNamedLWLockTranche("fasttrun");

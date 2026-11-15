@@ -92,6 +92,20 @@ SELECT CASE WHEN ft_rows_est('SELECT * FROM p_probe WHERE id = 1', 'on p_probe')
 
 ROLLBACK PREPARED 'fasttrun_registry_overflow';
 
+/* Committed local statistics survive an unrelated prepared transaction. */
+CREATE TEMP TABLE p_committed(id int);
+INSERT INTO p_committed SELECT 1 FROM generate_series(1, 10000);
+ANALYZE p_committed;
+SELECT fasttruncate('p_committed');
+INSERT INTO p_committed SELECT generate_series(1, 10000);
+SELECT fasttrun_analyze('p_committed');
+BEGIN;
+SELECT 1;
+PREPARE TRANSACTION 'fasttrun_committed_cache';
+COMMIT PREPARED 'fasttrun_committed_cache';
+SELECT CASE WHEN ft_rows_est('SELECT * FROM p_committed WHERE id = 1', 'on p_committed') <= 10
+            THEN 'CACHE_PASS' ELSE 'CACHE_FAIL' END;
+
 CREATE ROLE fasttrun_prepare_user LOGIN;
 SQL
 )
@@ -146,6 +160,7 @@ errors=$(echo "$temp_result" | grep -c 'ERROR:' || true)
 denied=$(echo "$temp_result" | grep -c 'ERROR:  permission denied for table t_parent' || true)
 echo "permanent targets: $(echo "$result" | grep -c '^PASS$' || true), temp targets: $(echo "$temp_result" | grep -c '^TEMP_PASS$' || true), prepared: $(echo "$temp_result" | grep -c '^PREPARED_OK$' || true), errors: $errors, permission errors: $denied"
 if echo "$result" | grep -q '^PASS$' &&
+	echo "$result" | grep -q '^CACHE_PASS$' &&
 	echo "$temp_result" | grep -q '^TEMP_PASS$' &&
 	echo "$temp_result" | grep -q '^PREPARED_OK$' &&
 	[ "$errors" -eq 2 ] && [ "$denied" -eq 2 ]; then

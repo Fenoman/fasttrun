@@ -42,7 +42,13 @@ typedef enum FasttrunTouchFlags
 	 * truncate damaged.  COMMIT removes the block, and an abort drops the
 	 * mark, because it may bring the damaged file back.
 	 */
-	FASTTRUN_TOUCH_POISON_RETIRE = 1 << 9
+	FASTTRUN_TOUCH_POISON_RETIRE = 1 << 9,
+	/* A recorded file birth can retire its failed operation on abort. */
+	FASTTRUN_TOUCH_POISON_FILE = 1 << 10,
+	/* An omitted index can return when this level rolls back. */
+	FASTTRUN_TOUCH_DROPPED_COMPONENT = 1 << 11,
+	/* A statistics object can return on rollback after a local storage reset. */
+	FASTTRUN_TOUCH_DROPPED_STATEXT = 1 << 12
 } FasttrunTouchFlags;
 
 typedef struct FasttrunXactRelEntry
@@ -54,6 +60,7 @@ typedef struct FasttrunXactRelEntry
 	BlockNumber level_pages;	/* heap pages before that write */
 	BlockNumber level_dead;		/* aborted_pages before that write */
 	RelFileLocator level_locator;	/* the file level_pages was measured on */
+	RelFileLocator file_birth_locator;	/* file owned by this level */
 	Oid			settle_owner;	/* abort walk: the heap of the index row it
 								 * reached, settled after the walk */
 	Bitmapset  *dropped_attrs;	/* columns dropped at this level, in
@@ -69,6 +76,8 @@ typedef struct FasttrunXactFrame
 } FasttrunXactFrame;
 
 static FasttrunXactFrame *fasttrun_xact_frame = NULL;
+/* Avoid ancestor lookups on truncates in transactions without statistics DDL. */
+static bool fasttrun_xact_dropped_statext = false;
 
 /*
  * Frames released by a finished subtransaction are kept here for reuse instead
@@ -216,19 +225,19 @@ fasttrun_xact_frame_for_current(bool create)
 	return fasttrun_xact_frame_for_subid(GetCurrentSubTransactionId(), create);
 }
 
-/* A descendant can abort its first use while the table's birth stays live. */
-static void
-fasttrun_xact_mark_created_relation(Relation rel)
+/* Mark the level that owns a table or storage lifetime, not its first use. */
+static FasttrunXactRelEntry *
+fasttrun_xact_mark_relation_at_level(Oid relid, SubTransactionId subid,
+								   uint32 flags)
 {
 	FasttrunXactFrame *frame;
 	FasttrunXactRelEntry *entry;
-	Oid			relid = RelationGetRelid(rel);
 	bool		found;
 
-	if (rel->rd_createSubid == InvalidSubTransactionId)
-		return;
+	if (subid == InvalidSubTransactionId)
+		return NULL;
 
-	frame = fasttrun_xact_frame_for_subid(rel->rd_createSubid, true);
+	frame = fasttrun_xact_frame_for_subid(subid, true);
 	entry = (FasttrunXactRelEntry *)
 		hash_search(frame->entries, &relid, HASH_ENTER, &found);
 	if (!found)
@@ -239,7 +248,102 @@ fasttrun_xact_mark_created_relation(Relation rel)
 		entry->settle_owner = InvalidOid;
 		entry->dropped_attrs = NULL;
 	}
-	entry->flags |= FASTTRUN_TOUCH_CREATED;
+	entry->flags |= flags;
+	return entry;
+}
+
+/* Preserve an observed birth before a deeper rollback clears rd_new*. */
+static void
+fasttrun_xact_note_file_birth(Relation rel)
+{
+	FasttrunXactRelEntry *entry;
+	SubTransactionId subid = rel->rd_newRelfilelocatorSubid;
+
+	if (subid == InvalidSubTransactionId &&
+		rel->rd_firstRelfilelocatorSubid == InvalidSubTransactionId)
+		subid = rel->rd_createSubid;
+
+	entry = fasttrun_xact_mark_relation_at_level(RelationGetRelid(rel),
+											subid,
+											FASTTRUN_TOUCH_POISON_FILE);
+	if (entry != NULL)
+		entry->file_birth_locator = rel->rd_locator;
+}
+
+static SubTransactionId
+fasttrun_xact_file_birth(Relation rel, bool *known)
+{
+	FasttrunXactFrame *frame;
+	Oid			relid = RelationGetRelid(rel);
+
+	*known = true;
+	/* Committed files need no journal lookup on the ordinary truncate path. */
+	if (rel->rd_newRelfilelocatorSubid == InvalidSubTransactionId &&
+		rel->rd_firstRelfilelocatorSubid == InvalidSubTransactionId &&
+		rel->rd_createSubid == InvalidSubTransactionId)
+		return InvalidSubTransactionId;
+	for (frame = fasttrun_xact_frame; frame != NULL; frame = frame->parent)
+	{
+		FasttrunXactRelEntry *entry;
+
+		entry = (FasttrunXactRelEntry *)
+			hash_search(frame->entries, &relid, HASH_FIND, NULL);
+		if (entry != NULL &&
+			(entry->flags & FASTTRUN_TOUCH_POISON_FILE) != 0 &&
+			RelFileLocatorEquals(entry->file_birth_locator, rel->rd_locator))
+			return frame->subid;
+	}
+	fasttrun_xact_note_file_birth(rel);
+	if (rel->rd_newRelfilelocatorSubid != InvalidSubTransactionId)
+		return rel->rd_newRelfilelocatorSubid;
+	if (rel->rd_firstRelfilelocatorSubid == InvalidSubTransactionId)
+		return rel->rd_createSubid;
+	*known = false;
+	return InvalidSubTransactionId;
+}
+
+static void
+fasttrun_xact_mark_created_relation(Relation rel)
+{
+	fasttrun_xact_mark_relation_at_level(RelationGetRelid(rel),
+										rel->rd_createSubid,
+										FASTTRUN_TOUCH_CREATED);
+}
+
+static bool
+fasttrun_xact_component_can_return(Oid relid, SubTransactionId file_subid)
+{
+	FasttrunXactFrame *frame;
+
+	for (frame = fasttrun_xact_frame; frame != NULL && frame->subid > file_subid;
+		 frame = frame->parent)
+	{
+		FasttrunXactRelEntry *entry = (FasttrunXactRelEntry *)
+			hash_search(frame->entries, &relid, HASH_FIND, NULL);
+
+		if (entry != NULL &&
+			(entry->flags & FASTTRUN_TOUCH_DROPPED_COMPONENT) != 0)
+			return true;
+	}
+	return false;
+}
+
+static bool
+fasttrun_xact_statistics_can_return(Oid relid)
+{
+	FasttrunXactFrame *frame;
+
+	if (!fasttrun_xact_dropped_statext)
+		return false;
+	for (frame = fasttrun_xact_frame; frame != NULL; frame = frame->parent)
+	{
+		FasttrunXactRelEntry *entry = (FasttrunXactRelEntry *)
+			hash_search(frame->entries, &relid, HASH_FIND, NULL);
+
+		if (entry != NULL && (entry->flags & FASTTRUN_TOUCH_DROPPED_STATEXT) != 0)
+			return true;
+	}
+	return false;
 }
 
 static FasttrunXactRelEntry *
@@ -355,8 +459,12 @@ fasttrun_xact_merge_entry(FasttrunXactFrame *parent,
 		return;
 	}
 
-	dst->root_relid = child->root_relid;
+	/* A component's birth mark does not replace an established owning heap. */
+	if (child->root_relid != child->relid || dst->root_relid == dst->relid)
+		dst->root_relid = child->root_relid;
 	dst->flags |= child->flags;
+	if ((child->flags & FASTTRUN_TOUCH_POISON_FILE) != 0)
+		dst->file_birth_locator = child->file_birth_locator;
 	if (child->dropped_attrs != NULL)
 	{
 		MemoryContext oldcxt = MemoryContextSwitchTo(TopTransactionContext);

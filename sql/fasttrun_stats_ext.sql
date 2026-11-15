@@ -277,6 +277,24 @@ SELECT analyze_entries = :ext_dropcol_entries_before AS ext_dropcol_entry_gone
   FROM fasttrun_cache_stats();
 DROP TABLE t_ext_dropcol;
 
+-- Recursive DROP COLUMN releases descendant entries held only by extended stats.
+SELECT analyze_entries AS ext_parent_drop_entries_before FROM fasttrun_cache_stats() \gset
+CREATE TEMP TABLE t_ext_drop_parent (a int, b int) PARTITION BY RANGE(a);
+CREATE TEMP TABLE t_ext_drop_leaf PARTITION OF t_ext_drop_parent
+  FOR VALUES FROM (0) TO (10);
+CREATE STATISTICS pg_temp.t_ext_drop_leaf_nd (ndistinct) ON a, b FROM t_ext_drop_leaf;
+INSERT INTO t_ext_drop_leaf SELECT 1, 1 FROM generate_series(1, 1000);
+ANALYZE t_ext_drop_leaf;
+SELECT fasttrun_collect_stats('t_ext_drop_leaf');
+SET client_min_messages = error;
+ANALYZE t_ext_drop_parent (a);
+ANALYZE t_ext_drop_parent (b);
+RESET client_min_messages;
+ALTER TABLE t_ext_drop_parent DROP COLUMN b;
+SELECT analyze_entries = :ext_parent_drop_entries_before AS ext_parent_drop_entry_gone
+  FROM fasttrun_cache_stats();
+DROP TABLE t_ext_drop_parent;
+
 -- Откат точки сохранения возвращает и флаг: свежие данные CREATE STATISTICS
 -- снова в силе.
 CREATE TEMP TABLE t_ext_undo (a int, b int);
@@ -354,5 +372,587 @@ DROP ROLE ft_ext_owner;
 \endif
 \echo maintain_revoked_uses_local_stats :maintain_revoked_uses_local_stats
 
-DROP EXTENSION fasttrun;
+-- Old multicolumn samples are hidden even when no column sample is published.
+DO $neutral_ext$
+DECLARE mode int; groups_est int; child int; overflows_before bigint;
+BEGIN
+  SET LOCAL client_min_messages = warning;
+  SET LOCAL fasttrun.sample_rows = 3000;
+  CREATE TEMP TABLE t_ext_budget(id int);
+  INSERT INTO t_ext_budget SELECT generate_series(1, 1000);
+  PERFORM fasttrun_collect_stats('t_ext_budget');
+  FOR mode IN 0..6 LOOP
+    CREATE TEMP TABLE t_ext_neutral(a int, b int);
+    CREATE STATISTICS pg_temp.t_ext_neutral_nd(ndistinct) ON a, b FROM t_ext_neutral;
+    INSERT INTO t_ext_neutral SELECT 1, 1 FROM generate_series(1, 10000);
+    ANALYZE t_ext_neutral;
+    IF mode = 5 THEN
+      CREATE TEMP TABLE t_ext_ctas AS SELECT 1 AS id;
+    ELSIF mode = 6 THEN
+      CREATE TEMP TABLE t_ext_writer_parent(id int);
+      FOR child IN 1..20 LOOP
+        EXECUTE format('CREATE TEMP TABLE t_ext_writer_%s() INHERITS (t_ext_writer_parent)', child);
+      END LOOP;
+      SELECT value INTO overflows_before FROM fasttrun_counters()
+       WHERE counter = 'writer_registry_overflows';
+      UPDATE t_ext_writer_parent SET id = 0;
+      IF (SELECT value FROM fasttrun_counters() WHERE counter = 'writer_registry_overflows') <= overflows_before THEN
+        RAISE EXCEPTION 'writer fixture did not overflow its registry';
+      END IF;
+    END IF;
+    IF mode = 3 THEN
+      DELETE FROM t_ext_neutral;
+    ELSIF mode = 4 THEN
+      BEGIN
+        PERFORM fasttruncate('t_ext_neutral');
+        RAISE EXCEPTION USING ERRCODE = 'no_data_found';
+      EXCEPTION WHEN no_data_found THEN
+        NULL;
+      END;
+    ELSE
+      PERFORM fasttruncate('t_ext_neutral');
+    END IF;
+    INSERT INTO t_ext_neutral SELECT n % 1000, n % 1000 FROM generate_series(1, 10000) n;
+    IF mode IN (0, 3, 4, 5, 6) THEN
+      PERFORM set_config('fasttrun.sample_rows', '0', true);
+    ELSIF mode = 1 THEN
+      ALTER TABLE t_ext_neutral ALTER COLUMN a SET STATISTICS 0;
+      ALTER TABLE t_ext_neutral ALTER COLUMN b SET STATISTICS 0;
+    ELSE
+      IF (SELECT column_stats_bytes FROM fasttrun_cache_stats()) <= 1024 THEN
+        RAISE EXCEPTION 'budget fixture has no statistics memory';
+      END IF;
+      PERFORM set_config('fasttrun.max_stats_memory', '1', true);
+    END IF;
+    PERFORM fasttrun_collect_stats('t_ext_neutral');
+    groups_est := pg_temp.ext_rows('SELECT a, b FROM t_ext_neutral GROUP BY a, b');
+    IF groups_est < 100 THEN
+      RAISE EXCEPTION 'old extended sample is visible, mode=% groups=%', mode, groups_est;
+    END IF;
+    DROP TABLE t_ext_neutral;
+    IF mode = 5 THEN
+      DROP TABLE t_ext_ctas;
+    ELSIF mode = 6 THEN
+      DROP TABLE t_ext_writer_parent CASCADE;
+    END IF;
+    PERFORM set_config('fasttrun.sample_rows', '3000', true);
+    PERFORM set_config('fasttrun.max_stats_memory', '0', true);
+  END LOOP;
+  DROP TABLE t_ext_budget;
+END
+$neutral_ext$;
+
+-- A completed overflowing writer does not keep an earlier fill visible.
+CREATE TEMP TABLE t_ext_overflow(a int, b int);
+CREATE STATISTICS pg_temp.t_ext_overflow_nd(ndistinct) ON a, b FROM t_ext_overflow;
+INSERT INTO t_ext_overflow SELECT 1, 1 FROM generate_series(1, 10000);
+ANALYZE t_ext_overflow;
+BEGIN;
+DO $overflow$
+DECLARE child int; before bigint;
+BEGIN
+  CREATE TEMP TABLE t_ext_overflow_parent(id int);
+  FOR child IN 1..20 LOOP
+    EXECUTE format('CREATE TEMP TABLE t_ext_overflow_%s() INHERITS (t_ext_overflow_parent)', child);
+  END LOOP;
+  SELECT value INTO before FROM fasttrun_counters() WHERE counter = 'writer_registry_overflows';
+  UPDATE t_ext_overflow_parent SET id = 0;
+  IF (SELECT value FROM fasttrun_counters() WHERE counter = 'writer_registry_overflows') <= before THEN
+    RAISE EXCEPTION 'writer fixture did not overflow';
+  END IF;
+END
+$overflow$;
+DELETE FROM t_ext_overflow;
+INSERT INTO t_ext_overflow SELECT n % 1000, n % 1000 FROM generate_series(1, 10000) n;
+SET LOCAL fasttrun.sample_rows = 0;
+SELECT fasttrun_collect_stats('t_ext_overflow') IS NULL AS ignored \gset
+COMMIT;
+DO $check$
+DECLARE groups_est int;
+BEGIN
+  groups_est := pg_temp.ext_rows('SELECT a, b FROM t_ext_overflow GROUP BY a, b');
+  IF groups_est < 100 THEN
+    RAISE EXCEPTION 'old extended sample after overflow/commit: groups=%', groups_est;
+  END IF;
+END
+$check$;
+DROP TABLE t_ext_overflow;
+
+-- Read queries and open cursors do not keep completed writers active.
+CREATE TEMP TABLE t_ext_overflow_reader(a int, b int);
+CREATE TEMP TABLE t_ext_overflow_cursor(a int, b int);
+CREATE STATISTICS pg_temp.t_ext_overflow_reader_nd(ndistinct) ON a, b FROM t_ext_overflow_reader;
+CREATE STATISTICS pg_temp.t_ext_overflow_cursor_nd(ndistinct) ON a, b FROM t_ext_overflow_cursor;
+INSERT INTO t_ext_overflow_reader SELECT 1, 1 FROM generate_series(1, 10000);
+INSERT INTO t_ext_overflow_cursor SELECT 1, 1 FROM generate_series(1, 10000);
+ANALYZE t_ext_overflow_reader;
+ANALYZE t_ext_overflow_cursor;
+BEGIN;
+UPDATE t_ext_overflow_parent SET id = 0;
+DELETE FROM t_ext_overflow_reader;
+DELETE FROM t_ext_overflow_cursor;
+INSERT INTO t_ext_overflow_reader SELECT n % 1000, n % 1000 FROM generate_series(1, 10000) n;
+INSERT INTO t_ext_overflow_cursor SELECT n % 1000, n % 1000 FROM generate_series(1, 10000) n;
+SET LOCAL fasttrun.sample_rows = 0;
+SELECT fasttrun_collect_stats('t_ext_overflow_reader') IS NULL AS ignored
+  FROM t_ext_overflow_reader LIMIT 1 \gset
+DECLARE ext_overflow_cursor CURSOR FOR SELECT a, b FROM t_ext_overflow_cursor;
+FETCH 1 FROM ext_overflow_cursor \gset
+SELECT fasttrun_collect_stats('t_ext_overflow_cursor') IS NULL AS ignored \gset
+COMMIT;
+DO $readers$
+DECLARE relname text; groups_est int;
+BEGIN
+  FOREACH relname IN ARRAY ARRAY['t_ext_overflow_reader', 't_ext_overflow_cursor'] LOOP
+    groups_est := pg_temp.ext_rows(format('SELECT a, b FROM %I GROUP BY a, b', relname));
+    IF groups_est < 100 THEN
+      RAISE EXCEPTION 'old extended sample after reader collection/commit: table=% groups=%', relname, groups_est;
+    END IF;
+  END LOOP;
+END
+$readers$;
+DROP TABLE t_ext_overflow_reader, t_ext_overflow_cursor;
+SET client_min_messages = warning;
+DROP TABLE t_ext_overflow_parent CASCADE;
+RESET client_min_messages;
+
+-- Empty relstats from an active writer still require extended-data retirement.
+CREATE TEMP TABLE t_ext_empty_gate(a int, b int);
+CREATE STATISTICS pg_temp.t_ext_empty_gate_nd(ndistinct) ON a, b FROM t_ext_empty_gate;
+INSERT INTO t_ext_empty_gate SELECT 1, 1 FROM generate_series(1, 10000);
+ANALYZE t_ext_empty_gate;
+TRUNCATE t_ext_empty_gate;
+CREATE ROLE ft_ext_empty_writer;
+GRANT SELECT, UPDATE ON t_ext_empty_gate TO ft_ext_empty_writer;
+SET ROLE ft_ext_empty_writer;
+WITH changed AS (UPDATE t_ext_empty_gate SET a = a RETURNING a)
+SELECT fasttrun_analyze('t_ext_empty_gate') IS NULL AS ignored \gset
+RESET ROLE;
+SELECT fasttruncate('t_ext_empty_gate') IS NULL AS ignored \gset
+INSERT INTO t_ext_empty_gate SELECT n % 1000, n % 1000 FROM generate_series(1, 10000) n;
+DO $check$
+DECLARE groups_est int;
+BEGIN
+  groups_est := pg_temp.ext_rows('SELECT a, b FROM t_ext_empty_gate GROUP BY a, b');
+  IF groups_est < 100 THEN
+    RAISE EXCEPTION 'old extended sample through empty fast path: groups=%', groups_est;
+  END IF;
+END
+$check$;
+DROP TABLE t_ext_empty_gate;
+DROP ROLE ft_ext_empty_writer;
+
+-- Empty-file adoption must preserve metadata undo across DROP STATISTICS.
+SET fasttrun.auto_collect_stats=off;
+CREATE ROLE ft_ext_drop_reader;
+DO $$DECLARE n int;
+BEGIN
+ FOR n IN 1..4 LOOP
+  EXECUTE format('CREATE TEMP TABLE t_ext_drop_%s(a int,b int) ON COMMIT DELETE ROWS',n);
+ END LOOP;
+END$$;
+BEGIN;
+DO $$DECLARE n int;
+BEGIN
+ FOR n IN 1..4 LOOP
+  EXECUTE format('INSERT INTO t_ext_drop_%s SELECT 0,0 FROM generate_series(1,10000)',n);
+  EXECUTE format('CREATE STATISTICS pg_temp.t_ext_drop_%s_nd(ndistinct) ON a,b FROM t_ext_drop_%s',n,n);
+  EXECUTE format('ANALYZE t_ext_drop_%s',n);
+  EXECUTE format('GRANT SELECT ON t_ext_drop_%s TO ft_ext_drop_reader',n);
+ END LOOP;
+END$$;
+SET LOCAL ROLE ft_ext_drop_reader;
+DO $$DECLARE n int;
+BEGIN
+ FOR n IN 1..4 LOOP
+  PERFORM fasttrun_analyze(format('t_ext_drop_%s',n));
+ END LOOP;
+END$$;
+RESET ROLE;
+COMMIT;
+BEGIN;
+SAVEPOINT drop_outer;
+SAVEPOINT drop_inner;
+DROP STATISTICS pg_temp.t_ext_drop_1_nd,pg_temp.t_ext_drop_2_nd,
+                pg_temp.t_ext_drop_3_nd,pg_temp.t_ext_drop_4_nd;
+DO $$DECLARE p json;
+BEGIN
+ PERFORM fasttrun_collect_stats('t_ext_drop_1');
+ PERFORM fasttrun_collect_stats('t_ext_drop_2');
+ EXECUTE 'EXPLAIN (FORMAT JSON) SELECT * FROM t_ext_drop_3' INTO p;
+ EXECUTE 'EXPLAIN (FORMAT JSON) SELECT * FROM t_ext_drop_4' INTO p;
+END$$;
+RELEASE SAVEPOINT drop_inner;
+INSERT INTO t_ext_drop_2 VALUES(1,1);
+INSERT INTO t_ext_drop_4 VALUES(1,1);
+ROLLBACK TO drop_outer;
+DO $$DECLARE n int; p json;
+BEGIN
+ FOR n IN 1..4 LOOP
+  IF (SELECT reltuples FROM fasttrun_relstats(format('t_ext_drop_%s',n))) IS DISTINCT FROM 0::real THEN
+   RAISE EXCEPTION 'DROP rollback restored pre-COMMIT cardinality: case %',n;
+  END IF;
+  EXECUTE format('INSERT INTO t_ext_drop_%s SELECT g%%1000,g%%1000 FROM generate_series(1,10000)g',n);
+  EXECUTE format('EXPLAIN (ANALYZE,FORMAT JSON) SELECT a,b FROM t_ext_drop_%s GROUP BY a,b',n) INTO p;
+  IF (p->0->'Plan'->>'Plan Rows')::int<100 OR
+     (p->0->'Plan'->>'Actual Rows')::numeric<>1000 THEN
+   RAISE EXCEPTION 'DROP rollback exposed stale extended data: case %, plan %',n,p;
+  END IF;
+  EXECUTE format('ANALYZE t_ext_drop_%s',n);
+  EXECUTE format('EXPLAIN (FORMAT JSON) SELECT a,b FROM t_ext_drop_%s GROUP BY a,b',n) INTO p;
+  IF (p->0->'Plan'->>'Plan Rows')::int<>1000 THEN
+   RAISE EXCEPTION 'core ANALYZE did not restore extended data: case %, plan %',n,p;
+  END IF;
+ END LOOP;
+END$$;
+COMMIT;
+DROP TABLE t_ext_drop_1,t_ext_drop_2,t_ext_drop_3,t_ext_drop_4;
+DROP ROLE ft_ext_drop_reader;
+RESET fasttrun.auto_collect_stats;
+-- A grantee's first analyze after CREATE STATISTICS must retain empty undo.
+SET fasttrun.auto_collect_stats=off;
+SET plan_cache_mode=force_generic_plan;
+CREATE ROLE ft_ext_new_reader;
+CREATE TEMP TABLE t_ext_new_stats(a int,b int) ON COMMIT DELETE ROWS;
+BEGIN;
+INSERT INTO t_ext_new_stats SELECT g,g FROM generate_series(1,10000)g;
+DO $$BEGIN PERFORM fasttrun_analyze('t_ext_new_stats'); END$$;
+GRANT SELECT,INSERT ON t_ext_new_stats TO ft_ext_new_reader;
+SET ROLE ft_ext_new_reader;
+PREPARE q_ext_new_analyze AS SELECT fasttrun_analyze('t_ext_new_stats');
+EXECUTE q_ext_new_analyze \gset
+RESET ROLE;
+CREATE STATISTICS pg_temp.t_ext_new_stats_nd(ndistinct) ON a,b FROM t_ext_new_stats;
+COMMIT;
+BEGIN;
+SET LOCAL ROLE ft_ext_new_reader;
+SAVEPOINT new_stats_empty;
+EXECUTE q_ext_new_analyze \gset
+INSERT INTO t_ext_new_stats VALUES(1,1);
+ROLLBACK TO new_stats_empty;
+DO $$DECLARE p json;
+BEGIN
+ IF (SELECT reltuples FROM fasttrun_relstats('t_ext_new_stats')) IS DISTINCT FROM 0::real THEN
+  RAISE EXCEPTION 'grantee analyze restored pre-COMMIT cardinality';
+ END IF;
+ PERFORM fasttrun_analyze('t_ext_new_stats');
+ EXECUTE 'EXPLAIN (ANALYZE,FORMAT JSON) SELECT * FROM t_ext_new_stats' INTO p;
+ IF (p->0->'Plan'->>'Plan Rows')::int<>1 OR (p->0->'Plan'->>'Actual Rows')::numeric<>0 THEN
+  RAISE EXCEPTION 'grantee analyze retained pre-COMMIT cardinality: %',p;
+ END IF;
+END$$;
+COMMIT;
+DEALLOCATE q_ext_new_analyze;
+DROP TABLE t_ext_new_stats;
+DROP ROLE ft_ext_new_reader;
+-- Full and partial index publications must converge after rolled-back growth.
+CREATE TEMP TABLE t_ext_empty_index(a int) ON COMMIT DELETE ROWS;
+CREATE INDEX t_ext_empty_full ON t_ext_empty_index(a);
+CREATE INDEX t_ext_empty_partial ON t_ext_empty_index(a) WHERE a>5000;
+BEGIN;
+INSERT INTO t_ext_empty_index SELECT generate_series(1,10000);
+DO $$BEGIN PERFORM fasttrun_analyze('t_ext_empty_index'); END$$;
+CREATE INDEX t_ext_empty_late ON t_ext_empty_index((a+1));
+COMMIT;
+BEGIN;
+SAVEPOINT index_empty;
+DO $$BEGIN PERFORM fasttrun_collect_stats('t_ext_empty_index'); END$$;
+COPY t_ext_empty_index FROM STDIN;
+6000
+\.
+ROLLBACK TO index_empty;
+SET LOCAL enable_seqscan=off;
+DO $$DECLARE p json; relname text;
+BEGIN
+ IF (SELECT reltuples FROM fasttrun_relstats('t_ext_empty_index')) IS DISTINCT FROM 0::real THEN
+  RAISE EXCEPTION 'index collection restored pre-COMMIT heap cardinality';
+ END IF;
+ FOREACH relname IN ARRAY ARRAY['t_ext_empty_full','t_ext_empty_partial'] LOOP
+  IF (SELECT reltuples FROM fasttrun_relstats(relname)) IS DISTINCT FROM 0::real THEN
+   RAISE EXCEPTION 'empty adoption retained index cardinality: %',relname;
+  END IF;
+ END LOOP;
+ PERFORM fasttrun_analyze('t_ext_empty_index');
+ FOREACH relname IN ARRAY ARRAY['t_ext_empty_full','t_ext_empty_partial'] LOOP
+  IF (SELECT reltuples FROM fasttrun_relstats(relname)) IS DISTINCT FROM 0::real THEN
+   RAISE EXCEPTION 'analyze retained index cardinality: %',relname;
+  END IF;
+ END LOOP;
+ EXECUTE 'EXPLAIN (ANALYZE,FORMAT JSON) SELECT * FROM t_ext_empty_index WHERE a>5000' INTO p;
+ IF (p->0->'Plan'->>'Plan Rows')::int<>1 OR (p->0->'Plan'->>'Actual Rows')::numeric<>0 THEN
+  RAISE EXCEPTION 'index plan retained pre-COMMIT cardinality: %',p;
+ END IF;
+END$$;
+COMMIT;
+DROP TABLE t_ext_empty_index;
+RESET plan_cache_mode;
+RESET fasttrun.auto_collect_stats;
+-- A local storage reset cannot restore core samples describing vanished rows.
+SET fasttrun.auto_collect_stats=off;
+DO $$DECLARE n int;
+BEGIN
+ FOR n IN 1..3 LOOP
+  EXECUTE format('CREATE TEMP TABLE t_reset_stats_%s(a int,b int)',n);
+  EXECUTE format('INSERT INTO t_reset_stats_%s SELECT 0,0 FROM generate_series(1,10000)',n);
+  IF n>1 THEN
+   EXECUTE format('CREATE STATISTICS pg_temp.t_reset_stats_%s_nd(ndistinct) ON a,b FROM t_reset_stats_%s',n,n);
+  END IF;
+  EXECUTE format('ANALYZE t_reset_stats_%s',n);
+ END LOOP;
+END$$;
+BEGIN;
+SAVEPOINT reset_samples;
+DROP STATISTICS pg_temp.t_reset_stats_3_nd;
+DO $$DECLARE n int;
+BEGIN
+ FOR n IN 1..3 LOOP PERFORM fasttruncate(format('t_reset_stats_%s',n)); END LOOP;
+END$$;
+ROLLBACK TO reset_samples;
+DO $$DECLARE n int; p json;
+BEGIN
+ FOR n IN 1..3 LOOP
+  IF (SELECT reltuples FROM fasttrun_relstats(format('t_reset_stats_%s',n))) IS DISTINCT FROM 0::real THEN
+   RAISE EXCEPTION 'reset rollback lost empty publication: case %',n;
+  END IF;
+  EXECUTE format('INSERT INTO t_reset_stats_%s SELECT g%%1000,g%%1000 FROM generate_series(1,10000)g',n);
+  EXECUTE format('EXPLAIN (ANALYZE,FORMAT JSON) SELECT * FROM t_reset_stats_%s WHERE a=0',n) INTO p;
+  IF (p->0->'Plan'->>'Plan Rows')::int>100 OR (p->0->'Plan'->>'Actual Rows')::numeric<>10 THEN
+   RAISE EXCEPTION 'reset rollback exposed core column sample: case %, plan %',n,p;
+  END IF;
+  EXECUTE format('EXPLAIN (ANALYZE,FORMAT JSON) SELECT a,b FROM t_reset_stats_%s GROUP BY a,b',n) INTO p;
+  IF (p->0->'Plan'->>'Plan Rows')::int<100 OR (p->0->'Plan'->>'Actual Rows')::numeric<>1000 THEN
+   RAISE EXCEPTION 'reset rollback exposed extended sample: case %, plan %',n,p;
+  END IF;
+ END LOOP;
+END$$;
+COMMIT;
+DROP TABLE t_reset_stats_1,t_reset_stats_2,t_reset_stats_3;
+-- An inner empty-file observation must preserve the outer file's samples.
+CREATE TEMP TABLE t_saved_local(a int,b int);
+CREATE TEMP TABLE t_saved_core(a int,b int);
+INSERT INTO t_saved_local SELECT 0,0 FROM generate_series(1,10000);
+INSERT INTO t_saved_core SELECT 0,0 FROM generate_series(1,10000);
+SET fasttrun.auto_collect_stats=on;
+DO $$BEGIN PERFORM fasttrun_analyze('t_saved_local'); END$$;
+ANALYZE t_saved_core;
+BEGIN;
+SAVEPOINT old_file;
+TRUNCATE t_saved_local,t_saved_core;
+SAVEPOINT empty_file;
+DO $$BEGIN
+ PERFORM fasttrun_analyze('t_saved_local');
+ PERFORM fasttrun_analyze('t_saved_core');
+END$$;
+ROLLBACK TO empty_file;
+ROLLBACK TO old_file;
+DO $$DECLARE relname text; p json;
+BEGIN
+ IF (SELECT count(*) FROM fasttrun_inspect_stats('t_saved_local'))<>2 THEN
+  RAISE EXCEPTION 'inner empty observation discarded outer file samples';
+ END IF;
+ FOREACH relname IN ARRAY ARRAY['t_saved_local','t_saved_core'] LOOP
+  EXECUTE format('EXPLAIN (ANALYZE,FORMAT JSON) SELECT * FROM %I WHERE a=0',relname) INTO p;
+  IF (p->0->'Plan'->>'Plan Rows')::int<>10000 OR (p->0->'Plan'->>'Actual Rows')::numeric<>10000 THEN
+   RAISE EXCEPTION 'outer file lost its statistics: table %, plan %',relname,p;
+  END IF;
+ END LOOP;
+END$$;
+COMMIT;
+DROP TABLE t_saved_local,t_saved_core;
+-- Non-rewriting DDL must not save a cardinality from before COMMIT emptying.
+SET fasttrun.auto_collect_stats=off;
+CREATE TEMP TABLE t_empty_ddl(a int,v varchar(100)) ON COMMIT DELETE ROWS;
+BEGIN;
+INSERT INTO t_empty_ddl SELECT g,'x' FROM generate_series(1,10000)g;
+DO $$BEGIN PERFORM fasttrun_analyze('t_empty_ddl'); END$$;
+COMMIT;
+BEGIN;
+SAVEPOINT before_ddl;
+ALTER TABLE t_empty_ddl ALTER COLUMN v TYPE varchar(200);
+INSERT INTO t_empty_ddl VALUES(1,'x');
+ROLLBACK TO before_ddl;
+DO $$BEGIN
+ IF (SELECT reltuples FROM fasttrun_relstats('t_empty_ddl')) IS DISTINCT FROM 0::real THEN
+  RAISE EXCEPTION 'DDL rollback restored pre-COMMIT cardinality';
+ END IF;
+ IF (SELECT count(*) FROM t_empty_ddl)<>0 THEN
+  RAISE EXCEPTION 'DDL rollback retained inserted rows';
+ END IF;
+END$$;
+COMMIT;
+DROP TABLE t_empty_ddl;
+-- A reset of an already empty file retires core statistics across rollback.
+SET fasttrun.auto_collect_stats=off;
+CREATE TEMP TABLE t_empty_fast_plain(a int,b int);
+CREATE TEMP TABLE t_empty_fast_ext(a int,b int);
+CREATE STATISTICS pg_temp.t_empty_fast_nd(ndistinct) ON a,b FROM t_empty_fast_ext;
+INSERT INTO t_empty_fast_plain SELECT 0,0 FROM generate_series(1,10000);
+INSERT INTO t_empty_fast_ext SELECT 0,0 FROM generate_series(1,10000);
+ANALYZE t_empty_fast_plain;
+ANALYZE t_empty_fast_ext;
+DELETE FROM t_empty_fast_plain;
+DELETE FROM t_empty_fast_ext;
+VACUUM t_empty_fast_plain;
+VACUUM t_empty_fast_ext;
+BEGIN;
+SAVEPOINT empty_reset;
+DROP STATISTICS pg_temp.t_empty_fast_nd;
+DO $$DECLARE before_count bigint; after_count bigint;
+BEGIN
+ PERFORM fasttrun_analyze('t_empty_fast_plain');
+ PERFORM fasttrun_analyze('t_empty_fast_ext');
+ SELECT sum(value) INTO before_count FROM fasttrun_counters() WHERE counter='truncate_empty_fast_path';
+ PERFORM fasttruncate('t_empty_fast_plain');
+ SELECT sum(value) INTO after_count FROM fasttrun_counters() WHERE counter='truncate_empty_fast_path';
+ IF after_count-before_count<>1 THEN
+  RAISE EXCEPTION 'empty reset unnecessarily rebuilds storage';
+ END IF;
+ PERFORM fasttruncate('t_empty_fast_ext');
+END$$;
+ROLLBACK TO empty_reset;
+INSERT INTO t_empty_fast_plain SELECT g%1000,g%1000 FROM generate_series(1,10000)g;
+INSERT INTO t_empty_fast_ext SELECT g%1000,g%1000 FROM generate_series(1,10000)g;
+DO $$DECLARE relname text; p json;
+BEGIN
+ FOREACH relname IN ARRAY ARRAY['t_empty_fast_plain','t_empty_fast_ext'] LOOP
+  EXECUTE format('EXPLAIN (ANALYZE,FORMAT JSON) SELECT * FROM %I WHERE a=0',relname) INTO p;
+  IF (p->0->'Plan'->>'Plan Rows')::int>100 OR (p->0->'Plan'->>'Actual Rows')::numeric<>10 THEN
+   RAISE EXCEPTION 'empty reset rollback exposed old column statistics: table %, plan %',relname,p;
+  END IF;
+  EXECUTE format('EXPLAIN (ANALYZE,FORMAT JSON) SELECT a,b FROM %I GROUP BY a,b',relname) INTO p;
+  IF (p->0->'Plan'->>'Plan Rows')::int<100 OR (p->0->'Plan'->>'Actual Rows')::numeric<>1000 THEN
+   RAISE EXCEPTION 'empty reset rollback exposed old grouping statistics: table %, plan %',relname,p;
+  END IF;
+ END LOOP;
+END$$;
+COMMIT;
+DROP TABLE t_empty_fast_plain,t_empty_fast_ext;
+-- A released empty reset keeps the bottom neutral policy on outer rollback.
+SET fasttrun.auto_collect_stats=off;
+CREATE TEMP TABLE t_release_neutral(a int,b int);
+CREATE STATISTICS pg_temp.t_release_neutral_nd(ndistinct) ON a,b FROM t_release_neutral;
+INSERT INTO t_release_neutral SELECT 0,0 FROM generate_series(1,10000);
+ANALYZE t_release_neutral;
+DELETE FROM t_release_neutral;
+VACUUM t_release_neutral;
+BEGIN;
+DO $$BEGIN
+ PERFORM fasttrun_collect_stats('t_release_neutral');
+ PERFORM fasttrun_analyze('t_release_neutral');
+END$$;
+SAVEPOINT empty_reset;
+DO $$BEGIN PERFORM fasttruncate('t_release_neutral'); END$$;
+RELEASE empty_reset;
+ROLLBACK;
+INSERT INTO t_release_neutral SELECT g%1000,g%1000 FROM generate_series(1,10000)g;
+DO $$DECLARE p json;
+BEGIN
+ EXECUTE 'EXPLAIN (ANALYZE,FORMAT JSON) SELECT * FROM t_release_neutral WHERE a=0' INTO p;
+ IF (p->0->'Plan'->>'Plan Rows')::int>100 OR (p->0->'Plan'->>'Actual Rows')::numeric<>10 THEN
+  RAISE EXCEPTION 'released reset exposed old column statistics: %',p;
+ END IF;
+ EXECUTE 'EXPLAIN (ANALYZE,FORMAT JSON) SELECT a,b FROM t_release_neutral GROUP BY a,b' INTO p;
+ IF (p->0->'Plan'->>'Plan Rows')::int<100 OR (p->0->'Plan'->>'Actual Rows')::numeric<>1000 THEN
+  RAISE EXCEPTION 'released reset exposed old grouping statistics: %',p;
+ END IF;
+END$$;
+DROP TABLE t_release_neutral;
+-- Core handoff and counter-free analyze must observe emptying before undo.
+CREATE TEMP TABLE t_empty_core(a int) ON COMMIT DELETE ROWS;
+CREATE TEMP TABLE t_empty_uncounted(a int) ON COMMIT DELETE ROWS;
+CREATE TEMP TABLE t_empty_new_index(a int) ON COMMIT DELETE ROWS;
+BEGIN;
+INSERT INTO t_empty_core SELECT generate_series(1,10000);
+INSERT INTO t_empty_uncounted SELECT generate_series(1,10000);
+INSERT INTO t_empty_new_index SELECT generate_series(1,10000);
+DO $$BEGIN
+ PERFORM fasttrun_analyze('t_empty_core');
+ PERFORM fasttrun_analyze('t_empty_uncounted');
+ PERFORM fasttrun_analyze('t_empty_new_index');
+END$$;
+COMMIT;
+BEGIN;
+SAVEPOINT before_handoff;
+ANALYZE t_empty_core;
+INSERT INTO t_empty_core VALUES(1);
+CREATE INDEX t_empty_new_idx ON t_empty_new_index(a);
+INSERT INTO t_empty_new_index VALUES(1);
+SET LOCAL track_counts=off;
+DO $$BEGIN PERFORM fasttrun_analyze('t_empty_uncounted'); END$$;
+INSERT INTO t_empty_uncounted VALUES(1);
+ROLLBACK TO before_handoff;
+DO $$DECLARE relname text; actual_count bigint;
+BEGIN
+ FOREACH relname IN ARRAY ARRAY['t_empty_core','t_empty_uncounted','t_empty_new_index'] LOOP
+  IF (SELECT reltuples FROM fasttrun_relstats(relname)) IS DISTINCT FROM 0::real THEN
+   RAISE EXCEPTION 'handoff rollback restored pre-COMMIT cardinality: %',relname;
+  END IF;
+  EXECUTE format('SELECT count(*) FROM %I',relname) INTO actual_count;
+  IF actual_count<>0 THEN RAISE EXCEPTION 'handoff rollback retained rows: %',relname; END IF;
+ END LOOP;
+END$$;
+COMMIT;
+DROP TABLE t_empty_core,t_empty_uncounted,t_empty_new_index;
+-- A collect-only heap owns index publications without publishing heap counts.
+CREATE TEMP TABLE t_collect_empty(a int) ON COMMIT DELETE ROWS;
+CREATE INDEX t_collect_full ON t_collect_empty(a);
+CREATE INDEX t_collect_partial ON t_collect_empty(a) WHERE a>5000;
+BEGIN;
+INSERT INTO t_collect_empty SELECT generate_series(1,10000);
+DO $$BEGIN PERFORM fasttrun_collect_stats('t_collect_empty'); END$$;
+COMMIT;
+BEGIN;
+SAVEPOINT before_copy;
+COPY t_collect_empty FROM STDIN;
+6000
+\.
+ROLLBACK TO before_copy;
+DO $$DECLARE indexname text; p json;
+BEGIN
+ FOREACH indexname IN ARRAY ARRAY['t_collect_full','t_collect_partial'] LOOP
+  IF (SELECT reltuples FROM fasttrun_relstats(indexname)) IS DISTINCT FROM 0::real THEN
+   RAISE EXCEPTION 'collect-only index restored pre-COMMIT cardinality: %',indexname;
+  END IF;
+ END LOOP;
+ PERFORM fasttrun_analyze('t_collect_empty');
+ EXECUTE 'EXPLAIN (ANALYZE,FORMAT JSON) SELECT * FROM t_collect_empty' INTO p;
+ IF (p->0->'Plan'->>'Plan Rows')::int<>1 OR (p->0->'Plan'->>'Actual Rows')::numeric<>0 THEN
+  RAISE EXCEPTION 'collect-only rollback did not converge after analyze: %',p;
+ END IF;
+END$$;
+COMMIT;
+DROP TABLE t_collect_empty;
+RESET fasttrun.auto_collect_stats;
 ALTER DATABASE :DBNAME RESET session_preload_libraries;
+\connect -
+DO $cold$ BEGIN
+  IF current_setting('fasttrun.sample_rows', true) IS NOT NULL THEN
+    RAISE EXCEPTION 'cold extended control has fasttrun preloaded';
+  END IF;
+END $cold$;
+-- A first collect inside UPDATE preserves core extended stats without overflow.
+CREATE TEMP TABLE cold_ext(id int, a int, b int);
+CREATE STATISTICS pg_temp.cold_ext_nd(ndistinct) ON a, b FROM cold_ext;
+INSERT INTO cold_ext SELECT n, n % 700, n % 700 FROM generate_series(1, 70000) n;
+ANALYZE cold_ext;
+CREATE FUNCTION pg_temp.cold_ext_inside() RETURNS int LANGUAGE plpgsql AS $f$
+BEGIN
+  LOAD 'fasttrun';
+  PERFORM set_config('fasttrun.sample_rows', '0', true);
+  PERFORM fasttrun_collect_stats('cold_ext');
+  RETURN 0;
+END $f$;
+UPDATE cold_ext SET b = b + pg_temp.cold_ext_inside() WHERE id = 1;
+DO $check$
+DECLARE plan json; groups_est int;
+BEGIN
+  EXECUTE 'EXPLAIN (FORMAT JSON) SELECT a, b FROM cold_ext GROUP BY a, b' INTO plan;
+  groups_est := (plan->0->'Plan'->>'Plan Rows')::int;
+  IF groups_est NOT BETWEEN 600 AND 800 THEN
+    RAISE EXCEPTION 'cold active writer lost core extended stats: %', groups_est;
+  END IF;
+END $check$;
+DROP TABLE cold_ext;
+\connect -
+
+DROP EXTENSION fasttrun;

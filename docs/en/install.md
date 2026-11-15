@@ -59,6 +59,9 @@ safe `search_path` for the role.
 The main functions, including `fasttruncate()` and `fasttrun_analyze()`, require
 neither a PostgreSQL restart nor `shared_preload_libraries` or
 `session_preload_libraries`. The library is loaded on the first function call.
+A first `fasttruncate()` loaded during a transaction can reject with `55000`
+when earlier storage changes were not observed. End the transaction and retry,
+or preload the library before the transaction starts.
 
 `shared_preload_libraries` is required for the shared tracking registry and
 `fasttrun_prewarm()`, and in background workers also for per-column `UPDATE`
@@ -118,6 +121,15 @@ GRANT EXECUTE ON FUNCTION public.fasttrun_analyze(text) TO app_role;
 Grant the remaining privileges separately to application, pooler, monitoring,
 and DBA roles. After upgrading an older installation, also check privileges on
 the old `fasttruncate_c(text)` function if it is still present.
+
+Automatic migration of an external legacy wrapper requires default function
+ACLs, extension-owner ownership, invoker security and no function settings on
+both the wrapper and its C alias. Otherwise upgrade fails with SQLSTATE `55000`
+before replacing either function.
+
+Migrate such a wrapper explicitly in one
+transaction, preserving its effective access policy, then update the extension.
+Granting PUBLIC access just to pass the check can expose the API.
 
 `trusted=true` also allows a role with `CREATE` privilege on a database to
 install the extension itself. The tracking registry is shared across the entire
@@ -252,14 +264,23 @@ preload is already disabled, stop PostgreSQL and remove the file manually.
 
 ## Compatibility
 
-| PostgreSQL | Builds | Basic tests 2.7.0 |
+Recorded qualification of source snapshots on 2026-11-14/15, not a guarantee for
+every vendor minor version or production workload:
+
+| PostgreSQL | Build | Basic tests 2.7.0 |
 |---|---|---|
-| PostgreSQL 16 | yes | 20/20 |
-| PostgreSQL 17 | yes | not run |
-| PostgreSQL 18 | yes | not run |
-| Tantor SE 18.6.3, `enable_temp_memory_catalog = off` | yes | 20/20 |
-| Tantor SE 18.6.3, `enable_temp_memory_catalog = on` | yes | 20/20 |
-| Postgres Pro Enterprise 18 | yes | checked separately |
+| PostgreSQL 16.16 | cassert/debug | 20/20 |
+| PostgreSQL 17.12 | cassert/debug | 20/20 |
+| PostgreSQL 18.7 | cassert/debug | 20/20 |
+| Postgres Pro Standard 16.15.2 | native release | 20/20 |
+| Postgres Pro Standard 18 | native release | 20/20 |
+| Postgres Pro Enterprise 18.6-TRIAL | native release | 20/20 |
+| Tantor SE 18.6.3, `enable_temp_memory_catalog = off` | native release | 20/20 |
+| Tantor SE 18.6.3, `enable_temp_memory_catalog = on` | native release | 20 expected matches, including four skipped suites |
+
+Upstream cassert qualification includes BRIN stress and tracking failure checks.
+Native Standard 16 assertion-only checks are not run: a cassert server and vendor
+sources are unavailable. Development headers alone do not enable server assertions.
 
 With `enable_temp_memory_catalog = on` some checks and suites are skipped
 (section ["Testing"](testing.md)). The mode itself is not reliable yet, without

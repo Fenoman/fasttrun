@@ -3409,6 +3409,185 @@ ROLLBACK;
 DROP TABLE t_seq_temp_child;
 DROP TABLE t_seq_perm_parent;
 
+-- EXPLAIN without ANALYZE must not register a writer or changed columns.
+CREATE TEMP TABLE t_explain_writer(k int, v int);
+INSERT INTO t_explain_writer SELECT 1, 1 FROM generate_series(1, 1000);
+SELECT fasttrun_analyze('t_explain_writer');
+BEGIN;
+SET LOCAL track_counts = off;
+EXPLAIN (COSTS OFF) UPDATE t_explain_writer SET k = k + 1;
+COMMIT;
+SELECT count(*) = 2 AS explain_keeps_samples
+FROM fasttrun_inspect_stats('t_explain_writer');
+BEGIN;
+SET LOCAL fasttrun.stats_refresh_threshold = 0.01;
+EXPLAIN (COSTS OFF) UPDATE t_explain_writer SET k = k + 1;
+UPDATE t_explain_writer SET v = v + 1;
+SELECT ft_rows_est('SELECT * FROM t_explain_writer WHERE k = 1', 'on t_explain_writer')
+       >= 900 AS explain_keeps_untouched_column;
+COMMIT;
+SELECT count(*) = 1000 AS explain_keeps_rows FROM t_explain_writer WHERE k = 1;
+BEGIN;
+SET LOCAL track_counts = off;
+DO $test$ BEGIN
+  EXECUTE 'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) '
+          'UPDATE t_explain_writer SET k = k + 1';
+END $test$;
+COMMIT;
+SELECT count(*) = 0 AS explain_analyze_invalidates_samples
+FROM fasttrun_inspect_stats('t_explain_writer');
+SELECT count(*) = 1000 AS explain_analyze_writes_rows FROM t_explain_writer WHERE k = 2;
+DROP TABLE t_explain_writer;
+
+-- Cloned triggers can update columns outside the ON CONFLICT target list.
+-- VACUUM clears relhastriggers after DROP, so the mask must retain the history.
+CREATE TEMP TABLE t_trigger_parent(k int PRIMARY KEY, v int, z int) PARTITION BY RANGE(k);
+CREATE TEMP TABLE t_trigger_leaf PARTITION OF t_trigger_parent
+  FOR VALUES FROM (0) TO (2000);
+INSERT INTO t_trigger_leaf SELECT g, 1, 1 FROM generate_series(1, 1000) g;
+SELECT fasttrun_analyze('t_trigger_leaf');
+CREATE FUNCTION pg_temp.parent_writer() RETURNS trigger LANGUAGE plpgsql AS $f$
+BEGIN NEW.v := 2; RETURN NEW; END $f$;
+CREATE TRIGGER parent_writer BEFORE UPDATE ON t_trigger_parent
+  FOR EACH ROW EXECUTE FUNCTION pg_temp.parent_writer();
+BEGIN;
+INSERT INTO t_trigger_leaf SELECT g, 1, 2 FROM generate_series(1, 1000) g
+  ON CONFLICT(k) DO UPDATE SET z = excluded.z;
+DROP TRIGGER parent_writer ON t_trigger_parent;
+COMMIT;
+VACUUM t_trigger_leaf;
+SELECT ft_rows_est('SELECT * FROM t_trigger_leaf WHERE v = 1', 'on t_trigger_leaf')
+       < 100 AS cloned_trigger_sample_not_trusted;
+SELECT count(*) = 0 AS cloned_trigger_changed_rows FROM t_trigger_leaf WHERE v = 1;
+DROP TABLE t_trigger_parent;
+DROP FUNCTION pg_temp.parent_writer();
+
+-- Core maintenance of a parent hands off each processed leaf's columns.
+CREATE TEMP TABLE t_handoff_parent(k int, v int) PARTITION BY RANGE(k);
+CREATE TEMP TABLE t_handoff_leaf PARTITION OF t_handoff_parent
+  FOR VALUES FROM (0) TO (20000);
+INSERT INTO t_handoff_leaf SELECT g, 1 FROM generate_series(1, 1000) g;
+SELECT fasttrun_analyze('t_handoff_leaf');
+UPDATE t_handoff_leaf SET v = 2;
+ANALYZE t_handoff_parent(v);
+SELECT ft_rows_est('SELECT * FROM t_handoff_leaf WHERE v = 2', 'on t_handoff_leaf')
+       >= 900 AS parent_analyze_hands_off_leaf;
+SELECT count(*) = 1 AS parent_analyze_keeps_other_column
+FROM fasttrun_inspect_stats('t_handoff_leaf') WHERE staattnum = 1;
+DROP TABLE t_handoff_parent;
+
+-- Classical inheritance is expanded for maintenance only in core 18+.
+-- Reversed child attributes also check name-based partial-column mapping.
+CREATE TEMP TABLE t_classic_parent(k int, v int);
+CREATE TEMP TABLE t_classic_child(v int, k int);
+ALTER TABLE t_classic_child INHERIT t_classic_parent;
+INSERT INTO t_classic_child SELECT 1, g FROM generate_series(1, 1000) g;
+SELECT fasttrun_analyze('t_classic_child');
+UPDATE t_classic_child SET v = 2;
+ANALYZE t_classic_parent(v);
+SELECT (ft_rows_est('SELECT * FROM t_classic_child WHERE v = 2', 'on t_classic_child') >= 900)
+       = (current_setting('server_version_num')::int >= 180000) AS inheritance_matches_core;
+SELECT count(*) = 1 AS inherited_partial_analyze_keeps_other_column
+FROM fasttrun_inspect_stats('t_classic_child') WHERE staattnum = 2;
+DO $test$ BEGIN
+  IF current_setting('server_version_num')::int >= 180000 THEN
+    PERFORM fasttrun_analyze('t_classic_child');
+    UPDATE t_classic_child SET v = 3;
+    EXECUTE 'ANALYZE ONLY t_classic_parent(v)';
+    IF ft_rows_est('SELECT * FROM t_classic_child WHERE v = 3', 'on t_classic_child') >= 900 THEN
+      RAISE EXCEPTION 'ANALYZE ONLY handed off child statistics';
+    END IF;
+  END IF;
+END $test$;
+TRUNCATE ONLY t_classic_parent;
+SELECT count(*) = 1000 AS truncate_only_keeps_child FROM t_classic_child;
+BEGIN;
+SAVEPOINT child_rewrite;
+ALTER TABLE t_classic_parent ALTER COLUMN k TYPE bigint;
+EXPLAIN (COSTS OFF) SELECT * FROM t_classic_child WHERE k = 5;
+ROLLBACK TO SAVEPOINT child_rewrite;
+SELECT count(*) = 1 AS recursive_ddl_restores_child_sample
+FROM fasttrun_inspect_stats('t_classic_child') WHERE staattnum = 2;
+COMMIT;
+DROP TABLE t_classic_child;
+DROP TABLE t_classic_parent;
+
+-- A descendant's neutral statistics and undo survive a core file replacement.
+CREATE TEMP TABLE t_undo_parent(k int) PARTITION BY RANGE(k);
+CREATE TEMP TABLE t_undo_leaf PARTITION OF t_undo_parent FOR VALUES FROM (0) TO (10);
+INSERT INTO t_undo_leaf SELECT 1 FROM generate_series(1, 10000);
+ANALYZE t_undo_leaf;
+SELECT fasttruncate('t_undo_leaf');
+INSERT INTO t_undo_leaf SELECT 2 FROM generate_series(1, 10000);
+BEGIN;
+SAVEPOINT parent_truncate;
+TRUNCATE t_undo_parent;
+EXPLAIN (COSTS OFF) SELECT * FROM t_undo_parent WHERE k = 1;
+ROLLBACK TO SAVEPOINT parent_truncate;
+SELECT ft_rows_est('SELECT * FROM t_undo_leaf WHERE k = 1', 'on t_undo_leaf')
+       < 1000 AS parent_truncate_restores_neutral_stats;
+SELECT count(*) = 10000 AS parent_truncate_restores_rows FROM t_undo_leaf WHERE k = 2;
+COMMIT;
+DROP TABLE t_undo_parent;
+
+-- Expression sample transitions also update cached plans and survive rollback.
+SET plan_cache_mode=force_generic_plan;
+CREATE TEMP TABLE t_expr_neutral(payload text);
+ALTER TABLE t_expr_neutral ALTER COLUMN payload SET STATISTICS 0;
+CREATE INDEX t_expr_neutral_idx ON t_expr_neutral((lower(payload)));
+INSERT INTO t_expr_neutral SELECT 'ALPHA' FROM generate_series(1,1000);
+BEGIN;
+DO $$BEGIN PERFORM fasttrun_analyze('t_expr_neutral'); END$$;
+SAVEPOINT expr_target;
+ALTER INDEX t_expr_neutral_idx ALTER COLUMN 1 SET STATISTICS 0;
+PREPARE q_expr_neutral AS SELECT * FROM t_expr_neutral WHERE lower(payload)='alpha';
+DO $$DECLARE p json; BEGIN EXECUTE 'EXPLAIN (FORMAT JSON) EXECUTE q_expr_neutral' INTO p; END$$;
+DO $$BEGIN PERFORM fasttrun_collect_stats('t_expr_neutral'); END$$;
+DO $$DECLARE p json;
+BEGIN
+ EXECUTE 'EXPLAIN (FORMAT JSON) EXECUTE q_expr_neutral' INTO p;
+ IF (p->0->'Plan'->>'Plan Rows')::int <> 5 THEN
+  RAISE EXCEPTION 'neutral expression statistics left a cached estimate: %',p;
+ END IF;
+END$$;
+ROLLBACK TO expr_target;
+DO $$DECLARE p json;
+BEGIN
+ EXECUTE 'EXPLAIN (FORMAT JSON) EXECUTE q_expr_neutral' INTO p;
+ IF (p->0->'Plan'->>'Plan Rows')::int <> 1000 THEN
+  RAISE EXCEPTION 'expression statistics were not restored by rollback: %',p;
+ END IF;
+END$$;
+DEALLOCATE q_expr_neutral;
+COMMIT;
+DROP TABLE t_expr_neutral;
+RESET plan_cache_mode;
+
+CREATE TEMP TABLE t_expr_light(payload text);
+CREATE INDEX t_expr_light_idx ON t_expr_light((lower(payload)));
+INSERT INTO t_expr_light SELECT 'ALPHA' FROM generate_series(1,1000);
+DO $$BEGIN PERFORM fasttrun_analyze('t_expr_light'); END$$;
+BEGIN;
+SAVEPOINT light_mode;
+SET LOCAL fasttrun.use_typanalyze=off;
+DO $$BEGIN PERFORM fasttrun_collect_stats('t_expr_light'); END$$;
+DO $$DECLARE p json;
+BEGIN
+ IF EXISTS(SELECT 1 FROM fasttrun_inspect_stats('t_expr_light') WHERE starelid='t_expr_light_idx'::regclass) THEN
+  RAISE EXCEPTION 'lightweight collection retained old expression statistics';
+ END IF;
+ EXECUTE 'EXPLAIN (FORMAT JSON) SELECT * FROM t_expr_light WHERE lower(payload)=''alpha''' INTO p;
+ IF (p->0->'Plan'->>'Plan Rows')::int <> 5 THEN RAISE EXCEPTION 'lightweight expression has nondefault estimate: %',p; END IF;
+END$$;
+ROLLBACK TO light_mode;
+DO $$DECLARE p json;
+BEGIN
+ EXECUTE 'EXPLAIN (FORMAT JSON) SELECT * FROM t_expr_light WHERE lower(payload)=''alpha''' INTO p;
+ IF (p->0->'Plan'->>'Plan Rows')::int <> 1000 THEN RAISE EXCEPTION 'lightweight rollback lost expression statistics: %',p; END IF;
+END$$;
+COMMIT;
+DROP TABLE t_expr_light;
+
 DROP FUNCTION ft_rows_est(text, text);
 
 \pset format aligned

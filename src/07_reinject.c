@@ -116,6 +116,8 @@ fasttrun_reinject_relstats(Relation rel, FasttrunAnalyzeCacheEntry *entry)
 
 			if (looks_empty)
 			{
+				BlockNumber empty_pages = RelationGetNumberOfBlocks(rel);
+
 				/* Count a table found emptied, not a known empty state. */
 				if (entry->state.heap_relid == RelationGetRelid(rel) &&
 					entry->state.cached_tuples > 0)
@@ -125,17 +127,7 @@ fasttrun_reinject_relstats(Relation rel, FasttrunAnalyzeCacheEntry *entry)
 				 * btree/hash metapage stays put.  One nblocks call returns
 				 * the right number for either case.
 				 */
-				entry->state.cached_pages = RelationGetNumberOfBlocks(rel);
-				entry->state.published_dead = entry->aborted_pages;
-				entry->state.published_aborted_writes = entry->aborted_writes;
-				entry->state.cached_tuples = 0;
-				entry->state.count_exact = true;
-				entry->state.cached_allvisible = 0;
-				entry->state.has_delta_state = false;
-				entry->state.cached_inserted = 0;
-				entry->state.cached_updated = 0;
-				entry->state.cached_deleted = 0;
-				entry->state.cached_truncdropped = false;
+				fasttrun_cache_adopt_empty_relstats(entry, empty_pages, false);
 				/*
 				 * Cached per-column stats for the now-empty relation get
 				 * hidden by the freshness check in

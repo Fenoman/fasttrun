@@ -46,6 +46,9 @@ static int	fasttrun_in_flight_used = 0;
  */
 static bool fasttrun_in_flight_incomplete = false;
 
+/* The aggregate cannot prove when all observed writers have ended. */
+static bool fasttrun_in_flight_counts_lost = false;
+
 
 /*
  * The registry filter.  It must answer the same at a statement's start and end
@@ -67,12 +70,100 @@ fasttrun_relid_is_temp(Oid relid)
 	return result;
 }
 
+/* Check ownership before taking a relation lock from a DDL observer. */
+static bool
+fasttrun_relid_is_our_temp(Oid relid)
+{
+	HeapTuple	tp = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
+	Form_pg_class form;
+	bool		result;
+
+	if (!HeapTupleIsValid(tp))
+		return false;
+	form = (Form_pg_class) GETSTRUCT(tp);
+	result = form->relpersistence == RELPERSISTENCE_TEMP &&
+		isTempNamespace(form->relnamespace);
+	ReleaseSysCache(tp);
+	return result;
+}
+
+/* After overflow, relation identities yield to one target count per subxact. */
+static void
+fasttrun_stats_merge_in_flight_subids(void)
+{
+	int			i;
+
+	for (i = 0; i < fasttrun_in_flight_used; i++)
+	{
+		int			j = i + 1;
+
+		fasttrun_in_flight[i].relid = InvalidOid;
+		while (j < fasttrun_in_flight_used)
+		{
+			int			depth = fasttrun_in_flight[j].depth;
+
+			if (fasttrun_in_flight[j].subid != fasttrun_in_flight[i].subid)
+			{
+				j++;
+				continue;
+			}
+			if (depth <= 0 || fasttrun_in_flight[i].depth <= 0 ||
+				fasttrun_in_flight[i].depth > INT_MAX - depth)
+				fasttrun_in_flight_counts_lost = true;
+			else
+				fasttrun_in_flight[i].depth += depth;
+			fasttrun_in_flight[j] = fasttrun_in_flight[--fasttrun_in_flight_used];
+		}
+	}
+}
+
+/* Count every observed target start and end in its subtransaction. */
+static void
+fasttrun_stats_update_in_flight_count(SubTransactionId subid, int delta)
+{
+	int			i;
+
+	Assert(delta == 1 || delta == -1);
+	for (i = 0; i < fasttrun_in_flight_used; i++)
+	{
+		if (fasttrun_in_flight[i].subid != subid)
+			continue;
+		if (fasttrun_in_flight[i].depth <= 0 ||
+			(delta > 0 && fasttrun_in_flight[i].depth == INT_MAX))
+		{
+			fasttrun_in_flight_counts_lost = true;
+			return;
+		}
+		fasttrun_in_flight[i].depth += delta;
+		if (fasttrun_in_flight[i].depth == 0)
+			fasttrun_in_flight[i] = fasttrun_in_flight[--fasttrun_in_flight_used];
+		return;
+	}
+
+	/* An unmatched end must not consume another subtransaction's writer. */
+	if (delta < 0 || fasttrun_in_flight_used >= FASTTRUN_IN_FLIGHT_SLOTS)
+	{
+		fasttrun_in_flight_counts_lost = true;
+		return;
+	}
+	fasttrun_in_flight[fasttrun_in_flight_used].relid = InvalidOid;
+	fasttrun_in_flight[fasttrun_in_flight_used].depth = 1;
+	fasttrun_in_flight[fasttrun_in_flight_used].subid = subid;
+	fasttrun_in_flight_used++;
+}
+
 static void
 fasttrun_stats_update_in_flight(Oid relid, int delta)
 {
 	SubTransactionId subid = GetCurrentSubTransactionId();
 	int			i;
 	int			fallback = -1;
+
+	if (fasttrun_in_flight_incomplete)
+	{
+		fasttrun_stats_update_in_flight_count(subid, delta);
+		return;
+	}
 
 	/*
 	 * One slot per (relation, subtransaction).  Keeping the subtransaction in
@@ -111,9 +202,10 @@ fasttrun_stats_update_in_flight(Oid relid, int delta)
 
 	if (fasttrun_in_flight_used >= FASTTRUN_IN_FLIGHT_SLOTS)
 	{
-		if (!fasttrun_in_flight_incomplete)
-			fasttrun_count(FTC_WRITER_REGISTRY_OVERFLOWS);
+		fasttrun_count(FTC_WRITER_REGISTRY_OVERFLOWS);
 		fasttrun_in_flight_incomplete = true;
+		fasttrun_stats_merge_in_flight_subids();
+		fasttrun_stats_update_in_flight_count(subid, delta);
 		return;
 	}
 
@@ -139,6 +231,28 @@ fasttrun_stats_relid_in_flight(Oid relid)
 	return false;
 }
 
+/* True when the active snapshot cannot show completed writes. */
+static bool
+fasttrun_stats_snapshot_predates_writes(Relation rel)
+{
+	int64		ins = 0;
+	int64		upd = 0;
+	int64		del = 0;
+	bool		truncdropped = false;
+
+	/*
+	 * Writes of this transaction that the scan's snapshot cannot show.  Both
+	 * halves are needed: without the counters an unrelated statement moving
+	 * the command id would forbid a perfectly good sample, and without the
+	 * snapshot age an ordinary collect after a finished write of this relation
+	 * would be forbidden although the scan sees every row of it.
+	 */
+	return (ActiveSnapshotSet() &&
+			GetActiveSnapshot()->curcid < GetCurrentCommandId(false) &&
+			fasttrun_read_pgstat_counters(rel, &ins, &upd, &del, &truncdropped) &&
+			(ins != 0 || upd != 0 || del != 0 || truncdropped));
+}
+
 /*
  * True when this relation's data and the counters beside it describe different
  * moments, so a sample taken now cannot be compared with anything later.
@@ -159,25 +273,27 @@ fasttrun_stats_relid_in_flight(Oid relid)
 static bool
 fasttrun_stats_relation_written_now(Relation rel)
 {
-	int64		ins = 0;
-	int64		upd = 0;
-	int64		del = 0;
-	bool		truncdropped = false;
+	return fasttrun_stats_relid_in_flight(RelationGetRelid(rel)) ||
+		fasttrun_stats_snapshot_predates_writes(rel);
+}
 
-	if (fasttrun_stats_relid_in_flight(RelationGetRelid(rel)))
-		return true;
-
-	/*
-	 * Writes of this transaction that the scan's snapshot cannot show.  Both
-	 * halves are needed: without the counters an unrelated statement moving
-	 * the command id would forbid a perfectly good sample, and without the
-	 * snapshot age an ordinary collect after a finished write of this relation
-	 * would be forbidden although the scan sees every row of it.
-	 */
-	return (ActiveSnapshotSet() &&
-			GetActiveSnapshot()->curcid < GetCurrentCommandId(false) &&
-			fasttrun_read_pgstat_counters(rel, &ins, &upd, &del, &truncdropped) &&
-			(ins != 0 || upd != 0 || del != 0 || truncdropped));
+/*
+ * Exact aggregate counts can prove all observed writers ended after overflow.
+ * A reader may still hold the relation open. Unobserved or unfinished writers,
+ * or lost counts, retain the reference guard: only the caller's sole reference
+ * proves no active query is using this local temporary heap.
+ */
+static bool
+fasttrun_stats_can_hide_extended(Relation rel)
+{
+	if (fasttrun_unobserved_writers && rel->rd_refcnt != 1)
+		return false;
+	if (!fasttrun_in_flight_incomplete)
+		return !fasttrun_stats_relation_written_now(rel);
+	if ((fasttrun_in_flight_counts_lost || fasttrun_in_flight_used > 0) &&
+		rel->rd_refcnt != 1)
+		return false;
+	return !fasttrun_stats_snapshot_predates_writes(rel);
 }
 
 /* Nothing is in flight once the top-level transaction is over. */
@@ -186,6 +302,7 @@ fasttrun_stats_forget_in_flight(void)
 {
 	fasttrun_in_flight_used = 0;
 	fasttrun_in_flight_incomplete = false;
+	fasttrun_in_flight_counts_lost = false;
 }
 
 /*
@@ -222,6 +339,8 @@ fasttrun_stats_in_flight_subxact_end(SubTransactionId mySubid,
 		}
 		fasttrun_in_flight[i] = fasttrun_in_flight[--fasttrun_in_flight_used];
 	}
+	if (fasttrun_in_flight_incomplete && !aborted)
+		fasttrun_stats_merge_in_flight_subids();
 }
 
 /*
@@ -237,7 +356,8 @@ static void
 fasttrun_stats_note_wide_writer_ddl(RangeVar *rv)
 {
 	Oid			relid;
-	FasttrunStatsRelidEntry *entry;
+	List	   *relids;
+	ListCell   *lc;
 
 	if (fasttrun_stats_relid_cache == NULL || rv == NULL)
 		return;
@@ -246,10 +366,20 @@ fasttrun_stats_note_wide_writer_ddl(RangeVar *rv)
 	if (!OidIsValid(relid))
 		return;
 
-	entry = (FasttrunStatsRelidEntry *)
-		hash_search(fasttrun_stats_relid_cache, &relid, HASH_FIND, NULL);
-	if (entry != NULL)
-		entry->updated_cols_exact = false;
+	/* Core clones row triggers to partitions without another utility call. */
+	relids = fasttrun_utility_tree(relid,
+								  get_rel_relkind(relid) == RELKIND_PARTITIONED_TABLE);
+	foreach(lc, relids)
+	{
+		FasttrunStatsRelidEntry *entry;
+
+		relid = lfirst_oid(lc);
+		entry = (FasttrunStatsRelidEntry *)
+			hash_search(fasttrun_stats_relid_cache, &relid, HASH_FIND, NULL);
+		if (entry != NULL)
+			entry->updated_cols_exact = false;
+	}
+	list_free(relids);
 }
 
 /*
