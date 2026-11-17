@@ -49,12 +49,14 @@
 #include "common/pg_prng.h"
 #include "common/relpath.h"
 #include "executor/executor.h"
+#include "libpq/libpq.h"
 #include "miscadmin.h"
 #include "mb/pg_wchar.h"
 #include "storage/proc.h"
 #include "nodes/makefuncs.h"
 #include "parser/parse_relation.h"
 #include "nodes/nodeFuncs.h"
+#include "optimizer/optimizer.h"
 #include "optimizer/plancat.h"
 #include "optimizer/planner.h"
 #include "parser/parsetree.h"
@@ -91,7 +93,6 @@
 #include "pgtime.h"
 #include "utils/timestamp.h"
 #include "utils/varlena.h"
-#include "storage/ipc.h"
 #include "storage/procarray.h"
 #if PG_VERSION_NUM >= 170000
 #include "storage/read_stream.h"		/* PG17+ rewrote analyze scan on ReadStream */
@@ -136,6 +137,7 @@ PG_FUNCTION_INFO_V1(fasttrun_test_evict_missing_relid);
 #ifdef USE_ASSERT_CHECKING
 PG_FUNCTION_INFO_V1(fasttrun_test_planner_probe);
 PG_FUNCTION_INFO_V1(fasttrun_test_call_attavgwidth);
+PG_FUNCTION_INFO_V1(fasttrun_test_simulate_atx_relcache_reset);
 #endif
 Datum	fasttruncate(PG_FUNCTION_ARGS);
 Datum	fasttrun_analyze(PG_FUNCTION_ARGS);
@@ -157,6 +159,8 @@ Datum	fasttrun_temp_same_cols(PG_FUNCTION_ARGS);
 void _PG_init(void);
 
 static int fasttrun_track_cmp_desc(const void *a, const void *b);
+static bool fasttrun_track_schedule_check_hook(char **newval, void **extra,
+											   GucSource source);
 static void fasttrun_track_schedule_assign_hook(const char *newval, void *extra);
 
 /* GUCs */
@@ -245,7 +249,7 @@ static char	   *fasttrun_prewarm_schema;	/* defined with the tracking GUCs */
 #include "src/29_utility_hooks.c"
 /* hot_temp_tables, prewarm, reset_temp_stats */
 #include "src/30_tracking_sql.c"
-/* cassert-only test SQL functions */
+/* test SQL functions */
 #include "src/31_test_funcs.c"
 
 /* Define GUCs and install the always-on utility hook. */
@@ -309,10 +313,9 @@ _PG_init(void)
 							 "different things: here the larger relative change of "
 							 "reltuples or relpages since the last invalidation, there "
 							 "DML churn since the last collect.  Set to 0 to invalidate "
-							 "plans on any relstats change.  A column-stats refresh, an "
-							 "index relstats change (e.g. partial index) or a stats "
-							 "visibility flip always invalidates: those signal "
-							 "distribution changes that this size ratio cannot measure.",
+							 "plans on any relstats change.  A column-stats refresh, a "
+							 "stats visibility flip, an index tuple-count change or an "
+							 "index page drift past the threshold always invalidates.",
 							 &fasttrun_invalidate_threshold,
 							 0.2,
 							 0.0,
@@ -449,17 +452,86 @@ _PG_init(void)
 							 0,
 							 NULL, NULL, NULL);
 
+	/* Tracking GUCs */
+	DefineCustomBoolVariable("fasttrun.track_temp_creates",
+							 "Track CREATE TEMP TABLE frequency in shared memory",
+							 NULL,
+							 &fasttrun_track_enabled,
+							 false,
+							 PGC_SUSET,
+							 0,
+							 NULL, NULL, NULL);
+
+	DefineCustomIntVariable("fasttrun.prewarm_count",
+							"Number of hottest temp tables to pre-create in fasttrun_prewarm()",
+							NULL,
+							&fasttrun_prewarm_count,
+							1000,
+							0,
+							FASTTRUN_TRACK_MAX,
+							PGC_USERSET,
+							0,
+							NULL, NULL, NULL);
+
+	DefineCustomStringVariable("fasttrun.prewarm_schema",
+							   "Schema with dummy (template) tables for prewarm tracking and template statistics targets",
+							   "CREATE TEMP TABLE ... (LIKE <schema>.xxx) tracking and "
+							   "fasttrun.template_stattarget look up template tables in "
+							   "this schema.",
+							   &fasttrun_prewarm_schema,
+							   "dummy_tmp",
+							   PGC_SUSET,
+							   0,
+							   NULL, NULL, NULL);
+
+	DefineCustomStringVariable("fasttrun.track_schedule",
+							   "Time windows when CREATE TEMP TABLE tracking is active",
+							   "Format: 'mon-fri 08:00-18:00; sat 10:00-14:00'. "
+							   "Empty string means tracking is always active. "
+							   "Invalid format is logged as WARNING and falls back "
+							   "to always-active.",
+							   &fasttrun_track_schedule,
+							   "mon-fri 08:00-18:00",
+								   PGC_SUSET,
+								   0,
+								   fasttrun_track_schedule_check_hook,
+								   fasttrun_track_schedule_assign_hook,
+								   NULL);
+
+#ifdef USE_ASSERT_CHECKING
+	DefineCustomStringVariable("fasttrun.test_failpoint",
+							   "Inject deterministic errors in cassert test builds",
+							   NULL,
+							   &fasttrun_test_failpoint,
+							   "",
+							   PGC_SUSET,
+							   GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE,
+							   NULL, NULL, NULL);
+#endif
+	MarkGUCPrefixReserved("fasttrun");
+
 	/*
-	 * Register the xact + subxact callbacks once per backend, here in
-	 * _PG_init, so they fire regardless of which cache is lazily
-	 * allocated first -- or whether only standalone
-	 * fasttrun_collect_stats() is ever called.
+	 * Register callbacks and hooks only after GUC definitions and prefix
+	 * reservation complete, so any error during GUC setup cannot leave
+	 * callbacks or hooks pointing into a partially initialized module.
+	 *
+	 * Register the xact + subxact callbacks once per backend so they fire
+	 * regardless of which cache is lazily allocated first -- or whether only
+	 * standalone fasttrun_collect_stats() is ever called.
 	 */
-	RegisterXactCallback(fasttrun_xact_callback, NULL);
-	RegisterSubXactCallback(fasttrun_subxact_callback, NULL);
-	/* Not stopped by passthrough: fasttrun_temp_is_ours works in both modes. */
+	/*
+	 * RegisterXactCallback and RegisterSubXactCallback prepend to LIFO lists,
+	 * so the second registration runs first.  Keep fasttrun_xact_callback and
+	 * fasttrun_subxact_callback ahead of the fresh callbacks so journal frames
+	 * unwind before TopTransactionContext pointers are cleared on xact end and
+	 * subcommit preparation in SUBXACT_EVENT_PRE_COMMIT_SUB stays ordered
+	 * ahead of fresh promotion.  Fresh callbacks stay active in passthrough
+	 * mode too.
+	 */
 	RegisterXactCallback(fasttrun_fresh_xact_callback, NULL);
 	RegisterSubXactCallback(fasttrun_fresh_subxact_callback, NULL);
+	RegisterXactCallback(fasttrun_xact_callback, NULL);
+	RegisterSubXactCallback(fasttrun_subxact_callback, NULL);
 
 	/*
 	 * The executor hooks go in here, not with the lazily installed stats
@@ -506,64 +578,6 @@ _PG_init(void)
 
 	prev_object_access_hook = object_access_hook;
 	object_access_hook = fasttrun_object_access_hook;
-
-	/* Tracking GUCs */
-	DefineCustomBoolVariable("fasttrun.track_temp_creates",
-							 "Track CREATE TEMP TABLE frequency in shared memory",
-							 NULL,
-							 &fasttrun_track_enabled,
-							 false,
-							 PGC_SUSET,
-							 0,
-							 NULL, NULL, NULL);
-
-	DefineCustomIntVariable("fasttrun.prewarm_count",
-							"Number of hottest temp tables to pre-create in fasttrun_prewarm()",
-							NULL,
-							&fasttrun_prewarm_count,
-							1000,
-							0,
-							FASTTRUN_TRACK_MAX,
-							PGC_USERSET,
-							0,
-							NULL, NULL, NULL);
-
-	DefineCustomStringVariable("fasttrun.prewarm_schema",
-							   "Schema with dummy (template) tables for prewarm tracking",
-							   "Only CREATE TEMP TABLE ... (LIKE <schema>.xxx) "
-							   "will be tracked. Tables created without LIKE from "
-							   "this schema are ignored.",
-							   &fasttrun_prewarm_schema,
-							   "dummy_tmp",
-							   PGC_SUSET,
-							   0,
-							   NULL, NULL, NULL);
-
-	DefineCustomStringVariable("fasttrun.track_schedule",
-							   "Time windows when CREATE TEMP TABLE tracking is active",
-							   "Format: 'mon-fri 08:00-18:00; sat 10:00-14:00'. "
-							   "Empty string means tracking is always active. "
-							   "Invalid format is logged as WARNING and falls back "
-							   "to always-active.",
-							   &fasttrun_track_schedule,
-							   "mon-fri 08:00-18:00",
-								   PGC_SUSET,
-								   0,
-								   NULL,
-								   fasttrun_track_schedule_assign_hook,
-								   NULL);
-
-#ifdef USE_ASSERT_CHECKING
-	DefineCustomStringVariable("fasttrun.test_failpoint",
-							   "Inject deterministic errors in cassert test builds",
-							   NULL,
-							   &fasttrun_test_failpoint,
-							   "",
-							   PGC_SUSET,
-							   GUC_NO_SHOW_ALL | GUC_NOT_IN_SAMPLE,
-							   NULL, NULL, NULL);
-#endif
-	MarkGUCPrefixReserved("fasttrun");
 
 	/* Shared memory tracking -- only when loaded via shared_preload_libraries. */
 	if (process_shared_preload_libraries_in_progress)

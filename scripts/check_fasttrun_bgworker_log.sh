@@ -18,7 +18,7 @@
 # строки LOG у воркера ничего бы не доказывало.
 # Скрипт печатает PASS или FAIL и не требует cassert-сборки.
 #
-set -e
+set -eu
 # На macOS postmaster отказывается стартовать при неустановленной локали.
 : "${LC_ALL:=C}"
 export LC_ALL
@@ -124,11 +124,13 @@ worker_log=$(grep "|LOG:  $MSG" "$LOG" | grep -vc '^client backend|' || true)
 worker_debug=$(grep "|DEBUG:  $MSG" "$LOG" | grep -vc '^client backend|' || true)
 worker_hint=$(grep -F "|HINT:  $HINT" "$LOG" | grep -vc '^client backend|' || true)
 
-echo "client LOG=$client_log worker LOG=$worker_log worker DEBUG=$worker_debug worker HINT=$worker_hint"
+fatal_errors=$(grep -cE '\|(ERROR|FATAL|PANIC):|TRAP|FailedAssertion|leaked hash_seq_search' "$LOG" || true)
+echo "client LOG=$client_log worker LOG=$worker_log worker DEBUG=$worker_debug worker HINT=$worker_hint errors=$fatal_errors"
 # Воркер применения, перезапущенный ядром, напишет строку еще раз, поэтому у
 # него проверяется "хотя бы одна", а у единственного клиентского сеанса - ровно одна.
 if [ "$client_log" -eq 1 ] && [ "$worker_log" -eq 0 ] &&
-	[ "$worker_debug" -ge 1 ] && [ "$worker_hint" -ge 1 ]; then
+	[ "$worker_debug" -ge 1 ] && [ "$worker_hint" -ge 1 ] &&
+	[ "$fatal_errors" -eq 0 ]; then
 	echo "bgworker lazy-load log: PASS"
 	exit 0
 fi

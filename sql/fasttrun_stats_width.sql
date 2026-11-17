@@ -1,8 +1,12 @@
 --
--- fasttrun_stats_width — регрессионные тесты вычисления stawidth (ширины колонок).
+-- fasttrun_stats_width - регрессионные тесты вычисления stawidth (ширины колонок).
 --
--- Требует shared_preload_libraries = 'fasttrun' (как и остальной suite stats).
+-- Использует session_preload_libraries = 'fasttrun' на базе теста, чтобы
+-- переподключение \c - сохраняло предзагрузку.
 --
+
+ALTER DATABASE :DBNAME SET session_preload_libraries = 'fasttrun';
+\connect -
 
 CREATE EXTENSION fasttrun;
 
@@ -264,3 +268,4 @@ DROP SCHEMA ft_stats_owner;
 DROP ROLE ft_stats_owner;
 
 DROP EXTENSION fasttrun;
+ALTER DATABASE :DBNAME RESET session_preload_libraries;

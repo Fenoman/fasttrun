@@ -56,6 +56,18 @@ SELECT fasttrun_analyze('pt_perm');
 SELECT fasttrun_collect_stats('pt_perm');
 SELECT fasttrun_analyze_bulk('pt_perm');
 
+-- Родители наследования и секционирования отклоняются с 0A000 и в passthrough.
+CREATE TEMP TABLE pt_inh_p (id int);
+CREATE TEMP TABLE pt_inh_c () INHERITS (pt_inh_p);
+INSERT INTO pt_inh_p VALUES (1);
+INSERT INTO pt_inh_c VALUES (2);
+CREATE TEMP TABLE pt_part_p (id int) PARTITION BY RANGE (id);
+SELECT fasttruncate('pt_inh_p');
+SELECT fasttruncate('pt_part_p');
+SELECT count(*) = 1 AS pt_inh_parent_intact FROM ONLY pt_inh_p;
+DROP TABLE pt_inh_p CASCADE;
+DROP TABLE pt_part_p;
+
 -- Режим задается на весь сеанс.
 SET fasttrun.passthrough = off;
 DROP TABLE pt;

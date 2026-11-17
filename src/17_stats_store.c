@@ -151,6 +151,8 @@ fasttrun_stats_set_entry_state(Relation rel, AttrNumber attnum, bool inh,
 							HASH_FIND, NULL);
 			if (relentry == NULL)
 				elog(ERROR, "fasttrun stats back-reference is missing");
+			if (new_candidate && !relentry->budget_admitted)
+				fasttrun_stats_relid_save_undo(relentry);
 		}
 
 		if (found && entry->state_subid != cur_subid)
@@ -172,6 +174,7 @@ fasttrun_stats_set_entry_state(Relation rel, AttrNumber attnum, bool inh,
 
 		if (new_candidate)
 		{
+			relentry->budget_admitted = true;
 			entry->statsTuple = (HeapTuple) staged_tuple;
 			staged_tuple = NULL;
 		}
@@ -386,7 +389,6 @@ fasttrun_stats_cache_commit_xact(void)
 	{
 		Oid			relid = xentry->relid;
 		FasttrunStatsRelidEntry *relentry;
-		List	   *unlink_keys = NIL;
 		ListCell   *klc;
 		int64		ins_now = 0;
 		int64		upd_now = 0;
@@ -445,10 +447,8 @@ fasttrun_stats_cache_commit_xact(void)
 		}
 
 		/*
-		 * The common candidate path never mutates attkeys.  Walk it in place
-		 * and defer the rare stale/handoff unlinks until after the loop.  A
-		 * list_copy per touched relation would dominate short COMMITs with
-		 * many analyzed temp tables.
+		 * Walk attkeys in place and unlink stale, dropped or pruned keys via
+		 * foreach_delete_current without allocating in TRANS_COMMIT.
 		 */
 		foreach(klc, relentry->attkeys)
 		{
@@ -460,8 +460,8 @@ fasttrun_stats_cache_commit_xact(void)
 				hash_search(fasttrun_stats_cache, &key, HASH_FIND, NULL);
 			if (entry == NULL)
 			{
-				/* Stale backref -- unlink after this live-list walk. */
-				unlink_keys = lappend(unlink_keys, kptr);
+				relentry->attkeys = foreach_delete_current(relentry->attkeys, klc);
+				pfree(kptr);
 				continue;
 			}
 
@@ -476,7 +476,8 @@ fasttrun_stats_cache_commit_xact(void)
 					heap_freetuple(entry->statsTuple);
 				(void) hash_search(fasttrun_stats_cache, &key,
 								   HASH_REMOVE, NULL);
-				unlink_keys = lappend(unlink_keys, kptr);
+				relentry->attkeys = foreach_delete_current(relentry->attkeys, klc);
+				pfree(kptr);
 				continue;
 			}
 
@@ -501,7 +502,8 @@ fasttrun_stats_cache_commit_xact(void)
 						heap_freetuple(entry->statsTuple);
 					(void) hash_search(fasttrun_stats_cache, &key,
 									   HASH_REMOVE, NULL);
-					unlink_keys = lappend(unlink_keys, kptr);
+					relentry->attkeys = foreach_delete_current(relentry->attkeys, klc);
+					pfree(kptr);
 					continue;
 				}
 				fasttrun_stats_entry_free_undo(entry);
@@ -569,14 +571,6 @@ fasttrun_stats_cache_commit_xact(void)
 			entry->collected_truncdropped = false;
 			entry->state_subid = InvalidSubTransactionId;
 		}
-
-		foreach(klc, unlink_keys)
-		{
-			FasttrunStatsKey *key = (FasttrunStatsKey *) lfirst(klc);
-
-			fasttrun_stats_relid_unlink_key(relentry, key);
-		}
-		list_free(unlink_keys);
 
 		/*
 		 * A column hidden here has no sample until the next collect, and
@@ -689,6 +683,33 @@ fasttrun_stats_cache_evict_relid(Oid relid)
 
 	list_free(keys);
 	return removed;
+}
+
+static bool
+fasttrun_stats_neutralize_core_overrides(Oid relid)
+{
+	FasttrunStatsRelidEntry *relentry;
+	ListCell   *lc;
+	bool		changed = false;
+
+	if (fasttrun_stats_cache == NULL || fasttrun_stats_relid_cache == NULL)
+		return false;
+	relentry = (FasttrunStatsRelidEntry *) hash_search(fasttrun_stats_relid_cache,
+													   &relid, HASH_FIND, NULL);
+	if (relentry == NULL || relentry->attkeys == NIL)
+		return false;
+
+	foreach(lc, relentry->attkeys)
+	{
+		FasttrunStatsKey *kptr = (FasttrunStatsKey *) lfirst(lc);
+		FasttrunStatsEntry *entry;
+
+		entry = (FasttrunStatsEntry *) hash_search(fasttrun_stats_cache,
+												   kptr, HASH_FIND, NULL);
+		if (entry != NULL && entry->state == FASTTRUN_COLUMN_CORE_ALLOWED)
+			changed |= fasttrun_stats_entry_neutralize(relid, entry);
+	}
+	return changed;
 }
 
 /*
@@ -963,6 +984,10 @@ fasttrun_stats_handoff_columns(Relation rel, Bitmapset *attnums,
 			(void) fasttrun_stats_set_column_state(rel, attnum, false,
 										 FASTTRUN_COLUMN_CORE_ALLOWED,
 										 NULL, NULL);
+			if (rel->rd_rel->relhassubclass)
+				(void) fasttrun_stats_set_column_state(rel, attnum, true,
+											 FASTTRUN_COLUMN_CORE_ALLOWED,
+											 NULL, NULL);
 		}
 		return;
 	}

@@ -477,6 +477,50 @@ DO $$BEGIN
 END$$;
 ROLLBACK;
 DROP TABLE t_cancel_collect,t_cancel_budget,t_cancel_saved;
+
+-- Verify cancellation under use_typanalyze = on as well.
+SET fasttrun.use_typanalyze=on;
+SET fasttrun.sample_rows=50000;
+SELECT format('CREATE TEMP TABLE t_cancel_typ AS SELECT %s FROM generate_series(1,50000) g',string_agg(format('((g::bigint * %s) %% 100003)::text AS c%s',n*7919,n),',')) FROM generate_series(1,96) n \gexec
+CREATE TEMP TABLE t_cancel_typ_budget(elapsed double precision);
+DO $$DECLARE started timestamptz:=clock_timestamp();
+BEGIN
+ PERFORM fasttrun_collect_stats('t_cancel_typ');
+ INSERT INTO t_cancel_typ_budget VALUES(extract(epoch FROM clock_timestamp()-started));
+END$$;
+CREATE TEMP TABLE t_cancel_typ_saved AS
+SELECT staattnum,to_jsonb(s) AS sample FROM fasttrun_inspect_stats('t_cancel_typ') s;
+BEGIN;
+UPDATE t_cancel_typ SET c1=NULL WHERE c1<'1000';
+SET statement_timeout='50ms';
+DO $$DECLARE started timestamptz:=clock_timestamp(); canceled boolean:=false; elapsed double precision; budget double precision;
+BEGIN
+ SELECT greatest(0.4,b.elapsed*0.6) INTO budget FROM t_cancel_typ_budget b;
+ BEGIN
+  PERFORM fasttrun_collect_stats('t_cancel_typ');
+ EXCEPTION WHEN query_canceled THEN canceled:=true;
+ END;
+ elapsed:=extract(epoch FROM clock_timestamp()-started);
+ IF NOT canceled OR elapsed>budget THEN
+  RAISE EXCEPTION 'typanalyze collection cancellation delayed: canceled=%, elapsed=%, budget=%',canceled,elapsed,budget;
+ END IF;
+END$$;
+RESET statement_timeout;
+DO $$BEGIN
+ IF (SELECT count(*) FROM fasttrun_inspect_stats('t_cancel_typ'))<>96 THEN
+  RAISE EXCEPTION 'canceled typanalyze collection did not restore the previous sample';
+ END IF;
+ IF EXISTS (
+  SELECT 1 FROM fasttrun_inspect_stats('t_cancel_typ') s
+  FULL JOIN t_cancel_typ_saved old USING(staattnum)
+  WHERE to_jsonb(s) IS DISTINCT FROM old.sample
+ ) THEN
+  RAISE EXCEPTION 'canceled typanalyze collection changed stored sample contents';
+ END IF;
+END$$;
+ROLLBACK;
+DROP TABLE t_cancel_typ,t_cancel_typ_budget,t_cancel_typ_saved;
+
 RESET fasttrun.use_typanalyze;
 RESET fasttrun.sample_rows;
 SELECT 'PUBLICATION_OK cancel';
@@ -519,5 +563,11 @@ case "$CASE_NAME" in
 		exit 2
 		;;
 esac
+
+if grep -Eq 'TRAP|Assertion|FailedAssertion|PANIC|terminated by signal|server process .* was terminated|leaked hash_seq_search' "$LOG"; then
+	grep -E 'TRAP|Assertion|FailedAssertion|PANIC|terminated by signal|server process .* was terminated|leaked hash_seq_search' "$LOG" >&2
+	echo "FAIL: publication atomicity caused an assertion or crash" >&2
+	exit 1
+fi
 
 echo "publication atomicity passed: $CASE_NAME"

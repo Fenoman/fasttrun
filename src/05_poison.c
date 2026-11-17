@@ -79,6 +79,17 @@ fasttrun_poison_find(Oid root_relid)
 												  &root_relid, HASH_FIND, NULL);
 }
 
+/* The current file is the one an incomplete fasttruncate left damaged. */
+static bool
+fasttrun_poison_blocks_file(Relation rel)
+{
+	FasttrunPoisonEntry *entry = fasttrun_poison_find(RelationGetRelid(rel));
+
+	return entry != NULL && entry->active &&
+		RelFileLocatorEquals(entry->root_rlb.locator, rel->rd_locator) &&
+		entry->root_rlb.backend == rel->rd_backend;
+}
+
 /*
  * Reserve the registry slot before mutation.  The final pointer assignment
  * is the publication boundary: errors before it leave no pending operation.
@@ -231,7 +242,8 @@ fasttrun_poison_check_relation(Relation rel, const char *operation,
 		entry->root_rlb.backend != rel->rd_backend)
 	{
 		/* A committed file cannot roll back to the damaged one. */
-		if (rel->rd_createSubid == InvalidSubTransactionId &&
+		if (!fasttrun_outer_xact_saw_atx &&
+			fasttrun_rel_create_subid(rel) == InvalidSubTransactionId &&
 			rel->rd_firstRelfilelocatorSubid == InvalidSubTransactionId)
 		{
 			fasttrun_poison_forget_relid(root_relid);
@@ -244,8 +256,9 @@ fasttrun_poison_check_relation(Relation rel, const char *operation,
 							RelationGetRelationName(rel)),
 					 errdetail("The damaged file can return if the storage replacement is rolled back."),
 					 errhint("Commit the storage replacement, or roll it back and retry fasttruncate on the damaged file.")));
-		fasttrun_xact_mark_relid(root_relid, root_relid,
-								 FASTTRUN_TOUCH_POISON_RETIRE);
+		if (!fasttrun_in_atx())
+			fasttrun_xact_mark_relid(root_relid, root_relid,
+									 FASTTRUN_TOUCH_POISON_RETIRE);
 		return;
 	}
 	if (allow_repair)
@@ -296,9 +309,18 @@ fasttrun_poison_commit_xact(void)
 			fasttrun_poison_find(xentry->relid) != NULL)
 			fasttrun_poison_forget_relid(xentry->relid);
 		else if ((xentry->flags & FASTTRUN_TOUCH_POISON_FILE) != 0)
-			fasttrun_poison_file_subxact_end(xentry->relid,
-											   fasttrun_xact_frame->subid,
-											   InvalidSubTransactionId, false);
+		{
+			FasttrunPoisonEntry *entry = fasttrun_poison_find(xentry->relid);
+
+			if (entry != NULL && entry->active &&
+				!RelFileLocatorEquals(xentry->file_birth_locator,
+									  entry->root_rlb.locator))
+				fasttrun_poison_forget_relid(xentry->relid);
+			else
+				fasttrun_poison_file_subxact_end(xentry->relid,
+												 fasttrun_xact_frame->subid,
+												 InvalidSubTransactionId, false);
+		}
 	}
 }
 

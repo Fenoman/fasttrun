@@ -31,7 +31,7 @@
 # "Производительность".
 # Скрипт печатает PASS или FAIL и не требует cassert-сборки.
 #
-set -e
+set -eu
 # На macOS postmaster отказывается стартовать при неустановленной локали.
 : "${LC_ALL:=C}"
 export LC_ALL
@@ -47,7 +47,7 @@ LOG="$WORKDIR/log"
 PORT=${PGPORT_CHECK:-$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')}
 MSG='fasttrun: marking cached plans invalid before temporary relation cleanup'
 DROP_RE='DEBUG:  drop (auto-)?cascades to '
-ERROR_RE='\|(ERROR|FATAL|PANIC):|TRAP'
+ERROR_RE='\|(ERROR|FATAL|PANIC):|TRAP|FailedAssertion|leaked hash_seq_search'
 
 show_errors() {
 	grep -E "$ERROR_RE" "$LOG" 2>/dev/null | tail -20 || true

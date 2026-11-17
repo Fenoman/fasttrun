@@ -48,11 +48,23 @@ fasttrun_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 	HASH_SEQ_STATUS status;
 	FasttrunXactRelEntry *xentry;
 
-	if (fasttrun_passthrough ||
-		(event != SUBXACT_EVENT_ABORT_SUB && event != SUBXACT_EVENT_COMMIT_SUB))
+	if (fasttrun_passthrough || fasttrun_in_atx())
+		return;
+	if (event == SUBXACT_EVENT_PRE_COMMIT_SUB)
+	{
+		frame = fasttrun_xact_frame;
+		if (frame != NULL && frame->subid == mySubid &&
+			frame->parent != NULL && frame->parent->subid == parentSubid)
+			fasttrun_xact_prepare_subcommit(frame->parent, frame);
+		FASTTRUN_TEST_FAILPOINT("after_pre_commit_sub", 0);
+		return;
+	}
+	if (event != SUBXACT_EVENT_ABORT_SUB && event != SUBXACT_EVENT_COMMIT_SUB)
 		return;
 	if (event == SUBXACT_EVENT_ABORT_SUB)
 		fasttrun_statement_seq++;
+
+	frame = fasttrun_xact_frame;
 
 	if (fasttrun_in_flight_used > 0)
 		fasttrun_stats_in_flight_subxact_end(mySubid, parentSubid,
@@ -68,7 +80,6 @@ fasttrun_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 	 * fasttrun state alone, such as a PL/pgSQL EXCEPTION block in a loop,
 	 * skips the walk.
 	 */
-	frame = fasttrun_xact_frame;
 	if (frame == NULL || frame->subid != mySubid)
 		return;
 
@@ -111,20 +122,20 @@ fasttrun_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 			}
 			fasttrun_stats_forget_relid(relid);
 			fasttrun_poison_forget_relid(relid);
+			fasttrun_fresh_forget_relid(relid);
 			goto finish_entry;
 		}
 
 		/*
 		 * Walk the column-stats entries only when this frame actually wrote
 		 * some (COLSTATS).  A relid touched only through the relstats path
-		 * (pure-delta analyze) has no per-column undo to process, and the
-		 * list_copy(attkeys) + per-column lookups would be wasted work.
+		 * (pure-delta analyze) has no per-column undo to process, so walking
+		 * its attkeys and per-column hash entries would be wasted work.
 		 */
 		if ((xentry->flags & FASTTRUN_TOUCH_COLSTATS) != 0 &&
 			fasttrun_stats_cache != NULL && fasttrun_stats_relid_cache != NULL)
 		{
 			FasttrunStatsRelidEntry *relentry;
-			List	   *keys;
 			ListCell   *klc;
 
 			relentry = (FasttrunStatsRelidEntry *)
@@ -132,12 +143,10 @@ fasttrun_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 			if (relentry != NULL && relentry->attkeys != NIL)
 			{
 				/*
-				 * Snapshot attkeys.  Drop paths below pfree list nodes via
-				 * fasttrun_stats_relid_drop_key, mutating the live list.
+				 * Walk attkeys in place via foreach_delete_current so abort
+				 * never allocates a list copy in TransactionAbortContext.
 				 */
-				keys = list_copy(relentry->attkeys);
-
-				foreach(klc, keys)
+				foreach(klc, relentry->attkeys)
 				{
 					FasttrunStatsKey *kptr = (FasttrunStatsKey *) lfirst(klc);
 					FasttrunStatsKey key = *kptr;
@@ -147,7 +156,9 @@ fasttrun_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 						hash_search(fasttrun_stats_cache, &key, HASH_FIND, NULL);
 					if (sentry == NULL)
 					{
-						fasttrun_stats_relid_drop_key(&key);
+						relentry->attkeys =
+							foreach_delete_current(relentry->attkeys, klc);
+						pfree(kptr);
 						continue;
 					}
 					if (sentry->state_subid != mySubid)
@@ -194,7 +205,9 @@ fasttrun_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 								heap_freetuple(sentry->statsTuple);
 							(void) hash_search(fasttrun_stats_cache, &key,
 											   HASH_REMOVE, NULL);
-							fasttrun_stats_relid_drop_key(&key);
+							relentry->attkeys =
+								foreach_delete_current(relentry->attkeys, klc);
+							pfree(kptr);
 						}
 					}
 					else	/* SUBXACT_EVENT_COMMIT_SUB */
@@ -220,7 +233,8 @@ fasttrun_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 					}
 				}
 
-				list_free(keys);
+				if (relentry->state_subid != mySubid)
+					fasttrun_stats_relid_maybe_drop(relid, relentry);
 			}
 		}
 
@@ -241,6 +255,7 @@ fasttrun_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 						relentry->policy = popped->policy;
 						relentry->heap_rlb = popped->heap_rlb;
 						relentry->heap_rlb_valid = popped->heap_rlb_valid;
+						relentry->budget_admitted = popped->budget_admitted;
 						relentry->state_subid = popped->state_subid;
 						relentry->undo = popped->older;
 						pfree(popped);
@@ -251,6 +266,7 @@ fasttrun_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 						memset(&relentry->heap_rlb, 0,
 							   sizeof(relentry->heap_rlb));
 						relentry->heap_rlb_valid = false;
+						relentry->budget_admitted = false;
 						relentry->state_subid = InvalidSubTransactionId;
 					}
 				}
@@ -277,6 +293,8 @@ fasttrun_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 
 		if (aentry != NULL)
 		{
+			bool	was_published = aentry->state.has_relstats;
+
 			if (event == SUBXACT_EVENT_ABORT_SUB)
 				xentry->settle_owner = fasttrun_cache_index_owner(aentry);
 			if (aentry->state_subid == mySubid)
@@ -303,6 +321,8 @@ fasttrun_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 						restored_state = true;
 						restored_dead = popped->aborted_pages;
 						pfree(popped);
+						if (was_published && !aentry->state.has_relstats)
+							RelationCacheInvalidateEntry(relid);
 					}
 					else if (emptied)
 						aentry->state_subid = InvalidSubTransactionId;
@@ -311,6 +331,8 @@ fasttrun_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 						(void) hash_search(fasttrun_analyze_cache, &relid,
 										   HASH_REMOVE, NULL);
 						aentry = NULL;
+						if (was_published)
+							RelationCacheInvalidateEntry(relid);
 					}
 				}
 				else
@@ -344,7 +366,8 @@ fasttrun_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 			 * walk.
 			 */
 			if (event == SUBXACT_EVENT_ABORT_SUB && aentry != NULL &&
-				OidIsValid(fasttrun_cache_index_owner(aentry)) &&
+				(xentry->relid != xentry->root_relid ||
+				 OidIsValid(fasttrun_cache_index_owner(aentry))) &&
 				!fasttrun_cache_entry_keeps_file(aentry) &&
 				!aentry->state.has_stats_baseline &&
 				aentry->undo == NULL)
@@ -352,6 +375,8 @@ fasttrun_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 				(void) hash_search(fasttrun_analyze_cache, &relid,
 								   HASH_REMOVE, NULL);
 				aentry = NULL;
+				if (was_published)
+					RelationCacheInvalidateEntry(relid);
 			}
 
 			/*
@@ -415,15 +440,14 @@ fasttrun_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 		 * older ancestor does.  Keep this frame and retag it.  Merging into the
 		 * ancestor would make a later ROLLBACK TO the empty parent invisible.
 		 */
+		fasttrun_xact_discard_prepared_subcommit(frame);
 		frame->subid = parentSubid;
 	}
 	else
 	{
 		FasttrunXactFrame *parent = frame->parent;
 
-		hash_seq_init(&status, frame->entries);
-		while ((xentry = (FasttrunXactRelEntry *) hash_seq_search(&status)) != NULL)
-			fasttrun_xact_merge_entry(parent, xentry);
+		fasttrun_xact_apply_subcommit(parent, frame);
 		fasttrun_xact_frame = parent;
 		fasttrun_xact_frame_release(frame);
 	}

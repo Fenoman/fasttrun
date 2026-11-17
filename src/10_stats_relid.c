@@ -146,9 +146,16 @@ fasttrun_stats_relid_has_saved_samples(Oid relid)
 	return false;
 }
 
-/* True when the relid already holds column-stats keys in the cache. */
+/* Common memory counter: NULL reads as zero. */
+static Size
+fasttrun_memory_context_bytes(MemoryContext mcxt)
+{
+	return mcxt != NULL ? MemoryContextMemAllocated(mcxt, true) : 0;
+}
+
+/* True when local column samples were collected at least once for relid. */
 static bool
-fasttrun_stats_relid_has_columns(Oid relid)
+fasttrun_stats_relid_budget_admitted(Oid relid)
 {
 	FasttrunStatsRelidEntry *entry;
 
@@ -157,14 +164,7 @@ fasttrun_stats_relid_has_columns(Oid relid)
 
 	entry = (FasttrunStatsRelidEntry *)
 		hash_search(fasttrun_stats_relid_cache, &relid, HASH_FIND, NULL);
-	return entry != NULL && entry->attkeys != NIL;
-}
-
-/* Common memory counter: NULL reads as zero. */
-static Size
-fasttrun_memory_context_bytes(MemoryContext mcxt)
-{
-	return mcxt != NULL ? MemoryContextMemAllocated(mcxt, true) : 0;
+	return entry != NULL && entry->budget_admitted;
 }
 
 /*
@@ -186,7 +186,7 @@ fasttrun_stats_budget_blocks_collect(Relation rel, bool explicit_collect)
 {
 	if (fasttrun_max_stats_memory <= 0)
 		return false;
-	if (fasttrun_stats_relid_has_columns(RelationGetRelid(rel)))
+	if (fasttrun_stats_relid_budget_admitted(RelationGetRelid(rel)))
 		return false;
 	if (fasttrun_memory_context_bytes(fasttrun_stats_mcxt) <=
 		(Size) fasttrun_max_stats_memory * 1024)
@@ -215,6 +215,7 @@ fasttrun_stats_relid_init(FasttrunStatsRelidEntry *entry)
 	entry->updated_cols = NULL;
 	entry->updated_cols_exact = false;
 	entry->period_unsafe = false;
+	entry->budget_admitted = false;
 	entry->collect_seq = 0;
 	memset(&entry->heap_rlb, 0, sizeof(entry->heap_rlb));
 	entry->heap_rlb_valid = false;

@@ -73,6 +73,8 @@ fasttrun_cache_set_empty_relstats(FasttrunAnalyzeState *state,
 	state->cached_tuples = 0;
 	state->count_exact = true;
 	state->cached_allvisible = 0;
+	state->has_base_heap_tuples = true;
+	state->base_heap_tuples = 0;
 	state->has_delta_state = false;
 	state->cached_inserted = 0;
 	state->cached_updated = 0;
@@ -823,7 +825,7 @@ fasttrun_exit_plan_reset_register(void)
 static void
 fasttrun_xact_callback(XactEvent event, void *arg)
 {
-	if (fasttrun_passthrough)
+	if (fasttrun_passthrough || fasttrun_in_atx())
 		return;
 	switch (event)
 	{

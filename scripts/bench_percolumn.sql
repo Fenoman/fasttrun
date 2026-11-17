@@ -12,7 +12,12 @@ SET max_parallel_workers_per_gather = 0;
 -- у метрик рабочего цикла и переключения видимости прогрев отдельно не сделан.
 -- Печатает две колонки через вертикальную черту: имя метрики и миллисекунды.
 --
-CREATE EXTENSION IF NOT EXISTS fasttrun;
+DO $$
+BEGIN
+  IF to_regprocedure('fasttruncate(text)') IS NULL THEN
+    CREATE EXTENSION fasttrun;
+  END IF;
+END$$;
 
 CREATE TEMP TABLE bench_result (metric text, ms numeric);
 
@@ -231,7 +236,8 @@ BEGIN
     BEGIN
       UPDATE b_nest1 SET c1 = c1 WHERE id = -1;
       UPDATE b_nest2 SET c1 = c1 WHERE id = -1;
-    EXCEPTION WHEN others THEN NULL;
+    EXCEPTION WHEN OTHERS THEN
+      RAISE;
     END;
   END LOOP;
   t0 := clock_timestamp();
@@ -239,7 +245,8 @@ BEGIN
     BEGIN
       UPDATE b_nest1 SET c1 = c1 WHERE id = -1;
       UPDATE b_nest2 SET c1 = c1 WHERE id = -1;
-    EXCEPTION WHEN others THEN NULL;
+    EXCEPTION WHEN OTHERS THEN
+      RAISE;
     END;
   END LOOP;
   PERFORM bench_note('nested_dml_subxact_cleanup', t0);
@@ -323,6 +330,21 @@ END$$;
 CALL bench_flip_commits(6, 'commit_visibility_flip_warmup');
 DELETE FROM bench_result WHERE metric = 'commit_visibility_flip_warmup';
 CALL bench_flip_commits(60, 'commit_visibility_flip_large_plans');
+
+CREATE OR REPLACE PROCEDURE bench_rollbacks(n int, m text)
+LANGUAGE plpgsql AS $$
+DECLARE t0 timestamptz; i int;
+BEGIN
+  t0 := clock_timestamp();
+  FOR i IN 1..n LOOP
+    UPDATE b_plan SET grp = grp WHERE id = -1;
+    ROLLBACK;
+  END LOOP;
+  PERFORM bench_note(m, t0);
+END$$;
+CALL bench_rollbacks(300, 'rollback_warmup');
+DELETE FROM bench_result WHERE metric = 'rollback_warmup';
+CALL bench_rollbacks(3000, 'rollback_large_plan_population');
 
 -- ---------------------------------------------------------------------------
 -- 3. Повторный рабочий цикл: очистка, набор, анализ, UPDATE, запрос по ключу.

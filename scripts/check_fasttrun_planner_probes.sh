@@ -238,4 +238,10 @@ SELECT 'NESTED_MEMO_OK';
 \endif
 SQL
 
+if grep -Eq 'TRAP|Assertion|FailedAssertion|PANIC|terminated by signal|server process .* was terminated|leaked hash_seq_search' "$WORKDIR/postgres.log"; then
+	grep -E 'TRAP|Assertion|FailedAssertion|PANIC|terminated by signal|server process .* was terminated|leaked hash_seq_search' "$WORKDIR/postgres.log" >&2
+	echo "FAIL: planner probes caused an assertion or crash" >&2
+	exit 1
+fi
+
 echo "planner probe passed: $MODE"

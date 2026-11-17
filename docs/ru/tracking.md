@@ -50,8 +50,10 @@ fasttrun.track_temp_creates = on
 | `fasttrun.prewarm_schema` | `dummy_tmp` | имя схемы | администратор | Схема таблиц-шаблонов |
 | `fasttrun.track_schedule` | `mon-fri 08:00-18:00` | строка | администратор | Временные окна, когда учитываются попытки создания таблиц |
 
-Эти параметры имеют практический смысл только при загрузке fasttrun через
-`shared_preload_libraries`.
+Общий учет и предварительное создание используют эти параметры только при
+загрузке fasttrun через `shared_preload_libraries`. Имя схемы из
+`fasttrun.prewarm_schema` также читается при сборе статистики столбцов с
+включенным `fasttrun.template_stattarget` и без общей предзагрузки.
 
 Контексты "пользователь" и "администратор" объяснены в
 [statistics.md](statistics.md#настройки).

@@ -133,7 +133,9 @@ step1a() {
 step1a fasttrun.o STEP1A
 
 MASK_ARGS="-include $OUT/mask.h"
-"$CC_WORD" --version 2>/dev/null | grep -qi clang && MASK_ARGS="$MASK_ARGS -Wno-builtin-macro-redefined"
+if "$CC_WORD" -Wno-builtin-macro-redefined -E -x c /dev/null >/dev/null 2>&1; then
+	MASK_ARGS="$MASK_ARGS -Wno-builtin-macro-redefined"
+fi
 if run_cpp "$OUT/base" fasttrun.o "$OUT/base.mask.i" $MASK_ARGS &&
 	run_cpp "$OUT/cand" fasttrun.o "$OUT/cand.mask.i" $MASK_ARGS; then
 	sed '/^[[:space:]]*$/d' "$OUT/base.mask.i" > "$OUT/base.mask.nb.i"
@@ -146,7 +148,8 @@ if run_cpp "$OUT/base" fasttrun.o "$OUT/base.mask.i" $MASK_ARGS &&
 		FAILED=1
 	fi
 else
-	echo "STEP1B SKIP: preprocessor refused the mask, see $OUT/*.mask.i.err"
+	echo "STEP1B FAIL: preprocessor refused the mask, see $OUT/*.mask.i.err"
+	FAILED=1
 fi
 
 if [ "$WITH_LLVM" = yes ]; then
@@ -179,6 +182,34 @@ if build "$OUT/base" && build "$OUT/cand"; then
 	fi
 else
 	echo "STEP2 FAIL: build failed, see $OUT/base/build.log and $OUT/cand/build.log"
+	FAILED=1
+fi
+
+build_masked() {
+	local dir=$1
+	make -s -C "$dir" clean PG_CONFIG="$PG_CONFIG" >/dev/null 2>&1 || true
+	if [ "$NO_OUTLINE" = 1 ]; then
+		make -s -C "$dir" PG_CONFIG="$PG_CONFIG" PG_CPPFLAGS="$MASK_ARGS" COPT=-mno-outline > "$dir/build.mask.log" 2>&1
+	else
+		make -s -C "$dir" PG_CONFIG="$PG_CONFIG" PG_CPPFLAGS="$MASK_ARGS" > "$dir/build.mask.log" 2>&1
+	fi
+}
+
+if build_masked "$OUT/base" && build_masked "$OUT/cand"; then
+	lib=fasttrun.so
+	[ -f "$OUT/cand/fasttrun.dylib" ] && lib=fasttrun.dylib
+	step2m_rc=0
+	"${COMPARE[@]}" compare-bin --strict "$OUT/base/fasttrun.o" "$OUT/cand/fasttrun.o" obj > "$OUT/step2m.obj.txt" || step2m_rc=1
+	"${COMPARE[@]}" compare-bin --strict "$OUT/base/$lib" "$OUT/cand/$lib" lib > "$OUT/step2m.lib.txt" || step2m_rc=1
+	if [ "$step2m_rc" = 0 ]; then
+		echo "STEP2M PASS: $(tail -1 "$OUT/step2m.obj.txt"); $(tail -1 "$OUT/step2m.lib.txt")"
+	else
+		echo "STEP2M FAIL: see $OUT/step2m.obj.txt and $OUT/step2m.lib.txt"
+		head -20 "$OUT/step2m.obj.txt" "$OUT/step2m.lib.txt" || true
+		FAILED=1
+	fi
+else
+	echo "STEP2M FAIL: masked build failed, see $OUT/base/build.mask.log and $OUT/cand/build.mask.log"
 	FAILED=1
 fi
 

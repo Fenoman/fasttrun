@@ -160,4 +160,13 @@
   `CREATE STATISTICS` на временной таблице портит системный каталог. Включать
   этот режим до исправления ядра не стоит. Как тесты fasttrun обходят эти
   ошибки, описано в разделе ["Тестирование"](testing.md).
+- На Postgres Pro Enterprise внутрипроцессные автономные транзакции
+  (`BEGIN AUTONOMOUS`) не поддерживаются для работы с временными таблицами:
+  вызовы `fasttruncate`, `fasttrun_analyze`, `fasttrun_analyze_bulk`,
+  `fasttrun_collect_stats`, `fasttrun_relstats`, `fasttrun_inspect_stats`,
+  `fasttrun_cached_tables`, `fasttrun_blocked_tables`, `fasttrun_temp_is_ours`,
+  `fasttrun_temp_same_cols` и `fasttrun_prewarm` внутри автономного блока
+  отклоняются с SQLSTATE `0A000` (доступны только сводные функции счетчиков и
+  общего реестра без открытия отношений), а кеши и транзакционный журнал внешней
+  транзакции на время автономного блока не затрагиваются.
 - fasttrun не является границей безопасности между клиентами пулера.

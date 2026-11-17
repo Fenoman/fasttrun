@@ -34,7 +34,7 @@ INITDB=${INITDB:-"$PG_BINDIR/initdb"}
 PG_CTL=${PG_CTL:-"$PG_BINDIR/pg_ctl"}
 CREATEDB=${CREATEDB:-"$PG_BINDIR/createdb"}
 BPFTRACE=${BPFTRACE:-bpftrace}
-SUDO=${SUDO:-sudo}
+SUDO=${SUDO-sudo}
 PG_RUN_AS=${PG_RUN_AS:-}
 PORT=${PGPORT:-55459}
 WORKDIR=${WORKDIR:-$(mktemp -d /tmp/fasttrun-cdur.XXXXXX)}
@@ -54,14 +54,74 @@ run_pg()
 	fi
 }
 
+terminate_child()
+{
+	local pid=${1:-}
+	local sig=${2:--TERM}
+	local as_root=${3:-0}
+	local i
+	local -a kcmd=(kill)
+	[ -n "$pid" ] || return 0
+	if [ "$as_root" -eq 1 ] && [ -n "$SUDO" ]; then
+		# shellcheck disable=SC2206
+		kcmd=($SUDO kill)
+	fi
+	"${kcmd[@]}" "$sig" "$pid" >/dev/null 2>&1 || true
+	"${kcmd[@]}" -CONT "$pid" >/dev/null 2>&1 || true
+	for i in $(seq 1 20); do
+		if ! "${kcmd[@]}" -0 "$pid" >/dev/null 2>&1; then
+			wait "$pid" >/dev/null 2>&1 || true
+			return 0
+		fi
+		sleep 0.05
+	done
+	"${kcmd[@]}" -KILL "$pid" >/dev/null 2>&1 || true
+	for i in $(seq 1 20); do
+		if ! "${kcmd[@]}" -0 "$pid" >/dev/null 2>&1; then
+			wait "$pid" >/dev/null 2>&1 || true
+			return 0
+		fi
+		sleep 0.05
+	done
+	return 0
+}
+
+wait_bounded()
+{
+	local pid=$1
+	local ticks=${2:-}
+	local as_root=${3:-0}
+	local i
+	local rc=0
+	local -a kcmd=(kill)
+	[ -n "$ticks" ] || ticks=${FASTTRUN_WAIT_TICKS:-200}
+	if [ "$as_root" -eq 1 ] && [ -n "$SUDO" ]; then
+		# shellcheck disable=SC2206
+		kcmd=($SUDO kill)
+	fi
+	for i in $(seq 1 "$ticks"); do
+		if ! "${kcmd[@]}" -0 "$pid" >/dev/null 2>&1; then
+			wait "$pid" || rc=$?
+			return "$rc"
+		fi
+		sleep 0.05
+	done
+	terminate_child "$pid" -TERM "$as_root"
+	return 124
+}
+
 cleanup()
 {
 	if [ -n "${TRACE_PID:-}" ]; then
-		$SUDO kill "$TRACE_PID" >/dev/null 2>&1 || true
-		wait "$TRACE_PID" >/dev/null 2>&1 || true
+		terminate_child "$TRACE_PID" -TERM 1
+	fi
+	if [ -n "${psql_pid:-}" ]; then
+		terminate_child "$psql_pid"
 	fi
 	if [ -f "$WORKDIR/data/postmaster.pid" ]; then
-		run_pg "$PG_CTL" -D "$WORKDIR/data" -w stop >/dev/null 2>&1 || true
+		run_pg "$PG_CTL" -D "$WORKDIR/data" -m fast -w stop >/dev/null 2>&1 \
+			|| run_pg "$PG_CTL" -D "$WORKDIR/data" -m immediate -w stop >/dev/null 2>&1 \
+			|| true
 	fi
 	rm -rf "$WORKDIR"
 }
@@ -80,6 +140,7 @@ require_cmd "$INITDB"
 require_cmd "$PG_CTL"
 require_cmd "$CREATEDB"
 require_cmd "$BPFTRACE"
+require_cmd stdbuf
 if [ -n "$PG_RUN_AS" ]; then
 	require_cmd runuser
 fi
@@ -99,6 +160,9 @@ run_pg "$PG_CTL" -D "$WORKDIR/data" \
 run_pg "$CREATEDB" -h "$WORKDIR" -p "$PORT" "$DBNAME"
 run_pg "$PSQL" -h "$WORKDIR" -p "$PORT" -d "$DBNAME" -X -qAt \
 	-v ON_ERROR_STOP=1 -c "CREATE EXTENSION fasttrun" >/dev/null
+run_pg "$PSQL" -h "$WORKDIR" -p "$PORT" -d "$DBNAME" -X -qAt \
+	-v ON_ERROR_STOP=1 -c \
+	"CREATE TABLE ft_cdur_trace_gate (go boolean NOT NULL); INSERT INTO ft_cdur_trace_gate VALUES (false)" >/dev/null
 
 # Build column list once: c1 int, c2 int, ...
 cols=""
@@ -154,23 +218,33 @@ END\$do\$;
 COMMIT;
 
 SELECT 'WORKLOAD_READY';
-SELECT pg_sleep(2);
+DO \$gate\$
+BEGIN
+  WHILE NOT (SELECT go FROM ft_cdur_trace_gate) LOOP
+    PERFORM pg_sleep(0.05);
+  END LOOP;
+END\$gate\$;
 
 DO \$do\$
 DECLARE i int;
 BEGIN
   FOR i IN 1..$ITERATIONS LOOP
+    IF i = 1 THEN
+      PERFORM pg_backend_pid();
+    END IF;
     FOR j IN 1..$TEMP_TABLES LOOP
       EXECUTE format(
         'INSERT INTO ft_cdur_t_%s SELECT $inserts FROM generate_series(1, 20) g', j);
     END LOOP;
     PERFORM fasttrun_analyze_bulk(VARIADIC ARRAY[$table_names]);
-    COMMIT;
+    IF i < $ITERATIONS THEN
+      COMMIT;
+    END IF;
   END LOOP;
 END\$do\$;
 
+SELECT pg_backend_pid() \g /dev/null
 SELECT 'WORKLOAD_DONE';
-SELECT pg_sleep(2);
 SQL
 
 run_pg "$PSQL" -h "$WORKDIR" -p "$PORT" -d "$DBNAME" -X -qAt \
@@ -187,7 +261,7 @@ for _ in $(seq 1 200); do
 	sleep 0.05
 done
 if [ -z "$backend_pid" ]; then
-	wait "$psql_pid" || true
+	terminate_child "$psql_pid"
 	cat "$WORKDIR/repro.psql.out" "$WORKDIR/repro.psql.err" >&2
 	echo "не удалось прочитать pid бэкенда" >&2
 	exit 1
@@ -197,28 +271,63 @@ for _ in $(seq 1 400); do
 	if grep -q '^WORKLOAD_READY$' "$WORKDIR/repro.psql.out"; then
 		break
 	fi
+	if ! kill -0 "$psql_pid" >/dev/null 2>&1; then
+		break
+	fi
 	sleep 0.05
 done
+if ! grep -q '^WORKLOAD_READY$' "$WORKDIR/repro.psql.out"; then
+	terminate_child "$psql_pid"
+	cat "$WORKDIR/repro.psql.out" "$WORKDIR/repro.psql.err" >&2
+	echo "нагрузка не дошла до WORKLOAD_READY" >&2
+	exit 1
+fi
 
-# bpftrace: измеряем суммарное время в callback'ах через uprobe/uretprobe пары.
-# Используем nsecs builtin -- BPF без HW PMU (Parallels) с ним справляется.
-$SUDO timeout 120 "$BPFTRACE" -e "
-uprobe:$FASTTRUN_SO:fasttrun_cache_commit_xact /pid == $backend_pid/ { @ts_a[tid] = nsecs; }
+# bpftrace: измеряем суммарное время в callback'ах через uprobe/uretprobe пары
+# строго внутри фазы 1 (между первым рабочим витком и выходом из DO), чтобы
+# контрольные транзакции до и после DO не размывали среднее и счетчик.
+$SUDO stdbuf -oL "$BPFTRACE" -e "
+BEGIN { @phase = 0; printf(\"ATTACHED_READY\\n\"); }
+uprobe:$PG_BINDIR/postgres:pg_backend_pid /pid == $backend_pid/ { @phase = @phase + 1; }
+uprobe:$FASTTRUN_SO:fasttrun_cache_commit_xact /pid == $backend_pid && @phase == 1/ { @ts_a[tid] = nsecs; }
 uretprobe:\
 $FASTTRUN_SO:fasttrun_cache_commit_xact /pid == $backend_pid && @ts_a[tid] != 0/ {
   @analyze_total = sum(nsecs - @ts_a[tid]);
   @analyze_count = count();
   delete(@ts_a[tid]);
 }
-uprobe:$FASTTRUN_SO:fasttrun_stats_cache_commit_xact /pid == $backend_pid/ { @ts_s[tid] = nsecs; }
+uprobe:$FASTTRUN_SO:fasttrun_stats_cache_commit_xact /pid == $backend_pid && @phase == 1/ { @ts_s[tid] = nsecs; }
 uretprobe:\
 $FASTTRUN_SO:fasttrun_stats_cache_commit_xact /pid == $backend_pid && @ts_s[tid] != 0/ {
   @stats_total = sum(nsecs - @ts_s[tid]);
   @stats_count = count();
   delete(@ts_s[tid]);
 }
-" -o "$WORKDIR/cdur.bpf.out" 2>&1 &
+END {
+  print(@analyze_total);
+  print(@analyze_count);
+  print(@stats_total);
+  print(@stats_count);
+  print(@phase);
+  printf(\"BPFTRACE_END\\n\");
+}
+" >"$WORKDIR/cdur.bpf.out" 2>&1 &
 TRACE_PID=$!
+
+for _ in $(seq 1 400); do
+	if grep -q '^ATTACHED_READY$' "$WORKDIR/cdur.bpf.out" 2>/dev/null; then
+		break
+	fi
+	sleep 0.05
+done
+if ! grep -q '^ATTACHED_READY$' "$WORKDIR/cdur.bpf.out" 2>/dev/null; then
+	cat "$WORKDIR/cdur.bpf.out" >&2
+	echo "FAIL: bpftrace не подтвердил ATTACHED_READY" >&2
+	exit 1
+fi
+
+run_pg "$PSQL" -h "$WORKDIR" -p "$PORT" -d "$DBNAME" -X -qAt \
+	-v ON_ERROR_STOP=1 -c "UPDATE ft_cdur_trace_gate SET go = true" >/dev/null
 
 for _ in $(seq 1 6000); do
 	if grep -q '^WORKLOAD_DONE$' "$WORKDIR/repro.psql.out"; then
@@ -229,10 +338,32 @@ for _ in $(seq 1 6000); do
 	fi
 	sleep 0.1
 done
-wait "$psql_pid"
-$SUDO kill "$TRACE_PID" >/dev/null 2>&1 || true
-wait "$TRACE_PID" >/dev/null 2>&1 || true
+if ! grep -q '^WORKLOAD_DONE$' "$WORKDIR/repro.psql.out"; then
+	terminate_child "$psql_pid"
+	cat "$WORKDIR/repro.psql.out" "$WORKDIR/repro.psql.err" >&2
+	echo "FAIL: SQL-сценарий не дошел до WORKLOAD_DONE" >&2
+	exit 1
+fi
+if ! wait_bounded "$psql_pid"; then
+	cat "$WORKDIR/repro.psql.out" "$WORKDIR/repro.psql.err" >&2
+	echo "FAIL: SQL-сценарий завершился с ошибкой" >&2
+	exit 1
+fi
+
+$SUDO kill -INT "$TRACE_PID" >/dev/null 2>&1 || true
+trace_rc=0
+wait_bounded "$TRACE_PID" "" 1 || trace_rc=$?
 TRACE_PID=""
+if [ "$trace_rc" -ne 0 ] && [ "$trace_rc" -ne 130 ]; then
+	cat "$WORKDIR/cdur.bpf.out" >&2
+	echo "FAIL: bpftrace завершился с кодом $trace_rc" >&2
+	exit 1
+fi
+if ! grep -q '^BPFTRACE_END$' "$WORKDIR/cdur.bpf.out"; then
+	cat "$WORKDIR/cdur.bpf.out" >&2
+	echo "FAIL: bpftrace не напечатал финальный маркер BPFTRACE_END" >&2
+	exit 1
+fi
 
 map_value()
 {
@@ -244,11 +375,13 @@ analyze_total=$(map_value "@analyze_total")
 analyze_count=$(map_value "@analyze_count")
 stats_total=$(map_value "@stats_total")
 stats_count=$(map_value "@stats_count")
+end_phase=$(map_value "@phase")
 
 analyze_total=${analyze_total:-0}
 analyze_count=${analyze_count:-0}
 stats_total=${stats_total:-0}
 stats_count=${stats_count:-0}
+end_phase=${end_phase:-0}
 
 analyze_avg=0
 if [ "$analyze_count" -gt 0 ]; then
@@ -266,12 +399,10 @@ echo "fasttrun_cache_commit_xact:       $analyze_count       $analyze_avg"
 echo "fasttrun_stats_cache_commit_xact: $stats_count       $stats_avg"
 echo "лимит avg ns/call: $MAX_AVG_NS"
 
-# Positive-attach guard: под нагрузкой оба commit-колбэка ОБЯЗАНЫ сработать.
-# Нулевой count означает, что uprobe не подцепился к соответствующей функции
-# (stripped-бинарь, инлайн символа, права) -- avg тогда тривиально 0 и порог
-# проходит ложно. Это отдельная причина от превышения avg-лимита ниже.
-if [ "$analyze_count" -eq 0 ] || [ "$stats_count" -eq 0 ]; then
-	echo "FAIL: uprobe не подцепился (@analyze_count=$analyze_count @stats_count=$stats_count, ожидается >0) -- харнес недостоверен, ничего не измерено" >&2
+# Positive-attach guard: внутри фазы 1 оба commit-колбэка ОБЯЗАНЫ сработать
+# ровно по числу рабочих транзакций ITERATIONS, а фаза дойти до 2.
+if [ "$analyze_count" -ne "$ITERATIONS" ] || [ "$stats_count" -ne "$ITERATIONS" ] || [ "$end_phase" -ne 2 ]; then
+	echo "FAIL: uprobe поймал неточное окно (@analyze_count=$analyze_count @stats_count=$stats_count @phase=$end_phase, ожидается ровно $ITERATIONS и phase=2) -- харнес недостоверен" >&2
 	echo "  (это НЕ превышение avg-лимита: проверьте bpftrace/uprobe attach к commit-колбэкам)" >&2
 	exit 1
 fi

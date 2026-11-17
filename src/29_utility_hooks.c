@@ -32,11 +32,18 @@ fasttrun_evict_utility_caches(Node *parsetree)
 			{
 				AlterTableStmt *stmt = (AlterTableStmt *) parsetree;
 				FasttrunDdlEffect effect = fasttrun_alter_table_effect(stmt);
-				List	   *relids = fasttrun_utility_tree(
-					RangeVarGetRelid(stmt->relation, NoLock, true),
-					fasttrun_alter_table_recurses(stmt));
+				Oid			target_oid =
+					RangeVarGetRelid(stmt->relation, NoLock, true);
+				List	   *relids;
 				ListCell   *lc;
 
+				if (OidIsValid(target_oid) &&
+					get_rel_relkind(target_oid) == RELKIND_INDEX &&
+					effect != FASTTRUN_DDL_EVICTS)
+					target_oid = IndexGetRelation(target_oid, true);
+
+				relids = fasttrun_utility_tree(target_oid,
+											   fasttrun_alter_table_recurses(stmt));
 				foreach(lc, relids)
 				{
 					if (effect == FASTTRUN_DDL_EVICTS)
@@ -47,6 +54,26 @@ fasttrun_evict_utility_caches(Node *parsetree)
 													&kept_ddl);
 				}
 				list_free(relids);
+
+				foreach(lc, stmt->cmds)
+				{
+					AlterTableCmd *cmd = (AlterTableCmd *) lfirst(lc);
+
+					if ((cmd->subtype == AT_AttachPartition ||
+						 cmd->subtype == AT_DetachPartition) &&
+						cmd->def != NULL && IsA(cmd->def, PartitionCmd) &&
+						((PartitionCmd *) cmd->def)->name != NULL)
+					{
+						Oid			part_oid = RangeVarGetRelid(
+							((PartitionCmd *) cmd->def)->name, NoLock, true);
+						List	   *part_relids = fasttrun_utility_tree(part_oid, true);
+						ListCell   *plc;
+
+						foreach(plc, part_relids)
+							fasttrun_evict_temp_relid(lfirst_oid(plc));
+						list_free(part_relids);
+					}
+				}
 				break;
 			}
 		case T_CreateTrigStmt:
@@ -154,12 +181,32 @@ fasttrun_object_access_hook(ObjectAccessType access, Oid classId,
 	if (prev_object_access_hook)
 		(*prev_object_access_hook) (access, classId, objectId, subId, arg);
 
+	if (fasttrun_in_atx())
+		return;
+
+	if (access == OAT_POST_CREATE && classId == RelationRelationId && subId == 0)
+	{
+		fasttrun_fresh_note_create(objectId);
+		return;
+	}
+
 	/* Works in passthrough too: there fasttruncate is a core TRUNCATE. */
 	if (access == OAT_TRUNCATE && classId == RelationRelationId)
 	{
 		fasttrun_fresh_note_core_truncate(objectId);
+		if (!fasttrun_passthrough)
+		{
+			FasttrunPoisonEntry *pentry = fasttrun_poison_find(objectId);
+
+			if (pentry != NULL && pentry->active)
+				fasttrun_xact_mark_relid(objectId, objectId,
+										 FASTTRUN_TOUCH_POISON_RETIRE);
+		}
 		return;
 	}
+
+	if (access == OAT_DROP && classId == RelationRelationId && subId == 0)
+		fasttrun_fresh_note_drop(objectId);
 
 	if (fasttrun_passthrough || access != OAT_DROP)
 		return;
@@ -193,7 +240,7 @@ fasttrun_object_access_hook(ObjectAccessType access, Oid classId,
 			Relation	indexrel = try_relation_open(objectId, NoLock);
 
 			if (indexrel == NULL ||
-				indexrel->rd_createSubid != GetCurrentSubTransactionId())
+				fasttrun_rel_create_subid(indexrel) != GetCurrentSubTransactionId())
 				fasttrun_xact_mark_relid(heap_relid, heap_relid,
 										 FASTTRUN_TOUCH_DROPPED_COMPONENT);
 			if (indexrel != NULL)
@@ -273,6 +320,7 @@ fasttrun_utility_hook_body(PlannedStmt *pstmt,
 	List   *kept_ddl;
 	List   *statistics_drops;
 	Oid		copy_relid = InvalidOid;
+	bool	saved_unobserved_writers = fasttrun_unobserved_writers;
 
 	if (fasttrun_passthrough)
 	{
@@ -291,9 +339,20 @@ fasttrun_utility_hook_body(PlannedStmt *pstmt,
 	else if (IsA(parsetree, ExplainStmt) &&
 			 IsA(((ExplainStmt *) parsetree)->query, Query))
 	{
-		Query	   *explained = (Query *) ((ExplainStmt *) parsetree)->query;
+		ExplainStmt *estmt = (ExplainStmt *) parsetree;
+		Query	   *explained = (Query *) estmt->query;
+		ListCell   *olc;
+		bool		analyze_opt = false;
 
-		if (explained->commandType == CMD_UTILITY &&
+		foreach(olc, estmt->options)
+		{
+			DefElem    *opt = (DefElem *) lfirst(olc);
+
+			if (strcmp(opt->defname, "analyze") == 0)
+				analyze_opt = defGetBoolean(opt);
+		}
+		if (analyze_opt &&
+			explained->commandType == CMD_UTILITY &&
 			explained->utilityStmt != NULL &&
 			IsA(explained->utilityStmt, CreateTableAsStmt))
 			fasttrun_unobserved_writers = true;
@@ -350,7 +409,8 @@ fasttrun_utility_hook_body(PlannedStmt *pstmt,
 						entry->create_count = 0;
 						entry->last_create = 0;
 					}
-					entry->create_count++;
+					if (entry->create_count < PG_INT64_MAX)
+						entry->create_count++;
 					entry->last_create = GetCurrentTimestamp();
 				}
 				else
@@ -368,13 +428,21 @@ fasttrun_utility_hook_body(PlannedStmt *pstmt,
 	kept_ddl = fasttrun_evict_utility_caches(parsetree);
 	statistics_drops = fasttrun_statistics_drop_relids(parsetree);
 
-	/* Chain to next hook or standard ProcessUtility. */
-	if (prev_utility_hook)
-		prev_utility_hook(pstmt, queryString, readOnlyTree, context,
-						  params, queryEnv, dest, qc);
-	else
-		standard_ProcessUtility(pstmt, queryString, readOnlyTree, context,
-								params, queryEnv, dest, qc);
+	PG_TRY();
+	{
+		/* Chain to next hook or standard ProcessUtility. */
+		if (prev_utility_hook)
+			prev_utility_hook(pstmt, queryString, readOnlyTree, context,
+							  params, queryEnv, dest, qc);
+		else
+			standard_ProcessUtility(pstmt, queryString, readOnlyTree, context,
+									params, queryEnv, dest, qc);
+	}
+	PG_FINALLY();
+	{
+		fasttrun_unobserved_writers = saved_unobserved_writers;
+	}
+	PG_END_TRY();
 
 	if (OidIsValid(copy_relid))
 		fasttrun_stats_update_in_flight(copy_relid, -1);
@@ -387,8 +455,8 @@ fasttrun_utility_hook_body(PlannedStmt *pstmt,
 	fasttrun_finish_kept_ddl(kept_ddl);
 	fasttrun_finish_statistics_drop(statistics_drops);
 	list_free(rewrite_relids);
-	list_free(vacuum_relids);
-	list_free_deep(kept_ddl);
+	fasttrun_free_vacuum_targets(vacuum_relids);
+	fasttrun_free_kept_ddl(kept_ddl);
 	list_free(statistics_drops);
 }
 
@@ -407,22 +475,54 @@ fasttrun_utility_hook(PlannedStmt *pstmt,
 					  DestReceiver *dest,
 					  QueryCompletion *qc)
 {
-	List	   *outer_pending;
-	SubTransactionId outer_stmt_subid;
-	SubTransactionId stmt_subid;
+	List	   *outer_pending = NIL;
+	SubTransactionId outer_stmt_subid = InvalidSubTransactionId;
+	SubTransactionId stmt_subid = InvalidSubTransactionId;
+	List	   *outer_creates;
+	SubTransactionId outer_create_subid;
+	SubTransactionId create_subid;
+	MemoryContext outer_top_mcxt;
+	uint64		outer_xact_epoch;
+	bool		is_truncate;
 
-	if (pstmt->utilityStmt == NULL || !IsA(pstmt->utilityStmt, TruncateStmt))
+	if (fasttrun_in_atx())
+	{
+		if (prev_utility_hook)
+			prev_utility_hook(pstmt, queryString, readOnlyTree, context,
+							  params, queryEnv, dest, qc);
+		else
+			standard_ProcessUtility(pstmt, queryString, readOnlyTree, context,
+									params, queryEnv, dest, qc);
+		return;
+	}
+
+	if (pstmt->utilityStmt == NULL ||
+		IsA(pstmt->utilityStmt, TransactionStmt) ||
+		IsA(pstmt->utilityStmt, CallStmt) ||
+		IsA(pstmt->utilityStmt, DoStmt))
 	{
 		fasttrun_utility_hook_body(pstmt, queryString, readOnlyTree, context,
 								   params, queryEnv, dest, qc);
 		return;
 	}
 
-	outer_pending = fasttrun_fresh_pending;
-	outer_stmt_subid = fasttrun_fresh_stmt_subid;
-	stmt_subid = GetCurrentSubTransactionId();
-	fasttrun_fresh_pending = NIL;
-	fasttrun_fresh_stmt_subid = stmt_subid;
+	is_truncate = IsA(pstmt->utilityStmt, TruncateStmt);
+	outer_creates = fasttrun_create_pending;
+	outer_create_subid = fasttrun_create_stmt_subid;
+	create_subid = IsTransactionState()
+		? GetCurrentSubTransactionId() : InvalidSubTransactionId;
+	outer_top_mcxt = TopTransactionContext;
+	outer_xact_epoch = fasttrun_xact_epoch;
+	fasttrun_create_pending = NIL;
+	fasttrun_create_stmt_subid = create_subid;
+	if (is_truncate)
+	{
+		outer_pending = fasttrun_fresh_pending;
+		outer_stmt_subid = fasttrun_fresh_stmt_subid;
+		stmt_subid = GetCurrentSubTransactionId();
+		fasttrun_fresh_pending = NIL;
+		fasttrun_fresh_stmt_subid = stmt_subid;
+	}
 	PG_TRY();
 	{
 		fasttrun_utility_hook_body(pstmt, queryString, readOnlyTree, context,
@@ -431,15 +531,51 @@ fasttrun_utility_hook(PlannedStmt *pstmt,
 	PG_CATCH();
 	{
 		/* The statement failed: its tables get no mark. */
-		list_free(fasttrun_fresh_pending);
-		fasttrun_fresh_pending = outer_pending;
-		fasttrun_fresh_stmt_subid = outer_stmt_subid;
+		if (IsTransactionState() && TopTransactionContext == outer_top_mcxt &&
+			fasttrun_xact_epoch == outer_xact_epoch)
+		{
+			list_free(fasttrun_create_pending);
+			fasttrun_create_pending = outer_creates;
+			fasttrun_create_stmt_subid = outer_create_subid;
+			if (is_truncate)
+			{
+				list_free(fasttrun_fresh_pending);
+				fasttrun_fresh_pending = outer_pending;
+				fasttrun_fresh_stmt_subid = outer_stmt_subid;
+			}
+		}
+		else
+		{
+			fasttrun_create_pending = NIL;
+			fasttrun_create_stmt_subid = InvalidSubTransactionId;
+			if (is_truncate)
+			{
+				fasttrun_fresh_pending = NIL;
+				fasttrun_fresh_stmt_subid = InvalidSubTransactionId;
+			}
+		}
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
-	Assert(GetCurrentSubTransactionId() == stmt_subid);
-	fasttrun_fresh_confirm_pending(stmt_subid);
-	fasttrun_fresh_pending = outer_pending;
-	fasttrun_fresh_stmt_subid = outer_stmt_subid;
+	if (fasttrun_create_pending != NIL)
+		fasttrun_fresh_confirm_creates(create_subid);
+	if (IsTransactionState() && TopTransactionContext == outer_top_mcxt &&
+		fasttrun_xact_epoch == outer_xact_epoch)
+	{
+		fasttrun_create_pending = outer_creates;
+		fasttrun_create_stmt_subid = outer_create_subid;
+	}
+	else
+	{
+		fasttrun_create_pending = NIL;
+		fasttrun_create_stmt_subid = InvalidSubTransactionId;
+	}
+	if (is_truncate)
+	{
+		Assert(GetCurrentSubTransactionId() == stmt_subid);
+		fasttrun_fresh_confirm_pending(stmt_subid);
+		fasttrun_fresh_pending = outer_pending;
+		fasttrun_fresh_stmt_subid = outer_stmt_subid;
+	}
 }
 

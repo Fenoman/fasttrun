@@ -27,7 +27,11 @@ PostgreSQL 17 и PostgreSQL 18 ожидается результат 20/20. `fas
   `fasttrun_outer_rollback` (откат подтранзакции после смены файла или создания
   таблицы на внешнем уровне)
 
-Результат в этом режиме: 20/20.
+Результат `pg_regress` в этом режиме: 20/20 (16 выполненных наборов и 4
+пропущенных по `_1.out`). Отдельно `expected/fasttrun_fresh_1.out` и
+`expected/fasttrun_observe_1.out` задают эталонный вывод этих двух наборов при
+предзагрузке библиотеки через `shared_preload_libraries` или
+`session_preload_libraries`.
 
 Расширенный локальный набор:
 
@@ -59,12 +63,15 @@ FT_CASSERT_TARGETS="16:/path/pg16/bin/pg_config:port:log,..." \
   scripts/check_fasttrun_prerelease.sh
 ```
 
-Обязательный набор включает cassert-сборки PostgreSQL 16/17/18, 20/20
-`pg_regress`, BRIN stress, cache-init faults, fault matrix, проверки памяти,
-планировщика, локальных инвалидаций, сброса планов при завершении backend,
-основной ветки теста трекинга с предзагрузкой, сброса реестра идущих пишущих
-операторов на `PREPARE TRANSACTION`, журнала фонового воркера и зерна выборки
-блоков.
+Обязательный набор включает cassert-сборки PostgreSQL 16/17/18, проверку
+документации и контракта набора, 20/20 `pg_regress`, BRIN stress, cache-init
+faults, fault matrix, порядок и сохранение файла учета (`tracking_order`,
+`tracking_persistence`), атомарность публикации кешей (`publication_atomicity`),
+проверки памяти журнала транзакций, планировщика, сброса планов при завершении
+backend, основной ветки теста трекинга с предзагрузкой, сброса реестра идущих
+пишущих операторов на `PREPARE TRANSACTION`, журнала фонового воркера, зерна
+выборки блоков и примера интеграции с `pg_variables` (или его штатного пропуска
+с кодом 77 при отсутствии `pg_variables` либо 64-битной смены эпохи XID).
 
 Fault matrix выполняет 50 сценариев на 25 точках отказа. Короткий
 `scripts/check_fasttrun_brin_stress.sh` делает 96 обычных и 48 принудительных
@@ -83,6 +90,10 @@ make check-tracking-persistence PG_CONFIG=/path/to/pg_config
 make check-exit-plan-reset PG_CONFIG=/path/to/pg_config
 make check-tracking-preload PG_CONFIG=/path/to/pg_config
 make check-block-sample-seed PG_CONFIG=/path/to/pg_config
+make check-cache-init-release PG_CONFIG=/path/to/pg_config
+make check-example PG_CONFIG=/path/to/pg_config
+make check-codegen-selftest
+make check-codegen-identity PG_CONFIG=/path/to/pg_config
 make check-required-suite
 make check-docs
 make check-docs-installed PG_CONFIG=/path/to/pg_config
@@ -90,7 +101,9 @@ make check-docs-installed PG_CONFIG=/path/to/pg_config
 
 `check-docs-installed` устанавливает документацию штатной целью Makefile во
 временный каталог и проверяет локальные ссылки и якоря. Обязательный cassert
-набор запускает его для каждой установки PostgreSQL.
+набор запускает его для каждой установки PostgreSQL. Цель
+`check-codegen-identity` сравнивает машинный код сборки с `${BASE_REF:-HEAD}` и
+используется при чистых переносах кода между срезами без функциональных правок.
 
 Сохранение файла учета проверяет
 `scripts/check_fasttrun_tracking_persistence.sh`.
@@ -101,7 +114,8 @@ make check-docs-installed PG_CONFIG=/path/to/pg_config
 эпохах XID 0 и 2. Эпоха меняется только в собственном остановленном временном
 кластере. Также проверяется повтор после неудачной очистки. Без pg_variables
 скрипт возвращает код пропуска 77. Если вендорский `pg_resetwal` не поддерживает
-`--epoch`, скрипт проверяет эпоху 0 и возвращает 77 для недоступной проверки эпохи 2.
+`--epoch`, для проверки эпохи 2 скрипт пересоздает свой временный кластер через
+64-битный `initdb -x 8589934595` и возвращает 77 только там, где недоступен и он.
 
 `make check-exit-plan-reset` проверяет по журналу сервера, что сброс планов при
 завершении backend выполняется раньше удаления временных таблиц ядром, что

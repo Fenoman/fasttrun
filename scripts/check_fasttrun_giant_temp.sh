@@ -34,7 +34,7 @@ INITDB=${INITDB:-"$PG_BINDIR/initdb"}
 PG_CTL=${PG_CTL:-"$PG_BINDIR/pg_ctl"}
 CREATEDB=${CREATEDB:-"$PG_BINDIR/createdb"}
 BPFTRACE=${BPFTRACE:-bpftrace}
-SUDO=${SUDO:-sudo}
+SUDO=${SUDO-sudo}
 PG_RUN_AS=${PG_RUN_AS:-}
 PORT=${PGPORT:-55471}
 WORKDIR=${WORKDIR:-$(mktemp -d /tmp/fasttrun-giant.XXXXXX)}
@@ -53,14 +53,74 @@ run_pg()
 	fi
 }
 
+terminate_child()
+{
+	local pid=${1:-}
+	local sig=${2:--TERM}
+	local as_root=${3:-0}
+	local i
+	local -a kcmd=(kill)
+	[ -n "$pid" ] || return 0
+	if [ "$as_root" -eq 1 ] && [ -n "$SUDO" ]; then
+		# shellcheck disable=SC2206
+		kcmd=($SUDO kill)
+	fi
+	"${kcmd[@]}" "$sig" "$pid" >/dev/null 2>&1 || true
+	"${kcmd[@]}" -CONT "$pid" >/dev/null 2>&1 || true
+	for i in $(seq 1 20); do
+		if ! "${kcmd[@]}" -0 "$pid" >/dev/null 2>&1; then
+			wait "$pid" >/dev/null 2>&1 || true
+			return 0
+		fi
+		sleep 0.05
+	done
+	"${kcmd[@]}" -KILL "$pid" >/dev/null 2>&1 || true
+	for i in $(seq 1 20); do
+		if ! "${kcmd[@]}" -0 "$pid" >/dev/null 2>&1; then
+			wait "$pid" >/dev/null 2>&1 || true
+			return 0
+		fi
+		sleep 0.05
+	done
+	return 0
+}
+
+wait_bounded()
+{
+	local pid=$1
+	local ticks=${2:-}
+	local as_root=${3:-0}
+	local i
+	local rc=0
+	local -a kcmd=(kill)
+	[ -n "$ticks" ] || ticks=${FASTTRUN_WAIT_TICKS:-200}
+	if [ "$as_root" -eq 1 ] && [ -n "$SUDO" ]; then
+		# shellcheck disable=SC2206
+		kcmd=($SUDO kill)
+	fi
+	for i in $(seq 1 "$ticks"); do
+		if ! "${kcmd[@]}" -0 "$pid" >/dev/null 2>&1; then
+			wait "$pid" || rc=$?
+			return "$rc"
+		fi
+		sleep 0.05
+	done
+	terminate_child "$pid" -TERM "$as_root"
+	return 124
+}
+
 cleanup()
 {
 	if [ -n "${TRACE_PID:-}" ]; then
-		$SUDO kill "$TRACE_PID" >/dev/null 2>&1 || true
-		wait "$TRACE_PID" >/dev/null 2>&1 || true
+		terminate_child "$TRACE_PID" -TERM 1
+	fi
+	if [ -n "${psql_pid:-}" ]; then
+		terminate_child "$psql_pid"
 	fi
 	if [ -f "$WORKDIR/data/postmaster.pid" ]; then
-		run_pg "$PG_CTL" -D "$WORKDIR/data" -w stop >/dev/null 2>&1 || true
+		run_pg "$PG_CTL" -D "$WORKDIR/data" -m fast -w stop >/dev/null 2>&1 \
+			|| run_pg "$PG_CTL" -D "$WORKDIR/data" -m immediate -w stop >/dev/null 2>&1 \
+			|| true
 	fi
 	rm -rf "$WORKDIR"
 }
@@ -71,7 +131,7 @@ require_cmd()
 	command -v "$1" >/dev/null 2>&1 || { echo "не нашёл команду: $1" >&2; exit 1; }
 }
 require_cmd "$PSQL"; require_cmd "$INITDB"; require_cmd "$PG_CTL"
-require_cmd "$CREATEDB"; require_cmd "$BPFTRACE"
+require_cmd "$CREATEDB"; require_cmd "$BPFTRACE"; require_cmd stdbuf
 if [ -n "$PG_RUN_AS" ]; then
 	require_cmd runuser
 fi
@@ -115,33 +175,31 @@ END
 \$gate\$;
 
 -- Контрольный полный проход подтверждает, что трассировка видит
--- heap_getnext этого серверного процесса.
+-- heap_getnext этого серверного процесса. Границы фаз переключает синхронный
+-- uprobe на pg_backend_pid() внутри самого трассера без гонок со sleep:
+--   phase 1 = control, phase 2 = A (block-sampling), phase 3 = reload,
+--   phase 4 = B (full-scan), phase 5 = завершение сценария.
 CREATE TEMP TABLE trace_control AS SELECT g FROM generate_series(1, 1000) g;
 SET fasttrun.max_analyze_pages = 0;
-SELECT 'CONTROL_READY';
-SELECT pg_sleep(1);
+SELECT pg_backend_pid() \g /dev/null
 SELECT fasttrun_analyze('trace_control');
-SELECT 'CONTROL_DONE';
-SELECT pg_sleep(1);
 
 -- Прогон A: block-sampling.
 SET fasttrun.max_analyze_pages = $SAMPLE_MAX_PAGES;
-SELECT 'A_READY';
-SELECT pg_sleep(1);
+SELECT pg_backend_pid() \g /dev/null
 SELECT fasttrun_analyze('giant');
-SELECT 'A_DONE';
-SELECT pg_sleep(2);
 
--- Сброс кэша, прогон B: полный скан (порог 0).
+-- Сброс кэша (phase 3), затем прогон B: полный скан (phase 4, порог 0).
+SELECT pg_backend_pid() \g /dev/null
 SELECT fasttruncate('giant');
 INSERT INTO giant SELECT g, g % 1000, repeat('x', 40)
 FROM generate_series(1, $ROWS) g;
 SET fasttrun.max_analyze_pages = 0;
-SELECT 'B_READY';
-SELECT pg_sleep(1);
+SELECT pg_backend_pid() \g /dev/null
 SELECT fasttrun_analyze('giant');
-SELECT 'B_DONE';
-SELECT pg_sleep(2);
+SELECT pg_backend_pid() \g /dev/null
+SELECT 'WORKLOAD_DONE';
+SELECT pg_sleep(1);
 SQL
 
 run_pg "$PSQL" -h "$WORKDIR" -p "$PORT" -d "$DBNAME" -X -qAt \
@@ -155,7 +213,7 @@ for _ in $(seq 1 400); do
 	[ -n "$backend_pid" ] && break
 	sleep 0.05
 done
-[ -n "$backend_pid" ] || { wait "$psql_pid" || true; cat "$WORKDIR/repro."* >&2; echo "нет pid бэкенда" >&2; exit 1; }
+[ -n "$backend_pid" ] || { terminate_child "$psql_pid"; cat "$WORKDIR/repro."* >&2; echo "нет pid бэкенда" >&2; exit 1; }
 
 for _ in $(seq 1 6000); do
 	grep -q '^WORKLOAD_READY$' "$WORKDIR/repro.out" && break
@@ -163,7 +221,7 @@ for _ in $(seq 1 6000); do
 	sleep 0.1
 done
 if ! grep -q '^WORKLOAD_READY$' "$WORKDIR/repro.out"; then
-	wait "$psql_pid" || true
+	terminate_child "$psql_pid"
 	cat "$WORKDIR/repro.out" "$WORKDIR/repro.err" >&2
 	echo "тестовая нагрузка не дошла до точки запуска трассировки" >&2
 	exit 1
@@ -175,26 +233,23 @@ case "$total_blocks" in
 	''|*[!0-9]*) echo "неверное число блоков: $total_blocks" >&2; exit 1 ;;
 esac
 
-# Считаем heap_getnext в бэкенде с интервальным флашем; снимаем дельты
-# на границах A_READY..A_DONE и B_READY..B_DONE через shell-сэмплинг.
-$SUDO timeout 300 "$BPFTRACE" -e "
-BEGIN { printf(\"ATTACHED_READY\\n\"); }
-uprobe:$PG_BINDIR/postgres:heap_getnext /pid == $backend_pid/ { @reads = count(); }
-interval:ms:200 { print(@reads); }
-" -o "$WORKDIR/reads.bpf.out" 2>&1 &
+# Фазы переключает синхронный вызов pg_backend_pid() в том же серверном процессе,
+# поэтому каждое чтение heap_getnext попадает строго в корзину своей фазы.
+$SUDO stdbuf -oL "$BPFTRACE" -e "
+BEGIN { @phase = 0; printf(\"ATTACHED_READY\\n\"); }
+uprobe:$PG_BINDIR/postgres:pg_backend_pid /pid == $backend_pid/ { @phase = @phase + 1; }
+uprobe:$PG_BINDIR/postgres:heap_getnext /pid == $backend_pid && @phase > 0/ { @reads[@phase] = count(); }
+END { print(@phase); print(@reads); printf(\"BPFTRACE_END\\n\"); }
+" >"$WORKDIR/reads.bpf.out" 2>&1 &
 TRACE_PID=$!
 
-for _ in $(seq 1 200); do
+for _ in $(seq 1 400); do
 	if grep -q '^ATTACHED_READY$' "$WORKDIR/reads.bpf.out" 2>/dev/null; then
-		break
-	fi
-	if ! kill -0 "$TRACE_PID" >/dev/null 2>&1; then
 		break
 	fi
 	sleep 0.05
 done
-if ! grep -q '^ATTACHED_READY$' "$WORKDIR/reads.bpf.out" 2>/dev/null || \
-	! kill -0 "$TRACE_PID" >/dev/null 2>&1; then
+if ! grep -q '^ATTACHED_READY$' "$WORKDIR/reads.bpf.out" 2>/dev/null; then
 	if [ -f "$WORKDIR/reads.bpf.out" ]; then
 		cat "$WORKDIR/reads.bpf.out" >&2
 	fi
@@ -205,7 +260,6 @@ run_pg "$PSQL" -h "$WORKDIR" -p "$PORT" -d "$DBNAME" -X -qAt \
 	-v ON_ERROR_STOP=1 -c \
 	'UPDATE fasttrun_giant_trace_gate SET go = true' >/dev/null
 
-snap() { awk '$1 == "@reads:" {gsub(/[^0-9]/,"",$2); print $2}' "$WORKDIR/reads.bpf.out" | tail -1 | tr -dc 0-9; }
 wait_marker() {
 	for _ in $(seq 1 6000); do
 		grep -q "^$1\$" "$WORKDIR/repro.out" && return 0
@@ -215,33 +269,48 @@ wait_marker() {
 	return 1
 }
 
-wait_marker CONTROL_READY || { echo "контрольный полный проход не начался" >&2; exit 1; }
-sleep 0.5; control_start=$(snap)
-wait_marker CONTROL_DONE || { echo "контрольный полный проход не завершился" >&2; exit 1; }
-sleep 0.5; control_end=$(snap)
-wait_marker A_READY || { echo "выборка по блокам не началась" >&2; exit 1; }
-sleep 0.5; a_start=$(snap)
-wait_marker A_DONE  || { echo "выборка по блокам не завершилась" >&2; exit 1; }
-sleep 0.5; a_end=$(snap)
-wait_marker B_READY || { echo "полный проход не начался" >&2; exit 1; }
-sleep 0.5; b_start=$(snap)
-wait_marker B_DONE  || { echo "полный проход не завершился" >&2; exit 1; }
-sleep 0.5; b_end=$(snap)
+wait_marker WORKLOAD_DONE || {
+	terminate_child "$psql_pid"
+	cat "$WORKDIR/repro.out" "$WORKDIR/repro.err" >&2
+	echo "SQL-сценарий большой временной таблицы не дошел до WORKLOAD_DONE" >&2
+	exit 1
+}
 
-if ! wait "$psql_pid"; then
+if ! wait_bounded "$psql_pid"; then
 	cat "$WORKDIR/repro.out" "$WORKDIR/repro.err" >&2
 	echo "SQL-сценарий большой временной таблицы завершился ошибкой" >&2
 	exit 1
 fi
-$SUDO kill "$TRACE_PID" >/dev/null 2>&1 || true
-wait "$TRACE_PID" >/dev/null 2>&1 || true
+$SUDO kill -INT "$TRACE_PID" >/dev/null 2>&1 || true
+trace_rc=0
+wait_bounded "$TRACE_PID" "" 1 || trace_rc=$?
 TRACE_PID=""
+if [ "$trace_rc" -ne 0 ] && [ "$trace_rc" -ne 130 ]; then
+	cat "$WORKDIR/reads.bpf.out" >&2
+	echo "FAIL: bpftrace завершился с кодом $trace_rc" >&2
+	exit 1
+fi
+if ! grep -q '^BPFTRACE_END$' "$WORKDIR/reads.bpf.out"; then
+	cat "$WORKDIR/reads.bpf.out" >&2
+	echo "FAIL: bpftrace не напечатал финальный маркер BPFTRACE_END" >&2
+	exit 1
+fi
 
-control_start=${control_start:-0}; control_end=${control_end:-0}
-a_start=${a_start:-0}; a_end=${a_end:-0}; b_start=${b_start:-0}; b_end=${b_end:-0}
-control_reads=$(( control_end - control_start ))
-a_reads=$(( a_end - a_start ))
-b_reads=$(( b_end - b_start ))
+phase_reads() {
+	val=$(awk -v k="@reads[$1]:" '$1 == k {gsub(/[^0-9]/,"",$2); print $2}' "$WORKDIR/reads.bpf.out" | tail -1)
+	printf '%s' "${val:-0}"
+}
+end_phase=$(awk '$1 == "@phase:" {gsub(/[^0-9]/,"",$2); print $2}' "$WORKDIR/reads.bpf.out" | tail -1)
+end_phase=${end_phase:-0}
+if [ "$end_phase" -ne 5 ]; then
+	cat "$WORKDIR/reads.bpf.out" >&2
+	echo "FAIL: трассировка завершилась на фазе $end_phase вместо 5 (неполное окно)" >&2
+	exit 1
+fi
+
+control_reads=$(phase_reads 1)
+a_reads=$(phase_reads 2)
+b_reads=$(phase_reads 4)
 
 cat <<METRICS
 

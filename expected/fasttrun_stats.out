@@ -5523,6 +5523,317 @@ BEGIN
 END$$;
 COMMIT;
 DROP TABLE t_expr_light;
+-- Borrowed statsTuple safety under re-entrant collection from an operator.
+CREATE TEMP TABLE t_stats_borrow(v int);
+INSERT INTO t_stats_borrow
+  SELECT CASE WHEN g <= 900 THEN 1 ELSE 2 END FROM generate_series(1, 1000) g;
+CREATE FUNCTION pg_temp.ft_recollect_eq(a int, b int) RETURNS boolean
+LANGUAGE plpgsql VOLATILE AS $$
+BEGIN
+  PERFORM fasttrun_collect_stats('pg_temp.t_stats_borrow');
+  RETURN a = b;
+END$$;
+CREATE OPERATOR pg_temp.=== (
+  FUNCTION = pg_temp.ft_recollect_eq,
+  LEFTARG = int, RIGHTARG = int,
+  RESTRICT = pg_catalog.eqsel
+);
+BEGIN;
+DO $$
+DECLARE
+  est_miss int;
+  est_hit int;
+BEGIN
+  PERFORM fasttrun_analyze('t_stats_borrow');
+  est_miss := ft_rows_est('SELECT * FROM t_stats_borrow WHERE v OPERATOR(pg_temp.===) 3',
+                          'on t_stats_borrow');
+  est_hit := ft_rows_est('SELECT * FROM t_stats_borrow WHERE v OPERATOR(pg_temp.===) 1',
+                         'on t_stats_borrow');
+  IF est_miss <> 1 OR est_hit <> 900 THEN
+    RAISE EXCEPTION 're-entrant collect corrupted borrowed statsTuple: miss=%, hit=%',
+      est_miss, est_hit;
+  END IF;
+END$$;
+COMMIT;
+DROP OPERATOR pg_temp.=== (int, int);
+DROP FUNCTION pg_temp.ft_recollect_eq(int, int);
+DROP TABLE t_stats_borrow;
+-- Security context isolation in index rebuild (fasttruncate) and stats callbacks.
+CREATE ROLE ft_sec_owner;
+CREATE ROLE ft_sec_caller;
+GRANT ft_sec_owner TO ft_sec_caller;
+CREATE SCHEMA ft_sec_hijack AUTHORIZATION ft_sec_caller;
+CREATE FUNCTION public.ft_sec_allequal(oid) RETURNS boolean
+LANGUAGE plpgsql IMMUTABLE AS $$
+BEGIN
+  IF current_setting('application_name', true) IN ('ft_sec_probe', 'ft_sec_throw') THEN
+    IF current_user <> 'ft_sec_owner' OR
+       current_setting('search_path') <> 'pg_catalog, pg_temp' THEN
+      RAISE EXCEPTION 'allequal callback bad context: usr=%, sp=%',
+        current_user, current_setting('search_path');
+    END IF;
+    IF current_setting('application_name', true) = 'ft_sec_throw' THEN
+      RAISE EXCEPTION 'sec_cb_allequal_boom';
+    END IF;
+    RAISE NOTICE 'sec_cb:allequal:%:%', current_user, current_setting('search_path');
+  END IF;
+  RETURN false;
+END$$;
+CREATE OPERATOR CLASS public.ft_sec_int4_ops FOR TYPE int4 USING btree AS
+  OPERATOR 1 <, OPERATOR 2 <=, OPERATOR 3 =, OPERATOR 4 >=, OPERATOR 5 >,
+  FUNCTION 1 btint4cmp(int4, int4),
+  FUNCTION 4 public.ft_sec_allequal(oid);
+CREATE FUNCTION public.ft_sec_expr(v int) RETURNS int
+LANGUAGE plpgsql IMMUTABLE AS $$
+BEGIN
+  IF current_setting('application_name', true) IN ('ft_sec_probe', 'ft_sec_throw') THEN
+    IF current_user <> 'ft_sec_owner' OR
+       current_setting('search_path') <> 'pg_catalog, pg_temp' THEN
+      RAISE EXCEPTION 'expr callback bad context: usr=%, sp=%',
+        current_user, current_setting('search_path');
+    END IF;
+    IF current_setting('application_name', true) = 'ft_sec_throw' THEN
+      RAISE EXCEPTION 'sec_cb_expr_boom';
+    END IF;
+    RAISE NOTICE 'sec_cb:expr:%:%', current_user, current_setting('search_path');
+  END IF;
+  RETURN v;
+END$$;
+SET ROLE ft_sec_owner;
+CREATE TEMP TABLE t_sec_cb(id int);
+CREATE INDEX t_sec_cb_op_idx ON t_sec_cb (id public.ft_sec_int4_ops);
+CREATE INDEX t_sec_cb_expr_idx ON t_sec_cb ((public.ft_sec_expr(id)));
+INSERT INTO t_sec_cb VALUES (1);
+GRANT ALL ON TABLE t_sec_cb TO ft_sec_caller;
+SET ROLE ft_sec_caller;
+SET search_path = ft_sec_hijack, public;
+SET application_name = 'ft_sec_probe';
+DO $$
+BEGIN
+  PERFORM public.fasttrun_analyze('pg_temp.t_sec_cb');
+  PERFORM public.fasttruncate('pg_temp.t_sec_cb');
+  IF current_user <> 'ft_sec_caller' OR
+     current_setting('search_path') <> 'ft_sec_hijack, public' THEN
+    RAISE EXCEPTION 'caller context not restored after success';
+  END IF;
+END$$;
+NOTICE:  sec_cb:expr:ft_sec_owner:pg_catalog, pg_temp
+NOTICE:  sec_cb:allequal:ft_sec_owner:pg_catalog, pg_temp
+SET application_name = '';
+INSERT INTO t_sec_cb VALUES (2);
+SET application_name = 'ft_sec_throw';
+DO $$
+DECLARE
+  caught_an boolean := false;
+  caught_tr boolean := false;
+BEGIN
+  BEGIN
+    PERFORM public.fasttrun_analyze('pg_temp.t_sec_cb');
+  EXCEPTION WHEN raise_exception THEN
+    IF SQLERRM = 'sec_cb_expr_boom' THEN caught_an := true; ELSE RAISE; END IF;
+  END;
+  IF NOT caught_an OR current_user <> 'ft_sec_caller' OR
+     current_setting('search_path') <> 'ft_sec_hijack, public' THEN
+    RAISE EXCEPTION 'caller context not restored after analyze callback error';
+  END IF;
+  BEGIN
+    PERFORM public.fasttruncate('pg_temp.t_sec_cb');
+  EXCEPTION WHEN raise_exception THEN
+    IF SQLERRM = 'sec_cb_allequal_boom' THEN caught_tr := true; ELSE RAISE; END IF;
+  END;
+  IF NOT caught_tr OR current_user <> 'ft_sec_caller' OR
+     current_setting('search_path') <> 'ft_sec_hijack, public' THEN
+    RAISE EXCEPTION 'caller context not restored after truncate callback error';
+  END IF;
+END$$;
+SET application_name = '';
+DO $$BEGIN PERFORM public.fasttruncate('pg_temp.t_sec_cb'); END$$;
+RESET application_name;
+RESET search_path;
+RESET ROLE;
+DROP TABLE t_sec_cb;
+DROP FUNCTION public.ft_sec_expr(int);
+DROP OPERATOR CLASS public.ft_sec_int4_ops USING btree;
+DROP FUNCTION public.ft_sec_allequal(oid);
+DROP SCHEMA ft_sec_hijack;
+REVOKE ft_sec_owner FROM ft_sec_caller;
+DROP ROLE ft_sec_caller;
+DROP ROLE ft_sec_owner;
+-- vardata->acl_ok: unprivileged callers through security_barrier views must not
+-- receive MCV/histogram values in non-LEAKPROOF operators.
+CREATE ROLE ft_acl_reader;
+CREATE TEMP TABLE t_acl_secret(secret text);
+CREATE INDEX t_acl_secret_expr ON t_acl_secret ((lower(secret)));
+CREATE INDEX t_acl_secret_brin ON t_acl_secret USING brin (secret);
+INSERT INTO t_acl_secret SELECT 'tok_' || (g % 3) FROM generate_series(1, 300) g;
+DO $$BEGIN PERFORM fasttrun_analyze('t_acl_secret'); END$$;
+CREATE TEMP VIEW v_acl_secret WITH (security_barrier = true) AS
+  SELECT secret FROM t_acl_secret WHERE secret <> 'never_match';
+GRANT SELECT ON v_acl_secret TO ft_acl_reader;
+CREATE FUNCTION public.ft_acl_probe_op(a text, b text) RETURNS boolean
+LANGUAGE plpgsql COST 1 AS $$
+BEGIN
+  RAISE EXCEPTION 'leaked MCV value: %', a;
+END$$;
+CREATE OPERATOR public.~=~ (
+  FUNCTION = public.ft_acl_probe_op,
+  LEFTARG = text, RIGHTARG = text,
+  RESTRICT = pg_catalog.eqsel
+);
+-- Positive control: owner directly querying table invokes non-leakproof operator on MCV.
+DO $$
+DECLARE
+  p json;
+  owner_invoked boolean := false;
+BEGIN
+  BEGIN
+    EXECUTE 'EXPLAIN (FORMAT JSON) SELECT * FROM t_acl_secret WHERE secret OPERATOR(public.~=~) ''x''' INTO p;
+  EXCEPTION WHEN raise_exception THEN
+    IF SQLERRM LIKE 'leaked MCV value: tok_%' THEN
+      owner_invoked := true;
+    ELSE
+      RAISE;
+    END IF;
+  END;
+  IF NOT owner_invoked THEN
+    RAISE EXCEPTION 'positive control did not invoke probe operator on MCV';
+  END IF;
+END$$;
+SET ROLE ft_acl_reader;
+DO $$DECLARE p json;
+BEGIN
+  EXECUTE 'EXPLAIN (FORMAT JSON) SELECT * FROM pg_temp.v_acl_secret WHERE secret OPERATOR(public.~=~) ''x''' INTO p;
+  EXECUTE 'EXPLAIN (FORMAT JSON) SELECT * FROM pg_temp.v_acl_secret WHERE lower(secret) OPERATOR(public.~=~) ''x''' INTO p;
+  EXECUTE 'EXPLAIN (FORMAT JSON) SELECT * FROM pg_temp.v_acl_secret WHERE secret = ''tok_1'' AND lower(secret) = ''tok_1''' INTO p;
+END$$;
+RESET ROLE;
+DROP VIEW v_acl_secret;
+DROP TABLE t_acl_secret;
+DROP OPERATOR public.~=~ (text, text);
+DROP FUNCTION public.ft_acl_probe_op(text, text);
+DROP ROLE ft_acl_reader;
+-- SET STATISTICS 0, partial ANALYZE + sample_rows = 0, and max_stats_memory after fasttruncate.
+CREATE TEMP TABLE t_stat0_col(a int, b int);
+CREATE INDEX t_stat0_col_expr ON t_stat0_col ((a + 0));
+INSERT INTO t_stat0_col SELECT 1, g FROM generate_series(1, 1000) g;
+DO $$BEGIN PERFORM fasttrun_analyze('t_stat0_col'); END$$;
+ALTER TABLE t_stat0_col ALTER COLUMN a SET STATISTICS 0;
+ALTER INDEX t_stat0_col_expr ALTER COLUMN 1 SET STATISTICS 0;
+DO $$
+BEGIN
+  PERFORM fasttrun_analyze('t_stat0_col');
+  IF EXISTS (SELECT 1 FROM fasttrun_inspect_stats('t_stat0_col') WHERE staattnum = 1) OR
+     EXISTS (SELECT 1 FROM fasttrun_inspect_stats('t_stat0_col')
+              WHERE starelid = 't_stat0_col_expr'::regclass) THEN
+    RAISE EXCEPTION 'SET STATISTICS 0 survived zero-churn fasttrun_analyze';
+  END IF;
+END$$;
+ALTER TABLE t_stat0_col ALTER COLUMN b SET STATISTICS 0;
+DO $$
+BEGIN
+  PERFORM fasttrun_collect_stats('t_stat0_col');
+  IF EXISTS (SELECT 1 FROM fasttrun_inspect_stats('t_stat0_col')) THEN
+    RAISE EXCEPTION 'all-zero statistics targets survived fasttrun_collect_stats';
+  END IF;
+END$$;
+DROP TABLE t_stat0_col;
+CREATE TEMP TABLE t_core_override_zero(a int, b int);
+INSERT INTO t_core_override_zero SELECT 1, g FROM generate_series(1, 1000) g;
+DO $$BEGIN PERFORM fasttrun_analyze('t_core_override_zero'); END$$;
+ANALYZE t_core_override_zero(a);
+UPDATE t_core_override_zero SET a = b;
+BEGIN;
+SET LOCAL fasttrun.sample_rows = 0;
+DO $$
+BEGIN
+  PERFORM fasttrun_analyze('t_core_override_zero');
+  IF ft_rows_est('SELECT * FROM t_core_override_zero WHERE a = 1',
+                 'on t_core_override_zero') > 50 THEN
+    RAISE EXCEPTION 'stale CORE_ALLOWED column survived fasttrun_analyze with sample_rows=0';
+  END IF;
+END$$;
+COMMIT;
+DROP TABLE t_core_override_zero;
+CREATE TEMP TABLE t_budget_fill(v text);
+CREATE TEMP TABLE t_budget_victim(v text);
+INSERT INTO t_budget_fill SELECT repeat('x', 200) || g FROM generate_series(1, 2000) g;
+INSERT INTO t_budget_victim SELECT 'y' || g FROM generate_series(1, 500) g;
+ANALYZE t_budget_victim(v);
+DO $$
+BEGIN
+  PERFORM fasttruncate('t_budget_victim');
+  INSERT INTO t_budget_victim SELECT 'z' || g FROM generate_series(1, 500) g;
+  PERFORM fasttrun_analyze('t_budget_fill');
+  SET LOCAL fasttrun.max_stats_memory = 1;
+  PERFORM fasttrun_analyze('t_budget_victim');
+  IF EXISTS (SELECT 1 FROM fasttrun_inspect_stats('t_budget_victim')) THEN
+    RAISE EXCEPTION 'unadmitted table bypassed max_stats_memory cap after fasttruncate';
+  END IF;
+END$$;
+DROP TABLE t_budget_fill, t_budget_victim;
+-- Inheritance stainherit=true handoff and ATTACH/DETACH PARTITION cache eviction.
+CREATE TEMP TABLE t_inh_handoff_p(a int, b int);
+INSERT INTO t_inh_handoff_p SELECT 1, g FROM generate_series(1, 500) g;
+DO $$BEGIN PERFORM fasttrun_analyze('t_inh_handoff_p'); END$$;
+CREATE TEMP TABLE t_inh_handoff_c() INHERITS (t_inh_handoff_p);
+INSERT INTO t_inh_handoff_c SELECT 1, g FROM generate_series(501, 1000) g;
+ANALYZE t_inh_handoff_p(a);
+DO $$
+DECLARE p json;
+BEGIN
+  EXECUTE 'EXPLAIN (FORMAT JSON) SELECT a FROM t_inh_handoff_p GROUP BY a' INTO p;
+  IF (p->0->'Plan'->>'Plan Rows')::int > 5 THEN
+    RAISE EXCEPTION 'partial ANALYZE on inheritance parent hid stainherit=true stats: %', p;
+  END IF;
+END$$;
+DROP TABLE t_inh_handoff_p CASCADE;
+NOTICE:  drop cascades to table t_inh_handoff_c
+CREATE TEMP TABLE t_attach_parent(id int) PARTITION BY RANGE (id);
+CREATE TEMP TABLE t_attach_leaf(id int);
+INSERT INTO t_attach_leaf SELECT generate_series(1, 200);
+DO $$BEGIN PERFORM fasttrun_analyze('t_attach_leaf'); END$$;
+ALTER TABLE t_attach_parent ATTACH PARTITION t_attach_leaf FOR VALUES FROM (1) TO (1000);
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM fasttrun_inspect_stats('t_attach_leaf')) OR
+     EXISTS (SELECT 1 FROM fasttrun_cached_tables()
+              WHERE relname = 't_attach_leaf' AND reltuples IS NOT NULL) THEN
+    RAISE EXCEPTION 'ATTACH PARTITION did not evict leaf stats/relstats';
+  END IF;
+END$$;
+DROP TABLE t_attach_parent;
+-- Changing fasttrun.prewarm_schema invalidates the template attstattarget memo.
+CREATE SCHEMA ft_tmpl_s1;
+CREATE SCHEMA ft_tmpl_s2;
+CREATE TABLE ft_tmpl_s1.t_memo_sw(a int);
+CREATE TABLE ft_tmpl_s2.t_memo_sw(a int);
+ALTER TABLE ft_tmpl_s1.t_memo_sw ALTER COLUMN a SET STATISTICS 0;
+ALTER TABLE ft_tmpl_s2.t_memo_sw ALTER COLUMN a SET STATISTICS 100;
+CREATE TEMP TABLE t_memo_sw(a int);
+INSERT INTO t_memo_sw SELECT generate_series(1, 200);
+BEGIN;
+SET LOCAL fasttrun.prewarm_schema = 'ft_tmpl_s1';
+DO $$
+BEGIN
+  PERFORM fasttrun_collect_stats('t_memo_sw');
+  IF EXISTS (SELECT 1 FROM fasttrun_inspect_stats('t_memo_sw')) THEN
+    RAISE EXCEPTION 'template s1 target=0 was ignored';
+  END IF;
+END$$;
+SET LOCAL fasttrun.prewarm_schema = 'ft_tmpl_s2';
+DO $$
+BEGIN
+  PERFORM fasttrun_collect_stats('t_memo_sw');
+  IF NOT EXISTS (SELECT 1 FROM fasttrun_inspect_stats('t_memo_sw')) THEN
+    RAISE EXCEPTION 'template memo ignored prewarm_schema switch to s2';
+  END IF;
+END$$;
+COMMIT;
+DROP TABLE t_memo_sw;
+DROP SCHEMA ft_tmpl_s1 CASCADE;
+NOTICE:  drop cascades to table ft_tmpl_s1.t_memo_sw
+DROP SCHEMA ft_tmpl_s2 CASCADE;
+NOTICE:  drop cascades to table ft_tmpl_s2.t_memo_sw
 DROP FUNCTION ft_rows_est(text, text);
 \pset format aligned
 DROP EXTENSION fasttrun;

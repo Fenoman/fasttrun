@@ -187,12 +187,12 @@ The synthetic test is in
 for your own system.
 
 To compare two builds against each other there is
-[scripts/bench_percolumn.sh](../../scripts/bench_percolumn.sh): it swaps in two
-pre-built libraries in turn and runs
-[scripts/bench_percolumn.sql](../../scripts/bench_percolumn.sql) in alternating
-series, collecting the measurements into `scripts/raw.csv`. The alternation
-matters: on single runs machine noise easily passes for a difference between
-builds that is not there.
+[scripts/bench_percolumn.sh](../../scripts/bench_percolumn.sh): it starts an
+isolated disposable cluster, swaps in two pre-built libraries in `ABBA` order,
+and runs [scripts/bench_percolumn.sql](../../scripts/bench_percolumn.sql),
+collecting the measurements into a temporary CSV (`BENCH_OUT_CSV`). The
+alternation matters: on single runs machine noise easily passes for a difference
+between builds that is not there.
 
 Example of the observed effect on one production cluster:
 

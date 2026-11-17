@@ -33,7 +33,7 @@ INITDB=${INITDB:-"$PG_BINDIR/initdb"}
 PG_CTL=${PG_CTL:-"$PG_BINDIR/pg_ctl"}
 CREATEDB=${CREATEDB:-"$PG_BINDIR/createdb"}
 BPFTRACE=${BPFTRACE:-bpftrace}
-SUDO=${SUDO:-sudo}
+SUDO=${SUDO-sudo}
 PG_RUN_AS=${PG_RUN_AS:-}
 PORT=${PGPORT:-55439}
 WORKDIR=${WORKDIR:-$(mktemp -d /tmp/fasttrun-bulk.XXXXXX)}
@@ -55,14 +55,72 @@ run_pg()
 }
 
 BPF_PID=""
+
+terminate_child()
+{
+	local pid=${1:-}
+	local sig=${2:--TERM}
+	local as_root=${3:-0}
+	local i
+	local -a kcmd=(kill)
+	[ -n "$pid" ] || return 0
+	if [ "$as_root" -eq 1 ] && [ -n "$SUDO" ]; then
+		# shellcheck disable=SC2206
+		kcmd=($SUDO kill)
+	fi
+	"${kcmd[@]}" "$sig" "$pid" >/dev/null 2>&1 || true
+	"${kcmd[@]}" -CONT "$pid" >/dev/null 2>&1 || true
+	for i in $(seq 1 20); do
+		if ! "${kcmd[@]}" -0 "$pid" >/dev/null 2>&1; then
+			wait "$pid" >/dev/null 2>&1 || true
+			return 0
+		fi
+		sleep 0.05
+	done
+	"${kcmd[@]}" -KILL "$pid" >/dev/null 2>&1 || true
+	for i in $(seq 1 20); do
+		if ! "${kcmd[@]}" -0 "$pid" >/dev/null 2>&1; then
+			wait "$pid" >/dev/null 2>&1 || true
+			return 0
+		fi
+		sleep 0.05
+	done
+	return 0
+}
+
+wait_bounded()
+{
+	local pid=$1
+	local ticks=${2:-}
+	local as_root=${3:-0}
+	local i
+	local rc=0
+	local -a kcmd=(kill)
+	[ -n "$ticks" ] || ticks=${FASTTRUN_WAIT_TICKS:-200}
+	if [ "$as_root" -eq 1 ] && [ -n "$SUDO" ]; then
+		# shellcheck disable=SC2206
+		kcmd=($SUDO kill)
+	fi
+	for i in $(seq 1 "$ticks"); do
+		if ! "${kcmd[@]}" -0 "$pid" >/dev/null 2>&1; then
+			wait "$pid" || rc=$?
+			return "$rc"
+		fi
+		sleep 0.05
+	done
+	terminate_child "$pid" -TERM "$as_root"
+	return 124
+}
+
 cleanup()
 {
 	if [ -n "$BPF_PID" ]; then
-		$SUDO kill "$BPF_PID" >/dev/null 2>&1 || true
-		wait "$BPF_PID" >/dev/null 2>&1 || true
+		terminate_child "$BPF_PID" -TERM 1
 	fi
 	if [ -f "$WORKDIR/data/postmaster.pid" ]; then
-		run_pg "$PG_CTL" -D "$WORKDIR/data" -w stop >/dev/null 2>&1 || true
+		run_pg "$PG_CTL" -D "$WORKDIR/data" -m fast -w stop >/dev/null 2>&1 \
+			|| run_pg "$PG_CTL" -D "$WORKDIR/data" -m immediate -w stop >/dev/null 2>&1 \
+			|| true
 	fi
 	rm -rf "$WORKDIR"
 }
@@ -73,7 +131,7 @@ require_cmd()
 	command -v "$1" >/dev/null 2>&1 || { echo "не нашёл команду: $1" >&2; exit 1; }
 }
 require_cmd "$PSQL"; require_cmd "$INITDB"; require_cmd "$PG_CTL"
-require_cmd "$CREATEDB"; require_cmd "$BPFTRACE"
+require_cmd "$CREATEDB"; require_cmd "$BPFTRACE"; require_cmd stdbuf
 if [ -n "$PG_RUN_AS" ]; then
 	require_cmd runuser
 fi
@@ -103,30 +161,31 @@ BPF_PROG="$WORKDIR/bulk.bt"
 {
 	echo 'BEGIN { printf("FASTTRUN_BULK_READY\n"); }'
 	echo "uprobe:$FASTTRUN_SO:fasttrun_invalidate_local_plan_cache { @ft_inval[pid] = count(); }"
+	echo "uprobe:$PG_BINDIR/postgres:pg_backend_pid { @end_sentinel[pid] = count(); }"
 	if [ "$PLAN_CB_OK" -eq 1 ]; then
 		echo "uprobe:$PG_BINDIR/postgres:PlanCacheRelCallback { @plan_cb[pid] = count(); }"
 	fi
 	echo "END { print(@ft_inval);"
+	echo "        print(@end_sentinel);"
 	[ "$PLAN_CB_OK" -eq 1 ] && echo "        print(@plan_cb);"
+	echo '        printf("BPFTRACE_END\n");'
 	echo "}"
 } >"$BPF_PROG"
 
 BPF_DUMP="$WORKDIR/bulk.out"
 BPF_ERR="$WORKDIR/bulk.err"
-$SUDO "$BPFTRACE" "$BPF_PROG" -o "$BPF_DUMP" 2>"$BPF_ERR" &
+$SUDO stdbuf -oL "$BPFTRACE" "$BPF_PROG" >"$BPF_DUMP" 2>"$BPF_ERR" &
 BPF_PID=$!
 
 # Wait for the BPF program's marker after probe attachment.
 attached=0
 for _ in $(seq 1 200); do
 	if grep -qx 'FASTTRUN_BULK_READY' "$BPF_DUMP" 2>/dev/null; then attached=1; break; fi
-	if ! kill -0 "$BPF_PID" >/dev/null 2>&1; then break; fi
 	sleep 0.1
 done
 if [ "$attached" -ne 1 ]; then
 	echo "bpftrace не прицепился:" >&2; cat "$BPF_DUMP" "$BPF_ERR" >&2; exit 1
 fi
-sleep 1
 
 # --- SQL одного варианта: своя сессия, свой pid ---
 # Порог invalidate действует на дрейф relstats.  analyze после любого DML
@@ -181,6 +240,7 @@ VSQL
 		cat <<VSQL
   END LOOP;
 END\$do\$;
+SELECT pg_backend_pid() \g /dev/null
 SELECT '${marker}_DONE';
 VSQL
 	} >"$sqlpath"
@@ -208,14 +268,30 @@ run_variant()
 	vpid[$v]=$pid
 }
 
-for v in A B C D; do run_variant "$v"; done
+for v in A B C D; do
+	run_variant "$v"
+	if ! $SUDO kill -0 "$BPF_PID" >/dev/null 2>&1; then
+		cat "$BPF_DUMP" "$BPF_ERR" >&2
+		echo "FAIL: bpftrace завершился до окончания варианта $v" >&2
+		exit 1
+	fi
+done
 
 # Останавливаем bpftrace -- END печатает карты по pid.
-$SUDO kill "$BPF_PID" >/dev/null 2>&1 || true
-wait "$BPF_PID" >/dev/null 2>&1 || true
+$SUDO kill -INT "$BPF_PID" >/dev/null 2>&1 || true
+bpf_rc=0
+wait_bounded "$BPF_PID" "" 1 || bpf_rc=$?
 BPF_PID=""
-# Дать файлу дописаться.
-for _ in $(seq 1 50); do grep -q '@ft_inval\[' "$BPF_DUMP" 2>/dev/null && break; sleep 0.1; done
+if [ "$bpf_rc" -ne 0 ] && [ "$bpf_rc" -ne 130 ]; then
+	cat "$BPF_DUMP" "$BPF_ERR" >&2
+	echo "FAIL: bpftrace завершился с кодом $bpf_rc" >&2
+	exit 1
+fi
+if ! grep -qx 'BPFTRACE_END' "$BPF_DUMP" 2>/dev/null; then
+	cat "$BPF_DUMP" "$BPF_ERR" >&2
+	echo "FAIL: bpftrace не напечатал финальный маркер BPFTRACE_END" >&2
+	exit 1
+fi
 
 # @ft_inval[<pid>]: <count>  ->  count для pid варианта
 count_for()
@@ -248,12 +324,20 @@ if [ "$PLAN_CB_OK" -eq 1 ]; then
 fi
 
 failed=0
-if [ "$A_inval" -le 0 ]; then
-	echo "FAIL: baseline дал ноль инвалидаций -- uprobe на fasttrun.so не подцепился?" >&2
+for v in A B C D; do
+	sent=$(count_for @end_sentinel "${vpid[$v]}")
+	if [ "$sent" -lt 2 ]; then
+		echo "FAIL: вариант $v (pid=${vpid[$v]}) не подтвердил полное окно трассировки (@end_sentinel=$sent, ожидалось >=2)" >&2
+		exit 1
+	fi
+done
+expected_min=$(( ITERATIONS * TEMP_TABLES ))
+if [ "$A_inval" -lt "$expected_min" ]; then
+	echo "FAIL: baseline A дал только $A_inval инвалидаций при ожидаемых >= $expected_min" >&2
 	exit 1
 fi
-if [ "$C_inval" -le 0 ]; then
-	echo "FAIL: bulk baseline (C) produced no invalidations" >&2
+if [ "$C_inval" -lt "$expected_min" ]; then
+	echo "FAIL: bulk baseline C дал только $C_inval инвалидаций при ожидаемых >= $expected_min" >&2
 	exit 1
 fi
 

@@ -35,6 +35,7 @@ DATA = extension/fasttrun--2.0.sql \
        extension/fasttrun--2.6.0.sql \
        extension/fasttrun--2.7.0.sql \
        extension/fasttrun--2.7.1.sql \
+       extension/fasttrun--2.7.2.sql \
        extension/fasttrun--2.0--2.1.sql \
        extension/fasttrun--2.1--2.1.1.sql \
        extension/fasttrun--2.1.1--2.1.2.sql \
@@ -52,6 +53,7 @@ DATA = extension/fasttrun--2.0.sql \
        extension/fasttrun--2.5.2--2.6.0.sql \
        extension/fasttrun--2.6.0--2.7.0.sql \
        extension/fasttrun--2.7.0--2.7.1.sql \
+       extension/fasttrun--2.7.1--2.7.2.sql \
        extension/fasttrun--unpackaged--2.0.sql
 DOCS = README.fasttrun
 PGFILEDESC = "fasttrun - sinval-free truncate and analyze for temporary tables"
@@ -80,7 +82,7 @@ REGRESS = fasttrun_basic \
 PG_CONFIG ?= pg_config
 
 # Статические проверки и pre-release driver сами не используют PGXS.
-NO_PGXS_GOALS = check-docs check-required-suite check-prerelease
+NO_PGXS_GOALS = check-docs check-required-suite check-prerelease check-codegen-selftest
 ifeq ($(strip $(MAKECMDGOALS)),)
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
@@ -152,6 +154,8 @@ endif
         check-publication-atomicity check-tracking-persistence \
         check-exit-plan-reset check-tracking-preload \
         check-block-sample-seed check-brin-stress check-required-suite check-prerelease \
+        check-example check-cache-init-release \
+        check-codegen-selftest check-codegen-identity \
         check-docs check-deep-local
 
 check-parity:
@@ -194,6 +198,9 @@ check-xact-journal-memory:
 check-cache-init-faults:
 	PG_CONFIG="$(PG_CONFIG)" scripts/check_fasttrun_cache_init_faults.sh
 
+check-cache-init-release:
+	FASTTRUN_CACHE_INIT_MODE=release PG_CONFIG="$(PG_CONFIG)" scripts/check_fasttrun_cache_init_faults.sh
+
 check-brin-stress:
 	PG_CONFIG="$(PG_CONFIG)" scripts/check_fasttrun_brin_stress.sh
 
@@ -230,6 +237,16 @@ check-tracking-preload:
 check-block-sample-seed:
 	PG_CONFIG="$(PG_CONFIG)" scripts/check_fasttrun_block_sample_seed.sh
 
+check-example:
+	@rc=0; PG_CONFIG="$(PG_CONFIG)" scripts/check_fasttrun_example.sh || rc=$$?; \
+		[ "$$rc" -eq 0 ] || [ "$$rc" -eq 77 ] || exit "$$rc"
+
+check-codegen-selftest:
+	python3 scripts/codegen_compare_selftest.py
+
+check-codegen-identity:
+	PG_CONFIG="$(PG_CONFIG)" scripts/check_codegen_identity.sh $${BASE_REF:-HEAD}
+
 check-docs:
 	python3 scripts/check_docs_consistency.py
 
@@ -247,4 +264,6 @@ check-deep-local: installcheck check-parity check-soak check-perf-smoke \
                   check-no-temp-impact check-tracking-persistence \
                   check-prepare-registry check-bgworker-log \
                   check-exit-plan-reset check-tracking-preload \
-                  check-block-sample-seed check-required-suite check-docs
+                  check-block-sample-seed check-cache-init-faults \
+                  check-example check-codegen-selftest \
+                  check-required-suite check-docs

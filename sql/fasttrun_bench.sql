@@ -188,13 +188,10 @@ BEGIN
     END IF;
 
     -- ----------------------------------------------------------
-    -- DELETE половины (500k) - доля изменений = 1.0 > порог 0.2
-    -- по умолчанию, поэтому первый analyze запускает пересбор
-    -- статистики через полный reservoir sample (дельта-математика
-    -- обновляет число строк, refresh обновляет n_distinct / null_frac
-    -- / width).  Второй analyze идет чистым попаданием в кэш через
-    -- дельту, без пересбора (доля изменений = 0 после продвижения
-    -- опорного снимка).
+    -- DELETE половины (500k): число строк дает дельта-математика,
+    -- а пересбор статистики колонок идет по выборке блоков (а не
+    -- полным сканированием всей кучи). Второй analyze идет чистым
+    -- попаданием в кэш через дельту без пересбора.
     -- ----------------------------------------------------------
     DELETE FROM t_bench WHERE id % 2 = 0;
 
@@ -232,9 +229,9 @@ BEGIN
     END IF;
 
     -- ----------------------------------------------------------
-    -- UPDATE всех оставшихся 500k - доля изменений = 500k > 20%
-    -- порога: первый analyze -> полный reservoir refresh,
-    -- второй -> попадание в кэш через дельту без сканирования.
+    -- UPDATE всех оставшихся 500k: первый analyze пересобирает
+    -- статистику колонок по выборке блоков, второй попадает в кэш
+    -- через дельту без сканирования.
     -- ----------------------------------------------------------
     UPDATE t_bench SET i01 = i01 + 1;
 
@@ -463,7 +460,7 @@ BEGIN
 
     t_start := clock_timestamp();
     FOR i IN 1..1000 LOOP
-        PERFORM 1 FROM (SELECT * FROM t_hook_perf WHERE id = i LIMIT 1) x;
+        EXECUTE 'EXPLAIN SELECT * FROM t_hook_perf WHERE id = ' || i || ' LIMIT 1';
     END LOOP;
     t_without := EXTRACT(EPOCH FROM (clock_timestamp() - t_start)) * 1000;
 
@@ -473,7 +470,7 @@ BEGIN
 
     t_start := clock_timestamp();
     FOR i IN 1..1000 LOOP
-        PERFORM 1 FROM (SELECT * FROM t_hook_perf WHERE id = i LIMIT 1) x;
+        EXECUTE 'EXPLAIN SELECT * FROM t_hook_perf WHERE id = ' || i || ' LIMIT 1';
     END LOOP;
     t_with := EXTRACT(EPOCH FROM (clock_timestamp() - t_start)) * 1000;
 

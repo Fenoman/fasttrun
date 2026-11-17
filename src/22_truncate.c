@@ -179,6 +179,8 @@ fasttrun_smgr_bypass_truncate(Relation rel, bool buffers_already_dropped)
 	 */
 	for (i = 0; i < nforks; i++)
 	{
+		if (forks[i] == MAIN_FORKNUM)
+			FASTTRUN_TEST_FAILPOINT("before_smgrcreate_main", 0);
 		smgrcreate(reln, forks[i], false);
 		reln->smgr_cached_nblocks[forks[i]] = 0;
 	}
@@ -221,6 +223,7 @@ fasttrun_write_empty_btree(Relation indexrel)
 	_bt_initmetapage(metapage, P_NONE, 0,
 					 _bt_allequalimage(indexrel, true));
 	PageSetChecksumInplace(metapage, BTREE_METAPAGE);
+	FASTTRUN_TEST_FAILPOINT("before_btree_smgrextend", 0);
 	smgrextend(RelationGetSmgr(indexrel), MAIN_FORKNUM, BTREE_METAPAGE,
 			   metapage, true);
 	pfree(metapage);
@@ -238,6 +241,7 @@ fasttrun_write_empty_btree(Relation indexrel)
 static BlockNumber
 fasttrun_ambuild_empty_index(Relation heaprel, Relation indexrel)
 {
+	FasttrunOwnerSecContext sec;
 	BlockNumber pages;
 
 	if (indexrel->rd_amcache != NULL)
@@ -245,17 +249,27 @@ fasttrun_ambuild_empty_index(Relation heaprel, Relation indexrel)
 		pfree(indexrel->rd_amcache);
 		indexrel->rd_amcache = NULL;
 	}
-	if (indexrel->rd_rel->relam == BTREE_AM_OID)
-		fasttrun_write_empty_btree(indexrel);
-	else
+	fasttrun_prepare_owner_sec_context(&sec);
+	PG_TRY();
 	{
-		IndexInfo  *indexInfo = BuildDummyIndexInfo(indexrel);
-		IndexBuildResult *result;
+		fasttrun_switch_owner_sec_context(heaprel->rd_rel->relowner, &sec);
+		if (indexrel->rd_rel->relam == BTREE_AM_OID)
+			fasttrun_write_empty_btree(indexrel);
+		else
+		{
+			IndexInfo  *indexInfo = BuildDummyIndexInfo(indexrel);
+			IndexBuildResult *result;
 
-		result = indexrel->rd_indam->ambuild(heaprel, indexrel, indexInfo);
-		pfree(result);
-		pfree(indexInfo);
+			result = indexrel->rd_indam->ambuild(heaprel, indexrel, indexInfo);
+			pfree(result);
+			pfree(indexInfo);
+		}
 	}
+	PG_FINALLY();
+	{
+		fasttrun_leave_owner_sec_context(&sec);
+	}
+	PG_END_TRY();
 	RelationGetSmgr(indexrel)->smgr_cached_nblocks[MAIN_FORKNUM] =
 		InvalidBlockNumber;
 	pages = RelationGetNumberOfBlocks(indexrel);
@@ -279,7 +293,13 @@ fasttrun_truncate_one_storage(Relation rel, bool zero_sinval,
 	if (zero_sinval)
 		fasttrun_smgr_bypass_truncate(rel, buffers_already_dropped);
 	else
+	{
+		SMgrRelation srel = RelationGetSmgr(rel);
+
+		if (!smgrexists(srel, MAIN_FORKNUM))
+			smgrcreate(srel, MAIN_FORKNUM, false);
 		RelationTruncate(rel, 0);
+	}
 #endif
 }
 
@@ -544,8 +564,8 @@ fasttrun_allocate_truncate_operation(Relation heaprel,
 		if (component_subid == root_file_subid)
 			continue;
 		/* A new component disappears instead of restoring an older file. */
-		if (component->rd_createSubid != InvalidSubTransactionId &&
-			component_subid == component->rd_createSubid &&
+		if (fasttrun_rel_create_subid(component) != InvalidSubTransactionId &&
+			component_subid == fasttrun_rel_create_subid(component) &&
 			component_subid >= root_file_subid)
 			continue;
 		goto independent_files;
@@ -904,8 +924,10 @@ fasttrun_truncate_check_target(const RangeVar *relation, Oid relid,
 		isTempNamespace(form->relnamespace);
 	ReleaseSysCache(tuple);
 	if (!local_temp)
-		elog(ERROR, "fasttruncate: relation \"%s\" is not a local temporary table",
-			 relation->relname);
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("fasttruncate: relation \"%s\" is not a local temporary table",
+						relation->relname)));
 }
 
 /*
@@ -985,7 +1007,7 @@ fasttrun_truncate_check_target(const RangeVar *relation, Oid relid,
 Datum
 fasttruncate(PG_FUNCTION_ARGS)
 {
-	text		   *name = PG_GETARG_TEXT_P(0);
+	text		   *name;
 	RangeVar	   *relvar;
 	Oid				relOid;
 	Relation		rel;
@@ -996,6 +1018,11 @@ fasttruncate(PG_FUNCTION_ARGS)
 	volatile uint64 cleanup_generation = 0;
 	volatile bool cleanup_pending_published = false;
 	instr_time		started;
+
+	fasttrun_reject_in_atx("fasttruncate");
+	if (PG_ARGISNULL(0))
+		PG_RETURN_VOID();
+	name = PG_GETARG_TEXT_P(0);
 
 	fasttrun_statement_seq++;
 	relvar = fasttrun_make_rangevar(name);
@@ -1014,12 +1041,23 @@ fasttruncate(PG_FUNCTION_ARGS)
 		!isTempNamespace(RelationGetNamespace(rel)))
 	{
 		table_close(rel, NoLock);
-		elog(ERROR, "fasttruncate: relation \"%s\" is not a local temporary table",
-			 RelationGetRelationName(rel));
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("fasttruncate: relation \"%s\" is not a local temporary table",
+						RelationGetRelationName(rel))));
 	}
 
-	if (rel->rd_rel->relkind != RELKIND_RELATION &&
-		rel->rd_rel->relkind != RELKIND_PARTITIONED_TABLE)
+	if (rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE ||
+		rel->rd_rel->relhassubclass)
+	{
+		table_close(rel, NoLock);
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("fasttruncate does not support partitioned or inheritance-parent temporary tables"),
+				 errhint("Use core SQL TRUNCATE for inheritance or partition traversal.")));
+	}
+
+	if (rel->rd_rel->relkind != RELKIND_RELATION)
 	{
 		table_close(rel, NoLock);
 		ereport(ERROR,
@@ -1031,8 +1069,10 @@ fasttruncate(PG_FUNCTION_ARGS)
 	if (rel->rd_tableam != GetHeapamTableAmRoutine())
 	{
 		table_close(rel, NoLock);
-		elog(ERROR, "fasttruncate: relation \"%s\" is not heap-AM",
-			 RelationGetRelationName(rel));
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("fasttruncate: relation \"%s\" is not heap-AM",
+						RelationGetRelationName(rel))));
 	}
 	if (fasttrun_passthrough)
 	{

@@ -182,7 +182,11 @@ fasttrun_sched_parse(const char *input,
 					dp++;
 				tok_end = dp;
 				if (*dp == ',')
+				{
 					dp++;
+					if (dp == day_end)
+						return -1;
+				}
 
 				day_dash = memchr(tok_start, '-', tok_end - tok_start);
 				if (day_dash)
@@ -289,7 +293,26 @@ fasttrun_schedule_is_active_now(void)
 	return false;
 }
 
-/* GUC assign hook: parse schedule string, apply to static state. */
+/*
+ * GUC check + assign hooks for fasttrun.track_schedule.  An invalid schedule
+ * warns at SET time and falls back to always-on rather than rejecting startup
+ * or SET.  Keeping ereport(WARNING) in check_hook avoids calling ereport()
+ * from assign_hook during AtEOXact_GUC transaction-abort rollback.
+ */
+static bool
+fasttrun_track_schedule_check_hook(char **newval, void **extra,
+								   GucSource source)
+{
+	FasttrunSchedWindow	parsed[FASTTRUN_SCHED_MAX_WINDOWS];
+
+	if (*newval != NULL &&
+		fasttrun_sched_parse(*newval, parsed, FASTTRUN_SCHED_MAX_WINDOWS) < 0)
+		ereport(WARNING,
+				(errmsg("fasttrun: invalid track_schedule \"%s\", tracking will stay always-on",
+						*newval)));
+	return true;
+}
+
 static void
 fasttrun_track_schedule_assign_hook(const char *newval, void *extra)
 {
@@ -299,9 +322,6 @@ fasttrun_track_schedule_assign_hook(const char *newval, void *extra)
 	n = fasttrun_sched_parse(newval, parsed, FASTTRUN_SCHED_MAX_WINDOWS);
 	if (n < 0)
 	{
-		ereport(WARNING,
-				(errmsg("fasttrun: invalid track_schedule \"%s\", tracking will stay always-on",
-						newval)));
 		fasttrun_sched_window_count = 0;
 		fasttrun_sched_cache_minute = (pg_time_t) -1;
 		fasttrun_sched_cache_active = true;
@@ -458,35 +478,47 @@ static void
 fasttrun_track_load(void)
 {
 	FILE			   *f;
-	int32				magic, count;
+	int32				magic = 0;
+	int32				count = 0;
+	unsigned char		trailing;
 	int					i;
 
 	f = AllocateFile(FASTTRUN_TRACK_FILE, PG_BINARY_R);
 	if (f == NULL)
+	{
+		if (errno != ENOENT)
+			ereport(WARNING,
+					(errcode_for_file_access(),
+					 errmsg("fasttrun: could not open tracking statistics file \"%s\": %m",
+							FASTTRUN_TRACK_FILE)));
 		return;		/* no saved stats -- fresh start */
-
-	if (fread(&magic, sizeof(magic), 1, f) != 1 || magic != FASTTRUN_TRACK_MAGIC)
-	{
-		FreeFile(f);
-		return;
-	}
-	if (fread(&count, sizeof(count), 1, f) != 1 || count < 0)
-	{
-		FreeFile(f);
-		return;
 	}
 
-	for (i = 0; i < count && i < FASTTRUN_TRACK_MAX; i++)
+	if (fread(&magic, sizeof(magic), 1, f) != 1 ||
+		magic != FASTTRUN_TRACK_MAGIC ||
+		fread(&count, sizeof(count), 1, f) != 1 ||
+		count < 0 || count > FASTTRUN_TRACK_MAX)
+		goto corrupt;
+
+	for (i = 0; i < count; i++)
 	{
 		FasttrunTrackEntry	buf;
 		FasttrunTrackEntry *entry;
 		bool				found;
 
 		if (fread(&buf, sizeof(buf), 1, f) != 1)
-			break;
+			goto corrupt;
+		if (buf.relname[0] == '\0' ||
+			memchr(buf.relname, '\0', NAMEDATALEN) == NULL ||
+			buf.create_count <= 0 ||
+			!IS_VALID_TIMESTAMP(buf.last_create))
+			goto corrupt;
 
-		entry = hash_search(fasttrun_track_htab, buf.relname,
-							HASH_ENTER, &found);
+		entry = (FasttrunTrackEntry *) hash_search(fasttrun_track_htab,
+												   buf.relname,
+												   HASH_ENTER_NULL, &found);
+		if (entry == NULL)
+			goto corrupt;
 		if (!found)
 		{
 			entry->create_count = buf.create_count;
@@ -494,13 +526,34 @@ fasttrun_track_load(void)
 		}
 		else
 		{
+			if (entry->create_count > PG_INT64_MAX - buf.create_count)
+				goto corrupt;
 			entry->create_count += buf.create_count;
 			if (buf.last_create > entry->last_create)
 				entry->last_create = buf.last_create;
 		}
 	}
 
+	if (fread(&trailing, 1, 1, f) != 0 || ferror(f))
+		goto corrupt;
+
 	FreeFile(f);
+	return;
+
+corrupt:
+	{
+		HASH_SEQ_STATUS		status;
+		FasttrunTrackEntry *entry;
+
+		hash_seq_init(&status, fasttrun_track_htab);
+		while ((entry = (FasttrunTrackEntry *) hash_seq_search(&status)) != NULL)
+			(void) hash_search(fasttrun_track_htab, entry->relname,
+							   HASH_REMOVE, NULL);
+	}
+	FreeFile(f);
+	ereport(WARNING,
+			(errmsg("fasttrun: ignoring corrupt tracking statistics file \"%s\"",
+					FASTTRUN_TRACK_FILE)));
 }
 
 /* Shared memory startup: create hash table + load from disk. */

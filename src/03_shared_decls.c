@@ -55,6 +55,10 @@ static bool fasttrun_read_pgstat_counters_for_hook(Oid relid, bool *wide_writers
 static void fasttrun_fresh_reserve(Relation rel);
 static void fasttrun_fresh_mark(Relation rel);
 static void fasttrun_fresh_note_core_truncate(Oid relid);
+static void fasttrun_fresh_note_create(Oid relid);
+static void fasttrun_fresh_confirm_creates(SubTransactionId stmt_subid);
+static void fasttrun_fresh_note_drop(Oid relid);
+static void fasttrun_fresh_forget_relid(Oid relid);
 static void fasttrun_invalidate_local_plan_cache(Oid relid);
 static bool fasttrun_relation_has_extended_stats(Relation rel);
 static bool fasttrun_may_core_analyze(Relation rel);
@@ -203,6 +207,9 @@ typedef struct FasttrunAnalyzeState
 	RelFileLocatorBackend probe_rlb;
 	Oid			heap_relid;
 	RelFileLocatorBackend heap_rlb;
+	bool		has_base_heap_tuples;
+	int64		base_heap_tuples;	/* heap row count cached_tuples was scaled
+									 * from on an index entry */
 	bool		has_delta_state;
 	int64		cached_inserted;
 	int64		cached_updated;

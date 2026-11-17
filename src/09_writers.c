@@ -55,7 +55,9 @@ fasttrun_cache_storage_check_due(const FasttrunAnalyzeCacheEntry *entry,
 								 Oid relid)
 {
 	return ((entry->state.has_relstats && entry->state.cached_pages > 0) ||
-			(!entry->state.has_relstats && entry->state.owns_index_relstats)) &&
+			(!entry->state.has_relstats &&
+			 (entry->state.owns_index_relstats ||
+			  fasttrun_stats_relid_has_samples(relid)))) &&
 		entry->state.heap_relid == relid &&
 		entry->write_check_epoch != fasttrun_xact_epoch;
 }
@@ -305,7 +307,8 @@ fasttrun_executor_start(QueryDesc *queryDesc, int eflags)
 {
 	if (!fasttrun_passthrough)
 	{
-		fasttrun_exit_plan_reset_register();
+		if (!fasttrun_in_atx())
+			fasttrun_exit_plan_reset_register();
 		/*
 		 * A plan can run long after it was made: a SQL function in PG 16 and
 		 * 17 plans all its statements before the first one runs, and that one
@@ -313,9 +316,12 @@ fasttrun_executor_start(QueryDesc *queryDesc, int eflags)
 		 */
 		if (fasttrun_poison_cache != NULL)
 			fasttrun_poison_check_plan(queryDesc->plannedstmt);
-		if (!(eflags & EXEC_FLAG_EXPLAIN_ONLY))
-			fasttrun_executor_walk_targets(queryDesc->plannedstmt, true);
-		fasttrun_statement_seq++;
+		if (!fasttrun_in_atx())
+		{
+			if (!(eflags & EXEC_FLAG_EXPLAIN_ONLY))
+				fasttrun_executor_walk_targets(queryDesc->plannedstmt, true);
+			fasttrun_statement_seq++;
+		}
 	}
 
 	if (prev_ExecutorStart != NULL)
@@ -327,7 +333,7 @@ fasttrun_executor_start(QueryDesc *queryDesc, int eflags)
 static void
 fasttrun_executor_end(QueryDesc *queryDesc)
 {
-	if (!fasttrun_passthrough &&
+	if (!fasttrun_passthrough && !fasttrun_in_atx() &&
 		!(queryDesc->estate->es_top_eflags & EXEC_FLAG_EXPLAIN_ONLY))
 		fasttrun_executor_walk_targets(queryDesc->plannedstmt, false);
 

@@ -125,6 +125,26 @@ BEGIN
     RETURN "temp BEGIN ANALYZE temp_a; END";
 END
 $body$;
+
+CREATE FUNCTION f_restricted_path() RETURNS void LANGUAGE plpgsql
+SET search_path = pg_catalog, pg_temp AS $body$
+BEGIN
+    ANALYZE temp_a;
+END
+$body$;
+
+CREATE FUNCTION f_backslash_ident() RETURNS void LANGUAGE plpgsql AS $body$
+BEGIN
+    ANALYZE "temp_\n";
+END
+$body$;
+
+CREATE FUNCTION f_partial_opts() RETURNS void LANGUAGE plpgsql AS $body$
+BEGIN
+    ANALYZE temp_a;
+    ANALYZE (VERBOSE) temp_b;
+END
+$body$;
 SQL
 
 snapshot()
@@ -133,7 +153,7 @@ snapshot()
 		-c "SELECT oid::text || E'\n' || prosrc FROM pg_proc WHERE proname = '$1'"
 }
 
-for fixture in f_exec f_comment f_dollar f_block f_quoted_carrier; do
+for fixture in f_exec f_comment f_dollar f_block f_quoted_carrier f_backslash_ident f_partial_opts; do
 	snapshot "$fixture" >"$WORKDIR/before.$fixture"
 done
 
@@ -161,9 +181,11 @@ assert "f_then: замена после THEN" \
 assert "f_adjacent: both adjacent statements are replaced" \
 	"(SELECT prosrc !~* 'ANALYZE\s+temp_' AND prosrc LIKE '%fasttrun_analyze(''temp_a'')%' AND prosrc LIKE '%fasttrun_analyze(''temp_b'')%' FROM pg_proc WHERE proname='f_adjacent')"
 assert "f_quoted: identifier quotes reach the relation parser" \
-	"(SELECT position(\$want\$fasttrun_analyze('\"temp name\"')\$want\$ in prosrc) > 0 AND position(\$want\$fasttrun_analyze('\"temp \"\"quoted\"\"\"')\$want\$ in prosrc) > 0 FROM pg_proc WHERE proname='f_quoted')"
+	"(SELECT position(\$want\$public.fasttrun_analyze('\"temp name\"')\$want\$ in prosrc) > 0 AND position(\$want\$public.fasttrun_analyze('\"temp \"\"quoted\"\"\"')\$want\$ in prosrc) > 0 FROM pg_proc WHERE proname='f_quoted')"
+assert "f_restricted_path: schema-qualified replacement" \
+	"(SELECT prosrc LIKE '%public.fasttrun_analyze(''temp_a'')%' FROM pg_proc WHERE proname='f_restricted_path')"
 
-for fixture in f_exec f_comment f_dollar f_block f_quoted_carrier; do
+for fixture in f_exec f_comment f_dollar f_block f_quoted_carrier f_backslash_ident f_partial_opts; do
 	snapshot "$fixture" >"$WORKDIR/after.$fixture"
 	if cmp -s "$WORKDIR/before.$fixture" "$WORKDIR/after.$fixture"; then
 		echo "ok: $fixture: skipped body and OID are unchanged"
@@ -175,7 +197,9 @@ done
 
 for skipped in 'f_exec:single quote' 'f_comment:line comment' \
 	'f_dollar:dollar sign' 'f_block:block comment' \
-	'f_quoted_carrier:semicolon in quoted identifier'; do
+	'f_quoted_carrier:semicolon in quoted identifier' \
+	'f_backslash_ident:backslash in quoted identifier' \
+	'f_partial_opts:unsupported ANALYZE statement position or identifier'; do
 	fixture=${skipped%%:*}
 	reason=${skipped#*:}
 	if grep -Eq "$fixture.*SKIP.*$reason" "$WORKDIR/apply.out"; then
@@ -211,10 +235,15 @@ CREATE TEMP TABLE temp_d (x int);
 CREATE TEMP TABLE temp_f (x int);
 CREATE TEMP TABLE "temp name" (x int);
 CREATE TEMP TABLE "temp ""quoted""" (x int);
+CREATE TEMP TABLE "temp_\n" (x int);
+SET standard_conforming_strings = off;
 SELECT f_plain();
 SELECT f_then();
 SELECT f_adjacent();
 SELECT f_quoted();
+SELECT f_restricted_path();
+SELECT f_backslash_ident();
+SELECT f_partial_opts();
 SELECT f_exec();
 SELECT f_comment();
 SELECT f_dollar();
@@ -227,6 +256,43 @@ then
 	failed=1
 else
 	echo "ok: все функции исполнимы"
+fi
+
+# Проверка схемы с символом '&' в имени: regexp_replace не должен подставлять
+# совпавший текст ANALYZE вместо '&'.
+if ! "$PSQL" -h "$WORKDIR" -p "$PORT" -d "$DBNAME" -X -qAt \
+		-v ON_ERROR_STOP=1 >/dev/null 2>"$WORKDIR/amp.err" <<'SQL'
+CREATE SCHEMA "ft&api";
+ALTER EXTENSION fasttrun SET SCHEMA "ft&api";
+CREATE FUNCTION f_amp_schema() RETURNS void LANGUAGE plpgsql AS $body$
+BEGIN
+    ANALYZE temp_a;
+END
+$body$;
+SQL
+then
+	echo "FAIL: не удалось подготовить схему ft&api:" >&2
+	cat "$WORKDIR/amp.err" >&2
+	failed=1
+else
+	"$PSQL" -h "$WORKDIR" -p "$PORT" -d "$DBNAME" -X -q -v ON_ERROR_STOP=1 \
+		-f "$WORKDIR/apply.sql" >"$WORKDIR/amp_apply.out" 2>&1
+	assert "f_amp_schema: literal ampersand preserved in schema qualification" \
+		"(SELECT position(\$want\$\"ft&api\".fasttrun_analyze('temp_a')\$want\$ in prosrc) > 0 FROM pg_proc WHERE proname='f_amp_schema')"
+	"$PSQL" -h "$WORKDIR" -p "$PORT" -d "$DBNAME" -X -qAt -v ON_ERROR_STOP=1 \
+		-c 'CREATE TEMP TABLE IF NOT EXISTS temp_a (x int); SELECT f_amp_schema();' >/dev/null
+
+	# Verify both DRY RUN and APPLY succeed identically when standard_conforming_strings = off
+	"$PSQL" -h "$WORKDIR" -p "$PORT" -d "$DBNAME" -X -q -v ON_ERROR_STOP=1 \
+		-c "CREATE FUNCTION f_scs_off() RETURNS void LANGUAGE plpgsql AS \$b\$ BEGIN ANALYZE temp_a; END \$b\$;" >/dev/null
+	PGOPTIONS="-c standard_conforming_strings=off" \
+		"$PSQL" -h "$WORKDIR" -p "$PORT" -d "$DBNAME" -X -q -v ON_ERROR_STOP=1 \
+		-f "$ADMIN_SQL" >"$WORKDIR/scs_off_dry.out" 2>&1
+	PGOPTIONS="-c standard_conforming_strings=off" \
+		"$PSQL" -h "$WORKDIR" -p "$PORT" -d "$DBNAME" -X -q -v ON_ERROR_STOP=1 \
+		-f "$WORKDIR/apply.sql" >"$WORKDIR/scs_off_apply.out" 2>&1
+	assert "f_scs_off: standard_conforming_strings=off replacement" \
+		"(SELECT position(\$want\$\"ft&api\".fasttrun_analyze('temp_a')\$want\$ in prosrc) > 0 FROM pg_proc WHERE proname='f_scs_off')"
 fi
 
 if [ "$failed" -ne 0 ]; then

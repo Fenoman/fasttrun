@@ -1,7 +1,7 @@
 /*-------------------------------------------------------------------------
  *
  * src/31_test_funcs.c
- *      Test SQL functions of cassert builds.
+ *      Test SQL helper functions (cassert helpers and relation size probe).
  *
  * Part of fasttrun.c: compiled only through its #include list, the order
  * is part of the build.
@@ -150,6 +150,18 @@ fasttrun_test_call_attavgwidth(PG_FUNCTION_ARGS)
 
 	PG_RETURN_INT32(fasttrun_get_attavgwidth_hook(relid, attnum));
 }
+
+/*
+ * Reproduce Postgres Pro Enterprise's SuspendTransaction/ResumeTransaction
+ * relcache discard inside an active outer transaction on cassert builds.
+ */
+Datum
+fasttrun_test_simulate_atx_relcache_reset(PG_FUNCTION_ARGS)
+{
+	RelationCacheInvalidate(false);
+	fasttrun_outer_xact_saw_atx = true;
+	PG_RETURN_VOID();
+}
 #endif
 
 
@@ -163,7 +175,20 @@ Datum
 fasttrun_test_relation_bytes(PG_FUNCTION_ARGS)
 {
 	Relation	rel = relation_open(PG_GETARG_OID(0), AccessShareLock);
-	int64		bytes = (int64) RelationGetNumberOfBlocks(rel) * BLCKSZ;
+	int64		bytes = 0;
+
+	if (rel->rd_rel->relpersistence != RELPERSISTENCE_TEMP ||
+		!isTempNamespace(RelationGetNamespace(rel)) ||
+		!RELKIND_HAS_STORAGE(rel->rd_rel->relkind))
+	{
+		relation_close(rel, AccessShareLock);
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("fasttrun_test_relation_bytes: relation \"%s\" is not a local temporary relation with storage",
+						RelationGetRelationName(rel))));
+	}
+	if (smgrexists(RelationGetSmgr(rel), MAIN_FORKNUM))
+		bytes = (int64) RelationGetNumberOfBlocks(rel) * BLCKSZ;
 
 	relation_close(rel, AccessShareLock);
 	PG_RETURN_INT64(bytes);

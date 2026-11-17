@@ -6,8 +6,6 @@
  * What it holds.  The truncate marks of the current transaction, their
  * transaction and subtransaction callbacks and the two SQL functions.
  *
- * Also here.  fasttrun_poison_blocks_file.
- *
  * Part of fasttrun.c: compiled only through its #include list, the order
  * is part of the build.
  *
@@ -67,6 +65,7 @@ typedef struct FasttrunFreshFile
 {
 	FasttrunFreshFileKey key;	/* hash key */
 	bool		on_file;
+	struct FasttrunFreshFile *next_for_rel;
 } FasttrunFreshFile;
 
 /*
@@ -81,14 +80,19 @@ typedef struct FasttrunFreshFile
  *   sql_subid      the outermost live level with a finished core TRUNCATE
  *                  seen by OAT_TRUNCATE.
  *   listed_subid   the newest level whose list holds the table.
+ *   files          all FasttrunFreshFile entries reserved for this table.
  */
 typedef struct FasttrunFreshEntry
 {
 	Oid			relid;			/* hash key */
+	SubTransactionId create_subid;
+	RelFileLocator create_locator;
+	SubTransactionId drop_subid;
 	SubTransactionId reset_subid;
 	RelFileLocator reset_locator;
 	SubTransactionId sql_subid;
 	SubTransactionId listed_subid;
+	FasttrunFreshFile *files;
 } FasttrunFreshEntry;
 
 /*
@@ -116,6 +120,8 @@ static HTAB *fasttrun_fresh_files = NULL;
 static FasttrunFreshLevel *fasttrun_fresh_levels = NULL;
 static List *fasttrun_fresh_pending = NIL;
 static SubTransactionId fasttrun_fresh_stmt_subid = InvalidSubTransactionId;
+static List *fasttrun_create_pending = NIL;
+static SubTransactionId fasttrun_create_stmt_subid = InvalidSubTransactionId;
 
 static FasttrunFreshEntry *
 fasttrun_fresh_find(Oid relid)
@@ -168,9 +174,12 @@ fasttrun_fresh_prepare(Oid relid)
 											   HASH_ENTER, &found);
 	if (!found)
 	{
+		entry->create_subid = InvalidSubTransactionId;
+		entry->drop_subid = InvalidSubTransactionId;
 		entry->reset_subid = InvalidSubTransactionId;
 		entry->sql_subid = InvalidSubTransactionId;
 		entry->listed_subid = InvalidSubTransactionId;
+		entry->files = NULL;
 	}
 	if (entry->listed_subid != subid)
 	{
@@ -208,7 +217,9 @@ fasttrun_fresh_reserve(Relation rel)
 
 	if (entry != NULL && entry->reset_subid != InvalidSubTransactionId)
 		return;
-	(void) fasttrun_fresh_prepare(relid);
+	if (!fasttrun_passthrough && fasttrun_rel_create_subid(rel) != InvalidSubTransactionId)
+		fasttrun_xact_mark_created_relation(rel);
+	entry = fasttrun_fresh_prepare(relid);
 	if (fasttrun_fresh_files == NULL)
 	{
 		HASHCTL		ctl;
@@ -227,7 +238,32 @@ fasttrun_fresh_reserve(Relation rel)
 	file = (FasttrunFreshFile *) hash_search(fasttrun_fresh_files, &key,
 											 HASH_ENTER, &found);
 	if (!found)
+	{
 		file->on_file = false;
+		file->next_for_rel = entry->files;
+		entry->files = file;
+	}
+}
+
+static void
+fasttrun_fresh_forget_relid(Oid relid)
+{
+	FasttrunFreshEntry *entry = fasttrun_fresh_find(relid);
+	FasttrunFreshFile *file;
+
+	if (entry == NULL)
+		return;
+	file = entry->files;
+	while (file != NULL)
+	{
+		FasttrunFreshFile *next = file->next_for_rel;
+		FasttrunFreshFileKey key = file->key;
+
+		if (fasttrun_fresh_files != NULL)
+			(void) hash_search(fasttrun_fresh_files, &key, HASH_REMOVE, NULL);
+		file = next;
+	}
+	(void) hash_search(fasttrun_fresh_marks, &relid, HASH_REMOVE, NULL);
 }
 
 /*
@@ -342,6 +378,8 @@ fasttrun_fresh_confirm_pending(SubTransactionId stmt_subid)
 			rel = try_relation_open(entry->relid, NoLock);
 			if (rel != NULL)
 			{
+				if (fasttrun_rel_create_subid(rel) != InvalidSubTransactionId)
+					fasttrun_xact_mark_created_relation(rel);
 				fasttrun_note_workset_birth(rel);
 				relation_close(rel, NoLock);
 			}
@@ -351,9 +389,176 @@ fasttrun_fresh_confirm_pending(SubTransactionId stmt_subid)
 	fasttrun_fresh_pending = NIL;
 }
 
+/*
+ * Record local temporary relations (heaps, indexes and TOAST tables) created
+ * by a utility command so creation birth survives relcache invalidations such
+ * as Postgres Pro Enterprise's SuspendTransaction/ResumeTransaction around
+ * in-process autonomous blocks.
+ */
+static void
+fasttrun_fresh_note_create(Oid relid)
+{
+	MemoryContext old_mcxt;
+
+	if (!IsTransactionState() ||
+		fasttrun_create_stmt_subid == InvalidSubTransactionId ||
+		fasttrun_create_stmt_subid != GetCurrentSubTransactionId())
+		return;
+	old_mcxt = MemoryContextSwitchTo(TopTransactionContext);
+	if (!list_member_oid(fasttrun_create_pending, relid))
+		fasttrun_create_pending = lappend_oid(fasttrun_create_pending, relid);
+	MemoryContextSwitchTo(old_mcxt);
+}
+
+static void
+fasttrun_fresh_confirm_creates(SubTransactionId stmt_subid)
+{
+	List	   *pending = fasttrun_create_pending;
+	ListCell   *lc;
+
+	fasttrun_create_pending = NIL;
+	if (pending == NIL || !IsTransactionState() ||
+		stmt_subid == InvalidSubTransactionId)
+		return;
+
+	foreach(lc, pending)
+	{
+		Oid			oid = lfirst_oid(lc);
+		HeapTuple	tp = SearchSysCache1(RELOID, ObjectIdGetDatum(oid));
+
+		if (HeapTupleIsValid(tp))
+		{
+			Form_pg_class form = (Form_pg_class) GETSTRUCT(tp);
+			bool		our_temp = (form->relpersistence == RELPERSISTENCE_TEMP &&
+									isTempOrTempToastNamespace(form->relnamespace));
+
+			ReleaseSysCache(tp);
+			if (our_temp)
+			{
+				Relation	rel = try_relation_open(oid, NoLock);
+
+				if (rel != NULL)
+				{
+					if ((rel->rd_createSubid == stmt_subid ||
+						 fasttrun_outer_xact_saw_atx) &&
+						stmt_subid != InvalidSubTransactionId)
+					{
+						FasttrunFreshEntry *entry = fasttrun_fresh_prepare(oid);
+
+						if (entry->create_subid == InvalidSubTransactionId)
+						{
+							entry->create_subid = stmt_subid;
+							entry->create_locator = rel->rd_locator;
+						}
+					}
+					relation_close(rel, NoLock);
+				}
+			}
+		}
+	}
+	list_free(pending);
+}
+
+static void
+fasttrun_fresh_prune_levels(FasttrunFreshLevel **p,
+							SubTransactionId subid, Oid relid)
+{
+	while (*p != NULL && (*p)->subid > subid)
+		p = &(*p)->next;
+	while (*p != NULL && (*p)->subid == subid)
+	{
+		FasttrunFreshLevel *lvl = *p;
+
+		lvl->relids = list_delete_oid(lvl->relids, relid);
+		if (lvl->relids == NIL)
+		{
+			*p = lvl->next;
+			pfree(lvl);
+		}
+		else
+			p = &lvl->next;
+	}
+}
+
+static void
+fasttrun_fresh_note_drop(Oid relid)
+{
+	SubTransactionId subid;
+	FasttrunFreshEntry *entry;
+
+	if (!IsTransactionState())
+		return;
+	entry = fasttrun_fresh_find(relid);
+	if (entry == NULL)
+		return;
+	subid = GetCurrentSubTransactionId();
+	if (entry->create_subid != subid)
+	{
+		if (entry->drop_subid == InvalidSubTransactionId)
+		{
+			entry = fasttrun_fresh_prepare(relid);
+			entry->drop_subid = subid;
+		}
+		return;
+	}
+	fasttrun_fresh_forget_relid(relid);
+	fasttrun_fresh_prune_levels(&fasttrun_fresh_levels, subid, relid);
+}
+
+static SubTransactionId
+fasttrun_rel_create_subid(Relation rel)
+{
+	Oid			relid = RelationGetRelid(rel);
+	FasttrunFreshEntry *entry;
+	FasttrunXactFrame *frame;
+
+	if (rel->rd_createSubid != InvalidSubTransactionId)
+		return rel->rd_createSubid;
+	entry = fasttrun_fresh_find(relid);
+	if (entry != NULL && entry->create_subid != InvalidSubTransactionId)
+		return entry->create_subid;
+	for (frame = fasttrun_xact_frame; frame != NULL; frame = frame->parent)
+	{
+		FasttrunXactRelEntry *xentry = (FasttrunXactRelEntry *)
+			hash_search(frame->entries, &relid, HASH_FIND, NULL);
+
+		if (xentry != NULL && (xentry->flags & FASTTRUN_TOUCH_CREATED) != 0)
+			return frame->subid;
+	}
+	return InvalidSubTransactionId;
+}
+
+static bool
+fasttrun_rel_on_create_file(Relation rel, SubTransactionId *subid_out)
+{
+	FasttrunFreshEntry *entry;
+
+	if (!fasttrun_outer_xact_saw_atx &&
+		rel->rd_firstRelfilelocatorSubid == InvalidSubTransactionId)
+	{
+		*subid_out = fasttrun_rel_create_subid(rel);
+		return true;
+	}
+	entry = fasttrun_fresh_find(RelationGetRelid(rel));
+	if (entry != NULL &&
+		entry->create_subid != InvalidSubTransactionId &&
+		RelFileLocatorEquals(entry->create_locator, rel->rd_locator))
+	{
+		*subid_out = entry->create_subid;
+		return true;
+	}
+	*subid_out = InvalidSubTransactionId;
+	return false;
+}
+
 static void
 fasttrun_fresh_xact_callback(XactEvent event, void *arg)
 {
+	if (fasttrun_in_atx())
+	{
+		fasttrun_outer_xact_saw_atx = true;
+		return;
+	}
 	switch (event)
 	{
 		case XACT_EVENT_COMMIT:
@@ -367,6 +572,9 @@ fasttrun_fresh_xact_callback(XactEvent event, void *arg)
 			fasttrun_fresh_levels = NULL;
 			fasttrun_fresh_pending = NIL;
 			fasttrun_fresh_stmt_subid = InvalidSubTransactionId;
+			fasttrun_create_pending = NIL;
+			fasttrun_create_stmt_subid = InvalidSubTransactionId;
+			fasttrun_outer_xact_saw_atx = false;
 			break;
 		default:
 			break;
@@ -384,15 +592,17 @@ fasttrun_fresh_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 								SubTransactionId parentSubid, void *arg)
 {
 	bool		aborting = (event == SUBXACT_EVENT_ABORT_SUB);
-	FasttrunFreshLevel *level = fasttrun_fresh_levels;
+	FasttrunFreshLevel **prev = &fasttrun_fresh_levels;
 
+	if (fasttrun_in_atx())
+		return;
 	if (event != SUBXACT_EVENT_COMMIT_SUB && !aborting)
 		return;
 
 	/* Every level tagged with mySubid, an earlier RELEASE may have left several. */
-	while (level != NULL && level->subid == mySubid)
+	while (*prev != NULL && (*prev)->subid == mySubid)
 	{
-		FasttrunFreshLevel *next = level->next;
+		FasttrunFreshLevel *level = *prev;
 		ListCell   *lc;
 
 		foreach(lc, level->relids)
@@ -401,9 +611,27 @@ fasttrun_fresh_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 			FasttrunFreshEntry *entry = fasttrun_fresh_find(relid);
 
 			if (entry == NULL)
+			{
+				if (!aborting)
+					level->relids = foreach_delete_current(level->relids, lc);
 				continue;
+			}
 			if (!aborting)
 			{
+				if (entry->create_subid == mySubid)
+					entry->create_subid = parentSubid;
+				if (entry->drop_subid == mySubid)
+				{
+					if (entry->create_subid == parentSubid)
+					{
+						fasttrun_fresh_forget_relid(relid);
+						level->relids = foreach_delete_current(level->relids, lc);
+						fasttrun_fresh_prune_levels(&level->next, parentSubid,
+													relid);
+						continue;
+					}
+					entry->drop_subid = parentSubid;
+				}
 				if (entry->reset_subid == mySubid)
 					entry->reset_subid = parentSubid;
 				if (entry->sql_subid == mySubid)
@@ -412,6 +640,13 @@ fasttrun_fresh_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 					entry->listed_subid = parentSubid;
 				continue;
 			}
+			if (entry->create_subid == mySubid)
+			{
+				fasttrun_fresh_forget_relid(relid);
+				continue;
+			}
+			if (entry->drop_subid == mySubid)
+				entry->drop_subid = InvalidSubTransactionId;
 			if (entry->sql_subid == mySubid)
 				entry->sql_subid = InvalidSubTransactionId;
 			if (entry->reset_subid == mySubid)
@@ -426,27 +661,18 @@ fasttrun_fresh_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 			}
 		}
 
-		if (!aborting)
+		if (!aborting && level->relids != NIL)
+		{
 			level->subid = parentSubid;
+			prev = &level->next;
+		}
 		else
 		{
-			fasttrun_fresh_levels = next;
+			*prev = level->next;
 			list_free(level->relids);
 			pfree(level);
 		}
-		level = next;
 	}
-}
-
-/* The current file is the one an incomplete fasttruncate left damaged. */
-static bool
-fasttrun_poison_blocks_file(Relation rel)
-{
-	FasttrunPoisonEntry *entry = fasttrun_poison_find(RelationGetRelid(rel));
-
-	return entry != NULL && entry->active &&
-		RelFileLocatorEquals(entry->root_rlb.locator, rel->rd_locator) &&
-		entry->root_rlb.backend == rel->rd_backend;
 }
 
 static bool
@@ -488,7 +714,7 @@ fasttrun_fresh_core_truncated(Relation rel)
 	return false;
 }
 
-/* The temporary table argument: a heap table of this session, not a parent. */
+/* The temporary table argument: a heap table of this session, not a partitioned parent. */
 static void
 fasttrun_check_local_temp_table(Relation rel, const char *func)
 {
@@ -536,6 +762,7 @@ fasttrun_temp_is_ours(PG_FUNCTION_ARGS)
 	Relation	rel;
 	bool		fresh;
 
+	fasttrun_reject_in_atx("fasttrun_temp_is_ours");
 	rel = try_relation_open(PG_GETARG_OID(0), AccessShareLock);
 	if (rel == NULL)
 		PG_RETURN_NULL();
@@ -544,9 +771,14 @@ fasttrun_temp_is_ours(PG_FUNCTION_ARGS)
 	if (fasttrun_poison_blocks_file(rel))
 		fresh = false;
 	else
-		fresh = rel->rd_createSubid != InvalidSubTransactionId ||
+	{
+		if (!fasttrun_passthrough && !fasttrun_in_atx() &&
+			rel->rd_createSubid != InvalidSubTransactionId)
+			fasttrun_xact_mark_created_relation(rel);
+		fresh = fasttrun_rel_create_subid(rel) != InvalidSubTransactionId ||
 			fasttrun_fresh_marked(rel) ||
 			fasttrun_fresh_core_truncated(rel);
+	}
 
 	relation_close(rel, AccessShareLock);
 	PG_RETURN_BOOL(fresh);
@@ -579,6 +811,7 @@ fasttrun_temp_same_cols(PG_FUNCTION_ARGS)
 	int			j = 0;
 	bool		same;
 
+	fasttrun_reject_in_atx("fasttrun_temp_same_cols");
 	temprel = try_relation_open(PG_GETARG_OID(0), AccessShareLock);
 	if (temprel == NULL)
 		PG_RETURN_NULL();

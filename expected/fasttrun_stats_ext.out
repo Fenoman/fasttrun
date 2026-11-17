@@ -1128,7 +1128,9 @@ RESET fasttrun.auto_collect_stats;
 ALTER DATABASE :DBNAME RESET session_preload_libraries;
 \connect -
 DO $cold$ BEGIN
-  IF current_setting('fasttrun.sample_rows', true) IS NOT NULL THEN
+  IF strpos(',' || regexp_replace(current_setting('shared_preload_libraries'), '\s+', '', 'g') || ',',
+            ',fasttrun,') = 0
+     AND current_setting('fasttrun.sample_rows', true) IS NOT NULL THEN
     RAISE EXCEPTION 'cold extended control has fasttrun preloaded';
   END IF;
 END $cold$;

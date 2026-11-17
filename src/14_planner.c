@@ -19,6 +19,62 @@
 #error "src/14_planner.c is included only from fasttrun.c"
 #endif /* FASTTRUN_UNITY */
 /*
+ * Resolve the range-table index of rte inside root without reading vardata:
+ * index cost estimators such as brincostestimate pass an uninitialized
+ * VariableStatData struct on the stack.
+ */
+static bool
+fasttrun_relation_stats_acl_ok(PlannerInfo *root, RangeTblEntry *rte,
+							   AttrNumber attnum)
+{
+	Index		rti = 0;
+
+	if (root == NULL || rte == NULL)
+		return false;
+
+	if (root->simple_rte_array != NULL)
+	{
+		int			i;
+
+		for (i = 1; i < root->simple_rel_array_size; i++)
+		{
+			if (root->simple_rte_array[i] == rte)
+			{
+				rti = (Index) i;
+				break;
+			}
+		}
+	}
+	else if (root->parse != NULL)
+	{
+		ListCell   *lc;
+		Index		i = 1;
+
+		foreach(lc, root->parse->rtable)
+		{
+			if ((RangeTblEntry *) lfirst(lc) == rte)
+			{
+				rti = i;
+				break;
+			}
+			i++;
+		}
+	}
+
+	if (rti > 0)
+	{
+		Bitmapset  *varattnos =
+			bms_make_singleton(attnum - FirstLowInvalidHeapAttributeNumber);
+		bool		ok;
+
+		ok = all_rows_selectable(root, rti, varattnos);
+		bms_free(varattnos);
+		return ok;
+	}
+	return false;
+}
+
+/*
  * Substitute our cached tuple while it stays within churn tolerance (see
  * fasttrun_stats_entry_usable).  Past the threshold we fall through so the
  * planner uses defaults instead of a distribution that has shifted too far.
@@ -41,7 +97,8 @@ fasttrun_get_relation_stats_hook(PlannerInfo *root, RangeTblEntry *rte,
 	vardata->statsTuple = NULL;
 	vardata->freefunc = NULL;
 
-	if (fasttrun_stats_cache == NULL || fasttrun_stats_relid_cache == NULL)
+	if (fasttrun_in_atx() ||
+		fasttrun_stats_cache == NULL || fasttrun_stats_relid_cache == NULL)
 		goto chain;
 	relentry = (FasttrunStatsRelidEntry *)
 		hash_search(fasttrun_stats_relid_cache, &rte->relid, HASH_FIND, NULL);
@@ -92,9 +149,9 @@ fasttrun_get_relation_stats_hook(PlannerInfo *root, RangeTblEntry *rte,
 	}
 
 	fasttrun_count(FTC_STATS_SERVED);
-	vardata->statsTuple = entry->statsTuple;
-	vardata->freefunc = fasttrun_stats_noop_free;
-	vardata->acl_ok = true;
+	vardata->statsTuple = heap_copytuple(entry->statsTuple);
+	vardata->freefunc = heap_freetuple;
+	vardata->acl_ok = fasttrun_relation_stats_acl_ok(root, rte, attnum);
 	return true;
 
 chain:
@@ -150,7 +207,8 @@ fasttrun_get_attavgwidth_hook(Oid relid, AttrNumber attnum)
 	bool				wide_writers = false;
 	int32				stawidth;
 
-	if (fasttrun_stats_cache == NULL || fasttrun_stats_relid_cache == NULL)
+	if (fasttrun_in_atx() ||
+		fasttrun_stats_cache == NULL || fasttrun_stats_relid_cache == NULL)
 		goto chain;
 	relentry = (FasttrunStatsRelidEntry *)
 		hash_search(fasttrun_stats_relid_cache, &relid, HASH_FIND, NULL);
@@ -327,6 +385,59 @@ fasttrun_expression_stats_tuple(Oid heap_relid, Oid indexOid,
 }
 
 /*
+ * Check SELECT privileges on all base columns referenced by indexattnum of
+ * indexOid inside root without touching vardata->rel or vardata->var:
+ * btcostestimate passes an uninitialized VariableStatData struct.
+ */
+static bool
+fasttrun_index_stats_acl_ok(PlannerInfo *root, Oid indexOid,
+							AttrNumber indexattnum)
+{
+	bool		found_index = false;
+	bool		acl_ok = true;
+	int			rti;
+
+	if (root == NULL || root->simple_rel_array == NULL)
+		return false;
+
+	for (rti = 1; rti < root->simple_rel_array_size; rti++)
+	{
+		RelOptInfo *rel = root->simple_rel_array[rti];
+		ListCell   *ilc;
+
+		if (rel == NULL)
+			continue;
+		foreach(ilc, rel->indexlist)
+		{
+			IndexOptInfo *index = (IndexOptInfo *) lfirst(ilc);
+
+			if (index->indexoid != indexOid)
+				continue;
+			found_index = true;
+			if (indexattnum < 1 ||
+				indexattnum > list_length(index->indextlist))
+				acl_ok = false;
+			else
+			{
+				Bitmapset  *varattnos = NULL;
+				Node	   *indexpr =
+					(Node *) list_nth(index->indextlist, indexattnum - 1);
+
+				pull_varattnos(indexpr, rel->relid, &varattnos);
+				if (!all_rows_selectable(root, rel->relid, varattnos))
+					acl_ok = false;
+				bms_free(varattnos);
+			}
+			if (!acl_ok)
+				break;
+		}
+		if (!acl_ok)
+			break;
+	}
+	return found_index && acl_ok;
+}
+
+/*
  * Expression indexes keep their stats in pg_statistic under the INDEX oid,
  * written only by core ANALYZE.  Once the owning heap goes LOCAL_NEUTRAL those
  * rows describe data the table may no longer have, so the hook never chains to
@@ -349,7 +460,8 @@ fasttrun_get_index_stats_hook(PlannerInfo *root, Oid indexOid,
 	 * Resolve only cached owners outside the planner frame. Function RTEs and
 	 * inheritance parents keep a frame for managed relations introduced later.
 	 */
-	if (fasttrun_stats_cache != NULL && fasttrun_stats_relid_cache != NULL &&
+	if (!fasttrun_in_atx() &&
+		fasttrun_stats_cache != NULL && fasttrun_stats_relid_cache != NULL &&
 		(fasttrun_in_planner || fasttrun_index_is_cached(indexOid)))
 	{
 		Oid			heap_relid = fasttrun_index_owning_heap(indexOid);
@@ -364,9 +476,10 @@ fasttrun_get_index_stats_hook(PlannerInfo *root, Oid indexOid,
 			if (tuple != NULL)
 			{
 				fasttrun_count(FTC_STATS_SERVED);
-				vardata->statsTuple = tuple;
-				vardata->freefunc = fasttrun_stats_noop_free;
-				vardata->acl_ok = true;
+				vardata->statsTuple = heap_copytuple(tuple);
+				vardata->freefunc = heap_freetuple;
+				vardata->acl_ok =
+					fasttrun_index_stats_acl_ok(root, indexOid, indexattnum);
 			}
 			else
 				fasttrun_count(FTC_STATS_HIDDEN);
@@ -759,7 +872,7 @@ fasttrun_get_relation_info_hook(PlannerInfo *root, Oid relationObjectId,
 
 	if (prev_get_relation_info_hook)
 		prev_get_relation_info_hook(root, relationObjectId, inhparent, rel);
-	if (inhparent || fasttrun_analyze_cache == NULL)
+	if (inhparent || fasttrun_in_atx() || fasttrun_analyze_cache == NULL)
 		return;
 	entry = fasttrun_cache_lookup(relationObjectId);
 	if (entry == NULL)
@@ -784,7 +897,9 @@ fasttrun_get_relation_info_hook(PlannerInfo *root, Oid relationObjectId,
 
 	relation = table_open(relationObjectId, NoLock);
 	if (!fasttrun_relation_has_same_locator(relation, entry) ||
-		(relation->rd_rel->relpages ==
+		(!(entry->state.cached_pages > 0 &&
+		   entry->lazy_check_epoch != fasttrun_xact_epoch) &&
+		 relation->rd_rel->relpages ==
 		 fasttrun_cache_effective_relpages(relation, entry) &&
 		 relation->rd_rel->reltuples == (float4) entry->state.cached_tuples &&
 		 relation->rd_rel->relallvisible == (int32) entry->state.cached_allvisible &&
@@ -821,18 +936,21 @@ fasttrun_planner_hook(Query *parse, const char *query_string,
 	if (fasttrun_poison_cache != NULL)
 		fasttrun_poison_check_query(parse);
 
-	if (fasttrun_analyze_cache != NULL)
+	if (!fasttrun_in_atx())
 	{
-		bool		detect = (fasttrun_stats_cache != NULL &&
-							  fasttrun_stats_relid_cache != NULL);
+		if (fasttrun_analyze_cache != NULL)
+		{
+			bool		detect = (fasttrun_stats_cache != NULL &&
+								  fasttrun_stats_relid_cache != NULL);
 
-		/* One walk: reinject relstats and detect cached column stats. */
-		stats_frame_needed = fasttrun_reinject_query_relstats(parse, detect);
-	}
-	else if (fasttrun_stats_cache != NULL)
-	{
-		/* Nothing to reinject -- detect-only walk with early exit. */
-		stats_frame_needed = fasttrun_query_contains_stats_relid(parse);
+			/* One walk: reinject relstats and detect cached column stats. */
+			stats_frame_needed = fasttrun_reinject_query_relstats(parse, detect);
+		}
+		else if (fasttrun_stats_cache != NULL)
+		{
+			/* Nothing to reinject -- detect-only walk with early exit. */
+			stats_frame_needed = fasttrun_query_contains_stats_relid(parse);
+		}
 	}
 
 	/*

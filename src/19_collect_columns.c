@@ -110,6 +110,7 @@ static Oid	fasttrun_template_memo_relid = InvalidOid;
 static Oid	fasttrun_template_memo_template = InvalidOid;
 static uint64 fasttrun_template_memo_epoch = 0;
 static CommandId fasttrun_template_memo_cid = InvalidCommandId;
+static char fasttrun_template_memo_schema[NAMEDATALEN] = "";
 
 static int
 fasttrun_template_attstattarget(Relation rel, AttrNumber attnum)
@@ -127,7 +128,9 @@ fasttrun_template_attstattarget(Relation rel, AttrNumber attnum)
 		return -1;
 	if (fasttrun_template_memo_relid != relid ||
 		fasttrun_template_memo_epoch != fasttrun_xact_epoch ||
-		fasttrun_template_memo_cid != cid)
+		fasttrun_template_memo_cid != cid ||
+		strncmp(fasttrun_template_memo_schema, fasttrun_prewarm_schema,
+				NAMEDATALEN) != 0)
 	{
 		Oid			nspid = get_namespace_oid(fasttrun_prewarm_schema, true);
 
@@ -136,6 +139,8 @@ fasttrun_template_attstattarget(Relation rel, AttrNumber attnum)
 		fasttrun_template_memo_relid = relid;
 		fasttrun_template_memo_epoch = fasttrun_xact_epoch;
 		fasttrun_template_memo_cid = cid;
+		strlcpy(fasttrun_template_memo_schema, fasttrun_prewarm_schema,
+				sizeof(fasttrun_template_memo_schema));
 	}
 	template_relid = fasttrun_template_memo_template;
 	if (!OidIsValid(template_relid))
@@ -271,6 +276,7 @@ fasttrun_sample_column(FasttrunSampleColumns *cols, int attidx,
 		cols->ncols = Min(cols->width, cols->tupdesc->natts - attidx);
 		for (i = 0; i < cols->sample_count; i++)
 		{
+			CHECK_FOR_INTERRUPTS();
 			heap_deform_tuple(cols->sample[i], cols->tupdesc,
 							  cols->row_values, cols->row_nulls);
 			for (a = 0; a < cols->ncols; a++)
@@ -573,6 +579,7 @@ fasttrun_compute_max_minrows_as_owner(Relation rel)
 	{
 		VacAttrStats *stats;
 
+		CHECK_FOR_INTERRUPTS();
 		stats = fasttrun_examine_attribute(rel, a + 1, tmp_ctx);
 		if (stats == NULL)
 			continue;
@@ -626,26 +633,18 @@ fasttrun_compute_max_minrows_as_owner(Relation rel)
 static int
 fasttrun_compute_max_minrows(Relation rel)
 {
-	Oid			save_userid;
-	int			save_sec_context;
-	int			save_nestlevel;
+	FasttrunOwnerSecContext sec;
 	int			minrows = 0;
 
-	GetUserIdAndSecContext(&save_userid, &save_sec_context);
-	save_nestlevel = NewGUCNestLevel();
+	fasttrun_prepare_owner_sec_context(&sec);
 	PG_TRY();
 	{
-		SetUserIdAndSecContext(rel->rd_rel->relowner,
-							   save_sec_context | SECURITY_RESTRICTED_OPERATION);
-#if PG_VERSION_NUM >= 170000
-		RestrictSearchPath();
-#endif
+		fasttrun_switch_owner_sec_context(rel->rd_rel->relowner, &sec);
 		minrows = fasttrun_compute_max_minrows_as_owner(rel);
 	}
 	PG_FINALLY();
 	{
-		AtEOXact_GUC(false, save_nestlevel);
-		SetUserIdAndSecContext(save_userid, save_sec_context);
+		fasttrun_leave_owner_sec_context(&sec);
 	}
 	PG_END_TRY();
 	return minrows;

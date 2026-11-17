@@ -165,4 +165,13 @@ work without `shared_preload_libraries`.
   `CREATE STATISTICS` on a temporary table damages the system catalog. It is
   better not to enable this mode until the core is fixed. How the fasttrun tests
   work around these bugs is described in section ["Testing"](testing.md).
+- On Postgres Pro Enterprise, in-process autonomous transactions
+  (`BEGIN AUTONOMOUS`) are not supported for temporary-table operations: calls
+  to `fasttruncate`, `fasttrun_analyze`, `fasttrun_analyze_bulk`,
+  `fasttrun_collect_stats`, `fasttrun_relstats`, `fasttrun_inspect_stats`,
+  `fasttrun_cached_tables`, `fasttrun_blocked_tables`, `fasttrun_temp_is_ours`,
+  `fasttrun_temp_same_cols`, and `fasttrun_prewarm` are rejected inside an
+  autonomous block with SQLSTATE `0A000` (only aggregate counter and shared
+  tracking functions that do not open relations remain callable), while the
+  outer transaction's caches and journal stay untouched across the block.
 - fasttrun is not a security boundary between connection-pooler clients.

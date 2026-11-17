@@ -23,7 +23,7 @@ DATA=$WORKDIR/data
 SOCKET_DIR=$WORKDIR/socket
 LOG=$WORKDIR/postgres.log
 DBNAME=${DBNAME:-fasttrun_cache_init}
-MODE=${FASTTRUN_CACHE_INIT_MODE:-cassert}
+MODE=${FASTTRUN_CACHE_INIT_MODE:-auto}
 
 cleanup()
 {
@@ -45,6 +45,16 @@ PORT=${PGPORT:-$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.
 "$PSQL" -h "$SOCKET_DIR" -p "$PORT" -d "$DBNAME" -XAtq \
 	-v ON_ERROR_STOP=1 -c 'CREATE EXTENSION fasttrun' >/dev/null
 
+if [ "$MODE" = auto ]; then
+	dbg_assert=$("$PSQL" -h "$SOCKET_DIR" -p "$PORT" -d "$DBNAME" -XAtq \
+		-v ON_ERROR_STOP=1 -c 'SHOW debug_assertions')
+	if [ "$dbg_assert" = on ]; then
+		MODE=cassert
+	else
+		MODE=release
+	fi
+fi
+
 if [ "$MODE" = release ]; then
 	if "$PSQL" -h "$SOCKET_DIR" -p "$PORT" -d "$DBNAME" -XAtq \
 		-v ON_ERROR_STOP=1 \
@@ -58,6 +68,11 @@ if [ "$MODE" = release ]; then
 		! grep -q '"fasttrun" is a reserved prefix' "$WORKDIR/release.err"; then
 		cat "$WORKDIR/release.err" >&2
 		echo "FAIL: release rejection did not come from reserved fasttrun prefix" >&2
+		exit 1
+	fi
+	if grep -Eq 'TRAP|Assertion|FailedAssertion|PANIC|terminated by signal|server process .* was terminated|leaked hash_seq_search' "$LOG"; then
+		grep -E 'TRAP|Assertion|FailedAssertion|PANIC|terminated by signal|server process .* was terminated|leaked hash_seq_search' "$LOG" >&2
+		echo "FAIL: cache init release check caused an assertion or crash" >&2
 		exit 1
 	fi
 	echo "cache init release guard passed: test_failpoint is unavailable"
@@ -188,6 +203,11 @@ if [ "$analyze_top" -ne 1 ] || [ "$analyze_hash" -ne 1 ] ||
 	[ "$stats_top" -ne 1 ] || [ "$stats_hash" -ne 1 ] ||
 	[ "$relid_hash" -ne 1 ]; then
 	echo "FAIL: retry left a missing/duplicate cache context" >&2
+	exit 1
+fi
+if grep -Eq 'TRAP|Assertion|FailedAssertion|PANIC|terminated by signal|server process .* was terminated|leaked hash_seq_search' "$LOG"; then
+	grep -E 'TRAP|Assertion|FailedAssertion|PANIC|terminated by signal|server process .* was terminated|leaked hash_seq_search' "$LOG" >&2
+	echo "FAIL: cache init fault injection caused an assertion or crash" >&2
 	exit 1
 fi
 

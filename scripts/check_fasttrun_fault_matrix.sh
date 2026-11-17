@@ -1494,9 +1494,559 @@ for expect in 'fasttrun: fasttrun_analyze of "ft_slow_log" took' \
 done
 echo "slow log passed"
 
-if grep -Eq 'TRAP|Assertion|FailedAssertion|PANIC|terminated by signal|server process .* was terminated|Segmentation fault|Abort trap' \
+# Targeted lifecycle and recovery cases: subtransaction merge failure, missing
+# main fork and btree metapage extension failure, TOAST REINDEX block, and
+# two-transaction parent TRUNCATE retirement.
+cat >"$WORKDIR/targeted_lifecycle.sql" <<'SQL'
+\set ON_ERROR_STOP 1
+SET client_min_messages = warning;
+
+-- 1. Failpoint during SUBXACT_EVENT_PRE_COMMIT_SUB (RELEASE SAVEPOINT / block exit)
+CREATE TEMP TABLE ft_submerge(a int, b text);
+INSERT INTO ft_submerge SELECT g, md5(g::text) FROM generate_series(1, 500) g;
+SELECT fasttrun_analyze('ft_submerge');
+BEGIN;
+SAVEPOINT sp_outer;
+DO $submerge$
+DECLARE caught boolean := false;
+BEGIN
+  INSERT INTO ft_submerge SELECT g, md5(g::text) FROM generate_series(501, 700) g;
+  BEGIN
+    INSERT INTO ft_submerge SELECT g, md5(g::text) FROM generate_series(701, 1000) g;
+    PERFORM fasttrun_analyze('ft_submerge');
+    PERFORM set_config('fasttrun.test_failpoint', 'subcommit_merge', false);
+  EXCEPTION WHEN division_by_zero THEN
+    NULL;
+  END;
+EXCEPTION WHEN SQLSTATE '55000' THEN
+  caught := true;
+  PERFORM set_config('fasttrun.test_failpoint', '', false);
+  IF NOT caught THEN
+    RAISE EXCEPTION 'subcommit_merge failpoint did not fire';
+  END IF;
+END $submerge$;
+-- Verify parent subxact inside DO survived cleanly, and test SQL RELEASE SAVEPOINT too:
+DO $submerge_mid$
+BEGIN
+  IF (SELECT reltuples FROM fasttrun_relstats('ft_submerge')) <> 500 THEN
+    RAISE EXCEPTION 'failed subcommit polluted parent subxact reltuples';
+  END IF;
+END $submerge_mid$;
+SAVEPOINT sp_inner;
+INSERT INTO ft_submerge SELECT g, md5(g::text) FROM generate_series(1001, 1200) g;
+SELECT fasttrun_analyze('ft_submerge');
+SET fasttrun.test_failpoint = 'subcommit_merge';
+\set ON_ERROR_STOP 0
+RELEASE SAVEPOINT sp_inner;
+\set ON_ERROR_STOP 1
+ROLLBACK TO SAVEPOINT sp_outer;
+SET fasttrun.test_failpoint = '';
+COMMIT;
+DO $submerge_verify$
+BEGIN
+  IF (SELECT reltuples FROM fasttrun_relstats('ft_submerge')) <> 500
+     OR (SELECT count(*) FROM fasttrun_inspect_stats('ft_submerge')) <> 2 THEN
+    RAISE EXCEPTION 'rollback after subcommit_merge corrupted outer cache state';
+  END IF;
+END $submerge_verify$;
+DROP TABLE ft_submerge;
+
+CREATE TEMP TABLE ft_submerge_old(id int, drop_me int);
+INSERT INTO ft_submerge_old VALUES (42, 7);
+SELECT fasttrun_collect_stats('ft_submerge_old');
+CREATE TEMP TABLE ft_submerge_anchor(id int);
+BEGIN;
+SELECT fasttrun_analyze('ft_submerge_anchor');
+DO $submerge_fresh$
+DECLARE
+  caught boolean := false;
+BEGIN
+  BEGIN
+    ALTER TABLE ft_submerge_old DROP COLUMN drop_me;
+    TRUNCATE ft_submerge_old;
+    PERFORM set_config('fasttrun.test_failpoint', 'subcommit_merge', false);
+  EXCEPTION WHEN SQLSTATE '55000' THEN
+    IF SQLERRM <> 'fasttrun test failpoint: subcommit_merge' THEN
+      RAISE;
+    END IF;
+    caught := true;
+    PERFORM set_config('fasttrun.test_failpoint', '', false);
+  END;
+  IF NOT caught THEN
+    RAISE EXCEPTION 'subcommit_merge failpoint did not fire';
+  END IF;
+  IF (SELECT array_agg(id) FROM ft_submerge_old) IS DISTINCT FROM ARRAY[42] THEN
+    RAISE EXCEPTION 'TRUNCATE rollback after subcommit_merge did not restore old rows';
+  END IF;
+  IF fasttrun_temp_is_ours('ft_submerge_old'::regclass) THEN
+    RAISE EXCEPTION 'failed subcommit left stale fresh mark after subxact rollback';
+  END IF;
+END $submerge_fresh$;
+COMMIT;
+DROP TABLE ft_submerge_old, ft_submerge_anchor;
+
+SELECT 'SUBCOMMIT_MERGE_OK';
+
+-- 2. Failure between unlink() and smgrcreate(MAIN_FORKNUM) and before btree smgrextend
+DO $missing_fork$
+DECLARE
+  is_ee boolean := false;
+  caught boolean := false;
+BEGIN
+  IF to_regprocedure('pg_catalog.pgpro_edition()') IS NOT NULL THEN
+    EXECUTE 'SELECT pg_catalog.pgpro_edition() = ''enterprise''' INTO is_ee;
+  END IF;
+  IF NOT is_ee THEN
+    EXECUTE 'CREATE TEMP TABLE ft_missing_main(id int PRIMARY KEY, v text)';
+    EXECUTE 'INSERT INTO ft_missing_main SELECT g, md5(g::text) FROM generate_series(1, 200) g';
+    PERFORM fasttrun_analyze('ft_missing_main');
+    PERFORM set_config('fasttrun.zero_sinval_truncate', 'on', false);
+    PERFORM set_config('fasttrun.test_failpoint', 'before_smgrcreate_main', false);
+    BEGIN
+      PERFORM fasttruncate('ft_missing_main');
+    EXCEPTION WHEN SQLSTATE '55000' THEN
+      caught := true;
+    END;
+    PERFORM set_config('fasttrun.test_failpoint', '', false);
+    IF NOT caught OR NOT EXISTS (
+      SELECT 1 FROM fasttrun_blocked_tables() WHERE relname = 'ft_missing_main'
+    ) THEN
+      RAISE EXCEPTION 'before_smgrcreate_main did not poison ft_missing_main';
+    END IF;
+    -- Diagnostic view must not fail with ENOENT when main fork is unlinked.
+    PERFORM count(*) FROM fasttrun_cached_tables();
+    -- Repair under zero_sinval_truncate = off must not PANIC inside RelationTruncate.
+    PERFORM set_config('fasttrun.zero_sinval_truncate', 'off', false);
+    PERFORM fasttruncate('ft_missing_main');
+    IF EXISTS (SELECT 1 FROM fasttrun_blocked_tables() WHERE relname = 'ft_missing_main') THEN
+      RAISE EXCEPTION 'zero_sinval_truncate=off repair left ft_missing_main blocked';
+    END IF;
+    -- Re-poison and repair under zero_sinval_truncate = on + DROP TABLE.
+    EXECUTE 'INSERT INTO ft_missing_main VALUES (1, ''ok'')';
+    PERFORM set_config('fasttrun.zero_sinval_truncate', 'on', false);
+    PERFORM set_config('fasttrun.test_failpoint', 'before_smgrcreate_main', false);
+    caught := false;
+    BEGIN
+      PERFORM fasttruncate('ft_missing_main');
+    EXCEPTION WHEN SQLSTATE '55000' THEN
+      caught := true;
+    END;
+    PERFORM set_config('fasttrun.test_failpoint', '', false);
+    IF NOT caught THEN
+      RAISE EXCEPTION 'second before_smgrcreate_main did not fire';
+    END IF;
+    PERFORM fasttruncate('ft_missing_main');
+    EXECUTE 'DROP TABLE ft_missing_main';
+
+    -- Failure right before btree metapage smgrextend.
+    EXECUTE 'CREATE TEMP TABLE ft_missing_bt(id int PRIMARY KEY)';
+    EXECUTE 'INSERT INTO ft_missing_bt SELECT generate_series(1, 50)';
+    PERFORM set_config('fasttrun.test_failpoint', 'before_btree_smgrextend', false);
+    caught := false;
+    BEGIN
+      PERFORM fasttruncate('ft_missing_bt');
+    EXCEPTION WHEN SQLSTATE '55000' THEN
+      caught := true;
+    END;
+    PERFORM set_config('fasttrun.test_failpoint', '', false);
+    IF NOT caught OR NOT EXISTS (
+      SELECT 1 FROM fasttrun_blocked_tables() WHERE relname = 'ft_missing_bt'
+    ) THEN
+      RAISE EXCEPTION 'before_btree_smgrextend did not poison ft_missing_bt';
+    END IF;
+    PERFORM fasttruncate('ft_missing_bt');
+    EXECUTE 'INSERT INTO ft_missing_bt VALUES (42)';
+    IF (SELECT count(*) FROM ft_missing_bt WHERE id = 42) <> 1 THEN
+      RAISE EXCEPTION 'repaired btree index after before_btree_smgrextend is unusable';
+    END IF;
+    EXECUTE 'DROP TABLE ft_missing_bt';
+  END IF;
+END $missing_fork$;
+SELECT 'MISSING_FORK_REPAIR_OK';
+
+-- 3. REINDEX TABLE / REINDEX SCHEMA on pg_toast_temp_N blocked while poisoned
+CREATE TEMP TABLE ft_toast_reindex(id int, big text);
+ALTER TABLE ft_toast_reindex ALTER COLUMN big SET STORAGE EXTERNAL;
+INSERT INTO ft_toast_reindex SELECT g, repeat('z', 4000) FROM generate_series(1, 30) g;
+DO $toast_reindex$
+DECLARE
+  toast_oid oid;
+  toast_nsp name;
+  toast_rel name;
+  caught_poison boolean := false;
+  caught_tbl boolean := false;
+  caught_sch boolean := false;
+BEGIN
+  SELECT c.reltoastrelid, n.nspname, t.relname
+    INTO toast_oid, toast_nsp, toast_rel
+  FROM pg_class c
+  JOIN pg_class t ON t.oid = c.reltoastrelid
+  JOIN pg_namespace n ON n.oid = t.relnamespace
+  WHERE c.oid = 'ft_toast_reindex'::regclass;
+
+  PERFORM set_config('fasttrun.test_failpoint', 'after_toast_index:1', false);
+  BEGIN
+    PERFORM fasttruncate('ft_toast_reindex');
+  EXCEPTION WHEN SQLSTATE '55000' THEN
+    caught_poison := true;
+  END;
+  PERFORM set_config('fasttrun.test_failpoint', '', false);
+  IF NOT caught_poison THEN
+    RAISE EXCEPTION 'after_toast_index:1 did not fire';
+  END IF;
+
+  BEGIN
+    EXECUTE format('REINDEX TABLE %I.%I', toast_nsp, toast_rel);
+  EXCEPTION WHEN SQLSTATE '55000' THEN
+    caught_tbl := true;
+  END;
+  BEGIN
+    EXECUTE format('REINDEX SCHEMA %I', toast_nsp);
+  EXCEPTION WHEN SQLSTATE '55000' THEN
+    caught_sch := true;
+  END;
+  IF NOT caught_tbl OR NOT caught_sch THEN
+    RAISE EXCEPTION 'TOAST REINDEX bypassed poison: table=%, schema=%', caught_tbl, caught_sch;
+  END IF;
+  PERFORM fasttruncate('ft_toast_reindex');
+END $toast_reindex$;
+DROP TABLE ft_toast_reindex;
+SELECT 'TOAST_REINDEX_BLOCK_OK';
+
+-- 4. Committed parent TRUNCATE retires child poison without reading child
+CREATE TEMP TABLE ft_retire_p(id int);
+CREATE TEMP TABLE ft_retire_c() INHERITS (ft_retire_p);
+INSERT INTO ft_retire_c VALUES (1), (2);
+DO $parent_retire$
+DECLARE caught boolean := false;
+BEGIN
+  PERFORM set_config('fasttrun.test_failpoint', 'after_main_heap', false);
+  BEGIN
+    PERFORM fasttruncate('ft_retire_c');
+  EXCEPTION WHEN SQLSTATE '55000' THEN
+    caught := true;
+  END;
+  PERFORM set_config('fasttrun.test_failpoint', '', false);
+  IF NOT caught THEN
+    RAISE EXCEPTION 'after_main_heap did not fire on ft_retire_c';
+  END IF;
+END $parent_retire$;
+BEGIN;
+TRUNCATE ft_retire_p;
+COMMIT;
+BEGIN;
+TRUNCATE ft_retire_p;
+SELECT fasttruncate('ft_retire_c');
+COMMIT;
+DROP TABLE ft_retire_c, ft_retire_p;
+SELECT 'PARENT_TRUNCATE_RETIRE_OK';
+SQL
+
+if ! run_pg "$PSQL" -h "$SOCKET_DIR" -p "$PORT" -d "$DBNAME" -XAtq \
+	-f "$WORKDIR/targeted_lifecycle.sql" >"$WORKDIR/targeted_lifecycle.out" 2>&1; then
+	cat "$WORKDIR/targeted_lifecycle.out" >&2
+	echo "FAIL: targeted lifecycle fault scenarios" >&2
+	exit 1
+fi
+for expect in 'SUBCOMMIT_MERGE_OK' 'MISSING_FORK_REPAIR_OK' 'TOAST_REINDEX_BLOCK_OK' 'PARENT_TRUNCATE_RETIRE_OK'; do
+	if ! grep -qx "$expect" "$WORKDIR/targeted_lifecycle.out"; then
+		cat "$WORKDIR/targeted_lifecycle.out" >&2
+		echo "FAIL: missing '$expect' in targeted_lifecycle.out" >&2
+		exit 1
+	fi
+done
+echo "targeted lifecycle fault scenarios passed"
+
+# 5. Real asynchronous pg_cancel_backend() mid-truncate after storage mutation:
+#    must abort with SQLSTATE 57014, leave the table blocked (55000), and repair cleanly.
+cat >"$WORKDIR/cancel_truncate.sql" <<'SQL'
+\set VERBOSITY verbose
+\set ON_ERROR_STOP 1
+LOAD 'fasttrun';
+SET client_min_messages = warning;
+CREATE TEMP TABLE ft_cancel_mid (
+  id int PRIMARY KEY,
+  grp int,
+  payload text
+);
+ALTER TABLE ft_cancel_mid ALTER COLUMN payload SET STORAGE EXTERNAL;
+CREATE INDEX ft_cancel_mid_grp ON ft_cancel_mid (grp);
+INSERT INTO ft_cancel_mid
+SELECT g, g % 10, repeat('X', 3000) FROM generate_series(1, 120) g;
+SELECT fasttrun_analyze('ft_cancel_mid');
+SELECT pg_backend_pid();
+SELECT 'CANCEL_READY';
+SET client_min_messages = notice;
+SET fasttrun.test_failpoint = 'pause:after_main_heap';
+\set ON_ERROR_STOP 0
+SELECT fasttruncate('ft_cancel_mid');
+\set ON_ERROR_STOP 1
+SET client_min_messages = warning;
+SET fasttrun.test_failpoint = '';
+DO $verify_cancel$
+DECLARE
+  blocked_read boolean := false;
+  blocked_dml boolean := false;
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM fasttrun_blocked_tables() WHERE relname = 'ft_cancel_mid') THEN
+    RAISE EXCEPTION 'canceled fasttruncate did not poison ft_cancel_mid';
+  END IF;
+  BEGIN
+    PERFORM count(*) FROM ft_cancel_mid;
+  EXCEPTION WHEN SQLSTATE '55000' THEN
+    blocked_read := true;
+  END;
+  BEGIN
+    INSERT INTO ft_cancel_mid VALUES (1, 1, 'a');
+  EXCEPTION WHEN SQLSTATE '55000' THEN
+    blocked_dml := true;
+  END;
+  IF NOT blocked_read OR NOT blocked_dml THEN
+    RAISE EXCEPTION 'poison after cancel did not block read=% or dml=%', blocked_read, blocked_dml;
+  END IF;
+  PERFORM fasttruncate('ft_cancel_mid');
+  IF EXISTS (SELECT 1 FROM fasttrun_blocked_tables() WHERE relname = 'ft_cancel_mid') THEN
+    RAISE EXCEPTION 'fasttruncate repair did not clear poison after cancel';
+  END IF;
+  INSERT INTO ft_cancel_mid VALUES (77, 7, repeat('Y', 3000));
+  PERFORM set_config('enable_seqscan', 'off', true);
+  IF (SELECT count(*) FROM ft_cancel_mid WHERE id = 77 AND length(payload) = 3000) <> 1 THEN
+    RAISE EXCEPTION 'repaired ft_cancel_mid index/TOAST check failed';
+  END IF;
+END $verify_cancel$;
+DROP TABLE ft_cancel_mid;
+SELECT 'PG_CANCEL_TRUNCATE_OK';
+SQL
+
+run_pg "$PSQL" -h "$SOCKET_DIR" -p "$PORT" -d "$DBNAME" -XAtq \
+	-f "$WORKDIR/cancel_truncate.sql" >"$WORKDIR/cancel_truncate.out" \
+	2>"$WORKDIR/cancel_truncate.err" &
+cancel_psql_pid=$!
+
+cancel_bpid=""
+for _ in $(seq 1 200); do
+	if grep -q '^CANCEL_READY$' "$WORKDIR/cancel_truncate.out" 2>/dev/null; then
+		cancel_bpid=$(grep -E '^[0-9]+$' "$WORKDIR/cancel_truncate.out" | head -1 || true)
+		break
+	fi
+	if ! kill -0 "$cancel_psql_pid" >/dev/null 2>&1; then
+		break
+	fi
+	sleep 0.02
+done
+terminate_cancel_worker()
+{
+	local pid=${1:-}
+	local i
+	[ -n "$pid" ] || return 0
+	kill -TERM "$pid" >/dev/null 2>&1 || true
+	kill -CONT "$pid" >/dev/null 2>&1 || true
+	for i in $(seq 1 20); do
+		if ! kill -0 "$pid" >/dev/null 2>&1; then
+			wait "$pid" >/dev/null 2>&1 || true
+			return 0
+		fi
+		sleep 0.05
+	done
+	kill -KILL "$pid" >/dev/null 2>&1 || true
+	for i in $(seq 1 20); do
+		if ! kill -0 "$pid" >/dev/null 2>&1; then
+			wait "$pid" >/dev/null 2>&1 || true
+			return 0
+		fi
+		sleep 0.05
+	done
+	return 0
+}
+
+wait_cancel_worker()
+{
+	local pid=$1
+	local ticks=${2:-}
+	local i
+	local rc=0
+	[ -n "$ticks" ] || ticks=${FASTTRUN_WAIT_TICKS:-200}
+	for i in $(seq 1 "$ticks"); do
+		if ! kill -0 "$pid" >/dev/null 2>&1; then
+			wait "$pid" || rc=$?
+			return "$rc"
+		fi
+		sleep 0.05
+	done
+	terminate_cancel_worker "$pid"
+	return 124
+}
+
+if [ -z "$cancel_bpid" ]; then
+	terminate_cancel_worker "$cancel_psql_pid"
+	cat "$WORKDIR/cancel_truncate.out" "$WORKDIR/cancel_truncate.err" >&2
+	echo "FAIL: cancel_truncate worker did not reach CANCEL_READY" >&2
+	exit 1
+fi
+for _ in $(seq 1 400); do
+	if grep -Fq 'fasttrun test failpoint paused: after_main_heap' "$WORKDIR/cancel_truncate.err" 2>/dev/null; then
+		break
+	fi
+	if ! kill -0 "$cancel_psql_pid" >/dev/null 2>&1; then
+		break
+	fi
+	sleep 0.02
+done
+if ! grep -Fq 'fasttrun test failpoint paused: after_main_heap' "$WORKDIR/cancel_truncate.err" 2>/dev/null; then
+	terminate_cancel_worker "$cancel_psql_pid"
+	cat "$WORKDIR/cancel_truncate.out" "$WORKDIR/cancel_truncate.err" >&2
+	echo "FAIL: cancel_truncate worker did not report pause:after_main_heap" >&2
+	exit 1
+fi
+cancel_sent=$(run_pg "$PSQL" -h "$SOCKET_DIR" -p "$PORT" -d "$DBNAME" -XAtq \
+	-v ON_ERROR_STOP=1 -c "SELECT pg_cancel_backend($cancel_bpid)")
+if [ "$cancel_sent" != "t" ]; then
+	terminate_cancel_worker "$cancel_psql_pid"
+	cat "$WORKDIR/cancel_truncate.out" "$WORKDIR/cancel_truncate.err" >&2
+	echo "FAIL: pg_cancel_backend($cancel_bpid) returned '$cancel_sent'" >&2
+	exit 1
+fi
+
+if ! wait_cancel_worker "$cancel_psql_pid"; then
+	cat "$WORKDIR/cancel_truncate.out" "$WORKDIR/cancel_truncate.err" >&2
+	echo "FAIL: cancel_truncate session exited nonzero" >&2
+	exit 1
+fi
+if ! grep -q '57014' "$WORKDIR/cancel_truncate.err" || \
+	! grep -qx 'PG_CANCEL_TRUNCATE_OK' "$WORKDIR/cancel_truncate.out"; then
+	cat "$WORKDIR/cancel_truncate.out" "$WORKDIR/cancel_truncate.err" >&2
+	echo "FAIL: missing 57014 or PG_CANCEL_TRUNCATE_OK in cancel_truncate" >&2
+	exit 1
+fi
+echo "pg_cancel_backend mid-truncate poison and repair passed"
+
+# ----------------------------------------------------------------------
+# Simulated ATX relcache invalidation inside an active outer transaction:
+# creation birth in fasttrun_temp_is_ours and uncommitted storage replacement
+# over a poisoned locator must both survive RelationCacheInvalidate().
+# ----------------------------------------------------------------------
+if ! run_pg "$PSQL" -h "$SOCKET_DIR" -p "$PORT" -d "$DBNAME" -XAtq \
+	-v ON_ERROR_STOP=1 >"$WORKDIR/atx_relcache.out" 2>"$WORKDIR/atx_relcache.err" <<'SQL'
+CREATE EXTENSION IF NOT EXISTS fasttrun;
+CREATE FUNCTION pg_temp.ft_sim_atx_reset() RETURNS void
+  AS '$libdir/fasttrun', 'fasttrun_test_simulate_atx_relcache_reset'
+  LANGUAGE C VOLATILE;
+
+BEGIN;
+CREATE TEMP TABLE ft_atx_born(id int PRIMARY KEY);
+INSERT INTO ft_atx_born VALUES (1), (2);
+SAVEPOINT sp_child;
+CREATE TEMP TABLE ft_atx_child(id int);
+SELECT pg_temp.ft_sim_atx_reset();
+DO $$
+BEGIN
+  IF NOT fasttrun_temp_is_ours('ft_atx_born'::regclass) OR
+     NOT fasttrun_temp_is_ours('ft_atx_child'::regclass) THEN
+    RAISE EXCEPTION 'creation birth lost across relcache reset';
+  END IF;
+END $$;
+ROLLBACK TO SAVEPOINT sp_child;
+DO $$
+BEGIN
+  IF NOT fasttrun_temp_is_ours('ft_atx_born'::regclass) THEN
+    RAISE EXCEPTION 'outer creation birth lost after child rollback';
+  END IF;
+END $$;
+COMMIT;
+DO $$
+BEGIN
+  IF fasttrun_temp_is_ours('ft_atx_born'::regclass) THEN
+    RAISE EXCEPTION 'creation birth leaked into next transaction';
+  END IF;
+END $$;
+
+CREATE TEMP TABLE ft_atx_poison_inh(id int);
+CREATE TEMP TABLE ft_atx_poison_child() INHERITS (ft_atx_poison_inh);
+INSERT INTO ft_atx_poison_child VALUES (10);
+SET fasttrun.test_failpoint = 'after_main_heap';
+DO $$
+BEGIN
+  PERFORM fasttruncate('ft_atx_poison_child');
+  RAISE EXCEPTION 'expected failpoint';
+EXCEPTION WHEN object_not_in_prerequisite_state THEN
+  IF SQLERRM <> 'fasttrun test failpoint: after_main_heap' THEN
+    RAISE;
+  END IF;
+END $$;
+SET fasttrun.test_failpoint = '';
+
+BEGIN;
+SAVEPOINT sp_rep;
+TRUNCATE ft_atx_poison_inh;
+SELECT pg_temp.ft_sim_atx_reset();
+SELECT count(*) FROM ft_atx_poison_child;
+ROLLBACK TO SAVEPOINT sp_rep;
+DO $$
+DECLARE blocked boolean := false;
+BEGIN
+  BEGIN
+    PERFORM count(*) FROM ft_atx_poison_child;
+  EXCEPTION WHEN object_not_in_prerequisite_state THEN
+    blocked := true;
+  END;
+  IF NOT blocked THEN
+    RAISE EXCEPTION 'poison block was prematurely retired across relcache reset';
+  END IF;
+END $$;
+ROLLBACK;
+
+DROP TABLE ft_atx_poison_child, ft_atx_poison_inh, ft_atx_born;
+
+BEGIN;
+SAVEPOINT sp_subp;
+CREATE TEMP TABLE ft_atx_subp(id int);
+INSERT INTO ft_atx_subp VALUES (1);
+SELECT pg_temp.ft_sim_atx_reset();
+SAVEPOINT sp_inner_fail;
+SET fasttrun.test_failpoint = 'after_main_heap';
+DO $$
+BEGIN
+  PERFORM fasttruncate('ft_atx_subp');
+  RAISE EXCEPTION 'expected failpoint';
+EXCEPTION WHEN object_not_in_prerequisite_state THEN
+  IF SQLERRM <> 'fasttrun test failpoint: after_main_heap' THEN
+    RAISE;
+  END IF;
+END $$;
+SET fasttrun.test_failpoint = '';
+ROLLBACK TO SAVEPOINT sp_inner_fail;
+DO $$
+BEGIN
+  IF (SELECT count(*) FROM fasttrun_blocked_tables() WHERE relname = 'ft_atx_subp') <> 1 THEN
+    RAISE EXCEPTION 'subxact-born poison lost after inner rollback';
+  END IF;
+END $$;
+ROLLBACK TO SAVEPOINT sp_subp;
+DO $$
+BEGIN
+  IF (SELECT count(*) FROM fasttrun_blocked_tables()) <> 0 THEN
+    RAISE EXCEPTION 'subxact-born poison leaked after creation savepoint rollback';
+  END IF;
+END $$;
+ROLLBACK;
+
+SELECT 'ATX_RELCACHE_RESET_OK';
+SQL
+then
+	cat "$WORKDIR/atx_relcache.out" "$WORKDIR/atx_relcache.err" >&2
+	echo "FAIL: ATX relcache reset survival check failed" >&2
+	exit 1
+fi
+if ! grep -qx 'ATX_RELCACHE_RESET_OK' "$WORKDIR/atx_relcache.out"; then
+	cat "$WORKDIR/atx_relcache.out" "$WORKDIR/atx_relcache.err" >&2
+	echo "FAIL: ATX relcache reset survival check failed" >&2
+	exit 1
+fi
+echo "ATX relcache reset birth and poison survival passed"
+
+if grep -Eq 'TRAP|Assertion|FailedAssertion|PANIC|terminated by signal|server process .* was terminated|Segmentation fault|Abort trap|leaked hash_seq_search|AbortSubTransaction while in COMMIT state' \
 	"$LOG"; then
-	grep -E 'TRAP|Assertion|FailedAssertion|PANIC|terminated by signal|server process .* was terminated|Segmentation fault|Abort trap' \
+	grep -E 'TRAP|Assertion|FailedAssertion|PANIC|terminated by signal|server process .* was terminated|Segmentation fault|Abort trap|leaked hash_seq_search|AbortSubTransaction while in COMMIT state' \
 		"$LOG" >&2
 	echo "FAIL: fault matrix caused an assertion or server exit" >&2
 	exit 1

@@ -6,22 +6,27 @@ Usage:
       Copy preprocessor output IN to OUT with the file name and line number
       arguments of errfinish() and ExceptionalCondition() replaced by "F" and
       0.  Prints the number of replaced calls.
-  codegen_compare.py compare-bin BASE CAND (obj|lib)
-      Compare two builds of the same program whose input differs only in those
-      arguments.  Prints every difference and exits 1 on any.
+  codegen_compare.py compare-bin [--strict] BASE CAND (obj|lib)
+      Compare two builds of the same program.  Without --strict, immediate
+      numbers and string-literal slot order are masked so builds that still
+      differ in __FILE__/__LINE__ pass structural comparison.  With --strict
+      (used after masking __FILE__/__LINE__ in STEP 2M), immediate constants,
+      field offsets, string order, and caller-to-outlined-body bindings must
+      match as well.  Prints every difference and exits 1 on any.
 
 What is compared:
   functions     the set, sizes, and per instruction the mnemonic, registers,
-                call and branch targets, relocation targets
+                call and branch targets (including content-addressed outlined
+                function targets), relocation targets, and (--strict) immediates
   sections      names and sizes
   object data   contents with relocated slots masked, relocation targets
   library data  named data objects of an ELF library: size, contents with
                 dynamic relocation slots masked, relocation targets
-  strings       the multiset of string literals of the object, file names aside
+  strings       exact ordered string table (--strict) or multiset, file names aside
 
 What may differ:
-  numbers         immediates, displacements and addresses
-  strings         which string literal a reference points to, file name strings
+  numbers         addresses and PC-relative displacements (and immediates without --strict)
+  strings         file name strings (and string slot order without --strict)
   debug sections  .debug_*, __debug_*, LTO bytecode and LTO debug sections
 
 Limits.  In a Mach-O library the data of named objects is not compared: dyld
@@ -31,6 +36,7 @@ and add pair whose target is not resolved, the object file relocations name it.
 """
 import bisect
 import collections
+import hashlib
 import os
 import re
 import subprocess
@@ -102,8 +108,7 @@ def sections(path):
 
 def norm_target(name):
     name = STRSYM_RE.sub("STR", name)
-    name = TU_HASH_RE.sub("TUSYM", name)
-    return re.sub(r"_OUTLINED_FUNCTION_\d+", "OUTLINED", name)
+    return TU_HASH_RE.sub("TUSYM", name)
 
 
 class Symbols:
@@ -145,14 +150,24 @@ class Symbols:
                 self.slots[off] = (rtype, value)
         self.code = [(v, v + n) for name, n, v in sections(path)
                      if re.search(r"(?:^|,)(?:\.text|\.plt[\w.]*|\.init|\.fini|__text|__stubs|__stub_helper)$", name)]
+        self.rodata = []
+        for sec_name, (sec_start, sec_bytes) in contents(path).items():
+            if sec_start is not None and (STRING_SECTION_RE.search(sec_name)
+                                          or (fmt[0] == "elf" and sec_name == ".rodata")):
+                raw_sec = bytes(sec_bytes)
+                fn_spans = []
+                for m in re.finditer(rb"[ -~]{2,}\x00", raw_sec):
+                    if FILE_NAME_RE.search(m.group(0)[:-1].decode("utf-8", "surrogateescape")):
+                        fn_spans.append((m.start(), m.end()))
+                self.rodata.append((sec_start, raw_sec, fn_spans))
         self.spans = spans
         self.starts = [a for a, _, _ in spans]
 
-    def resolve(self, addr, through_slot=True):
+    def resolve(self, addr, through_slot=True, strict=False):
         if through_slot and addr in self.slots:
             rtype, value = self.slots[addr]
             m = re.match(r"\*ABS\*\+0x([0-9a-fA-F]+)$", value)
-            return "slot:" + (self.resolve(int(m.group(1), 16), False) if m else norm_target(value))
+            return "slot:" + (self.resolve(int(m.group(1), 16), False, strict) if m else norm_target(value))
         i = bisect.bisect_right(self.starts, addr) - 1
         for j in range(i, max(i - 64, -1), -1):
             start, size, name = self.spans[j]
@@ -167,10 +182,27 @@ class Symbols:
             for start, size, name in reversed(self.spans[:i + 1]):
                 if size == 0:
                     return norm_target(name) + "+%#x" % (addr - start)
+        if strict:
+            for sec_start, sec_bytes, fn_spans in self.rodata:
+                if sec_start <= addr < sec_start + len(sec_bytes):
+                    off = addr - sec_start
+                    if any(s <= off < e for s, e in fn_spans):
+                        break
+                    logical_off = off - sum((e - s - 2) for s, e in fn_spans if e <= off)
+                    tail = re.sub(
+                        rb"[ -~]{2,}\x00",
+                        lambda m: (b"F\x00"
+                                   if FILE_NAME_RE.search(
+                                       m.group(0)[:-1].decode("utf-8", "surrogateescape"))
+                                   else m.group(0)),
+                        sec_bytes[off:min(len(sec_bytes), off + 64)],
+                    )[:16]
+                    return "ANON#%x:%s" % (logical_off,
+                                           hashlib.sha256(tail).hexdigest()[:12])
         return "ANON"
 
 
-def norm_insn(text, x86, symbols=None):
+def norm_insn(text, x86, symbols=None, strict=False):
     text = text.strip()
     data_target = ""
     # Comments of objdump repeat operands in another radix and are padded by
@@ -180,7 +212,7 @@ def norm_insn(text, x86, symbols=None):
     if x86:
         m = re.search(r"\s+#\s*([0-9a-fA-F]+)(?:\s*<[^>]*>)?\s*$", text)
         if m and symbols is not None:
-            data_target = " @" + symbols.resolve(int(m.group(1), 16))
+            data_target = " @" + symbols.resolve(int(m.group(1), 16), strict=strict)
         text = re.sub(r"\s+#.*$", "", text)
     else:
         text = re.sub(r"\s*(?:;|//).*$", "", text)
@@ -198,7 +230,12 @@ def norm_insn(text, x86, symbols=None):
             # an object file. In a library it is part of the resolved name.
             ops = ops[:m.start()] + "<" + target + ">" + ops[m.end():]
     ops = norm_target(ops)
-    if symbols is None:
+    if strict:
+        if x86 and symbols is not None:
+            ops = re.sub(r"-?(?:0x[0-9a-fA-F]+|\d+)\(%rip\)", "N(%rip)", ops)
+        elif not x86 and symbols is not None and mnem == "adrp":
+            ops = re.sub(r"-?0x[0-9a-fA-F]+", "N", ops)
+    elif symbols is None:
         ops = NUM_RE.sub("N", ops)
     else:
         head, sep, tail = ops.partition("<")
@@ -206,15 +243,15 @@ def norm_insn(text, x86, symbols=None):
     return (mnem + " " + ops).strip() + data_target
 
 
-def norm_reloc(rtype, target):
+def norm_reloc(rtype, target, strict=False):
     target = target.strip()
-    if STRSYM_RE.match(target):
+    if not strict and STRSYM_RE.match(target):
         return "RELOC %s STR" % rtype
-    return "RELOC %s %s" % (rtype, norm_target(target))
+    return "RELOC %s %s" % (rtype, target if strict else norm_target(target))
 
 
-def functions(path, fmt, kind):
-    """{name: (size, [normalized lines])} from objdump -d -r."""
+def functions(path, fmt, kind, strict=False):
+    """{name: (size, [normalized lines])}, [outlined_body_tuples] from objdump -d -r."""
     out = run([objdump(), "-d", "-r", "--no-show-raw-insn", path])
     symbols = None
     if kind == "lib":
@@ -222,35 +259,74 @@ def functions(path, fmt, kind):
                    re.finditer(r"^([0-9a-fA-F]+) <(.+)>:$", out, re.M)]
         symbols = Symbols(path, fmt, headers)
     funcs = collections.OrderedDict()
+    outlined = []
+    outlined_by_name = {}
     order = []
     cur = None
+    cur_outlined = None
     sec = None
     for line in out.splitlines():
         m = re.match(r"Disassembly of section (.+):$", line)
         if m:
             sec = m.group(1)
             cur = None
+            cur_outlined = None
             continue
         m = re.match(r"([0-9a-fA-F]+) <(.+)>:$", line)
         if m:
             name = m.group(2)
             if name.startswith("_OUTLINED_FUNCTION_"):
+                cur_outlined = []
+                outlined.append(cur_outlined)
+                outlined_by_name[name] = cur_outlined
                 cur = None
                 continue
+            cur_outlined = None
             key = name if name not in funcs else "%s@%s" % (name, sec)
             cur = funcs.setdefault(key, [int(m.group(1), 16), []])
             order.append((key, sec))
             continue
-        if cur is None or not line.strip():
+        if (cur is None and cur_outlined is None) or not line.strip():
             continue
         m = re.match(r"\s*[0-9a-fA-F]+:\s+(ARM64_RELOC_\w+|R_[A-Z0-9_]+)\s+(\S+)", line)
         if m:
-            cur[1].append(norm_reloc(m.group(1), m.group(2)))
+            normed = norm_reloc(m.group(1), m.group(2), strict)
+            if cur is not None:
+                cur[1].append(normed)
+            else:
+                cur_outlined.append(normed)
             continue
         m = re.match(r"\s*([0-9a-fA-F]+):\s+(.*)$", line)
         if m:
-            cur[1].append(norm_insn(m.group(2), fmt[1], symbols))
-            cur.append(int(m.group(1), 16))
+            normed = norm_insn(m.group(2), fmt[1], symbols, strict)
+            if cur is not None:
+                cur[1].append(normed)
+                cur.append(int(m.group(1), 16))
+            else:
+                cur_outlined.append(normed)
+
+    outlined_memo = {}
+
+    def outlined_tag(oname, visiting=frozenset()):
+        if oname in outlined_memo:
+            return outlined_memo[oname]
+        if oname not in outlined_by_name or oname in visiting:
+            return "OUTLINED#unknown"
+        resolved = [
+            re.sub(r"_OUTLINED_FUNCTION_\d+",
+                   lambda mm: outlined_tag(mm.group(0), visiting | {oname}),
+                   ln)
+            for ln in outlined_by_name[oname]
+        ]
+        digest = hashlib.sha256("\n".join(resolved).encode("utf-8")).hexdigest()[:16]
+        tag = "OUTLINED#" + digest
+        outlined_memo[oname] = tag
+        return tag
+
+    def bind_outlined(lines):
+        return [re.sub(r"_OUTLINED_FUNCTION_\d+", lambda mm: outlined_tag(mm.group(0)), ln)
+                for ln in lines]
+
     res = {}
     by_sec = collections.defaultdict(list)
     for key, s in order:
@@ -263,8 +339,8 @@ def functions(path, fmt, kind):
             else:
                 addrs = funcs[key][2:]
                 size = (max(addrs) - start) if addrs else 0
-            res[key] = (size, funcs[key][1])
-    return res
+            res[key] = (size, bind_outlined(funcs[key][1]))
+    return res, [tuple(bind_outlined(body)) for body in outlined]
 
 
 def contents(path):
@@ -326,8 +402,12 @@ def split_strings(data):
     return [s.decode("utf-8", "surrogateescape") for s in bytes(data).split(b"\0")]
 
 
-def compare_functions(base, cand, fmt, kind):
-    fb, fc = functions(base, fmt, kind), functions(cand, fmt, kind)
+def compare_functions(base, cand, fmt, kind, strict=False):
+    (fb, ob), (fc, oc) = functions(base, fmt, kind, strict), functions(cand, fmt, kind, strict)
+    if len(ob) != len(oc):
+        problem("OUTLINED count %d -> %d" % (len(ob), len(oc)))
+    elif collections.Counter(ob) != collections.Counter(oc):
+        problem("OUTLINED function bodies differ")
     if not fb:
         problem("FUNC none found in %s: objdump output not understood" % base)
     for name in sorted(set(fb) - set(fc)):
@@ -370,11 +450,13 @@ def compare_sections(base, cand, kind):
             problem("SECTION %s: size %d -> %d" % (name, a, b))
 
 
-def norm_relocs(relocs):
+def norm_relocs(relocs, strict=False):
+    if strict:
+        return sorted((o, t, v) for o, t, v, _ in relocs)
     return sorted((o, t, "STR" if STRSYM_RE.match(v) else norm_target(v)) for o, t, v, _ in relocs)
 
 
-def compare_object_data(base, cand, fmt):
+def compare_object_data(base, cand, fmt, strict=False):
     cb, cc = contents(base), contents(cand)
     rb, rc = relocations(base, fmt), relocations(cand, fmt)
     for name, (_, data) in cb.items():
@@ -382,17 +464,22 @@ def compare_object_data(base, cand, fmt):
         if name not in cc or SKIP_SECTION_RE.search(short):
             continue
         if STRING_SECTION_RE.search(name):
-            sb = collections.Counter(s for s in split_strings(data) if not FILE_NAME_RE.search(s))
-            sc = collections.Counter(s for s in split_strings(cc[name][1]) if not FILE_NAME_RE.search(s))
-            if sb != sc:
-                problem("STRINGS %s: only in base %s, only in candidate %s"
-                        % (name, sorted((sb - sc).elements())[:5], sorted((sc - sb).elements())[:5]))
+            lb = [s for s in split_strings(data) if not FILE_NAME_RE.search(s)]
+            lc = [s for s in split_strings(cc[name][1]) if not FILE_NAME_RE.search(s)]
+            if strict:
+                if lb != lc:
+                    problem("STRINGS %s: ordered string list differs" % name)
+            else:
+                sb, sc = collections.Counter(lb), collections.Counter(lc)
+                if sb != sc:
+                    problem("STRINGS %s: only in base %s, only in candidate %s"
+                            % (name, sorted((sb - sc).elements())[:5], sorted((sc - sb).elements())[:5]))
             continue
         if re.search(r"__text$|^\.text", short):
             continue
         xb, xc = rb.get(name, []), rc.get(name, [])
-        if norm_relocs(xb) != norm_relocs(xc):
-            problem("RELOCS %s: %s" % (name, sorted(set(norm_relocs(xb)) ^ set(norm_relocs(xc)))[:5]))
+        if norm_relocs(xb, strict) != norm_relocs(xc, strict):
+            problem("RELOCS %s: %s" % (name, sorted(set(norm_relocs(xb, strict)) ^ set(norm_relocs(xc, strict)))[:5]))
         if masked(data, xb) != masked(cc[name][1], xc):
             problem("DATA %s: contents differ outside relocated slots" % name)
 
@@ -422,14 +509,30 @@ def dynamic_relocations(path):
     return res
 
 
-def compare_library_data(base, cand, fmt):
+def compare_library_data(base, cand, fmt, strict=False):
+    cb, cc = contents(base), contents(cand)
+    if strict:
+        for name, (start_b, data_b) in cb.items():
+            if name not in cc:
+                continue
+            if STRING_SECTION_RE.search(name) or (fmt[0] == "elf" and name == ".rodata"):
+                rb_sec = [r for r in (dynamic_relocations(base) if fmt[0] == "elf" else [])
+                          if start_b <= r[0] < start_b + len(data_b)]
+                start_c, data_c = cc[name]
+                rc_sec = [r for r in (dynamic_relocations(cand) if fmt[0] == "elf" else [])
+                          if start_c <= r[0] < start_c + len(data_c)]
+                mb = masked(data_b, rb_sec, base=start_b)
+                mc = masked(data_c, rc_sec, base=start_c)
+                lb = [s for s in split_strings(mb) if not FILE_NAME_RE.search(s)]
+                lc = [s for s in split_strings(mc) if not FILE_NAME_RE.search(s)]
+                if lb != lc:
+                    problem("LIB_STRINGS %s: anonymous/rodata contents differ" % name)
     if fmt[0] != "elf":
         return
     ob, oc = data_objects(base), data_objects(cand)
     if set(ob) != set(oc):
         problem("OBJECTS only in base %s, only in candidate %s"
                 % (sorted(set(ob) - set(oc))[:5], sorted(set(oc) - set(ob))[:5]))
-    cb, cc = contents(base), contents(cand)
     rb, rc = dynamic_relocations(base), dynamic_relocations(cand)
     hb = Symbols(base, fmt, [])
     hc = Symbols(cand, fmt, [])
@@ -445,7 +548,8 @@ def compare_library_data(base, cand, fmt):
         targets = []
         for off, rtype, value, _ in inside:
             m = re.match(r"\*ABS\*\+0x([0-9a-fA-F]+)$", value)
-            target = syms.resolve(int(m.group(1), 16)) if m else norm_target(value)
+            target = (syms.resolve(int(m.group(1), 16), strict=strict) if m
+                      else (value if strict else norm_target(value)))
             targets.append((off - addr, rtype, target))
         return size, bytes(body), targets
 
@@ -459,18 +563,18 @@ def compare_library_data(base, cand, fmt):
             problem("OBJECT %s: relocation targets %s -> %s" % (key[0], vb[2][:3], vc[2][:3]))
 
 
-def compare_bin(base, cand, kind):
+def compare_bin(base, cand, kind, strict=False):
     fmt = file_format(base)
     if fmt is None or file_format(cand) != fmt:
         problem("FORMAT not understood or different: %s, %s" % (base, cand))
         n = 0
     else:
-        n = compare_functions(base, cand, fmt, kind)
+        n = compare_functions(base, cand, fmt, kind, strict)
         compare_sections(base, cand, kind)
         if kind == "obj":
-            compare_object_data(base, cand, fmt)
+            compare_object_data(base, cand, fmt, strict)
         else:
-            compare_library_data(base, cand, fmt)
+            compare_library_data(base, cand, fmt, strict)
     for p in problems[:200]:
         print(p)
     if len(problems) > 200:
@@ -484,7 +588,9 @@ def main(argv):
     if len(argv) == 3 and argv[0] == "normalize-cpp":
         normalize_cpp(argv[1], argv[2])
     elif len(argv) == 4 and argv[0] == "compare-bin" and argv[3] in ("obj", "lib"):
-        compare_bin(argv[1], argv[2], argv[3])
+        compare_bin(argv[1], argv[2], argv[3], strict=False)
+    elif len(argv) == 5 and argv[0] == "compare-bin" and argv[1] == "--strict" and argv[4] in ("obj", "lib"):
+        compare_bin(argv[2], argv[3], argv[4], strict=True)
     else:
         print(__doc__)
         sys.exit(2)

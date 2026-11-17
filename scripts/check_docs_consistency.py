@@ -39,8 +39,113 @@ CACHE_STATS_FIELDS = (
     "total_bytes",
 )
 FROZEN_SQL_SHA256 = {
+    "fasttrun--2.0--2.1.sql": (
+        "3134078de967ce61e4d66f99560aa6638c5eafc3af07a8f60f75d2c5cca4816f"
+    ),
+    "fasttrun--2.0.sql": (
+        "69d8756f8e9459f92dc37ba6240ceac2134072ef3fbbe9f11373d7aca74ed08d"
+    ),
+    "fasttrun--2.1--2.1.1.sql": (
+        "c119d118a5900e84d7c6dbe72bbe42bc57617899aed12520ca18bc9d3ea7ecfa"
+    ),
+    "fasttrun--2.1.1--2.1.2.sql": (
+        "d8e26cce14e5c21bd3df05c5f93e4e1715aec45d077de4bf02e8da58eb5008ea"
+    ),
+    "fasttrun--2.1.1.sql": (
+        "617f537dbdc3ce64985a7ef3146a0067a298380dc42844bd13cce84f831c3fb5"
+    ),
+    "fasttrun--2.1.2--2.2.0.sql": (
+        "475213b0f7ac9a4d0f2d17e99f9610062cf0de42d106510ef071e8bf628b3f7c"
+    ),
+    "fasttrun--2.1.2.sql": (
+        "617f537dbdc3ce64985a7ef3146a0067a298380dc42844bd13cce84f831c3fb5"
+    ),
+    "fasttrun--2.1.sql": (
+        "617f537dbdc3ce64985a7ef3146a0067a298380dc42844bd13cce84f831c3fb5"
+    ),
+    "fasttrun--2.2.0--2.3.0.sql": (
+        "94b5fe3d6992755293e74394bdd821e45a6f23f526feb714ee7e0ec8231663f2"
+    ),
+    "fasttrun--2.2.0.sql": (
+        "617f537dbdc3ce64985a7ef3146a0067a298380dc42844bd13cce84f831c3fb5"
+    ),
+    "fasttrun--2.3.0--2.3.1.sql": (
+        "c3d70f646ed4afe3fb8af21aed32cd406adb43267278372182b20dd443059776"
+    ),
+    "fasttrun--2.3.0.sql": (
+        "2e7d5cd64ba1dc2c2e3bcdaae14fec26c4c91ce0651239e74df364e4504cf1bf"
+    ),
+    "fasttrun--2.3.1--2.3.2.sql": (
+        "010b2ed915fde3735416adbf23dc79d5320e3adba0d71c2dbb6446e3dda39aef"
+    ),
+    "fasttrun--2.3.1.sql": (
+        "2e7d5cd64ba1dc2c2e3bcdaae14fec26c4c91ce0651239e74df364e4504cf1bf"
+    ),
+    "fasttrun--2.3.2--2.3.3.sql": (
+        "ef3bde707baf5e27eb893fab677e7397203de05b63d2d20abab07ebec9456343"
+    ),
+    "fasttrun--2.3.2.sql": (
+        "2e7d5cd64ba1dc2c2e3bcdaae14fec26c4c91ce0651239e74df364e4504cf1bf"
+    ),
+    "fasttrun--2.3.3--2.3.4.sql": (
+        "0bddaa218f8271affd4f98779665795df9c4ab0df9e5f9a363727aa39f6ff9b9"
+    ),
+    "fasttrun--2.3.3.sql": (
+        "2e7d5cd64ba1dc2c2e3bcdaae14fec26c4c91ce0651239e74df364e4504cf1bf"
+    ),
+    "fasttrun--2.3.4--2.4.0.sql": (
+        "0379f9676f34beecab59b6f7008f2d903b9ec08579c99fc43d952d4d799c1825"
+    ),
     "fasttrun--2.3.4.sql": (
         "2e7d5cd64ba1dc2c2e3bcdaae14fec26c4c91ce0651239e74df364e4504cf1bf"
+    ),
+    "fasttrun--2.4.0--2.4.1.sql": (
+        "ca1cce445e75585e09601fe852d5e883855cb5342ca5464e4dc0936d7b5f4d00"
+    ),
+    "fasttrun--2.4.0.sql": (
+        "99b821bdadab98b20291a2800c4c914913f6307b2bfcc3640d9aa5293818d917"
+    ),
+    "fasttrun--2.4.1--2.5.0.sql": (
+        "1eb401074645c6e25af38499cd317e41d0a1b1c99785b06ef29c6d5abafb43bf"
+    ),
+    "fasttrun--2.4.1.sql": (
+        "99b821bdadab98b20291a2800c4c914913f6307b2bfcc3640d9aa5293818d917"
+    ),
+    "fasttrun--2.5.0--2.5.1.sql": (
+        "4d2f5e1a63191ddd1763bc9fc6c9e5ec76e4b3ba2e289f9bdeba7d43b3926e9f"
+    ),
+    "fasttrun--2.5.0.sql": (
+        "99b821bdadab98b20291a2800c4c914913f6307b2bfcc3640d9aa5293818d917"
+    ),
+    "fasttrun--2.5.1--2.5.2.sql": (
+        "61a19b8dde493ace19f46ec449a70e4f6f357424a1d06a39ba6c905b385e7f2b"
+    ),
+    "fasttrun--2.5.1.sql": (
+        "d1cde6e9324c148b07ce222e6091af00f700e626f873588f664d376d591ccddb"
+    ),
+    "fasttrun--2.5.2--2.6.0.sql": (
+        "87afe7844bdfba7bad1077d6637ca66413ae8dbb2a8ca9a1c223b3f2b2a3285c"
+    ),
+    "fasttrun--2.5.2.sql": (
+        "d1cde6e9324c148b07ce222e6091af00f700e626f873588f664d376d591ccddb"
+    ),
+    "fasttrun--2.6.0--2.7.0.sql": (
+        "fa61a7dfc420a0d9fec1a9fd92e32d67221956524204cdc9f5c86ee7923a75df"
+    ),
+    "fasttrun--2.6.0.sql": (
+        "88debf6cd3c09c7c1819508306f97c8965a536a45358851c70a26129288da696"
+    ),
+    "fasttrun--2.7.0.sql": (
+        "08de4006dca78e7dd03d1ddfd08a86527244370f101ebc17087e7bbe8a480cf6"
+    ),
+    "fasttrun--2.7.0--2.7.1.sql": (
+        "ae29ddc8af2a6a422feac456a88478de1ecf6645477bbbedf05e5590a9cd5d82"
+    ),
+    "fasttrun--2.7.1.sql": (
+        "08de4006dca78e7dd03d1ddfd08a86527244370f101ebc17087e7bbe8a480cf6"
+    ),
+    "fasttrun--unpackaged--2.0.sql": (
+        "570c6f9be968d858d3b09b7a36833dd19b9e654fc7c2b73bfc76ade0fe24e8f5"
     ),
 }
 VERSION_PATTERN = r"\d+(?:\.\d+)+"

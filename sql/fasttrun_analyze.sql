@@ -1059,23 +1059,40 @@ SELECT relpages = pg_temp.rel_bytes('t_carry_vacuum') / 8192 AND reltuples = 200
 DROP TABLE t_carry_vacuum;
 
 -- Ноль, оцененный выборкой блоков, не подтверждает базу пересбора, пока
--- пересбор отложен записью: следующий analyze пересчитывает строки.  Выборка
--- из одного блока изредка попадает на единственную живую страницу и дает не
--- ноль, тогда проверять нечего.
+-- пересбор отложен записью: следующий analyze пересчитывает строки.
 CREATE TEMP TABLE t_carry_zero (grp int);
 INSERT INTO t_carry_zero SELECT 1 FROM generate_series(1, 200);
 INSERT INTO t_carry_zero SELECT 2 FROM generate_series(1, 20000);
 DELETE FROM t_carry_zero WHERE grp = 2;
 SET fasttrun.max_analyze_pages = 1;
 SET fasttrun.sample_rows = 1;
-SELECT fasttrun_analyze('t_carry_zero');
-SELECT reltuples AS zero_cold_estimate FROM fasttrun_relstats('t_carry_zero') \gset
+DO $seed_zero$
+DECLARE attempt int;
+BEGIN
+  FOR attempt IN 1..50 LOOP
+    BEGIN
+      PERFORM fasttrun_analyze('t_carry_zero');
+      IF (SELECT reltuples FROM fasttrun_relstats('t_carry_zero')) <> 0 THEN
+        RAISE EXCEPTION 'retry_zero_sample';
+      END IF;
+      EXIT;
+    EXCEPTION WHEN raise_exception THEN
+      IF SQLERRM <> 'retry_zero_sample' THEN
+        RAISE;
+      END IF;
+    END;
+  END LOOP;
+  IF (SELECT reltuples FROM fasttrun_relstats('t_carry_zero')) <> 0 THEN
+    RAISE EXCEPTION 'block sample did not observe an empty block in 50 attempts';
+  END IF;
+END
+$seed_zero$;
 SET fasttrun.max_analyze_pages = 0;
 SET fasttrun.sample_rows = 1000;
 WITH w AS (UPDATE t_carry_zero SET grp = grp RETURNING grp)
 SELECT count(*) AS carry21b_zero_updated, fasttrun_analyze('t_carry_zero') IS NOT NULL AS analyzed FROM w;
 SELECT fasttrun_analyze('t_carry_zero');
-SELECT reltuples = 200 OR :zero_cold_estimate <> 0 AS carry21b_zero_recount
+SELECT reltuples = 200 AS carry21b_zero_recount
   FROM fasttrun_relstats('t_carry_zero');
 RESET fasttrun.max_analyze_pages;
 RESET fasttrun.sample_rows;
@@ -1972,16 +1989,39 @@ DROP TABLE t_m23;
 CREATE TEMP TABLE t_bulk_cancel(id int);
 INSERT INTO t_bulk_cancel SELECT generate_series(1, 20);
 DO $$BEGIN PERFORM fasttrun_analyze('t_bulk_cancel'); END$$;
-CREATE TEMP TABLE t_bulk_args(names text[]);
-INSERT INTO t_bulk_args SELECT array_fill('t_bulk_cancel'::text, ARRAY[1000000]);
-DO $$BEGIN PERFORM fasttrun_counters_reset(); END$$;
-SET statement_timeout = '25ms';
-SELECT fasttrun_analyze_bulk(VARIADIC names) FROM t_bulk_args;
-RESET statement_timeout;
-DO $cancel$
+CREATE TEMP TABLE t_bulk_arr(n_elems integer, arr text[]);
+DO $calibrate$
+DECLARE
+  probe text[] := array_fill('t_bulk_cancel'::text, ARRAY[10000]);
+  t0 timestamptz;
+  elapsed double precision;
+  n integer;
 BEGIN
-  IF (SELECT value FROM fasttrun_counters() WHERE counter = 'analyze_calls') >= 1000000 THEN
-    RAISE EXCEPTION 'bulk cancellation waited for every element';
+  t0 := clock_timestamp();
+  PERFORM fasttrun_analyze_bulk(VARIADIC probe);
+  elapsed := greatest(extract(epoch FROM clock_timestamp() - t0), 0.0005);
+  n := least(2000000, greatest(60000, round((1.00 / elapsed) * 10000)::integer));
+  INSERT INTO t_bulk_arr VALUES (n, array_fill('t_bulk_cancel'::text, ARRAY[n]));
+  PERFORM fasttrun_counters_reset();
+END
+$calibrate$;
+SET statement_timeout = '200ms';
+DO $cancel$
+DECLARE
+  n_elems integer;
+  calls bigint;
+  canceled boolean := false;
+BEGIN
+  SELECT a.n_elems INTO n_elems FROM t_bulk_arr a;
+  BEGIN
+    PERFORM fasttrun_analyze_bulk(VARIADIC a.arr) FROM t_bulk_arr a;
+  EXCEPTION WHEN query_canceled THEN
+    canceled := true;
+  END;
+  SELECT value INTO calls FROM fasttrun_counters() WHERE counter = 'analyze_calls';
+  IF NOT canceled OR calls <= 0 OR calls >= n_elems THEN
+    RAISE EXCEPTION 'bulk cancellation out of bounds: canceled=%, calls=%, n_elems=%',
+      canceled, calls, n_elems;
   END IF;
   IF (SELECT count(*) FROM t_bulk_cancel) <> 20 OR
      (SELECT reltuples FROM fasttrun_relstats('t_bulk_cancel')) <> 20 THEN
@@ -1989,7 +2029,139 @@ BEGIN
   END IF;
 END
 $cancel$;
-DROP TABLE t_bulk_args;
-DROP TABLE t_bulk_cancel;
+RESET statement_timeout;
+DROP TABLE t_bulk_arr, t_bulk_cancel;
+
+-- Partial index and small-drift heap rd_rel restore on SAVEPOINT rollback and VACUUM.
+CREATE TEMP TABLE t_vac_part_sync(a int);
+CREATE INDEX t_vac_part_sync_idx ON t_vac_part_sync(a) WHERE a > 900;
+INSERT INTO t_vac_part_sync SELECT generate_series(1, 1000);
+ANALYZE t_vac_part_sync;
+BEGIN;
+SAVEPOINT sp_first_part;
+DELETE FROM t_vac_part_sync WHERE a > 900;
+DO $$BEGIN PERFORM fasttrun_analyze('t_vac_part_sync'); END$$;
+ROLLBACK TO SAVEPOINT sp_first_part;
+COMMIT;
+DO $$
+BEGIN
+  IF (SELECT reltuples FROM fasttrun_relstats('t_vac_part_sync_idx')) <> 100 THEN
+    RAISE EXCEPTION 'partial index rd_rel kept rolled-back tuple estimate';
+  END IF;
+END$$;
+DO $$BEGIN PERFORM fasttrun_analyze('t_vac_part_sync'); END$$;
+DELETE FROM t_vac_part_sync WHERE a > 900;
+VACUUM t_vac_part_sync;
+DO $$
+BEGIN
+  IF (SELECT reltuples FROM fasttrun_relstats('t_vac_part_sync_idx')) <> 0 THEN
+    RAISE EXCEPTION 'VACUUM left stale partial-index reltuples in cache';
+  END IF;
+END$$;
+DROP TABLE t_vac_part_sync;
+CREATE TEMP TABLE t_vac_ic_off(a int);
+CREATE INDEX t_vac_ic_off_idx ON t_vac_ic_off(a) WHERE a > 0;
+INSERT INTO t_vac_ic_off SELECT generate_series(1, 100);
+ANALYZE t_vac_ic_off;
+INSERT INTO t_vac_ic_off SELECT generate_series(101, 200);
+DO $$BEGIN PERFORM fasttrun_analyze('t_vac_ic_off'); END$$;
+VACUUM (INDEX_CLEANUP OFF) t_vac_ic_off;
+DO $$
+BEGIN
+  IF (SELECT reltuples FROM fasttrun_relstats('t_vac_ic_off_idx')) <> 200 THEN
+    RAISE EXCEPTION 'VACUUM (INDEX_CLEANUP OFF) overwrote fresher partial-index reltuples';
+  END IF;
+END$$;
+DROP TABLE t_vac_ic_off;
+CREATE TEMP TABLE t_vac_collect_part(a int);
+CREATE INDEX t_vac_collect_part_idx ON t_vac_collect_part(a) WHERE a % 2 = 0;
+INSERT INTO t_vac_collect_part SELECT generate_series(1, 100);
+DO $$BEGIN PERFORM fasttrun_analyze('t_vac_collect_part'); END$$;
+INSERT INTO t_vac_collect_part SELECT generate_series(101, 200);
+DO $$BEGIN PERFORM fasttrun_collect_stats('t_vac_collect_part'); END$$;
+VACUUM (INDEX_CLEANUP OFF) t_vac_collect_part;
+DO $$
+BEGIN
+  IF (SELECT reltuples FROM fasttrun_relstats('t_vac_collect_part_idx')) <> 100 THEN
+    RAISE EXCEPTION 'VACUUM (INDEX_CLEANUP OFF) rescaled partial-index reltuples after collect_stats';
+  END IF;
+END$$;
+DROP TABLE t_vac_collect_part;
+CREATE TEMP TABLE t_vac_dup_part(a int);
+CREATE INDEX t_vac_dup_part_idx ON t_vac_dup_part(a) WHERE a % 10 = 0;
+INSERT INTO t_vac_dup_part SELECT generate_series(1, 100);
+DO $$BEGIN PERFORM fasttrun_analyze('t_vac_dup_part'); END$$;
+INSERT INTO t_vac_dup_part SELECT generate_series(101, 200);
+VACUUM (INDEX_CLEANUP OFF) t_vac_dup_part, t_vac_dup_part;
+DO $$
+BEGIN
+  IF (SELECT reltuples FROM fasttrun_relstats('t_vac_dup_part_idx')) <> 20 THEN
+    RAISE EXCEPTION 'repeated VACUUM target scaled partial-index reltuples more than once';
+  END IF;
+END$$;
+DROP TABLE t_vac_dup_part;
+
+-- Active CTAS writer and re-entrant collection guards.
+CREATE FUNCTION pg_temp.ft_ctas_analyze_probe(n int) RETURNS int LANGUAGE plpgsql AS $$
+BEGIN
+  IF n = 500 THEN
+    PERFORM fasttrun_analyze('pg_temp.t_ctas_active');
+    PERFORM fasttrun_collect_stats('pg_temp.t_ctas_active');
+  END IF;
+  RETURN n;
+END$$;
+DO $$BEGIN PERFORM fasttrun_counters_reset(); END$$;
+CREATE TEMP TABLE t_ctas_active AS
+  SELECT pg_temp.ft_ctas_analyze_probe(g) AS id FROM generate_series(1, 1000) g;
+DO $$
+BEGIN
+  PERFORM fasttrun_analyze('t_ctas_active');
+  IF (SELECT reltuples FROM fasttrun_relstats('t_ctas_active')) <> 1000 THEN
+    RAISE EXCEPTION 'CTAS mid-write analyze anchored stale delta row count';
+  END IF;
+  IF (SELECT value FROM fasttrun_counters() WHERE counter = 'column_collects_during_write') < 1 THEN
+    RAISE EXCEPTION 'CTAS mid-write collect was not marked unsafe';
+  END IF;
+END$$;
+DROP TABLE t_ctas_active;
+DROP FUNCTION pg_temp.ft_ctas_analyze_probe(int);
+
+CREATE TEMP TABLE t_reentrant_an(v int);
+INSERT INTO t_reentrant_an SELECT generate_series(1, 200);
+CREATE FUNCTION pg_temp.ft_reentrant_expr(x int) RETURNS int LANGUAGE plpgsql IMMUTABLE AS $$
+BEGIN
+  IF x = 1 THEN
+    PERFORM public.fasttrun_analyze('pg_temp.t_reentrant_an');
+    PERFORM public.fasttrun_collect_stats('pg_temp.t_reentrant_an');
+  END IF;
+  RETURN x;
+END$$;
+CREATE INDEX t_reentrant_an_idx ON t_reentrant_an ((pg_temp.ft_reentrant_expr(v)));
+DO $$
+BEGIN
+  PERFORM fasttrun_analyze('t_reentrant_an');
+  IF (SELECT reltuples FROM fasttrun_relstats('t_reentrant_an')) <> 200 THEN
+    RAISE EXCEPTION 're-entrant analyze corrupted row count';
+  END IF;
+END$$;
+DROP TABLE t_reentrant_an;
+DROP FUNCTION pg_temp.ft_reentrant_expr(int);
+
+-- ON COMMIT DELETE ROWS first touched via an inlined SQL function adopts empty storage.
+CREATE TEMP TABLE t_odr_inline(id int) ON COMMIT DELETE ROWS;
+CREATE FUNCTION pg_temp.ft_odr_inline_fn() RETURNS SETOF t_odr_inline
+LANGUAGE sql STABLE AS 'SELECT * FROM t_odr_inline';
+BEGIN;
+INSERT INTO t_odr_inline SELECT generate_series(1, 500);
+DO $$BEGIN PERFORM fasttrun_analyze('t_odr_inline'); END$$;
+COMMIT;
+DO $$
+BEGIN
+  IF pg_temp.an_rows('SELECT * FROM pg_temp.ft_odr_inline_fn()') > 10 THEN
+    RAISE EXCEPTION 'inlined SQL function missed ON COMMIT DELETE ROWS empty check';
+  END IF;
+END$$;
+DROP FUNCTION pg_temp.ft_odr_inline_fn();
+DROP TABLE t_odr_inline;
 
 DROP EXTENSION fasttrun;

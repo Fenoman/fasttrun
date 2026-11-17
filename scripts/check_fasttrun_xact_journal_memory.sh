@@ -47,7 +47,7 @@ PORT=${PGPORT:-$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.
 
 run_pg "$INITDB" -D "$DATA" --no-locale -E UTF8 >/dev/null
 run_pg "$PG_CTL" -D "$DATA" -l "$LOG" \
-	-o "-k $SOCKET_DIR -p $PORT -c listen_addresses='' -c track_counts=on" \
+	-o "-k $SOCKET_DIR -p $PORT -c listen_addresses='' -c track_counts=on -c max_locks_per_transaction=256" \
 	-w start >/dev/null
 run_pg "$CREATEDB" -h "$SOCKET_DIR" -p "$PORT" "$DBNAME"
 
@@ -331,6 +331,188 @@ END $repeat$;
 SELECT 'FRESH_FINAL_USED ' || used_bytes
 FROM pg_backend_memory_contexts WHERE name = 'TopTransactionContext';
 COMMIT;
+
+CREATE TEMP TABLE ft_dc_parent(a int);
+INSERT INTO ft_dc_parent VALUES (1);
+CREATE TEMP TABLE ft_dc_child(a int);
+INSERT INTO ft_dc_child VALUES (1);
+\if :load_fasttrun
+CREATE FUNCTION pg_temp.ft_dc_touch_parent() RETURNS void LANGUAGE sql AS $$
+  SELECT fasttrun_analyze('ft_dc_parent');
+$$;
+CREATE FUNCTION pg_temp.ft_dc_touch_child() RETURNS void LANGUAGE sql AS $$
+  SELECT fasttrun_collect_stats('ft_dc_child');
+$$;
+\else
+CREATE FUNCTION pg_temp.ft_dc_touch_parent() RETURNS void LANGUAGE sql AS $$
+  SELECT NULL::void;
+$$;
+CREATE FUNCTION pg_temp.ft_dc_touch_child() RETURNS void LANGUAGE sql AS $$
+  SELECT NULL::void;
+$$;
+\endif
+BEGIN;
+DO $dropcol_warm$ BEGIN
+  FOR i IN 1..30 LOOP
+    BEGIN
+      PERFORM pg_temp.ft_dc_touch_parent();
+      BEGIN
+        ALTER TABLE ft_dc_child ADD COLUMN b_tmp int DEFAULT 2;
+        PERFORM pg_temp.ft_dc_touch_child();
+        ALTER TABLE ft_dc_child DROP COLUMN b_tmp;
+      EXCEPTION WHEN division_by_zero THEN NULL;
+      END;
+      RAISE EXCEPTION USING MESSAGE = 'rollback dropcol outer';
+    EXCEPTION WHEN raise_exception THEN
+      IF SQLERRM <> 'rollback dropcol outer' THEN RAISE; END IF;
+    END;
+  END LOOP;
+END $dropcol_warm$;
+SELECT 'DROPCOL_WARM_USED ' || used_bytes
+FROM pg_backend_memory_contexts WHERE name = 'TopTransactionContext';
+DO $dropcol_repeat$ BEGIN
+  FOR i IN 1..1000 LOOP
+    BEGIN
+      PERFORM pg_temp.ft_dc_touch_parent();
+      BEGIN
+        ALTER TABLE ft_dc_child ADD COLUMN b_tmp int DEFAULT 2;
+        PERFORM pg_temp.ft_dc_touch_child();
+        ALTER TABLE ft_dc_child DROP COLUMN b_tmp;
+      EXCEPTION WHEN division_by_zero THEN NULL;
+      END;
+      RAISE EXCEPTION USING MESSAGE = 'rollback dropcol outer';
+    EXCEPTION WHEN raise_exception THEN
+      IF SQLERRM <> 'rollback dropcol outer' THEN RAISE; END IF;
+    END;
+  END LOOP;
+END $dropcol_repeat$;
+SELECT 'DROPCOL_FINAL_USED ' || used_bytes
+FROM pg_backend_memory_contexts WHERE name = 'TopTransactionContext';
+COMMIT;
+DROP FUNCTION pg_temp.ft_dc_touch_parent(), pg_temp.ft_dc_touch_child();
+DROP TABLE ft_dc_parent, ft_dc_child;
+
+\if :load_fasttrun
+BEGIN;
+DO $create_warm$ BEGIN
+  FOR i IN 1..50 LOOP
+    BEGIN
+      CREATE TEMP TABLE ft_fresh_create_rb(id int PRIMARY KEY, v text);
+      RAISE EXCEPTION USING MESSAGE = 'rollback create';
+    EXCEPTION WHEN raise_exception THEN
+      IF SQLERRM <> 'rollback create' THEN RAISE; END IF;
+    END;
+    CREATE TEMP TABLE ft_fresh_create_drop(id int PRIMARY KEY, v text);
+    DROP TABLE ft_fresh_create_drop;
+    CREATE TEMP TABLE ft_fresh_sub_drop(id int);
+    BEGIN
+      DROP TABLE ft_fresh_sub_drop;
+    EXCEPTION WHEN OTHERS THEN RAISE;
+    END;
+  END LOOP;
+END $create_warm$;
+SELECT 'FRESH_CREATE_WARM ' || coalesce(sum(used_bytes), 0)
+FROM pg_backend_memory_contexts WHERE name = 'fasttrun fresh marks';
+DO $create_repeat$ BEGIN
+  FOR i IN 1..2000 LOOP
+    BEGIN
+      CREATE TEMP TABLE ft_fresh_create_rb(id int PRIMARY KEY, v text);
+      RAISE EXCEPTION USING MESSAGE = 'rollback create';
+    EXCEPTION WHEN raise_exception THEN
+      IF SQLERRM <> 'rollback create' THEN RAISE; END IF;
+    END;
+    IF i <= 150 THEN
+      CREATE TEMP TABLE ft_fresh_create_drop(id int PRIMARY KEY, v text);
+      DROP TABLE ft_fresh_create_drop;
+      CREATE TEMP TABLE ft_fresh_sub_drop(id int);
+      BEGIN
+        DROP TABLE ft_fresh_sub_drop;
+      EXCEPTION WHEN OTHERS THEN RAISE;
+      END;
+    END IF;
+  END LOOP;
+END $create_repeat$;
+SELECT 'FRESH_CREATE_FINAL ' || coalesce(sum(used_bytes), 0)
+FROM pg_backend_memory_contexts WHERE name = 'fasttrun fresh marks';
+COMMIT;
+
+SELECT current_setting('debug_assertions') = 'on' AS has_cassert \gset
+\if :has_cassert
+CREATE TEMP TABLE ft_subcommit_anchor(a int);
+INSERT INTO ft_subcommit_anchor VALUES (1);
+BEGIN;
+SELECT fasttrun_analyze('ft_subcommit_anchor');
+DO $subcommit_fail_warm$
+DECLARE
+  caught boolean;
+  fp text;
+BEGIN
+  FOR i IN 1..50 LOOP
+    caught := false;
+    fp := CASE WHEN i % 2 = 0 THEN 'subcommit_merge' ELSE 'after_pre_commit_sub' END;
+    BEGIN
+      CREATE TEMP TABLE ft_subcommit_child(a int, b int);
+      INSERT INTO ft_subcommit_child VALUES (1, 2);
+      PERFORM fasttrun_analyze('ft_subcommit_child');
+      ALTER TABLE ft_subcommit_child DROP COLUMN b;
+      PERFORM set_config('fasttrun.test_failpoint', fp, false);
+    EXCEPTION WHEN SQLSTATE '55000' THEN
+      IF SQLERRM <> ('fasttrun test failpoint: ' || fp) THEN
+        RAISE;
+      END IF;
+      PERFORM set_config('fasttrun.test_failpoint', '', false);
+      caught := true;
+    END;
+    IF NOT caught THEN
+      RAISE EXCEPTION '% failpoint did not fire in warm pass %', fp, i;
+    END IF;
+  END LOOP;
+END $subcommit_fail_warm$;
+SELECT 'SUBCOMMIT_FAIL_WARM_USED ' || coalesce(sum(used_bytes), 0)
+FROM pg_backend_memory_contexts
+WHERE name IN ('fasttrun xact frame', 'fasttrun xact frame relids');
+DO $subcommit_fail_repeat$
+DECLARE
+  caught boolean;
+  fp text;
+BEGIN
+  FOR i IN 1..1000 LOOP
+    caught := false;
+    fp := CASE WHEN i % 2 = 0 THEN 'subcommit_merge' ELSE 'after_pre_commit_sub' END;
+    BEGIN
+      CREATE TEMP TABLE ft_subcommit_child(a int, b int);
+      INSERT INTO ft_subcommit_child VALUES (1, 2);
+      PERFORM fasttrun_analyze('ft_subcommit_child');
+      ALTER TABLE ft_subcommit_child DROP COLUMN b;
+      PERFORM set_config('fasttrun.test_failpoint', fp, false);
+    EXCEPTION WHEN SQLSTATE '55000' THEN
+      IF SQLERRM <> ('fasttrun test failpoint: ' || fp) THEN
+        RAISE;
+      END IF;
+      PERFORM set_config('fasttrun.test_failpoint', '', false);
+      caught := true;
+    END;
+    IF NOT caught THEN
+      RAISE EXCEPTION '% failpoint did not fire in repeat pass %', fp, i;
+    END IF;
+  END LOOP;
+END $subcommit_fail_repeat$;
+SELECT 'SUBCOMMIT_FAIL_FINAL_USED ' || coalesce(sum(used_bytes), 0)
+FROM pg_backend_memory_contexts
+WHERE name IN ('fasttrun xact frame', 'fasttrun xact frame relids');
+DO $subcommit_anchor_check$
+BEGIN
+  IF (SELECT reltuples FROM fasttrun_relstats('ft_subcommit_anchor')) <> 1 THEN
+    RAISE EXCEPTION 'failed child subcommits corrupted surviving parent anchor state';
+  END IF;
+END $subcommit_anchor_check$;
+COMMIT;
+DROP TABLE ft_subcommit_anchor;
+\else
+SELECT 'SUBCOMMIT_FAIL_WARM_USED 0';
+SELECT 'SUBCOMMIT_FAIL_FINAL_USED 0';
+\endif
+\endif
 SQL
 for load_fasttrun in 0 1; do
 	PGOPTIONS='-c session_preload_libraries= -c local_preload_libraries=' \
@@ -345,15 +527,42 @@ fresh_core_warm=$(value FRESH_WARM_USED "$WORKDIR/fresh_0.out")
 fresh_core_final=$(value FRESH_FINAL_USED "$WORKDIR/fresh_0.out")
 fresh_local_warm=$(value FRESH_WARM_USED "$WORKDIR/fresh_1.out")
 fresh_local_final=$(value FRESH_FINAL_USED "$WORKDIR/fresh_1.out")
-for metric in "$fresh_core_warm" "$fresh_core_final" "$fresh_local_warm" "$fresh_local_final"; do
+fresh_create_warm=$(value FRESH_CREATE_WARM "$WORKDIR/fresh_1.out")
+fresh_create_final=$(value FRESH_CREATE_FINAL "$WORKDIR/fresh_1.out")
+dropcol_core_warm=$(value DROPCOL_WARM_USED "$WORKDIR/fresh_0.out")
+dropcol_core_final=$(value DROPCOL_FINAL_USED "$WORKDIR/fresh_0.out")
+dropcol_local_warm=$(value DROPCOL_WARM_USED "$WORKDIR/fresh_1.out")
+dropcol_local_final=$(value DROPCOL_FINAL_USED "$WORKDIR/fresh_1.out")
+subcommit_fail_warm=$(value SUBCOMMIT_FAIL_WARM_USED "$WORKDIR/fresh_1.out")
+subcommit_fail_final=$(value SUBCOMMIT_FAIL_FINAL_USED "$WORKDIR/fresh_1.out")
+for metric in "$fresh_core_warm" "$fresh_core_final" "$fresh_local_warm" \
+	"$fresh_local_final" "$fresh_create_warm" "$fresh_create_final" \
+	"$dropcol_core_warm" "$dropcol_core_final" \
+	"$dropcol_local_warm" "$dropcol_local_final" \
+	"$subcommit_fail_warm" "$subcommit_fail_final"; do
 	case "$metric" in
 		''|*[!0-9]*) echo "invalid fresh-memory metric: $metric" >&2; exit 1 ;;
 	esac
 done
 fresh_extra=$((fresh_local_final - fresh_local_warm - fresh_core_final + fresh_core_warm))
-echo "fresh markers: core_growth=$((fresh_core_final-fresh_core_warm)) local_growth=$((fresh_local_final-fresh_local_warm)) extra=$fresh_extra"
+fresh_create_growth=$((fresh_create_final - fresh_create_warm))
+dropcol_growth=$((dropcol_local_final - dropcol_local_warm - dropcol_core_final + dropcol_core_warm))
+subcommit_fail_growth=$((subcommit_fail_final - subcommit_fail_warm))
+echo "fresh markers: core_growth=$((fresh_core_final-fresh_core_warm)) local_growth=$((fresh_local_final-fresh_local_warm)) extra=$fresh_extra create_churn_growth=$fresh_create_growth dropcol_growth=$dropcol_growth subcommit_fail_growth=$subcommit_fail_growth"
 if [ "$fresh_extra" -gt 16384 ]; then
 	echo 'FAIL: repeated core TRUNCATE retains fresh marks by call count' >&2
+	exit 1
+fi
+if [ "$fresh_create_growth" -gt 0 ]; then
+	echo "FAIL: rolled-back or dropped CREATE TEMP TABLE retains fresh marks ($fresh_create_growth bytes)" >&2
+	exit 1
+fi
+if [ "$dropcol_growth" -gt 16384 ]; then
+	echo "FAIL: child DROP COLUMN merge/abort leaks dropped_attrs in TopTransactionContext ($dropcol_growth bytes)" >&2
+	exit 1
+fi
+if [ "$subcommit_fail_growth" -gt 0 ]; then
+	echo "FAIL: failed subcommit preparation leaks parent journal entries ($subcommit_fail_growth bytes)" >&2
 	exit 1
 fi
 
@@ -449,8 +658,8 @@ if [ "$stable_one_used" -gt $((warm_used + 65536)) ] || \
 	echo "FAIL: общая память fasttrun не вернулась к прогретому уровню" >&2
 	exit 1
 fi
-if grep -Eq 'TRAP|Assertion|PANIC|server process .* was terminated' "$LOG"; then
-	grep -E 'TRAP|Assertion|PANIC|server process .* was terminated' "$LOG" >&2
+if grep -Eq 'TRAP|Assertion|FailedAssertion|PANIC|server process .* was terminated|leaked hash_seq_search' "$LOG"; then
+	grep -E 'TRAP|Assertion|FailedAssertion|PANIC|server process .* was terminated|leaked hash_seq_search' "$LOG" >&2
 	echo "FAIL: проверка памяти вызвала Assert или завершение серверного процесса" >&2
 	exit 1
 fi

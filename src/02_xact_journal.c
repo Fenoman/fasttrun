@@ -67,11 +67,21 @@ typedef struct FasttrunXactRelEntry
 								 * TopTransactionContext */
 } FasttrunXactRelEntry;
 
+typedef struct FasttrunSubcommitDropped
+{
+	Oid			relid;
+	Bitmapset  *merged;
+} FasttrunSubcommitDropped;
+
 typedef struct FasttrunXactFrame
 {
 	SubTransactionId subid;
 	MemoryContext mcxt;
 	HTAB	   *entries;
+	FasttrunSubcommitDropped *subcommit_dropped;
+	int			subcommit_ndropped;
+	Oid		   *subcommit_inserted;
+	int			subcommit_ninserted;
 	struct FasttrunXactFrame *parent;
 } FasttrunXactFrame;
 
@@ -143,6 +153,10 @@ fasttrun_xact_frame_for_subid(SubTransactionId subid, bool create)
 		fasttrun_xact_frame_pool_used--;
 		MemoryContextSetIdentifier(reused->mcxt, NULL);
 		reused->subid = subid;
+		reused->subcommit_dropped = NULL;
+		reused->subcommit_ndropped = 0;
+		reused->subcommit_inserted = NULL;
+		reused->subcommit_ninserted = 0;
 		reused->parent = *link;
 		*link = reused;
 		return *link;
@@ -181,6 +195,44 @@ fasttrun_xact_frame_for_subid(SubTransactionId subid, bool create)
 	return *link;
 }
 
+/* Discard preallocated parent merge state when a prepared frame aborts. */
+static void
+fasttrun_xact_discard_prepared_subcommit(FasttrunXactFrame *frame)
+{
+	int			i;
+
+	if (frame->subcommit_inserted != NULL)
+	{
+		if (frame->parent != NULL && frame->parent->entries != NULL)
+		{
+			for (i = 0; i < frame->subcommit_ninserted; i++)
+			{
+				FasttrunXactRelEntry *dst;
+
+				dst = (FasttrunXactRelEntry *)
+					hash_search(frame->parent->entries,
+								&frame->subcommit_inserted[i],
+								HASH_FIND, NULL);
+				if (dst != NULL && dst->flags == 0 &&
+					!dst->level_size_known && dst->dropped_attrs == NULL)
+					(void) hash_search(frame->parent->entries,
+									   &frame->subcommit_inserted[i],
+									   HASH_REMOVE, NULL);
+			}
+		}
+		pfree(frame->subcommit_inserted);
+		frame->subcommit_inserted = NULL;
+		frame->subcommit_ninserted = 0;
+	}
+	if (frame->subcommit_dropped == NULL)
+		return;
+	for (i = 0; i < frame->subcommit_ndropped; i++)
+		bms_free(frame->subcommit_dropped[i].merged);
+	pfree(frame->subcommit_dropped);
+	frame->subcommit_dropped = NULL;
+	frame->subcommit_ndropped = 0;
+}
+
 /*
  * Release the frame of a finished subtransaction.  Its entries are cleared and
  * the empty frame, context and hash table included, goes to the pool.  A frame
@@ -191,19 +243,38 @@ fasttrun_xact_frame_release(FasttrunXactFrame *frame)
 {
 	HASH_SEQ_STATUS status;
 	FasttrunXactRelEntry *xentry;
+	bool		pool_frame;
 
-	if (fasttrun_xact_frame_pool_used >= FASTTRUN_XACT_FRAME_POOL_MAX ||
-		hash_get_num_entries(frame->entries) >
-		FASTTRUN_XACT_FRAME_POOL_ENTRIES_MAX)
+	fasttrun_xact_discard_prepared_subcommit(frame);
+
+	pool_frame =
+		(fasttrun_xact_frame_pool_used < FASTTRUN_XACT_FRAME_POOL_MAX &&
+		 hash_get_num_entries(frame->entries) <=
+		 FASTTRUN_XACT_FRAME_POOL_ENTRIES_MAX);
+
+	/*
+	 * dropped_attrs bitmaps live in TopTransactionContext rather than
+	 * frame->mcxt, so release them whether the frame is pooled or deleted.
+	 * Deleting the just-returned entry during a seq scan is allowed.
+	 */
+	hash_seq_init(&status, frame->entries);
+	while ((xentry = (FasttrunXactRelEntry *) hash_seq_search(&status)) != NULL)
+	{
+		if (xentry->dropped_attrs != NULL)
+		{
+			bms_free(xentry->dropped_attrs);
+			xentry->dropped_attrs = NULL;
+		}
+		if (pool_frame)
+			(void) hash_search(frame->entries, &xentry->relid,
+							   HASH_REMOVE, NULL);
+	}
+
+	if (!pool_frame)
 	{
 		MemoryContextDelete(frame->mcxt);
 		return;
 	}
-
-	/* Deleting the just-returned entry during a seq scan is allowed. */
-	hash_seq_init(&status, frame->entries);
-	while ((xentry = (FasttrunXactRelEntry *) hash_seq_search(&status)) != NULL)
-		(void) hash_search(frame->entries, &xentry->relid, HASH_REMOVE, NULL);
 
 	/*
 	 * A pooled frame keeps the context name, so mark it instead: the memory
@@ -258,10 +329,11 @@ fasttrun_xact_note_file_birth(Relation rel)
 {
 	FasttrunXactRelEntry *entry;
 	SubTransactionId subid = rel->rd_newRelfilelocatorSubid;
+	SubTransactionId create_file_subid = InvalidSubTransactionId;
 
 	if (subid == InvalidSubTransactionId &&
-		rel->rd_firstRelfilelocatorSubid == InvalidSubTransactionId)
-		subid = rel->rd_createSubid;
+		fasttrun_rel_on_create_file(rel, &create_file_subid))
+		subid = create_file_subid;
 
 	entry = fasttrun_xact_mark_relation_at_level(RelationGetRelid(rel),
 											subid,
@@ -275,12 +347,15 @@ fasttrun_xact_file_birth(Relation rel, bool *known)
 {
 	FasttrunXactFrame *frame;
 	Oid			relid = RelationGetRelid(rel);
+	SubTransactionId create_subid = fasttrun_rel_create_subid(rel);
+	SubTransactionId create_file_subid = InvalidSubTransactionId;
 
 	*known = true;
 	/* Committed files need no journal lookup on the ordinary truncate path. */
-	if (rel->rd_newRelfilelocatorSubid == InvalidSubTransactionId &&
+	if (!fasttrun_outer_xact_saw_atx &&
+		rel->rd_newRelfilelocatorSubid == InvalidSubTransactionId &&
 		rel->rd_firstRelfilelocatorSubid == InvalidSubTransactionId &&
-		rel->rd_createSubid == InvalidSubTransactionId)
+		create_subid == InvalidSubTransactionId)
 		return InvalidSubTransactionId;
 	for (frame = fasttrun_xact_frame; frame != NULL; frame = frame->parent)
 	{
@@ -296,8 +371,8 @@ fasttrun_xact_file_birth(Relation rel, bool *known)
 	fasttrun_xact_note_file_birth(rel);
 	if (rel->rd_newRelfilelocatorSubid != InvalidSubTransactionId)
 		return rel->rd_newRelfilelocatorSubid;
-	if (rel->rd_firstRelfilelocatorSubid == InvalidSubTransactionId)
-		return rel->rd_createSubid;
+	if (fasttrun_rel_on_create_file(rel, &create_file_subid))
+		return create_file_subid;
 	*known = false;
 	return InvalidSubTransactionId;
 }
@@ -306,7 +381,7 @@ static void
 fasttrun_xact_mark_created_relation(Relation rel)
 {
 	fasttrun_xact_mark_relation_at_level(RelationGetRelid(rel),
-										rel->rd_createSubid,
+										fasttrun_rel_create_subid(rel),
 										FASTTRUN_TOUCH_CREATED);
 }
 
@@ -444,43 +519,207 @@ fasttrun_xact_mark_dml_plan_dependency(Oid relid)
 	}
 }
 
+/*
+ * Reserve parent journal entries and merged dropped-attribute bitmaps during
+ * SUBXACT_EVENT_PRE_COMMIT_SUB while the subtransaction is still in
+ * TRANS_INPROGRESS, before CommitSubTransaction() records subcommit or merges
+ * local invalidation lists.  Newly inserted parent entries are removed if
+ * preparation fails or a later pre-commit step aborts the subtransaction.
+ */
 static void
-fasttrun_xact_merge_entry(FasttrunXactFrame *parent,
-						  FasttrunXactRelEntry *child)
+fasttrun_xact_prepare_subcommit(FasttrunXactFrame *parent,
+								FasttrunXactFrame *child)
 {
-	FasttrunXactRelEntry *dst;
-	bool		found;
+	HASH_SEQ_STATUS status;
+	volatile bool seq_open = false;
+	FasttrunSubcommitDropped * volatile dropped = NULL;
+	int volatile ndropped = 0;
+	int			drop_cap = 0;
+	Oid		   * volatile inserted = NULL;
+	int volatile ninserted = 0;
+	int			ins_cap = 0;
+	MemoryContext caller_cxt = CurrentMemoryContext;
 
-	dst = (FasttrunXactRelEntry *)
-		hash_search(parent->entries, &child->relid, HASH_ENTER, &found);
-	if (!found)
-	{
-		*dst = *child;
-		return;
-	}
+	fasttrun_xact_discard_prepared_subcommit(child);
 
-	/* A component's birth mark does not replace an established owning heap. */
-	if (child->root_relid != child->relid || dst->root_relid == dst->relid)
-		dst->root_relid = child->root_relid;
-	dst->flags |= child->flags;
-	if ((child->flags & FASTTRUN_TOUCH_POISON_FILE) != 0)
-		dst->file_birth_locator = child->file_birth_locator;
-	if (child->dropped_attrs != NULL)
+	PG_TRY();
 	{
-		MemoryContext oldcxt = MemoryContextSwitchTo(TopTransactionContext);
+		FasttrunXactRelEntry *xentry;
 
-		dst->dropped_attrs = bms_add_members(dst->dropped_attrs,
-											 child->dropped_attrs);
-		MemoryContextSwitchTo(oldcxt);
+		hash_seq_init(&status, child->entries);
+		seq_open = true;
+		while ((xentry = (FasttrunXactRelEntry *) hash_seq_search(&status)) != NULL)
+		{
+			FasttrunXactRelEntry *dst;
+			bool		found;
+
+			dst = (FasttrunXactRelEntry *)
+				hash_search(parent->entries, &xentry->relid, HASH_FIND, NULL);
+			if (dst == NULL)
+			{
+				if (ninserted == ins_cap)
+				{
+					MemoryContext oldcxt =
+						MemoryContextSwitchTo(TopTransactionContext);
+
+					ins_cap = (ins_cap == 0) ? 8 : ins_cap * 2;
+					if (inserted == NULL)
+						inserted = (Oid *) palloc(sizeof(Oid) * ins_cap);
+					else
+						inserted = (Oid *)
+							repalloc(inserted, sizeof(Oid) * ins_cap);
+					MemoryContextSwitchTo(oldcxt);
+				}
+				dst = (FasttrunXactRelEntry *)
+					hash_search(parent->entries, &xentry->relid,
+								HASH_ENTER, &found);
+				Assert(!found);
+				if (!found)
+				{
+					memset(dst, 0, sizeof(*dst));
+					dst->relid = xentry->relid;
+					dst->root_relid = xentry->relid;
+					inserted[ninserted] = xentry->relid;
+					ninserted++;
+				}
+			}
+			if (xentry->dropped_attrs != NULL)
+			{
+				MemoryContext oldcxt = MemoryContextSwitchTo(TopTransactionContext);
+				Bitmapset  *merged;
+
+				if (ndropped == drop_cap)
+				{
+					drop_cap = (drop_cap == 0) ? 4 : drop_cap * 2;
+					if (dropped == NULL)
+						dropped = (FasttrunSubcommitDropped *)
+							palloc(sizeof(FasttrunSubcommitDropped) * drop_cap);
+					else
+						dropped = (FasttrunSubcommitDropped *)
+							repalloc(dropped,
+									 sizeof(FasttrunSubcommitDropped) * drop_cap);
+				}
+				merged = bms_union(dst->dropped_attrs, xentry->dropped_attrs);
+				dropped[ndropped].relid = xentry->relid;
+				dropped[ndropped].merged = merged;
+				ndropped++;
+				MemoryContextSwitchTo(oldcxt);
+			}
+			FASTTRUN_TEST_FAILPOINT("subcommit_merge", 0);
+		}
+		seq_open = false;
 	}
-	/* The parent level's first write may have happened in the child. */
-	if (!dst->level_size_known && child->level_size_known)
+	PG_CATCH();
 	{
-		dst->level_size_known = true;
-		dst->level_pages = child->level_pages;
-		dst->level_dead = child->level_dead;
-		dst->level_locator = child->level_locator;
+		int			i;
+
+		MemoryContextSwitchTo(caller_cxt);
+		if (seq_open)
+			hash_seq_term(&status);
+		for (i = 0; i < ninserted; i++)
+			(void) hash_search(parent->entries, &inserted[i],
+							   HASH_REMOVE, NULL);
+		if (inserted != NULL)
+			pfree(inserted);
+		for (i = 0; i < ndropped; i++)
+			bms_free(dropped[i].merged);
+		if (dropped != NULL)
+			pfree(dropped);
+		PG_RE_THROW();
 	}
+	PG_END_TRY();
+
+	child->subcommit_dropped = dropped;
+	child->subcommit_ndropped = ndropped;
+	child->subcommit_inserted = inserted;
+	child->subcommit_ninserted = ninserted;
+}
+
+/* Allocation-free commit merge after fasttrun_xact_prepare_subcommit. */
+static void
+fasttrun_xact_apply_subcommit(FasttrunXactFrame *parent,
+							  FasttrunXactFrame *child)
+{
+	HASH_SEQ_STATUS status;
+	FasttrunXactRelEntry *xentry;
+	FasttrunSubcommitDropped *dropped = child->subcommit_dropped;
+	int			ndropped = child->subcommit_ndropped;
+	int			drop_idx = 0;
+
+	if (child->subcommit_inserted != NULL)
+	{
+		pfree(child->subcommit_inserted);
+		child->subcommit_inserted = NULL;
+		child->subcommit_ninserted = 0;
+	}
+	child->subcommit_dropped = NULL;
+	child->subcommit_ndropped = 0;
+
+	hash_seq_init(&status, child->entries);
+	while ((xentry = (FasttrunXactRelEntry *) hash_seq_search(&status)) != NULL)
+	{
+		FasttrunXactRelEntry *dst;
+
+		dst = (FasttrunXactRelEntry *)
+			hash_search(parent->entries, &xentry->relid, HASH_FIND, NULL);
+		Assert(dst != NULL);
+		if (dst == NULL)
+		{
+			if (xentry->dropped_attrs != NULL)
+			{
+				bms_free(xentry->dropped_attrs);
+				xentry->dropped_attrs = NULL;
+			}
+			continue;
+		}
+
+		/* A component's birth mark does not replace an established owning heap. */
+		if (xentry->root_relid != xentry->relid || dst->root_relid == dst->relid)
+			dst->root_relid = xentry->root_relid;
+		dst->flags |= xentry->flags;
+		if ((xentry->flags & FASTTRUN_TOUCH_POISON_FILE) != 0)
+			dst->file_birth_locator = xentry->file_birth_locator;
+		if (xentry->dropped_attrs != NULL)
+		{
+			Assert(dropped != NULL && drop_idx < ndropped &&
+				   dropped[drop_idx].relid == xentry->relid);
+			if (dropped != NULL && drop_idx < ndropped &&
+				dropped[drop_idx].relid == xentry->relid)
+			{
+				if (dst->dropped_attrs != NULL)
+					bms_free(dst->dropped_attrs);
+				bms_free(xentry->dropped_attrs);
+				xentry->dropped_attrs = NULL;
+				dst->dropped_attrs = dropped[drop_idx].merged;
+				drop_idx++;
+			}
+			else if (dst->dropped_attrs == NULL)
+			{
+				dst->dropped_attrs = xentry->dropped_attrs;
+				xentry->dropped_attrs = NULL;
+			}
+			else
+			{
+				bms_free(xentry->dropped_attrs);
+				xentry->dropped_attrs = NULL;
+			}
+		}
+		/* The parent level's first write may have happened in the child. */
+		if (!dst->level_size_known && xentry->level_size_known)
+		{
+			dst->level_size_known = true;
+			dst->level_pages = xentry->level_pages;
+			dst->level_dead = xentry->level_dead;
+			dst->level_locator = xentry->level_locator;
+		}
+	}
+	while (dropped != NULL && drop_idx < ndropped)
+	{
+		bms_free(dropped[drop_idx].merged);
+		drop_idx++;
+	}
+	if (dropped != NULL)
+		pfree(dropped);
 }
 
 static bool

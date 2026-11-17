@@ -155,6 +155,7 @@ typedef struct FasttrunStatsRelidSavedState
 	FasttrunRelStatsPolicy policy;
 	RelFileLocatorBackend heap_rlb;
 	bool			heap_rlb_valid;
+	bool			budget_admitted;
 	SubTransactionId state_subid;
 	struct FasttrunStatsRelidSavedState *older;
 } FasttrunStatsRelidSavedState;
@@ -191,6 +192,8 @@ typedef struct FasttrunStatsRelidEntry
 									 * Placed here to reuse existing padding */
 	bool		period_unsafe;	/* samples of the current period were taken
 								 * while a statement was writing the relation */
+	bool		budget_admitted;	/* local column samples were collected at
+									 * least once for this relation */
 	FasttrunRelStatsPolicy policy;
 	SubTransactionId state_subid;
 	FasttrunStatsRelidSavedState *undo;

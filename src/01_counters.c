@@ -232,6 +232,7 @@ static void
 fasttrun_test_fail(const char *name, int ordinal)
 {
 	char		key[96];
+	char		pause_key[104];
 
 	if (ordinal > 0)
 		snprintf(key, sizeof(key), "%s:%d", name, ordinal);
@@ -241,6 +242,21 @@ fasttrun_test_fail(const char *name, int ordinal)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("fasttrun test failpoint: %s", key)));
+	snprintf(pause_key, sizeof(pause_key), "pause:%s", key);
+	if (fasttrun_test_failpoint != NULL &&
+		strcmp(fasttrun_test_failpoint, pause_key) == 0)
+	{
+		int			w;
+
+		ereport(NOTICE,
+				(errmsg("fasttrun test failpoint paused: %s", key)));
+		pq_flush();
+		for (w = 0; w < 1000; w++)
+		{
+			pg_usleep(10000L);
+			CHECK_FOR_INTERRUPTS();
+		}
+	}
 }
 #define FASTTRUN_TEST_FAILPOINT(name, ordinal) \
 	fasttrun_test_fail((name), (ordinal))
@@ -316,3 +332,77 @@ static uint64 fasttrun_test_owner_opens = 0;
 static uint64 fasttrun_test_plan_invalidations = 0;
 static uint64 fasttrun_test_index_hook_calls = 0;
 #endif
+
+/*
+ * Postgres Pro Enterprise runs autonomous transactions inside the same
+ * backend via SuspendTransaction, delivering vanilla XACT_EVENT_COMMIT and
+ * XACT_EVENT_ABORT callbacks before ResumeTransaction restores the outer
+ * transaction.  Keep the outer transaction's session/journal state untouched
+ * while an autonomous transaction is active.
+ */
+static bool fasttrun_outer_xact_saw_atx = false;
+static SubTransactionId fasttrun_rel_create_subid(Relation rel);
+static bool fasttrun_rel_on_create_file(Relation rel,
+										SubTransactionId *subid_out);
+
+static inline bool
+fasttrun_in_atx(void)
+{
+#ifdef PGPRO_EE
+	return getNestLevelATX() > 0;
+#else
+	return false;
+#endif
+}
+
+static inline void
+fasttrun_reject_in_atx(const char *funcname)
+{
+	if (fasttrun_in_atx())
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("%s cannot be called inside an autonomous transaction",
+						funcname)));
+}
+
+/*
+ * Run relation-owner callbacks (typanalyze, index expressions, partial-index
+ * predicates, index rebuild support procs) as the relation owner under
+ * SECURITY_RESTRICTED_OPERATION with a restricted search_path, matching core
+ * index_build() and analyze.c across PostgreSQL 16+.
+ */
+typedef struct FasttrunOwnerSecContext
+{
+	Oid			save_userid;
+	int			save_sec_context;
+	int			save_nestlevel;
+} FasttrunOwnerSecContext;
+
+static inline void
+fasttrun_prepare_owner_sec_context(FasttrunOwnerSecContext *sec)
+{
+	GetUserIdAndSecContext(&sec->save_userid, &sec->save_sec_context);
+	sec->save_nestlevel = NewGUCNestLevel();
+}
+
+static inline void
+fasttrun_switch_owner_sec_context(Oid relowner,
+								  const FasttrunOwnerSecContext *sec)
+{
+	SetUserIdAndSecContext(relowner,
+						   sec->save_sec_context | SECURITY_RESTRICTED_OPERATION);
+#if PG_VERSION_NUM >= 170000
+	RestrictSearchPath();
+#else
+	(void) set_config_option("search_path", "pg_catalog, pg_temp",
+							 PGC_USERSET, PGC_S_SESSION,
+							 GUC_ACTION_SAVE, true, 0, false);
+#endif
+}
+
+static inline void
+fasttrun_leave_owner_sec_context(const FasttrunOwnerSecContext *sec)
+{
+	AtEOXact_GUC(false, sec->save_nestlevel);
+	SetUserIdAndSecContext(sec->save_userid, sec->save_sec_context);
+}

@@ -364,6 +364,7 @@ fasttrun_keep_stats_through_ddl(Oid relid, AlterTableStmt *alter,
 	if (alter != NULL)
 	{
 		ListCell   *lc;
+		bool		stats_opts_changed = false;
 		FasttrunStatsRelidEntry *entry = fasttrun_stats_relid_cache == NULL ? NULL :
 			hash_search(fasttrun_stats_relid_cache, &relid, HASH_FIND, NULL);
 
@@ -374,13 +375,32 @@ fasttrun_keep_stats_through_ddl(Oid relid, AlterTableStmt *alter,
 			AlterTableCmd *cmd = (AlterTableCmd *) lfirst(lc);
 			AttrNumber	attnum;
 
-			if (cmd->subtype != AT_DropColumn || cmd->name == NULL)
+			if (cmd->subtype == AT_SetStatistics ||
+				cmd->subtype == AT_SetOptions ||
+				cmd->subtype == AT_ResetOptions)
+				stats_opts_changed = true;
+			if (alter->objtype == OBJECT_INDEX ||
+				cmd->subtype != AT_DropColumn || cmd->name == NULL)
 				continue;
 			attnum = get_attnum(relid, cmd->name);
 			if (attnum > 0)
 				(void) fasttrun_stats_set_column_state(rel, attnum, false,
 													 FASTTRUN_COLUMN_LOCAL_NEUTRAL,
 													 NULL, NULL);
+		}
+		if (stats_opts_changed)
+		{
+			FasttrunAnalyzeCacheEntry *aentry = fasttrun_cache_lookup(relid);
+
+			if (aentry != NULL &&
+				(aentry->state.has_delta_state ||
+				 aentry->state.has_stats_baseline))
+			{
+				fasttrun_xact_mark_relid(relid, relid, FASTTRUN_TOUCH_ANALYZE);
+				fasttrun_analyze_save_undo(aentry);
+				aentry->state.has_delta_state = false;
+				aentry->state.has_stats_baseline = false;
+			}
 		}
 	}
 
@@ -422,6 +442,75 @@ fasttrun_evict_rangevar(RangeVar *rv)
 	fasttrun_evict_temp_relid(relid);
 }
 
+static Oid
+fasttrun_toast_owner_relid(Oid toast_relid)
+{
+	char	   *relname;
+
+	if (!OidIsValid(toast_relid))
+		return InvalidOid;
+	relname = get_rel_name(toast_relid);
+	if (relname != NULL && strncmp(relname, "pg_toast_", 9) == 0 &&
+		isdigit((unsigned char) relname[9]))
+	{
+		char	   *endp = NULL;
+		unsigned long parsed;
+
+		errno = 0;
+		parsed = strtoul(relname + 9, &endp, 10);
+		if (errno == 0 && endp != NULL && *endp == '\0' &&
+			parsed > 0 && parsed <= PG_UINT32_MAX)
+		{
+			Oid			cand = (Oid) parsed;
+			HeapTuple	tp = SearchSysCache1(RELOID, ObjectIdGetDatum(cand));
+
+			if (HeapTupleIsValid(tp))
+			{
+				Oid			cand_toast =
+					((Form_pg_class) GETSTRUCT(tp))->reltoastrelid;
+
+				ReleaseSysCache(tp);
+				if (cand_toast == toast_relid)
+				{
+					pfree(relname);
+					return cand;
+				}
+			}
+		}
+	}
+	if (relname != NULL)
+		pfree(relname);
+
+	if (fasttrun_poison_cache != NULL)
+	{
+		HASH_SEQ_STATUS status;
+		FasttrunPoisonEntry *entry;
+
+		hash_seq_init(&status, fasttrun_poison_cache);
+		while ((entry = (FasttrunPoisonEntry *) hash_seq_search(&status)) != NULL)
+		{
+			HeapTuple	tp;
+
+			if (!entry->active)
+				continue;
+			tp = SearchSysCache1(RELOID, ObjectIdGetDatum(entry->root_relid));
+			if (HeapTupleIsValid(tp))
+			{
+				Oid			cand_toast =
+					((Form_pg_class) GETSTRUCT(tp))->reltoastrelid;
+
+				ReleaseSysCache(tp);
+				if (cand_toast == toast_relid)
+				{
+					hash_seq_term(&status);
+					return entry->root_relid;
+				}
+			}
+		}
+	}
+	return InvalidOid;
+}
+
 static void
 fasttrun_poison_check_relid(Oid relid, const char *operation)
 {
@@ -432,9 +521,19 @@ fasttrun_poison_check_relid(Oid relid, const char *operation)
 	if (fasttrun_poison_cache == NULL || !OidIsValid(relid))
 		return;
 	entry = fasttrun_poison_find(root_relid);
-	if (entry == NULL && get_rel_relkind(relid) == RELKIND_INDEX)
+	if (entry == NULL)
 	{
-		root_relid = IndexGetRelation(relid, true);
+		char		kind = get_rel_relkind(relid);
+
+		if (kind == RELKIND_INDEX)
+		{
+			root_relid = IndexGetRelation(relid, true);
+			if (OidIsValid(root_relid) &&
+				get_rel_relkind(root_relid) == RELKIND_TOASTVALUE)
+				root_relid = fasttrun_toast_owner_relid(root_relid);
+		}
+		else if (kind == RELKIND_TOASTVALUE)
+			root_relid = fasttrun_toast_owner_relid(relid);
 		entry = fasttrun_poison_find(root_relid);
 	}
 	if (entry == NULL || !entry->active)
@@ -606,7 +705,7 @@ fasttrun_poison_check_utility(Node *parsetree)
 					Oid nspid = get_namespace_oid(stmt->name, true);
 
 					/* Other schemas and system catalogs cannot contain our heap. */
-					if (OidIsValid(nspid) && isTempNamespace(nspid))
+					if (OidIsValid(nspid) && isTempOrTempToastNamespace(nspid))
 						fasttrun_poison_check_any("REINDEX");
 				}
 			}
@@ -899,14 +998,67 @@ fasttrun_prepare_relation_handoff(Relation rel, Bitmapset *attnums,
 		*rewrite_relids = lappend_oid(*rewrite_relids, relid);
 }
 
+typedef struct FasttrunVacuumIndexSnap
+{
+	Oid				idx_oid;
+	bool			present;
+	int32			pre_pages;
+	float4			pre_tuples;
+	int32			pre_allvisible;
+} FasttrunVacuumIndexSnap;
+
+typedef struct FasttrunVacuumTarget
+{
+	Oid				relid;
+	bool			had_relstats;
+	int64			pre_heap_tuples;
+	List		   *index_snaps;
+} FasttrunVacuumTarget;
+
+static bool
+fasttrun_rel_pgclass_stats(Oid relid, int32 *pages, float4 *tuples,
+						   int32 *allvisible)
+{
+	HeapTuple	tp;
+	Form_pg_class form;
+
+	*pages = 0;
+	*tuples = -1;
+	*allvisible = 0;
+	tp = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
+	if (!HeapTupleIsValid(tp))
+		return false;
+	form = (Form_pg_class) GETSTRUCT(tp);
+	*pages = form->relpages;
+	*tuples = form->reltuples;
+	*allvisible = form->relallvisible;
+	ReleaseSysCache(tp);
+	return true;
+}
+
+static void
+fasttrun_free_vacuum_targets(List *targets)
+{
+	ListCell   *lc;
+
+	foreach(lc, targets)
+	{
+		FasttrunVacuumTarget *vt = (FasttrunVacuumTarget *) lfirst(lc);
+
+		list_free_deep(vt->index_snaps);
+		pfree(vt);
+	}
+	list_free(targets);
+}
+
 /*
  * VACUUM removes dead rows and may cut the empty tail of the heap without
  * moving the change counters.  The row count of the delta state stays right,
  * but its page and all-visible figures would outlive the command, and a no-op
  * analyze publishes them as they are.  Drop the delta state of every target,
  * so the next analyze takes a fresh pass.  VACUUM cannot run in a transaction
- * block, so no rollback needs the old state back.  The targets are returned
- * for fasttrun_finish_vacuum.
+ * block, so no rollback needs the old state back.  The targets and pre-VACUUM
+ * index pg_class tuple versions are returned for fasttrun_finish_vacuum.
  */
 static List *
 fasttrun_vacuum_drop_delta(VacuumStmt *stmt)
@@ -926,7 +1078,8 @@ fasttrun_vacuum_drop_delta(VacuumStmt *stmt)
 		{
 			VacuumRelation *vrel = (VacuumRelation *) lfirst(lc);
 
-			relids = list_concat(relids, fasttrun_vacuum_targets(vrel, false));
+			relids = list_concat_unique_oid(relids,
+											fasttrun_vacuum_targets(vrel, false));
 		}
 	}
 	foreach(lc, relids)
@@ -947,11 +1100,48 @@ fasttrun_vacuum_drop_delta(VacuumStmt *stmt)
 		foreach(lc, relids)
 		{
 			Oid			relid = lfirst_oid(lc);
+			FasttrunAnalyzeCacheEntry *entry = fasttrun_cache_lookup(relid);
 
-			if (fasttrun_cache_lookup(relid) != NULL &&
+			if (entry != NULL &&
 				fasttrun_relid_is_our_temp(relid) &&
 				fasttrun_may_maintain_relid(relid, false))
-				permitted = lappend_oid(permitted, relid);
+			{
+				FasttrunVacuumTarget *vt;
+				Relation	rel;
+
+				vt = (FasttrunVacuumTarget *) palloc0(sizeof(*vt));
+				vt->relid = relid;
+				vt->had_relstats = entry->state.has_relstats;
+				vt->pre_heap_tuples = entry->state.cached_tuples;
+				rel = fasttrun_try_open_managed_heap(relid);
+				if (rel != NULL)
+				{
+					List	   *index_oids = RelationGetIndexList(rel);
+					ListCell   *ilc;
+
+					foreach(ilc, index_oids)
+					{
+						Oid			idx_oid = lfirst_oid(ilc);
+						FasttrunAnalyzeCacheEntry *idx_entry =
+							fasttrun_cache_lookup(idx_oid);
+
+						if (idx_entry != NULL && idx_entry->state.has_relstats)
+						{
+							FasttrunVacuumIndexSnap *snap =
+								palloc0(sizeof(*snap));
+
+							snap->idx_oid = idx_oid;
+							snap->present = fasttrun_rel_pgclass_stats(
+								idx_oid, &snap->pre_pages, &snap->pre_tuples,
+								&snap->pre_allvisible);
+							vt->index_snaps = lappend(vt->index_snaps, snap);
+						}
+					}
+					list_free(index_oids);
+					relation_close(rel, AccessShareLock);
+				}
+				permitted = lappend(permitted, vt);
+			}
 		}
 	}
 	list_free(relids);
@@ -968,24 +1158,183 @@ fasttrun_vacuum_drop_delta(VacuumStmt *stmt)
  * marked as an estimate (VACUUM extrapolates over the pages it skipped), and
  * the size backstop of the column statistics moves to the new size: the rows
  * are the same, the cut is not a refill.
+ *
+ * Indexes.  Core VACUUM updates pg_class in place via heap_inplace_update
+ * without changing xmin or ctid, and skips updating an index's pg_class row
+ * under INDEX_CLEANUP OFF or when index vacuuming is bypassed without dead
+ * items, leaving an older ANALYZE figure in pg_class.  Adopt idx_form only
+ * when VACUUM actually changed that index's pg_class stats, and otherwise
+ * refresh its physical page count and reconcile its tuple estimate with the
+ * heap change.
  */
 static void
-fasttrun_finish_vacuum(List *relids)
+fasttrun_finish_vacuum_indexes(Relation rel, FasttrunVacuumTarget *vt,
+							   bool has_new_heap, int64 new_heap_tuples,
+							   bool *any_changed)
+{
+	List	   *index_oids = RelationGetIndexList(rel);
+	ListCell   *ilc;
+
+	foreach(ilc, index_oids)
+	{
+		Oid			idx_oid = lfirst_oid(ilc);
+		FasttrunAnalyzeCacheEntry *idx_entry = fasttrun_cache_lookup(idx_oid);
+		Relation	idx_rel;
+		HeapTuple	idx_tp;
+
+		if (idx_entry == NULL || !idx_entry->state.has_relstats)
+			continue;
+		idx_rel = try_relation_open(idx_oid, AccessShareLock);
+		if (idx_rel == NULL)
+			continue;
+		if (!fasttrun_relation_has_same_locator(idx_rel, idx_entry))
+		{
+			relation_close(idx_rel, AccessShareLock);
+			continue;
+		}
+		idx_tp = SearchSysCache1(RELOID, ObjectIdGetDatum(idx_oid));
+		if (HeapTupleIsValid(idx_tp))
+		{
+			Form_pg_class idx_form = (Form_pg_class) GETSTRUCT(idx_tp);
+			bool		pgclass_changed = true;
+			ListCell   *slc;
+
+			foreach(slc, vt->index_snaps)
+			{
+				FasttrunVacuumIndexSnap *s =
+					(FasttrunVacuumIndexSnap *) lfirst(slc);
+
+				if (s->idx_oid == idx_oid)
+				{
+					pgclass_changed = !s->present ||
+						s->pre_pages != idx_form->relpages ||
+						s->pre_tuples != idx_form->reltuples ||
+						s->pre_allvisible != idx_form->relallvisible;
+					break;
+				}
+			}
+
+			if (pgclass_changed && idx_form->reltuples >= 0)
+			{
+				idx_entry->state.cached_pages = (BlockNumber) idx_form->relpages;
+				idx_entry->state.cached_tuples = (int64) idx_form->reltuples;
+				idx_entry->state.cached_allvisible =
+					(BlockNumber) idx_form->relallvisible;
+				idx_entry->state.has_base_heap_tuples = has_new_heap;
+				idx_entry->state.base_heap_tuples =
+					has_new_heap ? new_heap_tuples : 0;
+				idx_entry->state.count_exact = false;
+				idx_entry->lazy_check_subid = InvalidSubTransactionId;
+				idx_entry->lazy_check_epoch = 0;
+				idx_entry->lazy_check_pages = 0;
+				*any_changed = true;
+			}
+			else
+			{
+				BlockNumber new_idx_pages = RelationGetNumberOfBlocks(idx_rel);
+				int64		new_idx_tuples = idx_entry->state.cached_tuples;
+				bool		has_base = idx_entry->state.has_base_heap_tuples
+					? true : vt->had_relstats;
+				int64		base_heap = idx_entry->state.has_base_heap_tuples
+					? idx_entry->state.base_heap_tuples : vt->pre_heap_tuples;
+
+				if (has_new_heap)
+				{
+					if (new_heap_tuples <= 0)
+						new_idx_tuples = 0;
+					else if (RelationGetIndexPredicate(idx_rel) == NIL)
+						new_idx_tuples = new_heap_tuples;
+					else if (has_base && base_heap > 0 &&
+							 new_heap_tuples != base_heap)
+					{
+						double		scaled = (double) new_idx_tuples *
+							((double) new_heap_tuples / (double) base_heap);
+
+						if (scaled < 0.0)
+							scaled = 0.0;
+						if (scaled > (double) new_heap_tuples)
+							scaled = (double) new_heap_tuples;
+						new_idx_tuples = (int64) rint(scaled);
+					}
+					else if (new_idx_tuples > new_heap_tuples)
+						new_idx_tuples = new_heap_tuples;
+					idx_entry->state.has_base_heap_tuples = true;
+					idx_entry->state.base_heap_tuples = new_heap_tuples;
+				}
+				if (idx_entry->state.cached_pages != new_idx_pages ||
+					idx_entry->state.cached_tuples != new_idx_tuples)
+				{
+					idx_entry->state.cached_pages = new_idx_pages;
+					idx_entry->state.cached_tuples = new_idx_tuples;
+					idx_entry->state.cached_allvisible = 0;
+					idx_entry->state.count_exact = false;
+					idx_entry->lazy_check_subid = InvalidSubTransactionId;
+					idx_entry->lazy_check_epoch = 0;
+					idx_entry->lazy_check_pages = 0;
+					*any_changed = true;
+				}
+			}
+			ReleaseSysCache(idx_tp);
+		}
+		relation_close(idx_rel, AccessShareLock);
+	}
+	list_free(index_oids);
+}
+
+static void
+fasttrun_finish_vacuum(List *targets)
 {
 	ListCell   *lc;
 
-	foreach(lc, relids)
+	foreach(lc, targets)
 	{
-		Oid			relid = lfirst_oid(lc);
+		FasttrunVacuumTarget *vt = (FasttrunVacuumTarget *) lfirst(lc);
+		Oid			relid = vt->relid;
 		FasttrunAnalyzeCacheEntry *entry = fasttrun_cache_lookup(relid);
 		Relation	rel;
 		HeapTuple	tp;
+		bool		changed = false;
+		bool		has_new_heap = false;
+		int64		new_heap_tuples = 0;
 
+		CHECK_FOR_INTERRUPTS();
 		if (entry == NULL)
 			continue;
 		rel = fasttrun_try_open_managed_heap(relid);
 		if (rel == NULL)
 			continue;
+		tp = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
+		if (HeapTupleIsValid(tp))
+		{
+			Form_pg_class form = (Form_pg_class) GETSTRUCT(tp);
+
+			if (form->reltuples >= 0)
+			{
+				has_new_heap = true;
+				new_heap_tuples = (int64) form->reltuples;
+			}
+			if (entry->state.has_relstats &&
+				fasttrun_relation_has_same_locator(rel, entry) &&
+				form->reltuples >= 0)
+			{
+				entry->state.cached_pages = (BlockNumber) form->relpages;
+				entry->state.cached_tuples = (int64) form->reltuples;
+				entry->state.cached_allvisible = (BlockNumber) form->relallvisible;
+				entry->state.count_exact = false;
+				entry->aborted_pages = 0;
+				entry->state.published_dead = 0;
+				entry->state.published_aborted_writes = entry->aborted_writes;
+				entry->lazy_check_subid = InvalidSubTransactionId;
+				entry->lazy_check_epoch = 0;
+				entry->lazy_check_pages = 0;
+				fasttrun_stats_relid_set_size_anchor(relid,
+													 RelationGetNumberOfBlocks(rel));
+				changed = true;
+			}
+			ReleaseSysCache(tp);
+		}
+		fasttrun_finish_vacuum_indexes(rel, vt, has_new_heap, new_heap_tuples,
+									   &changed);
 		if (!entry->state.has_relstats)
 		{
 			/*
@@ -1001,33 +1350,14 @@ fasttrun_finish_vacuum(List *relids)
 													 RelationGetNumberOfBlocks(rel));
 			}
 			relation_close(rel, AccessShareLock);
+			if (changed)
+				fasttrun_invalidate_local_plan_cache(relid);
 			fasttrun_cache_reclaim_entry(relid);
 			continue;
 		}
-		tp = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
-		if (HeapTupleIsValid(tp))
-		{
-			Form_pg_class form = (Form_pg_class) GETSTRUCT(tp);
-
-			if (fasttrun_relation_has_same_locator(rel, entry) &&
-				form->reltuples >= 0)
-			{
-				entry->state.cached_pages = (BlockNumber) form->relpages;
-				entry->state.cached_tuples = (int64) form->reltuples;
-				entry->state.cached_allvisible = (BlockNumber) form->relallvisible;
-				entry->state.count_exact = false;
-				entry->aborted_pages = 0;
-				entry->state.published_dead = 0;
-				entry->state.published_aborted_writes = entry->aborted_writes;
-				entry->lazy_check_subid = InvalidSubTransactionId;
-				entry->lazy_check_epoch = 0;
-				entry->lazy_check_pages = 0;
-				fasttrun_stats_relid_set_size_anchor(relid,
-													 RelationGetNumberOfBlocks(rel));
-			}
-			ReleaseSysCache(tp);
-		}
 		relation_close(rel, AccessShareLock);
+		if (changed)
+			fasttrun_invalidate_local_plan_cache(relid);
 	}
 }
 
@@ -1064,7 +1394,10 @@ fasttrun_prepare_vacuum_handoff(VacuumStmt *stmt,
 		foreach(lc, relids)
 		{
 			Oid			relid = lfirst_oid(lc);
-			Relation	rel = fasttrun_try_open_managed_heap(relid);
+			Relation	rel;
+
+			CHECK_FOR_INTERRUPTS();
+			rel = fasttrun_try_open_managed_heap(relid);
 
 			if (rel == NULL)
 				continue;
@@ -1140,7 +1473,10 @@ fasttrun_prepare_cluster_handoff(ClusterStmt *stmt, List **rewrite_relids)
 
 	foreach(lc, relids)
 	{
-		Relation	rel = fasttrun_try_open_managed_heap(lfirst_oid(lc));
+		Relation	rel;
+
+		CHECK_FOR_INTERRUPTS();
+		rel = fasttrun_try_open_managed_heap(lfirst_oid(lc));
 
 		if (rel == NULL)
 			continue;
@@ -1193,9 +1529,24 @@ fasttrun_prepare_utility_handoff(Node *parsetree,
 	else if (IsA(parsetree, AlterTableStmt) &&
 			 fasttrun_alter_table_effect((AlterTableStmt *) parsetree) ==
 			 FASTTRUN_DDL_EVICTS)
-		fasttrun_remember_managed_rebind(
-			((AlterTableStmt *) parsetree)->relation,
-			fasttrun_alter_table_recurses((AlterTableStmt *) parsetree), rewrite_relids);
+	{
+		AlterTableStmt *stmt = (AlterTableStmt *) parsetree;
+		ListCell   *lc;
+
+		fasttrun_remember_managed_rebind(stmt->relation,
+										 fasttrun_alter_table_recurses(stmt),
+										 rewrite_relids);
+		foreach(lc, stmt->cmds)
+		{
+			AlterTableCmd *cmd = (AlterTableCmd *) lfirst(lc);
+
+			if ((cmd->subtype == AT_AttachPartition ||
+				 cmd->subtype == AT_DetachPartition) &&
+				cmd->def != NULL && IsA(cmd->def, PartitionCmd))
+				fasttrun_remember_managed_rebind(
+					((PartitionCmd *) cmd->def)->name, true, rewrite_relids);
+		}
+	}
 	else if (IsA(parsetree, TruncateStmt))
 	{
 		ListCell   *lc;
@@ -1389,6 +1740,21 @@ fasttrun_finish_kept_ddl(List *kept)
 	}
 }
 
+static void
+fasttrun_free_kept_ddl(List *kept)
+{
+	ListCell   *lc;
+
+	foreach(lc, kept)
+	{
+		FasttrunKeptDdl *target = (FasttrunKeptDdl *) lfirst(lc);
+
+		list_free(target->indexes_before);
+		pfree(target);
+	}
+	list_free(kept);
+}
+
 /*
  * The heaps whose CREATE STATISTICS objects the command may drop: DROP
  * STATISTICS, and ALTER TABLE, whose DROP COLUMN drops the objects over the
@@ -1505,6 +1871,8 @@ fasttrun_note_utility_file_births(Node *parsetree)
 		relid = lfirst_oid(lc);
 		if (get_rel_relkind(relid) == RELKIND_INDEX)
 			relid = IndexGetRelation(relid, true);
+		if (OidIsValid(relid) && get_rel_relkind(relid) == RELKIND_TOASTVALUE)
+			relid = fasttrun_toast_owner_relid(relid);
 		if (!fasttrun_relid_is_our_temp(relid))
 			continue;
 		rel = try_relation_open(relid, AccessShareLock);

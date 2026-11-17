@@ -304,6 +304,25 @@ for t in "${TARGET_ARR[@]}"; do
 	fi
 done
 
+if ! python3 "$REPO_ROOT/scripts/check_docs_consistency.py" \
+	> "$OUTDIR/docs.log" 2>&1; then
+	echo "ОШИБКА: не прошла статическая проверка документации (см. $OUTDIR/docs.log)" >&2
+	cat "$OUTDIR/docs.log" >&2
+	exit 1
+fi
+if ! python3 "$REPO_ROOT/scripts/check_required_suite.py" \
+	> "$OUTDIR/required_suite.log" 2>&1; then
+	echo "ОШИБКА: нарушен контракт обязательного набора (см. $OUTDIR/required_suite.log)" >&2
+	cat "$OUTDIR/required_suite.log" >&2
+	exit 1
+fi
+if ! python3 "$REPO_ROOT/scripts/codegen_compare_selftest.py" \
+	> "$OUTDIR/codegen_selftest.log" 2>&1; then
+	echo "ОШИБКА: не прошел selftest сравнения кодогенерации (см. $OUTDIR/codegen_selftest.log)" >&2
+	cat "$OUTDIR/codegen_selftest.log" >&2
+	exit 1
+fi
+
 overall_rc=0
 
 target_idx=0
@@ -333,8 +352,8 @@ for t in "${TARGET_ARR[@]}"; do
 		continue
 	fi
 
-	# 2. Снять базовую отметку TRAP до прогона.
-	trap_before=$(grep -c TRAP "$srvlog" 2>/dev/null || true)
+	# 2. Снять базовую отметку TRAP/PANIC/leaked до прогона.
+	trap_before=$(grep -cE 'TRAP|FailedAssertion|PANIC|leaked hash_seq_search' "$srvlog" 2>/dev/null || true)
 	trap_before=${trap_before//[!0-9]/}; trap_before=${trap_before:-0}
 
 	# 3. installcheck с ru_RU.UTF-8 и обособленным outputdir.
@@ -351,13 +370,13 @@ for t in "${TARGET_ARR[@]}"; do
 	passed=$(grep -cE '^ok ' "$OUTDIR/check${ver}.log" 2>/dev/null); passed=${passed//[!0-9]/}; passed=${passed:-0}
 	failed=$(grep -cE '^not ok ' "$OUTDIR/check${ver}.log" 2>/dev/null); failed=${failed//[!0-9]/}; failed=${failed:-0}
 
-	# 4. Дельта TRAP.
+	# 4. Дельта TRAP/PANIC/leaked.
 	if [ ! -r "$srvlog" ]; then
 		echo "  журнал сервера стал недоступен: $srvlog" >&2
 		trap_after=$trap_before
 		overall_rc=1
 	else
-		trap_after=$(grep -c TRAP "$srvlog" 2>/dev/null || true)
+		trap_after=$(grep -cE 'TRAP|FailedAssertion|PANIC|leaked hash_seq_search' "$srvlog" 2>/dev/null || true)
 		trap_after=${trap_after//[!0-9]/}; trap_after=${trap_after:-0}
 	fi
 	trap_delta=$((trap_after - trap_before))
@@ -375,6 +394,7 @@ for t in "${TARGET_ARR[@]}"; do
 	prepare_registry_rc=125
 	bgworker_log_rc=125
 	block_seed_rc=125
+	example_rc=125
 	if [ "$check_rc" -eq 0 ] && [ "$passed" -eq "$EXPECTED_REGRESS" ] && \
 		[ "$failed" -eq 0 ]; then
 		run_isolated_harness "$pgcfg" scripts/check_fasttrun_fault_matrix.sh \
@@ -418,9 +438,12 @@ for t in "${TARGET_ARR[@]}"; do
 		run_isolated_harness "$pgcfg" scripts/check_fasttrun_block_sample_seed.sh \
 			>"$OUTDIR/block_seed${ver}.log" 2>&1
 		block_seed_rc=$?
+		run_isolated_harness "$pgcfg" scripts/check_fasttrun_example.sh \
+			>"$OUTDIR/example${ver}.log" 2>&1
+		example_rc=$?
 	fi
 
-	echo "  тесты: пройдено ${passed}/${EXPECTED_REGRESS}, ошибок ${failed}, новых TRAP ${trap_delta}. Дополнительные проверки: ошибки=${fault_rc}, cache-init=${cache_init_rc}, BRIN-${BRIN_LEVEL}=${brin_rc}, порядок=${order_rc}, память=${memory_rc}, планировщик=${planner_rc}, публикация=${publication_rc}, persistence=${persistence_rc}, выход=${exit_reset_rc}, трекинг с предзагрузкой=${tracking_preload_rc}, PREPARE=${prepare_registry_rc}, фоновый воркер=${bgworker_log_rc}, зерно выборки=${block_seed_rc}"
+	echo "  тесты: пройдено ${passed}/${EXPECTED_REGRESS}, ошибок ${failed}, новых TRAP ${trap_delta}. Дополнительные проверки: ошибки=${fault_rc}, cache-init=${cache_init_rc}, BRIN-${BRIN_LEVEL}=${brin_rc}, порядок=${order_rc}, память=${memory_rc}, планировщик=${planner_rc}, публикация=${publication_rc}, persistence=${persistence_rc}, выход=${exit_reset_rc}, трекинг с предзагрузкой=${tracking_preload_rc}, PREPARE=${prepare_registry_rc}, фоновый воркер=${bgworker_log_rc}, зерно выборки=${block_seed_rc}, пример=${example_rc}"
 	if [ "$check_rc" -ne 0 ] || [ "$passed" -ne "$EXPECTED_REGRESS" ] || \
 		[ "$failed" -ne 0 ]; then
 		echo "  РЕГРЕСС: см. $OUTDIR/rc${ver}/regression.diffs" >&2
@@ -432,12 +455,13 @@ for t in "${TARGET_ARR[@]}"; do
 		[ "$publication_rc" -ne 0 ] || [ "$persistence_rc" -ne 0 ] || \
 		[ "$exit_reset_rc" -ne 0 ] || [ "$tracking_preload_rc" -ne 0 ] || \
 		[ "$prepare_registry_rc" -ne 0 ] || [ "$bgworker_log_rc" -ne 0 ] || \
-		[ "$block_seed_rc" -ne 0 ]; then
+		[ "$block_seed_rc" -ne 0 ] || \
+		{ [ "$example_rc" -ne 0 ] && [ "$example_rc" -ne 77 ]; }; then
 		echo "  не прошли дополнительные проверки, журналы находятся в $OUTDIR" >&2
 		overall_rc=1
 	fi
 	if [ "$trap_delta" -ne 0 ]; then
-		echo "  падение на Assert: $(grep TRAP "$srvlog" | tail -"$trap_delta")" >&2
+		echo "  падение на Assert: $(grep -E 'TRAP|FailedAssertion|PANIC|leaked hash_seq_search' "$srvlog" | tail -"$trap_delta")" >&2
 		overall_rc=1
 	fi
 done

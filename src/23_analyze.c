@@ -95,8 +95,25 @@
  * earlier message already marked is_valid=false is skipped cheaply rather
  * than re-marked.
  */
+#define FASTTRUN_MAX_ACTIVE_COLLECTS 32
+static Oid	fasttrun_active_collect_relids[FASTTRUN_MAX_ACTIVE_COLLECTS];
+static int	fasttrun_active_collect_depth = 0;
+
+static bool
+fasttrun_collect_relid_active(Oid relid)
+{
+	int			i;
+
+	for (i = 0; i < fasttrun_active_collect_depth; i++)
+	{
+		if (fasttrun_active_collect_relids[i] == relid)
+			return true;
+	}
+	return false;
+}
+
 static void
-fasttrun_analyze_relation(Relation rel)
+fasttrun_analyze_relation_body(Relation rel)
 {
 	Oid				relOid = RelationGetRelid(rel);
 	BlockNumber		pages_now = 0;
@@ -148,6 +165,9 @@ fasttrun_analyze_relation(Relation rel)
 	relation_policy_changed = fasttrun_stats_set_relation_policy(rel,
 													FASTTRUN_REL_LOCAL_NEUTRAL);
 	if (relation_policy_changed && fasttrun_relation_has_core_stats(rel))
+		stats_visibility_changed = true;
+	if (fasttrun_auto_collect_stats && fasttrun_sample_rows == 0 &&
+		fasttrun_stats_neutralize_core_overrides(relOid))
 		stats_visibility_changed = true;
 	if (has_extended_stats && fasttrun_stats_can_hide_extended(rel) &&
 		fasttrun_cache_mark_extended_stale(rel))
@@ -300,6 +320,9 @@ fasttrun_analyze_relation(Relation rel)
 						heap_freetuple(sample[i]);
 					pfree(sample);
 				}
+				else if (fasttrun_sample_rows < 0 &&
+						 fasttrun_stats_cache_evict_relid(relOid))
+					stats_visibility_changed = true;
 			}
 
 			/*
@@ -307,8 +330,9 @@ fasttrun_analyze_relation(Relation rel)
 			 * place, so the churn keeps counting toward the freshness check
 			 * and the next analyze tries again.
 			 */
-			if (stats_recollected ||
-				(tuples_count == 0 && count_exact && !refresh_deferred))
+			if (!collected_unsafe &&
+				(stats_recollected ||
+				 (tuples_count == 0 && count_exact && !refresh_deferred)))
 				fasttrun_cache_set_stats_baseline(relOid, ins_now, upd_now,
 												  del_now, truncdropped_now);
 		}
@@ -445,6 +469,9 @@ fasttrun_analyze_relation(Relation rel)
 			sample_target = fasttrun_effective_sample_target(rel);
 			if (sample_target > 0)
 				sample = (HeapTuple *) palloc(sizeof(HeapTuple) * sample_target);
+			else if (fasttrun_sample_rows < 0 &&
+					 fasttrun_stats_cache_evict_relid(relOid))
+				stats_visibility_changed = true;
 		}
 
 		if (pages_now > 0)
@@ -505,15 +532,16 @@ fasttrun_analyze_relation(Relation rel)
 		 * rows than the counters imply.  Publish what it saw, but anchor no
 		 * delta to it: the next analyze scans again.
 		 */
-		count_snapshot_stale = fasttrun_stats_relation_written_now(rel);
+		count_snapshot_stale = collected_unsafe ||
+			fasttrun_stats_relation_written_now(rel);
 
 		if (!stats_recollected)
 			index_relstats_changed |=
 				fasttrun_update_index_relstats(rel, NIL, NULL, 0, tuples_count,
 										   true);
 
-		/* Populate stats baseline only when pgstat is usable. */
-		if (have_counters)
+		/* Populate stats baseline only when pgstat is usable and clean. */
+		if (have_counters && !count_snapshot_stale)
 			fasttrun_cache_set_stats_baseline(relOid, ins_now, upd_now,
 											  del_now, truncdropped_now);
 	}
@@ -645,6 +673,31 @@ fasttrun_analyze_relation(Relation rel)
 	}
 
 	fasttrun_log_if_slow(&started, "fasttrun_analyze", rel, path);
+}
+
+static void
+fasttrun_analyze_relation(Relation rel)
+{
+	Oid			relid = RelationGetRelid(rel);
+	int			saved_depth = fasttrun_active_collect_depth;
+
+	if (fasttrun_collect_relid_active(relid))
+		return;
+	if (saved_depth >= FASTTRUN_MAX_ACTIVE_COLLECTS)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("fasttrun: nested statistics collection depth exceeds %d",
+						FASTTRUN_MAX_ACTIVE_COLLECTS)));
+	fasttrun_active_collect_relids[fasttrun_active_collect_depth++] = relid;
+	PG_TRY();
+	{
+		fasttrun_analyze_relation_body(rel);
+	}
+	PG_FINALLY();
+	{
+		fasttrun_active_collect_depth = saved_depth;
+	}
+	PG_END_TRY();
 }
 
 /*
@@ -851,6 +904,7 @@ fasttrun_analyze(PG_FUNCTION_ARGS)
 	Oid			relOid;
 	Relation	rel;
 
+	fasttrun_reject_in_atx("fasttrun_analyze");
 	relvar = fasttrun_make_rangevar(name);
 	relOid = RangeVarGetRelid(relvar, AccessShareLock, true);
 	if (!OidIsValid(relOid))
@@ -862,8 +916,10 @@ fasttrun_analyze(PG_FUNCTION_ARGS)
 		!isTempNamespace(RelationGetNamespace(rel)))
 	{
 		table_close(rel, NoLock);
-		elog(ERROR, "fasttrun_analyze: relation \"%s\" is not a local temporary table",
-			 RelationGetRelationName(rel));
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("fasttrun_analyze: relation \"%s\" is not a local temporary table",
+						RelationGetRelationName(rel))));
 	}
 
 	/*
@@ -891,8 +947,10 @@ fasttrun_analyze(PG_FUNCTION_ARGS)
 	if (rel->rd_tableam != GetHeapamTableAmRoutine())
 	{
 		table_close(rel, NoLock);
-		elog(ERROR, "fasttrun_analyze: relation \"%s\" is not heap-AM",
-			 RelationGetRelationName(rel));
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("fasttrun_analyze: relation \"%s\" is not heap-AM",
+						RelationGetRelationName(rel))));
 	}
 	if (fasttrun_passthrough)
 	{
@@ -946,6 +1004,7 @@ fasttrun_analyze_bulk(PG_FUNCTION_ARGS)
 	int			nelems;
 	int			i;
 
+	fasttrun_reject_in_atx("fasttrun_analyze_bulk");
 	if (PG_ARGISNULL(0))
 		PG_RETURN_VOID();
 
@@ -978,9 +1037,10 @@ fasttrun_analyze_bulk(PG_FUNCTION_ARGS)
 			!isTempNamespace(RelationGetNamespace(rel)))
 		{
 			table_close(rel, NoLock);
-			elog(ERROR, "fasttrun_analyze_bulk: relation \"%s\" "
-						"is not a local temporary table",
-				 RelationGetRelationName(rel));
+			ereport(ERROR,
+					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+					 errmsg("fasttrun_analyze_bulk: relation \"%s\" is not a local temporary table",
+							RelationGetRelationName(rel))));
 		}
 		if (rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE ||
 			rel->rd_rel->relhassubclass)
@@ -1002,8 +1062,10 @@ fasttrun_analyze_bulk(PG_FUNCTION_ARGS)
 		if (rel->rd_tableam != GetHeapamTableAmRoutine())
 		{
 			table_close(rel, NoLock);
-			elog(ERROR, "fasttrun_analyze_bulk: relation \"%s\" is not heap-AM",
-				 RelationGetRelationName(rel));
+			ereport(ERROR,
+					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+					 errmsg("fasttrun_analyze_bulk: relation \"%s\" is not heap-AM",
+							RelationGetRelationName(rel))));
 		}
 		if (fasttrun_passthrough)
 		{
@@ -1059,6 +1121,7 @@ fasttrun_relstats(PG_FUNCTION_ARGS)
 	bool		nulls[2] = {false, false};
 	HeapTuple	tuple;
 
+	fasttrun_reject_in_atx("fasttrun_relstats");
 	relvar = fasttrun_make_rangevar(name);
 	relOid = RangeVarGetRelid(relvar, AccessShareLock, true);
 	if (!OidIsValid(relOid))
@@ -1077,8 +1140,10 @@ fasttrun_relstats(PG_FUNCTION_ARGS)
 		!isTempNamespace(RelationGetNamespace(rel)))
 	{
 		relation_close(rel, NoLock);
-		elog(ERROR, "fasttrun_relstats: relation \"%s\" is not a local temporary table",
-			 RelationGetRelationName(rel));
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("fasttrun_relstats: relation \"%s\" is not a local temporary table",
+						RelationGetRelationName(rel))));
 	}
 
 	if (rel->rd_rel->relkind != RELKIND_RELATION &&

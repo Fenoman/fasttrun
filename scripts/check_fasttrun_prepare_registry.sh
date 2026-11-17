@@ -26,7 +26,7 @@
 # без нее поколоночный учет UPDATE выключен и проверять было бы нечего.
 # Скрипт печатает PASS или FAIL и не требует cassert-сборки.
 #
-set -e
+set -eu
 # На macOS postmaster отказывается стартовать при неустановленной локали.
 : "${LC_ALL:=C}"
 export LC_ALL
@@ -158,12 +158,13 @@ SQL
 # числе ROLLBACK PREPARED без подготовленной транзакции, - провал.
 errors=$(echo "$temp_result" | grep -c 'ERROR:' || true)
 denied=$(echo "$temp_result" | grep -c 'ERROR:  permission denied for table t_parent' || true)
-echo "permanent targets: $(echo "$result" | grep -c '^PASS$' || true), temp targets: $(echo "$temp_result" | grep -c '^TEMP_PASS$' || true), prepared: $(echo "$temp_result" | grep -c '^PREPARED_OK$' || true), errors: $errors, permission errors: $denied"
+crashes=$(grep -cE 'TRAP|FailedAssertion|PANIC|terminated by signal|server process .* was terminated|leaked hash_seq_search' "$LOG" || true)
+echo "permanent targets: $(echo "$result" | grep -c '^PASS$' || true), temp targets: $(echo "$temp_result" | grep -c '^TEMP_PASS$' || true), prepared: $(echo "$temp_result" | grep -c '^PREPARED_OK$' || true), errors: $errors, permission errors: $denied, crashes: $crashes"
 if echo "$result" | grep -q '^PASS$' &&
 	echo "$result" | grep -q '^CACHE_PASS$' &&
 	echo "$temp_result" | grep -q '^TEMP_PASS$' &&
 	echo "$temp_result" | grep -q '^PREPARED_OK$' &&
-	[ "$errors" -eq 2 ] && [ "$denied" -eq 2 ]; then
+	[ "$errors" -eq 2 ] && [ "$denied" -eq 2 ] && [ "$crashes" -eq 0 ]; then
 	echo "prepare registry reset: PASS"
 	exit 0
 fi

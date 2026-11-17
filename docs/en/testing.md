@@ -28,7 +28,11 @@ handle it this way:
   `fasttrun_outer_rollback` (a subtransaction rollback after a file change or a
   table creation on the outer level)
 
-The result in that mode is 20/20.
+The `pg_regress` result in that mode is 20/20 (16 executed suites and 4 skipped
+via `_1.out`). Separately, `expected/fasttrun_fresh_1.out` and
+`expected/fasttrun_observe_1.out` hold the expected output of those two suites
+when the library is preloaded via `shared_preload_libraries` or
+`session_preload_libraries`.
 
 Extended local suite:
 
@@ -61,12 +65,16 @@ FT_CASSERT_TARGETS="16:/path/pg16/bin/pg_config:port:log,..." \
   scripts/check_fasttrun_prerelease.sh
 ```
 
-The mandatory suite includes cassert builds of PostgreSQL 16/17/18, 20/20
-`pg_regress`, BRIN stress, cache-initialization faults, the fault matrix, and
-checks of memory, planning, local invalidations, the plan reset at backend exit,
-the main branch of the tracking test with preloading, the reset of the registry
-of running write statements at `PREPARE TRANSACTION`, the background worker log,
-and the block sample seed.
+The mandatory suite includes cassert builds of PostgreSQL 16/17/18, the
+documentation and suite-contract gates, 20/20 `pg_regress`, BRIN stress,
+cache-initialization faults, the fault matrix, tracking order and registry-file
+persistence (`tracking_order`, `tracking_persistence`), cache-publication
+atomicity (`publication_atomicity`), and checks of transaction-journal memory,
+planning, the plan reset at backend exit, the main branch of the tracking test
+with preloading, the reset of the registry of running write statements at
+`PREPARE TRANSACTION`, the background worker log, the block sample seed, and the
+shipped `pg_variables` example check (or its documented skip code 77 when
+`pg_variables` or 64-bit XID epoch reset is unavailable).
 
 The fault matrix runs 50 cases across 25 failure points. The short
 `scripts/check_fasttrun_brin_stress.sh` run performs 96 regular and 48 forced
@@ -85,6 +93,10 @@ make check-tracking-persistence PG_CONFIG=/path/to/pg_config
 make check-exit-plan-reset PG_CONFIG=/path/to/pg_config
 make check-tracking-preload PG_CONFIG=/path/to/pg_config
 make check-block-sample-seed PG_CONFIG=/path/to/pg_config
+make check-cache-init-release PG_CONFIG=/path/to/pg_config
+make check-example PG_CONFIG=/path/to/pg_config
+make check-codegen-selftest
+make check-codegen-identity PG_CONFIG=/path/to/pg_config
 make check-required-suite
 make check-docs
 make check-docs-installed PG_CONFIG=/path/to/pg_config
@@ -92,7 +104,9 @@ make check-docs-installed PG_CONFIG=/path/to/pg_config
 
 `check-docs-installed` stages the documentation through the actual install
 target and checks its local links and anchors. The mandatory cassert run also
-executes it for each PostgreSQL installation.
+executes it for each PostgreSQL installation. The `check-codegen-identity`
+target compares compiled machine code against `${BASE_REF:-HEAD}` for pure
+slice moves and non-functional refactorings.
 
 Registry-file persistence is checked by
 `scripts/check_fasttrun_tracking_persistence.sh`.
@@ -102,8 +116,9 @@ With real `pg_variables` installed for the same server, run
 shipped helper with current, nested, stale and marked incoming tables at XID
 epochs 0 and 2. It changes the epoch only in its own stopped disposable cluster.
 It also checks retry after a failed cleanup. Without pg_variables it returns
-skip code 77. A vendor `pg_resetwal` without `--epoch` runs epoch 0 and then
-returns 77 for the unsupported epoch 2 check.
+skip code 77. When a vendor `pg_resetwal` lacks `--epoch`, the script
+reinitializes its disposable cluster with 64-bit `initdb -x 8589934595` for the
+epoch 2 pass, returning 77 only when 64-bit `initdb -x` is also unsupported.
 
 `make check-exit-plan-reset` checks in the server log that the plan reset at
 backend exit runs before PostgreSQL core removes the temporary tables, that the

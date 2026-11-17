@@ -28,16 +28,36 @@ mkdir -p "$SOCKET_DIR"
 if [ -n "$PG_RUN_AS" ]; then chown -R "$PG_RUN_AS" "$WORKDIR"; fi
 run_pg "$BIN/initdb" -D "$DATA" --no-locale -E UTF8 >"$WORKDIR/initdb.log" 2>&1
 sql() { run_pg "$BIN/psql" -XAtq -h "$SOCKET_DIR" -p "$PORT" -d postgres -v ON_ERROR_STOP=1 "$@"; }
-for epoch in 0 2; do
-    if [ "$epoch" -ne 0 ]; then
+for epoch in initial 2; do
+    if [ "$epoch" != initial ]; then
         # The server is cleanly stopped. Only this disposable cluster changes.
         if ! run_pg "$BIN/pg_resetwal" -e "$epoch" "$DATA" >"$WORKDIR/epoch.log" 2>&1; then
-            if grep -q "invalid option -- 'e'" "$WORKDIR/epoch.log"; then
-                echo 'SKIP: forced epoch 2 requires pg_resetwal --epoch (epoch 0 passed)' >&2
-                exit 77
+            if grep -Eq "invalid option -- 'e'|unrecognized option" "$WORKDIR/epoch.log"; then
+                if ! initdb_help=$(run_pg "$BIN/initdb" --help 2>"$WORKDIR/epoch.log"); then
+                    cat "$WORKDIR/epoch.log" >&2
+                    exit 1
+                fi
+                if ! printf '%s\n' "$initdb_help" | grep -Eq '(^|[[:space:]])-x([[:space:],=]|$)'; then
+                    echo 'SKIP: forced epoch 2 requires pg_resetwal --epoch or 64-bit initdb -x (initial epoch passed)' >&2
+                    exit 77
+                fi
+                initdb_args=(-x 8589934595 -D "$DATA" --no-locale -E UTF8)
+                if printf '%s\n' "$initdb_help" | grep -q -- '--no-tune'; then
+                    initdb_args=(--no-tune "${initdb_args[@]}")
+                fi
+                rm -rf "$DATA"
+                if ! run_pg "$BIN/initdb" "${initdb_args[@]}" >"$WORKDIR/epoch.log" 2>&1; then
+                    if grep -Eiq "(transaction id|next-transaction-id|8589934595).*(out of range|exceeds|must be|greater than|invalid)|(out of range|invalid|unrecognized).*(transaction id|next-transaction-id|8589934595)" "$WORKDIR/epoch.log"; then
+                        echo 'SKIP: forced epoch 2 requires pg_resetwal --epoch or 64-bit initdb -x (initial epoch passed)' >&2
+                        exit 77
+                    fi
+                    cat "$WORKDIR/epoch.log" >&2
+                    exit 1
+                fi
+            else
+                cat "$WORKDIR/epoch.log" >&2
+                exit 1
             fi
-            cat "$WORKDIR/epoch.log" >&2
-            exit 1
         fi
     fi
     run_pg "$BIN/pg_ctl" -D "$DATA" -l "$WORKDIR/server.log" -w start \
@@ -144,8 +164,9 @@ BEGIN
   RAISE EXCEPTION 'table recreation rollback fixture is not restored';
  END IF;
  r:=create_temp_table('helper_recreate',true);
- IF r IS NOT NULL OR (SELECT count(*) FROM helper_recreate)<>0 THEN
-  RAISE EXCEPTION 'incoming helper trusted a mark from a rolled-back recreation';
+ IF r IS NOT NULL OR (SELECT count(*) FROM helper_recreate)<>0
+    OR NOT fasttrun_temp_same_cols('helper_recreate','dummy_tmp.helper_recreate') THEN
+  RAISE EXCEPTION 'incoming helper trusted a mark from a rolled-back recreation or kept stale columns';
  END IF;
 END$$;
 COMMIT;
@@ -229,6 +250,10 @@ SQL
         exit 1
     fi
     cat "$WORKDIR/proof.log"
-    grep -qx "EXAMPLE_PASS epoch=$epoch" "$WORKDIR/proof.log"
+    if [ "$epoch" = initial ]; then
+        grep -qx 'EXAMPLE_PASS epoch=0' "$WORKDIR/proof.log"
+    else
+        grep -qx "EXAMPLE_PASS epoch=$epoch" "$WORKDIR/proof.log"
+    fi
     run_pg "$BIN/pg_ctl" -D "$DATA" -m fast -w stop >/dev/null
 done

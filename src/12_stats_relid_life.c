@@ -115,6 +115,7 @@ fasttrun_stats_relid_save_undo(FasttrunStatsRelidEntry *entry)
 	saved->policy = entry->policy;
 	saved->heap_rlb = entry->heap_rlb;
 	saved->heap_rlb_valid = entry->heap_rlb_valid;
+	saved->budget_admitted = entry->budget_admitted;
 	saved->state_subid = entry->state_subid;
 	saved->older = entry->undo;
 	entry->undo = saved;
@@ -430,11 +431,5 @@ fasttrun_relation_has_core_stats(Relation rel)
 	list_free(index_oids);
 	table_close(statrel, AccessShareLock);
 	return found;
-}
-
-/* freefunc for VariableStatData -- we own the tuple, no-op. */
-static void
-fasttrun_stats_noop_free(HeapTuple tuple)
-{
 }
 

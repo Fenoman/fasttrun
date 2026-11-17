@@ -186,6 +186,7 @@ fasttrun_hot_temp_tables(PG_FUNCTION_ARGS)
 		int			len = strnlen(name, NAMEDATALEN);
 		char		escaped[2 * NAMEDATALEN + 3];
 
+		CHECK_FOR_INTERRUPTS();
 		/* The shared registry can contain names from another database encoding. */
 		if (!pg_verify_mbstr(GetDatabaseEncoding(), name, len, true))
 		{
@@ -240,6 +241,7 @@ fasttrun_prewarm(PG_FUNCTION_ARGS)
 	FasttrunTrackSnapshot snapshot;
 	FasttrunTrackEntry *sorted;
 
+	fasttrun_reject_in_atx("fasttrun_prewarm");
 	if (limit == 0 || fasttrun_track_htab == NULL)
 		PG_RETURN_INT32(0);
 
@@ -251,6 +253,12 @@ fasttrun_prewarm(PG_FUNCTION_ARGS)
 		/* Verify dummy schema exists.  If not, skip all prewarm. */
 		Oid		nspOid = get_namespace_oid(fasttrun_prewarm_schema, true);
 		bool	save_in_prewarm = fasttrun_in_prewarm;
+
+		if (!OidIsValid(nspOid))
+		{
+			pfree(sorted);
+			PG_RETURN_INT32(0);
+		}
 
 		/*
 		 * Suppress tracking of our own re-entrant CREATE TEMP TABLE.  Save and
@@ -266,17 +274,22 @@ fasttrun_prewarm(PG_FUNCTION_ARGS)
 
 			for (i = 0; i < limit; i++)
 			{
+				int			rc;
+
+				CHECK_FOR_INTERRUPTS();
 				/* Skip if no matching dummy table in the schema. */
-				if (nspOid == InvalidOid ||
-					get_relname_relid(sorted[i].relname, nspOid) == InvalidOid)
+				if (get_relname_relid(sorted[i].relname, nspOid) == InvalidOid)
 					continue;
 
-				SPI_execute_with_args(
+				rc = SPI_execute_with_args(
 					"SELECT create_temp_table($1)",
 					1,
 					(Oid[]) { TEXTOID },
 					(Datum[]) { CStringGetTextDatum(sorted[i].relname) },
 					NULL, false, 0);
+				if (rc != SPI_OK_SELECT)
+					elog(ERROR, "fasttrun_prewarm: SPI_execute_with_args failed: %s",
+						 SPI_result_code_string(rc));
 
 				/* Free this iteration's result so tuptables don't accumulate. */
 				if (SPI_tuptable != NULL)

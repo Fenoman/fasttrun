@@ -169,18 +169,30 @@ fasttrun_count_hidden_columns(Oid relid)
 	int64		del = 0;
 	bool		truncdropped = false;
 	bool		usable_source;
-	BlockNumber pages;
+	bool		poisoned;
+	bool		wide_writers;
+	BlockNumber pages = 0;
 	FasttrunUsableBaseline rel_baseline = {0};
 	ListCell   *lc;
 	int			hidden = 0;
 
+	if (fasttrun_stats_relid_cache == NULL)
+		return 0;
+	relentry = (FasttrunStatsRelidEntry *) hash_search(fasttrun_stats_relid_cache,
+													   &relid, HASH_FIND, NULL);
+	if (relentry == NULL || relentry->refcount == 0)
+		return 0;
+
 	rel = try_relation_open(relid, AccessShareLock);
 	if (rel == NULL)
 		return 0;
-	pages = RELKIND_HAS_STORAGE(rel->rd_rel->relkind) ?
-		RelationGetNumberOfBlocks(rel) : 0;
-	usable_source = fasttrun_read_pgstat_counters(rel, &ins, &upd, &del,
-												  &truncdropped);
+	poisoned = fasttrun_poison_blocks_file(rel);
+	if (!poisoned && RELKIND_HAS_STORAGE(rel->rd_rel->relkind) &&
+		smgrexists(RelationGetSmgr(rel), MAIN_FORKNUM))
+		pages = RelationGetNumberOfBlocks(rel);
+	usable_source = !poisoned &&
+		fasttrun_read_pgstat_counters(rel, &ins, &upd, &del, &truncdropped);
+	wide_writers = fasttrun_relation_has_wide_writers(rel);
 	rlb.locator = rel->rd_locator;
 	rlb.backend = rel->rd_backend;
 	relentry = fasttrun_stats_relid_cache == NULL ? NULL :
@@ -188,6 +200,10 @@ fasttrun_count_hidden_columns(Oid relid)
 												&relid, HASH_FIND, NULL);
 	if (relentry != NULL)
 	{
+		bool		saved_exact = relentry->updated_cols_exact;
+
+		if (wide_writers)
+			relentry->updated_cols_exact = false;
 		usable_source = usable_source && relentry->heap_rlb_valid &&
 			fasttrun_rlb_equals(relentry->heap_rlb, rlb);
 		foreach(lc, relentry->attkeys)
@@ -204,6 +220,7 @@ fasttrun_count_hidden_columns(Oid relid)
 												 &rel_baseline))
 				hidden++;
 		}
+		relentry->updated_cols_exact = saved_exact;
 	}
 	relation_close(rel, AccessShareLock);
 	return hidden;
@@ -219,10 +236,13 @@ Datum
 fasttrun_cached_tables(PG_FUNCTION_ARGS)
 {
 	TupleDesc	tupdesc;
-	Tuplestorestate *tupstore = fasttrun_begin_srf(fcinfo, &tupdesc);
+	Tuplestorestate *tupstore;
 	List	   *relids = NIL;
 	HASH_SEQ_STATUS status;
 	ListCell   *lc;
+
+	fasttrun_reject_in_atx("fasttrun_cached_tables");
+	tupstore = fasttrun_begin_srf(fcinfo, &tupdesc);
 
 	if (fasttrun_analyze_cache != NULL)
 	{
@@ -248,13 +268,17 @@ fasttrun_cached_tables(PG_FUNCTION_ARGS)
 	foreach(lc, relids)
 	{
 		Oid			relid = lfirst_oid(lc);
-		char	   *relname = get_rel_name(relid);
-		int			hidden = relname != NULL ? fasttrun_count_hidden_columns(relid) : 0;
+		char	   *relname;
+		int			hidden;
 		FasttrunAnalyzeCacheEntry *entry;
 		FasttrunStatsRelidEntry *relentry = NULL;
 		bool		is_index;
 		Datum		values[9];
 		bool		nulls[9];
+
+		CHECK_FOR_INTERRUPTS();
+		relname = get_rel_name(relid);
+		hidden = relname != NULL ? fasttrun_count_hidden_columns(relid) : 0;
 
 		/* Catalog access is over: look the entries up now. */
 		entry = fasttrun_cache_lookup(relid);
@@ -298,11 +322,14 @@ Datum
 fasttrun_blocked_tables(PG_FUNCTION_ARGS)
 {
 	TupleDesc	tupdesc;
-	Tuplestorestate *tupstore = fasttrun_begin_srf(fcinfo, &tupdesc);
+	Tuplestorestate *tupstore;
 	List	   *relids = NIL;
 	HASH_SEQ_STATUS status;
 	FasttrunPoisonEntry *entry;
 	ListCell   *lc;
+
+	fasttrun_reject_in_atx("fasttrun_blocked_tables");
+	tupstore = fasttrun_begin_srf(fcinfo, &tupdesc);
 
 	if (fasttrun_poison_cache == NULL)
 		return (Datum) 0;
@@ -319,13 +346,11 @@ fasttrun_blocked_tables(PG_FUNCTION_ARGS)
 		Datum		values[2];
 		bool		nulls[2] = {false, false};
 
+		CHECK_FOR_INTERRUPTS();
 		rel = try_relation_open(relid, AccessShareLock);
 		if (rel == NULL)
 			continue;
-		entry = fasttrun_poison_find(relid);
-		if (entry != NULL && entry->active &&
-			RelFileLocatorEquals(entry->root_rlb.locator, rel->rd_locator) &&
-			entry->root_rlb.backend == rel->rd_backend)
+		if (fasttrun_poison_blocks_file(rel))
 		{
 			values[0] = ObjectIdGetDatum(relid);
 			values[1] = CStringGetTextDatum(RelationGetRelationName(rel));

@@ -24,6 +24,7 @@ fasttrun_datum_cmp(const void *a, const void *b, void *arg)
 	Datum		da = *(const Datum *) a;
 	Datum		db = *(const Datum *) b;
 
+	CHECK_FOR_INTERRUPTS();
 	return ApplySortComparator(da, false, db, false, ssup);
 }
 

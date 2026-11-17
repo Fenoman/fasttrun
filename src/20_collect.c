@@ -40,6 +40,7 @@ fasttrun_estimate_index_fraction_as_owner(Relation heaprel, Relation indexrel,
 
 	for (i = 0; i < sample_count; i++)
 	{
+		CHECK_FOR_INTERRUPTS();
 		ResetExprContext(econtext);
 		ExecStoreHeapTuple(sample[i], slot, false);
 		if (ExecQual(predicate, econtext))
@@ -57,27 +58,19 @@ fasttrun_estimate_index_fraction(Relation heaprel, Relation indexrel,
 								 IndexInfo *indexInfo,
 								 HeapTuple *sample, int sample_count)
 {
-	Oid			save_userid;
-	int			save_sec_context;
-	int			save_nestlevel;
+	FasttrunOwnerSecContext sec;
 	double		fraction = 0.0;
 
-	GetUserIdAndSecContext(&save_userid, &save_sec_context);
-	save_nestlevel = NewGUCNestLevel();
+	fasttrun_prepare_owner_sec_context(&sec);
 	PG_TRY();
 	{
-		SetUserIdAndSecContext(heaprel->rd_rel->relowner,
-							   save_sec_context | SECURITY_RESTRICTED_OPERATION);
-#if PG_VERSION_NUM >= 170000
-		RestrictSearchPath();
-#endif
+		fasttrun_switch_owner_sec_context(heaprel->rd_rel->relowner, &sec);
 		fraction = fasttrun_estimate_index_fraction_as_owner(heaprel, indexrel,
 																indexInfo, sample, sample_count);
 	}
 	PG_FINALLY();
 	{
-		AtEOXact_GUC(false, save_nestlevel);
-		SetUserIdAndSecContext(save_userid, save_sec_context);
+		fasttrun_leave_owner_sec_context(&sec);
 	}
 	PG_END_TRY();
 	return fraction;
@@ -206,6 +199,7 @@ fasttrun_update_index_relstats(Relation rel, List *index_rels,
 	foreach(lc, index_rels)
 	{
 		Relation	indexrel = (Relation) lfirst(lc);
+		FasttrunAnalyzeCacheEntry *idx_entry;
 		BlockNumber	index_pages;
 		double		tuple_fract;
 		int64		index_tuples;
@@ -263,11 +257,16 @@ fasttrun_update_index_relstats(Relation rel, List *index_rels,
 										  index_pages)))
 			changed = true;
 
-		fasttrun_cache_set_owning_heap(fasttrun_cache_store_relstats(indexrel,
-														 index_pages,
-														 index_tuples,
-														 0),
-										   rel);
+		idx_entry = fasttrun_cache_store_relstats(indexrel,
+												  index_pages,
+												  index_tuples,
+												  0);
+		fasttrun_cache_set_owning_heap(idx_entry, rel);
+		if (set_reltuples || !idx_entry->state.has_base_heap_tuples)
+		{
+			idx_entry->state.has_base_heap_tuples = true;
+			idx_entry->state.base_heap_tuples = totalrows;
+		}
 		FASTTRUN_TEST_FAILPOINT("index_publication_boundary", 0);
 		indexrel->rd_rel->relpages = index_pages;
 		indexrel->rd_rel->reltuples = (float4) index_tuples;
@@ -326,7 +325,7 @@ fasttrun_cmp_heap_tuples_by_tid(const void *a, const void *b)
  * that decision to the hook), so their expressions stay on defaults.
  *
  * The expressions run as the table owner in a restricted security context,
- * with search_path restricted on PG17 and later, as in core ANALYZE.  An
+ * with search_path restricted to pg_catalog, pg_temp.  An
  * expression that yields no statistics this time loses the old ones.
  *
  * Reports publication and transitions to neutral for plan invalidation.
@@ -480,6 +479,30 @@ fasttrun_collect_index_expressions(Relation rel, HeapTuple *sample,
 	return result;
 }
 
+static bool
+fasttrun_neutralize_skipped_column(Relation rel, AttrNumber attnum)
+{
+	Oid			relid = RelationGetRelid(rel);
+	bool		changed = false;
+	int			inh_idx;
+
+	if (fasttrun_stats_cache == NULL)
+		return false;
+
+	for (inh_idx = 0; inh_idx < 2; inh_idx++)
+	{
+		FasttrunStatsKey key;
+		FasttrunStatsEntry *entry;
+
+		fasttrun_stats_key_init(&key, relid, attnum, inh_idx != 0);
+		entry = (FasttrunStatsEntry *) hash_search(fasttrun_stats_cache, &key,
+												   HASH_FIND, NULL);
+		if (entry != NULL)
+			changed |= fasttrun_stats_entry_neutralize(relid, entry);
+	}
+	return changed;
+}
+
 /*
  * The result separates publishing a candidate from a transition to neutral.
  * Callers invalidate only when either changes planner-visible ownership.
@@ -589,6 +612,8 @@ fasttrun_collect_and_store_as_owner(Relation rel, HeapTuple *sample, int sample_
 			if (stats == NULL)
 			{
 				MemoryContextSwitchTo(oldcxt);
+				result.became_neutral |=
+					fasttrun_neutralize_skipped_column(rel, attnum);
 				continue;
 			}
 
@@ -605,6 +630,8 @@ fasttrun_collect_and_store_as_owner(Relation rel, HeapTuple *sample, int sample_
 			if (!stats->stats_valid)
 			{
 				MemoryContextSwitchTo(oldcxt);
+				result.became_neutral |=
+					fasttrun_neutralize_skipped_column(rel, attnum);
 				continue;
 			}
 
@@ -690,14 +717,26 @@ fasttrun_collect_and_store_as_owner(Relation rel, HeapTuple *sample, int sample_
 			CHECK_FOR_INTERRUPTS();
 
 			if (!fasttrun_attribute_is_analyzable(attr))
+			{
+				result.became_neutral |=
+					fasttrun_neutralize_skipped_column(rel, attnum);
 				continue;
+			}
 			attstattarget = fasttrun_get_attstattarget(rel, attnum);
 			if (attstattarget == 0)
+			{
+				result.became_neutral |=
+					fasttrun_neutralize_skipped_column(rel, attnum);
 				continue;
+			}
 
 			typentry = lookup_type_cache(attr->atttypid, TYPECACHE_LT_OPR);
 			if (!OidIsValid(typentry->lt_opr))
+			{
+				result.became_neutral |=
+					fasttrun_neutralize_skipped_column(rel, attnum);
 				continue;	/* no btree comparator -> skip */
+			}
 
 			MemoryContextReset(per_col_mcxt);
 			oldcxt = MemoryContextSwitchTo(per_col_mcxt);
@@ -707,6 +746,8 @@ fasttrun_collect_and_store_as_owner(Relation rel, HeapTuple *sample, int sample_
 			{
 				bool	isnull = col_nulls[i];
 				Datum	d = col_values[i];
+
+				CHECK_FOR_INTERRUPTS();
 
 				if (isnull)
 				{
@@ -791,6 +832,8 @@ fasttrun_collect_and_store_as_owner(Relation rel, HeapTuple *sample, int sample_
 					{
 						bool	end_of_run;
 
+						CHECK_FOR_INTERRUPTS();
+
 						if (i == n_array)
 							end_of_run = true;
 						else
@@ -871,27 +914,19 @@ static FasttrunCollectResult
 fasttrun_collect_and_store(Relation rel, HeapTuple *sample, int sample_count,
 						   int64 totalrows, bool sample_needs_tid_sort)
 {
-	Oid			save_userid;
-	int			save_sec_context;
-	int			save_nestlevel;
+	FasttrunOwnerSecContext sec;
 	FasttrunCollectResult result = {0};
 
-	GetUserIdAndSecContext(&save_userid, &save_sec_context);
-	save_nestlevel = NewGUCNestLevel();
+	fasttrun_prepare_owner_sec_context(&sec);
 	PG_TRY();
 	{
-		SetUserIdAndSecContext(rel->rd_rel->relowner,
-							   save_sec_context | SECURITY_RESTRICTED_OPERATION);
-#if PG_VERSION_NUM >= 170000
-		RestrictSearchPath();
-#endif
+		fasttrun_switch_owner_sec_context(rel->rd_rel->relowner, &sec);
 		result = fasttrun_collect_and_store_as_owner(rel, sample, sample_count,
 														   totalrows, sample_needs_tid_sort);
 	}
 	PG_FINALLY();
 	{
-		AtEOXact_GUC(false, save_nestlevel);
-		SetUserIdAndSecContext(save_userid, save_sec_context);
+		fasttrun_leave_owner_sec_context(&sec);
 	}
 	PG_END_TRY();
 	return result;

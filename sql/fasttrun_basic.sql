@@ -464,4 +464,48 @@ SELECT count(*) = 0 AS lock_rows_gone FROM t_lock_mode \gset
 \echo lock_rows_gone :lock_rows_gone
 DROP TABLE t_lock_mode;
 
+-- SQLSTATE 0A000 for partitioned/inheritance parents and 42809 for wrong object types.
+CREATE TABLE public.t_sqlstate_perm (id int);
+CREATE TEMP VIEW t_sqlstate_view AS SELECT 1 AS id;
+CREATE TEMP TABLE t_sqlstate_part (id int) PARTITION BY RANGE (id);
+DO $sqlstate$
+DECLARE
+  cmd text;
+  st text;
+BEGIN
+  BEGIN
+    PERFORM fasttruncate('t_sqlstate_part');
+    RAISE EXCEPTION 'partitioned parent accepted';
+  EXCEPTION WHEN OTHERS THEN
+    IF SQLSTATE <> '0A000' THEN
+      RAISE EXCEPTION 'expected 0A000 for partitioned parent, got %', SQLSTATE;
+    END IF;
+  END;
+
+  FOREACH cmd IN ARRAY ARRAY[
+    'SELECT fasttruncate(''public.t_sqlstate_perm'')',
+    'SELECT fasttrun_analyze(''public.t_sqlstate_perm'')',
+    'SELECT fasttrun_analyze_bulk(''public.t_sqlstate_perm'')',
+    'SELECT fasttrun_collect_stats(''public.t_sqlstate_perm'')',
+    'SELECT * FROM fasttrun_relstats(''public.t_sqlstate_perm'')',
+    'SELECT * FROM fasttrun_inspect_stats(''public.t_sqlstate_perm'')',
+    'SELECT pg_temp.rel_bytes(''public.t_sqlstate_perm''::regclass)',
+    'SELECT pg_temp.rel_bytes(''pg_temp.t_sqlstate_view''::regclass)'
+  ] LOOP
+    st := NULL;
+    BEGIN
+      EXECUTE cmd;
+    EXCEPTION WHEN OTHERS THEN
+      st := SQLSTATE;
+    END;
+    IF st IS DISTINCT FROM '42809' THEN
+      RAISE EXCEPTION 'expected 42809 for %, got %', cmd, st;
+    END IF;
+  END LOOP;
+END
+$sqlstate$;
+DROP TABLE t_sqlstate_part;
+DROP VIEW t_sqlstate_view;
+DROP TABLE public.t_sqlstate_perm;
+
 DROP EXTENSION fasttrun;

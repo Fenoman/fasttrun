@@ -429,8 +429,145 @@ SQL
 	echo "tracking persistence passed: immediate_lock"
 }
 
+run_corrupt_load_case()
+{
+	local case_dir=$WORKDIR/corrupt_load
+	local data=$case_dir/data
+	local socket=$case_dir/socket
+	local track_file=$data/pg_stat/fasttrun_temp_stats
+	local port
+	local variant
+	local snap
+
+	mkdir -p "$socket" "$case_dir/payloads"
+	if [ -n "$PG_RUN_AS" ]; then
+		chown -R "$PG_RUN_AS" "$case_dir"
+	fi
+	port=$("$PYTHON" -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')
+
+	"$PYTHON" - "$case_dir/payloads" <<'PY'
+import struct
+import sys
+from pathlib import Path
+
+out = Path(sys.argv[1])
+MAGIC = 0x46545354
+INT64_MAX = (1 << 63) - 1
+
+def entry(name_bytes: bytes, count: int, ts: int = 1000) -> bytes:
+    assert len(name_bytes) == 64
+    return struct.pack("=64sqq", name_bytes, count, ts)
+
+def cname(s: str) -> bytes:
+    b = s.encode("ascii")
+    return b + b"\x00" * (64 - len(b))
+
+# 1. 64-byte relname without NUL terminator
+(out / "missing_nul.bin").write_bytes(
+    struct.pack("=ii", MAGIC, 1) + entry(b"A" * 64, 5)
+)
+# 2. Empty relname[0] == '\0'
+(out / "empty_name.bin").write_bytes(
+    struct.pack("=ii", MAGIC, 1) + entry(b"\x00" * 64, 5)
+)
+# 3. Non-positive create_count (0 and -5)
+(out / "zero_count.bin").write_bytes(
+    struct.pack("=ii", MAGIC, 1) + entry(cname("t_zero"), 0)
+)
+(out / "neg_count.bin").write_bytes(
+    struct.pack("=ii", MAGIC, 1) + entry(cname("t_neg"), -5)
+)
+# 4. Duplicate keys overflowing int64
+(out / "overflow_dup.bin").write_bytes(
+    struct.pack("=ii", MAGIC, 2)
+    + entry(cname("t_dup"), INT64_MAX - 10, 100)
+    + entry(cname("t_dup"), INT64_MAX - 10, 200)
+)
+# 5. Header count > FASTTRUN_TRACK_MAX (8192)
+(out / "over_max.bin").write_bytes(
+    struct.pack("=ii", MAGIC, 100000) + entry(cname("t_over"), 1)
+)
+# 6. Truncated mid-entry after one valid entry (must wipe partial entries too)
+(out / "truncated_mid.bin").write_bytes(
+    struct.pack("=ii", MAGIC, 3)
+    + entry(cname("t_partial_ok"), 7)
+    + b"half_entry"
+)
+# 7. Trailing junk after valid count entries
+(out / "trailing_junk.bin").write_bytes(
+    struct.pack("=ii", MAGIC, 1) + entry(cname("t_trail"), 3) + b"X"
+)
+# 8. Out-of-range TimestampTz (must be rejected by IS_VALID_TIMESTAMP)
+(out / "bad_timestamp.bin").write_bytes(
+    struct.pack("=ii", MAGIC, 1) + entry(cname("t_bad_ts"), 3, -(1 << 63) + 1)
+)
+# 9. Valid single record at INT64_MAX (must load cleanly and saturate on next CREATE)
+(out / "max_single.bin").write_bytes(
+    struct.pack("=ii", MAGIC, 1) + entry(cname("t_saturate"), INT64_MAX, 500)
+)
+PY
+
+	run_pg "$INITDB" -D "$data" --no-locale -E UTF8 >/dev/null
+	start_cluster "$data" "$socket" "$case_dir/init.log" "$port" ""
+	run_pg "$CREATEDB" -h "$socket" -p "$port" "$DBNAME"
+	run_pg "$PSQL" -h "$socket" -p "$port" -d "$DBNAME" -XAtq \
+		-v ON_ERROR_STOP=1 -c 'CREATE EXTENSION fasttrun' >/dev/null
+	stop_cluster "$data"
+	check_log_clean "$case_dir/init.log"
+
+	for variant in missing_nul empty_name zero_count neg_count overflow_dup over_max truncated_mid trailing_junk bad_timestamp; do
+		cp "$case_dir/payloads/$variant.bin" "$track_file"
+		if [ -n "$PG_RUN_AS" ]; then
+			chown "$PG_RUN_AS" "$track_file"
+		fi
+		start_cluster "$data" "$socket" "$case_dir/$variant.log" "$port" ""
+		snap=$(snapshot "$socket" "$port")
+		if [ "$snap" != "SNAPSHOT " ]; then
+			echo "FAIL: corrupt tracking file '$variant' loaded rows: $snap" >&2
+			return 1
+		fi
+		# Clean registry before shutdown so fasttrun_track_save writes a clean empty file.
+		run_pg "$PSQL" -h "$socket" -p "$port" -d "$DBNAME" -XAtq \
+			-v ON_ERROR_STOP=1 -c 'SELECT fasttrun_reset_temp_stats()' >/dev/null
+		stop_cluster "$data"
+		check_log_clean "$case_dir/$variant.log"
+		if ! grep -Fq 'WARNING:  fasttrun: ignoring corrupt tracking statistics file "pg_stat/fasttrun_temp_stats"' \
+			"$case_dir/$variant.log"; then
+			cat "$case_dir/$variant.log" >&2
+			echo "FAIL: corrupt tracking file '$variant' did not log WARNING" >&2
+			return 1
+		fi
+	done
+
+	# Verify single-record INT64_MAX loads cleanly and saturates without signed overflow on next CREATE
+	cp "$case_dir/payloads/max_single.bin" "$track_file"
+	if [ -n "$PG_RUN_AS" ]; then
+		chown "$PG_RUN_AS" "$track_file"
+	fi
+	start_cluster "$data" "$socket" "$case_dir/max_single.log" "$port" ""
+	sat_val=$(run_pg "$PSQL" -h "$socket" -p "$port" -d "$DBNAME" -XAtq -v ON_ERROR_STOP=1 <<'SQL'
+CREATE SCHEMA IF NOT EXISTS dummy_tmp;
+CREATE TABLE IF NOT EXISTS dummy_tmp.t_saturate (id int);
+SET fasttrun.track_schedule = '';
+SET fasttrun.track_temp_creates = on;
+CREATE TEMP TABLE t_saturate (LIKE dummy_tmp.t_saturate);
+SELECT create_count FROM fasttrun_hot_temp_tables(0) WHERE relname = 't_saturate';
+SQL
+	)
+	run_pg "$PSQL" -h "$socket" -p "$port" -d "$DBNAME" -XAtq \
+		-v ON_ERROR_STOP=1 -c 'SELECT fasttrun_reset_temp_stats()' >/dev/null
+	stop_cluster "$data"
+	check_log_clean "$case_dir/max_single.log"
+	if [ "$sat_val" != "9223372036854775807" ]; then
+		echo "FAIL: INT64_MAX entry did not saturate cleanly, got: $sat_val" >&2
+		return 1
+	fi
+
+	echo "tracking persistence passed: corrupt_load"
+}
+
 case "$CASE_NAME" in
-	all|clean|reset_error|track_save_write|track_save_close|track_save_pre_rename|immediate_lock)
+	all|clean|reset_error|corrupt_load|track_save_write|track_save_close|track_save_pre_rename|immediate_lock)
 		;;
 	*)
 		echo "unknown FASTTRUN_TRACKING_PERSISTENCE_CASE: $CASE_NAME" >&2
@@ -443,13 +580,16 @@ run_clean_case
 if [ "$CASE_NAME" = all ] || [ "$CASE_NAME" = reset_error ]; then
 	run_reset_error_case
 fi
+if [ "$CASE_NAME" = all ] || [ "$CASE_NAME" = corrupt_load ]; then
+	run_corrupt_load_case
+fi
 
-if [ "$CASE_NAME" = clean ] || [ "$CASE_NAME" = reset_error ]; then
+if [ "$CASE_NAME" = clean ] || [ "$CASE_NAME" = reset_error ] || [ "$CASE_NAME" = corrupt_load ]; then
 	exit 0
 fi
 if [ "$ASSERTIONS_ENABLED" != on ]; then
 	echo "SKIP: fault-case tracking persistence требуют cassert-сборку" >&2
-	exit 0
+	exit 77
 fi
 
 case "$CASE_NAME" in

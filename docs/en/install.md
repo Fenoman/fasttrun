@@ -36,7 +36,7 @@ FROM pg_extension
 WHERE extname = 'fasttrun';
 ```
 
-The default version is `2.7.1`.
+The default version is `2.7.2`.
 
 Instead of a plain `CREATE EXTENSION`, you can install the extension into a
 dedicated schema. Untrusted roles must not be allowed to create objects in the
@@ -50,7 +50,9 @@ CREATE EXTENSION fasttrun WITH SCHEMA fasttrun_api;
 
 With this layout, qualify calls - for example,
 `fasttrun_api.fasttruncate(...)`. The example under `examples/` calls
-`public.fasttruncate()` explicitly and must be adapted separately.
+`public.fasttruncate()`, `public.fasttrun_temp_is_ours()`,
+`public.fasttrun_temp_same_cols()`, and `public.pgv_set()` (`pg_variables`)
+explicitly and must be adapted separately.
 
 All SQL examples below assume a regular installation into `public`. If you use
 a dedicated schema, prefix function names with `fasttrun_api.` or configure a
@@ -119,13 +121,28 @@ GRANT EXECUTE ON FUNCTION public.fasttrun_analyze(text) TO app_role;
 ```
 
 Grant the remaining privileges separately to application, pooler, monitoring,
-and DBA roles. After upgrading an older installation, also check privileges on
-the old `fasttruncate_c(text)` function if it is still present.
+and DBA roles. Any permitted `ALTER EXTENSION fasttrun UPDATE` across
+`2.7.1 -> 2.7.2` (including upgrades starting from `2.7.0` or earlier)
+automatically revokes leftover `PUBLIC` `EXECUTE` on an extension-owned
+`fasttruncate_c(text)` alias when `PUBLIC` `EXECUTE` was revoked on
+`fasttruncate(text)`. If a separate grantor with `WITH GRANT OPTION` also
+granted `PUBLIC` `EXECUTE` on that alias, a `WARNING` lists those grantors:
+revoke `PUBLIC` `EXECUTE` as each of them (`SET ROLE <grantor>; REVOKE EXECUTE
+ON FUNCTION <schema>.fasttruncate_c(text) FROM PUBLIC; RESET ROLE;`, where
+`grantor::regrole` resolves the role name from `aclexplode(proacl)`). If an
+application still calls the legacy alias `fasttruncate_c(text)` directly under
+a role that was granted `EXECUTE` only on `fasttruncate(text)`, switch those
+calls to `fasttruncate(text)` or grant `EXECUTE` on `fasttruncate_c(text)` to
+that role explicitly.
 
 Automatic migration of an external legacy wrapper requires default function
-ACLs, extension-owner ownership, invoker security and no function settings on
-both the wrapper and its C alias. Otherwise upgrade fails with SQLSTATE `55000`
-before replacing either function.
+ACLs, bootstrap-superuser ownership (or extension-owner ownership when the
+extension owner is a superuser), invoker security and no function settings on
+both the wrapper and its C alias. When only the extension-owned C alias
+`fasttruncate_c(text)` is present without a wrapper, its owner and exact ACL
+graph are replayed onto `fasttruncate(text)` as long as the alias uses invoker
+security, is not `LEAKPROOF`, and carries no function settings. Otherwise
+upgrade fails with SQLSTATE `55000` before replacing functions.
 
 Migrate such a wrapper explicitly in one
 transaction, preserving its effective access policy, then update the extension.
@@ -169,7 +186,7 @@ The final check must return `true`.
 
 Upgrades are supported from versions `2.0`, `2.1`, `2.1.1`, `2.1.2`, `2.2.0`,
 `2.3.0`, `2.3.1`, `2.3.2`, `2.3.3`, `2.3.4`, `2.4.0`, `2.4.1`, `2.5.0`, `2.5.1`,
-`2.5.2`, and `2.6.0`.
+`2.5.2`, `2.6.0`, `2.7.0`, and `2.7.1`.
 
 Treat a C-library upgrade as maintenance on the server processes. Install the
 new build and SQL files on every cluster node.
@@ -191,16 +208,20 @@ After startup or after opening a new connection, run the following in every
 database as the extension owner or a superuser:
 
 ```sql
-ALTER EXTENSION fasttrun UPDATE TO '2.7.1';
+ALTER EXTENSION fasttrun UPDATE TO '2.7.2';
 ```
 
 With physical replication, install the files on standby nodes too, but run
 `ALTER EXTENSION` only on the writable primary. The catalog changes reach the
 standbys through normal replication.
 
-The 2.7.0 -> 2.7.1 upgrade leaves SQL objects unchanged and preserves function
-OIDs and privileges. Replace the C library and restart PostgreSQL when using
-shared preload, or open new connections otherwise, before running the update.
+The 2.7.0 -> 2.7.1 and 2.7.1 -> 2.7.2 upgrades leave the core SQL objects and
+their OIDs unchanged and preserve canonical function privileges, with
+2.7.1 -> 2.7.2 revoking only leftover `PUBLIC` `EXECUTE` on an extension-owned
+`fasttruncate_c(text)` alias when applicable (see
+["Privileges"](#privileges)). Replace the C library and restart PostgreSQL
+when using shared preload, or open new connections otherwise, before running
+the update.
 
 This is important for an upgrade from 2.3.4 to 2.4.0: the SQL migration adds a
 function that does not exist in the old C library.
@@ -219,7 +240,7 @@ The old C library does not have them either, so the order is the same: the new
 build and new server processes first, then `ALTER EXTENSION`. Code that must
 also work with the old version finds the functions with
 `to_regprocedure('fasttrun_temp_is_ours(regclass)')`. For per-column accounting of statistics
-wear, versions 2.5 **need the library to be preloaded**, and the main functions
+wear, versions 2.5.0 and newer **need the library to be preloaded**, and the main functions
 work without it. If fasttrun is already in `shared_preload_libraries`, nothing needs
 to change. Otherwise, for client sessions add:
 
@@ -268,19 +289,19 @@ preload is already disabled, stop PostgreSQL and remove the file manually.
 
 ## Compatibility
 
-Recorded qualification of source snapshots on 2026-11-14/15, not a guarantee for
+Recorded qualification of source snapshots on 2026-11-17, not a guarantee for
 every vendor minor version or production workload:
 
-| PostgreSQL | Build | Basic tests 2.7.0 |
+| PostgreSQL | Build | Basic tests 2.7.2 |
 |---|---|---|
-| PostgreSQL 16.16 | cassert/debug | 20/20 |
-| PostgreSQL 17.12 | cassert/debug | 20/20 |
-| PostgreSQL 18.7 | cassert/debug | 20/20 |
+| PostgreSQL 16.16 | cassert/debug and release | 20/20 |
+| PostgreSQL 17.12 | cassert/debug and release | 20/20 |
+| PostgreSQL 18.7 | cassert/debug and release | 20/20 |
 | Postgres Pro Standard 16.15.2 | native release | 20/20 |
-| Postgres Pro Standard 18 | native release | 20/20 |
-| Postgres Pro Enterprise 18.6-TRIAL | native release | 20/20 |
+| Postgres Pro Standard 18.6.2 | native release | 20/20 |
+| Postgres Pro Enterprise 18.6.2 | native release | 20/20 |
 | Tantor SE 18.6.3, `enable_temp_memory_catalog = off` | native release | 20/20 |
-| Tantor SE 18.6.3, `enable_temp_memory_catalog = on` | native release | 20 expected matches, including four skipped suites |
+| Tantor SE 18.6.3, `enable_temp_memory_catalog = on` | native release | 16/16 executed + 4 skipped via `_1.out` |
 
 Upstream cassert qualification includes BRIN stress and tracking failure checks.
 Native Standard 16 assertion-only checks are not run: a cassert server and vendor

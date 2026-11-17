@@ -340,14 +340,29 @@ BEGIN
     CREATE FUNCTION public.fasttruncate(integer) RETURNS void
         LANGUAGE plpgsql AS $fn$ BEGIN NULL; END; $fn$;
     REVOKE EXECUTE ON FUNCTION public.fasttruncate_c(text) FROM PUBLIC;
+    CREATE ROLE ft_mig_ga;
+    CREATE ROLE ft_mig_gb;
+    CREATE ROLE ft_mig_gc;
+    GRANT EXECUTE ON FUNCTION public.fasttruncate_c(text) TO ft_mig_gb WITH GRANT OPTION;
+    SET LOCAL ROLE ft_mig_gb;
+    GRANT EXECUTE ON FUNCTION public.fasttruncate_c(text) TO ft_mig_gc;
+    RESET ROLE;
+    GRANT EXECUTE ON FUNCTION public.fasttruncate_c(text) TO ft_mig_ga WITH GRANT OPTION;
+    SET LOCAL ROLE ft_mig_ga;
+    GRANT EXECUTE ON FUNCTION public.fasttruncate_c(text) TO ft_mig_gb WITH GRANT OPTION;
+    RESET ROLE;
+    REVOKE GRANT OPTION FOR EXECUTE ON FUNCTION public.fasttruncate_c(text) FROM ft_mig_gb;
     CREATE VIEW mig_alias_dependent AS
         SELECT public.fasttruncate_c(NULL::text) IS NULL AS is_null;
     SELECT * INTO STRICT alias_before FROM pg_catalog.pg_proc
      WHERE oid = 'public.fasttruncate_c(text)'::regprocedure;
     SELECT * INTO STRICT overload_before FROM pg_catalog.pg_proc
      WHERE oid = 'public.fasttruncate(integer)'::regprocedure;
+    CREATE ROLE ft_mig_default_grantee;
+    ALTER DEFAULT PRIVILEGES GRANT EXECUTE ON FUNCTIONS TO ft_mig_default_grantee;
 
     ALTER EXTENSION fasttrun UPDATE;
+    ALTER DEFAULT PRIVILEGES REVOKE EXECUTE ON FUNCTIONS FROM ft_mig_default_grantee;
 
     IF (SELECT pg_catalog.to_jsonb(p) FROM pg_catalog.pg_proc p WHERE p.oid = alias_before.oid)
            IS DISTINCT FROM pg_catalog.to_jsonb(alias_before) THEN
@@ -365,9 +380,21 @@ BEGIN
                      AND d.deptype = 'e' AND e.extname = 'fasttrun') THEN
         RAISE EXCEPTION 'legacy C alias lost extension membership';
     END IF;
+    CREATE ROLE ft_mig_denied;
+    IF has_function_privilege('ft_mig_denied', 'public.fasttruncate_c(text)', 'EXECUTE') OR
+       has_function_privilege('ft_mig_denied', 'public.fasttruncate(text)', 'EXECUTE') OR
+       has_function_privilege('ft_mig_default_grantee', 'public.fasttruncate(text)', 'EXECUTE') OR
+       NOT has_function_privilege('ft_mig_gc', 'public.fasttruncate(text)', 'EXECUTE') THEN
+        RAISE EXCEPTION 'upgrade failed to preserve exact alias ACL';
+    END IF;
+    DROP ROLE ft_mig_denied;
     PERFORM * FROM mig_alias_dependent;
     DROP VIEW mig_alias_dependent;
     DROP EXTENSION fasttrun;
+    DROP ROLE ft_mig_default_grantee;
+    DROP ROLE ft_mig_gc;
+    DROP ROLE ft_mig_gb;
+    DROP ROLE ft_mig_ga;
     IF to_regprocedure('public.fasttruncate_c(text)') IS NOT NULL THEN
         RAISE EXCEPTION 'DROP EXTENSION left the legacy C alias behind';
     END IF;
@@ -557,3 +584,331 @@ BEGIN
     DROP ROLE ft_mig_security;
 END
 $test_wrapper_security$;
+
+-- ----------------------------------------------------------------------
+-- 16. Vanilla 2.0 upgrade preserves REVOKE EXECUTE, creates no public
+--     fasttruncate_c alias, matches all 16 pg_proc rows of a fresh install,
+--     and returns NULL on NULL input for canonical fasttruncate(NULL).
+-- ----------------------------------------------------------------------
+DO $test_revoke_and_snapshot$
+DECLARE
+    upgraded_snap jsonb;
+    fresh_snap jsonb;
+    foreign_alias_before pg_catalog.pg_proc;
+BEGIN
+    CREATE ROLE ft_mig_unpriv;
+    CREATE EXTENSION fasttrun VERSION '2.0';
+    REVOKE EXECUTE ON FUNCTION public.fasttruncate(text) FROM PUBLIC;
+    CREATE FUNCTION public.fasttruncate_c(text) RETURNS void
+        LANGUAGE plpgsql AS $fn$ BEGIN NULL; END; $fn$;
+    REVOKE EXECUTE ON FUNCTION public.fasttruncate_c(text) FROM PUBLIC;
+    SELECT * INTO STRICT foreign_alias_before FROM pg_catalog.pg_proc
+     WHERE oid = 'public.fasttruncate_c(text)'::regprocedure;
+
+    ALTER EXTENSION fasttrun UPDATE;
+
+    IF has_function_privilege('ft_mig_unpriv', 'public.fasttruncate(text)', 'EXECUTE') THEN
+        RAISE EXCEPTION 'upgrade lost REVOKE EXECUTE on fasttruncate(text)';
+    END IF;
+    IF (SELECT pg_catalog.to_jsonb(p) FROM pg_catalog.pg_proc p WHERE p.oid = foreign_alias_before.oid)
+           IS DISTINCT FROM pg_catalog.to_jsonb(foreign_alias_before) THEN
+        RAISE EXCEPTION 'upgrade altered independent fasttruncate_c(text)';
+    END IF;
+    DROP FUNCTION public.fasttruncate_c(text);
+    IF to_regprocedure('public.fasttruncate_c(text)') IS NOT NULL THEN
+        RAISE EXCEPTION 'vanilla 2.0 upgrade created unexpected fasttruncate_c(text)';
+    END IF;
+    GRANT EXECUTE ON FUNCTION public.fasttruncate(text) TO PUBLIC;
+
+    SELECT jsonb_agg(row_to_json(q) ORDER BY q.sig) INTO upgraded_snap
+      FROM (
+          SELECT p.oid::regprocedure::text AS sig,
+                 p.pronargs,
+                 p.prorettype::regtype::text AS rettype,
+                 ARRAY(SELECT t::regtype::text FROM unnest(p.proargtypes) AS t) AS argtypes,
+                 ARRAY(SELECT t::regtype::text FROM unnest(p.proallargtypes) AS t) AS allargtypes,
+                 p.proargmodes,
+                 p.proargnames,
+                 p.provolatile,
+                 p.proisstrict,
+                 p.proretset,
+                 p.prosecdef,
+                 p.proleakproof,
+                 p.proparallel,
+                 p.proowner::regrole::text AS owner_role,
+                 p.pronargdefaults,
+                 pg_catalog.pg_get_expr(p.proargdefaults, 0) AS argdefaults,
+                 p.proconfig,
+                 ARRAY(
+                     SELECT pg_catalog.format('%s/%s:%s:%s',
+                                CASE WHEN a.grantee = 0 THEN 'PUBLIC'
+                                     ELSE pg_catalog.pg_get_userbyid(a.grantee)
+                                END,
+                                pg_catalog.pg_get_userbyid(a.grantor),
+                                a.privilege_type,
+                                a.is_grantable)
+                       FROM pg_catalog.aclexplode(
+                           COALESCE(p.proacl, pg_catalog.acldefault('f', p.proowner))) AS a
+                      ORDER BY 1
+                 ) AS acl,
+                 p.prosrc
+            FROM pg_catalog.pg_proc p
+            JOIN pg_catalog.pg_depend d ON d.objid = p.oid AND d.deptype = 'e'
+            JOIN pg_catalog.pg_extension e ON e.oid = d.refobjid AND e.extname = 'fasttrun'
+      ) q;
+
+    DROP EXTENSION fasttrun;
+    CREATE EXTENSION fasttrun;
+
+    IF public.fasttruncate(NULL) IS NOT NULL THEN
+        RAISE EXCEPTION 'fasttruncate(NULL) did not return NULL';
+    END IF;
+
+    SELECT jsonb_agg(row_to_json(q) ORDER BY q.sig) INTO fresh_snap
+      FROM (
+          SELECT p.oid::regprocedure::text AS sig,
+                 p.pronargs,
+                 p.prorettype::regtype::text AS rettype,
+                 ARRAY(SELECT t::regtype::text FROM unnest(p.proargtypes) AS t) AS argtypes,
+                 ARRAY(SELECT t::regtype::text FROM unnest(p.proallargtypes) AS t) AS allargtypes,
+                 p.proargmodes,
+                 p.proargnames,
+                 p.provolatile,
+                 p.proisstrict,
+                 p.proretset,
+                 p.prosecdef,
+                 p.proleakproof,
+                 p.proparallel,
+                 p.proowner::regrole::text AS owner_role,
+                 p.pronargdefaults,
+                 pg_catalog.pg_get_expr(p.proargdefaults, 0) AS argdefaults,
+                 p.proconfig,
+                 ARRAY(
+                     SELECT pg_catalog.format('%s/%s:%s:%s',
+                                CASE WHEN a.grantee = 0 THEN 'PUBLIC'
+                                     ELSE pg_catalog.pg_get_userbyid(a.grantee)
+                                END,
+                                pg_catalog.pg_get_userbyid(a.grantor),
+                                a.privilege_type,
+                                a.is_grantable)
+                       FROM pg_catalog.aclexplode(
+                           COALESCE(p.proacl, pg_catalog.acldefault('f', p.proowner))) AS a
+                      ORDER BY 1
+                 ) AS acl,
+                 p.prosrc
+            FROM pg_catalog.pg_proc p
+            JOIN pg_catalog.pg_depend d ON d.objid = p.oid AND d.deptype = 'e'
+            JOIN pg_catalog.pg_extension e ON e.oid = d.refobjid AND e.extname = 'fasttrun'
+      ) q;
+
+    IF jsonb_array_length(fresh_snap) <> 16 THEN
+        RAISE EXCEPTION 'expected 16 extension functions, got %', jsonb_array_length(fresh_snap);
+    END IF;
+    IF upgraded_snap IS DISTINCT FROM fresh_snap THEN
+        RAISE EXCEPTION 'upgraded pg_proc snapshot differs from fresh install';
+    END IF;
+
+    DROP EXTENSION fasttrun;
+    DROP ROLE ft_mig_unpriv;
+END
+$test_revoke_and_snapshot$;
+
+-- ----------------------------------------------------------------------
+-- 17. When both extension-owned fasttruncate(text) and fasttruncate_c(text)
+--     already exist before upgrade, canonical fasttruncate(text) retains its
+--     own ACL instead of being overwritten by fasttruncate_c(text).
+-- ----------------------------------------------------------------------
+DO $test_coexisting_canonical_and_alias$
+BEGIN
+    CREATE ROLE ft_mig_canon_role;
+    CREATE ROLE ft_mig_alias_role;
+    CREATE EXTENSION fasttrun VERSION '2.0';
+    ALTER FUNCTION public.fasttruncate(text) RENAME TO fasttruncate_c;
+    CREATE FUNCTION public.fasttruncate(text) RETURNS void
+        AS '$libdir/fasttrun', 'fasttruncate'
+        LANGUAGE C RETURNS NULL ON NULL INPUT VOLATILE;
+    ALTER EXTENSION fasttrun ADD FUNCTION public.fasttruncate(text);
+    REVOKE EXECUTE ON FUNCTION public.fasttruncate(text) FROM PUBLIC;
+    GRANT EXECUTE ON FUNCTION public.fasttruncate(text) TO ft_mig_canon_role;
+    REVOKE EXECUTE ON FUNCTION public.fasttruncate_c(text) FROM PUBLIC;
+    GRANT EXECUTE ON FUNCTION public.fasttruncate_c(text) TO ft_mig_alias_role;
+
+    ALTER EXTENSION fasttrun UPDATE;
+
+    IF NOT has_function_privilege('ft_mig_canon_role', 'public.fasttruncate(text)', 'EXECUTE') OR
+       has_function_privilege('ft_mig_alias_role', 'public.fasttruncate(text)', 'EXECUTE') OR
+       NOT has_function_privilege('ft_mig_alias_role', 'public.fasttruncate_c(text)', 'EXECUTE') OR
+       has_function_privilege('ft_mig_canon_role', 'public.fasttruncate_c(text)', 'EXECUTE') THEN
+        RAISE EXCEPTION 'upgrade overwrote existing canonical fasttruncate(text) ACL';
+    END IF;
+
+    DROP EXTENSION fasttrun;
+    DROP ROLE ft_mig_alias_role;
+    DROP ROLE ft_mig_canon_role;
+END
+$test_coexisting_canonical_and_alias$;
+
+-- ----------------------------------------------------------------------
+-- 18. Recreating canonical fasttruncate(text) from either a recognized
+--     default-ACL wrapper or a default-ACL alias preserves PUBLIC EXECUTE
+--     even when ALTER DEFAULT PRIVILEGES later revoked PUBLIC EXECUTE.
+-- ----------------------------------------------------------------------
+DO $test_default_privs_revoke_public$
+DECLARE
+    mode int;
+BEGIN
+    CREATE ROLE ft_mig_pub_caller;
+    FOR mode IN 0..1 LOOP
+        CREATE EXTENSION fasttrun VERSION '2.0';
+        ALTER FUNCTION public.fasttruncate(text) RENAME TO fasttruncate_c;
+        IF mode = 0 THEN
+            CREATE FUNCTION public.fasttruncate(text) RETURNS void LANGUAGE plpgsql AS $fn$
+            BEGIN
+                PERFORM public.fasttruncate_c($1);
+            END;
+            $fn$;
+        END IF;
+        ALTER DEFAULT PRIVILEGES REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;
+
+        ALTER EXTENSION fasttrun UPDATE;
+        ALTER DEFAULT PRIVILEGES GRANT EXECUTE ON FUNCTIONS TO PUBLIC;
+
+        IF NOT has_function_privilege('ft_mig_pub_caller', 'public.fasttruncate(text)', 'EXECUTE') THEN
+            RAISE EXCEPTION 'altered default privileges stripped PUBLIC EXECUTE in mode %', mode;
+        END IF;
+        DROP EXTENSION fasttrun;
+    END LOOP;
+    DROP ROLE ft_mig_pub_caller;
+END
+$test_default_privs_revoke_public$;
+
+-- ----------------------------------------------------------------------
+-- 19. Trusted non-superuser installation and upgrade preserve C-function
+--     ownership and ACLs across alias-only (default and delegated grants)
+--     and recognized DBA wrapper setups without touching the role GUC.
+-- ----------------------------------------------------------------------
+DO $test_trusted_role_upgrade$
+DECLARE
+    mode int;
+    db_name text := current_database();
+    canon_owner oid;
+    alias_owner oid;
+BEGIN
+    CREATE ROLE ft_mig_ext_owner;
+    CREATE ROLE ft_mig_delegate;
+    CREATE ROLE ft_mig_leaf;
+    CREATE ROLE ft_mig_outsider;
+    EXECUTE format('GRANT CREATE ON DATABASE %I TO ft_mig_ext_owner', db_name);
+
+    FOR mode IN 0..2 LOOP
+        CREATE SCHEMA ft_mig_trusted AUTHORIZATION ft_mig_ext_owner;
+        GRANT USAGE ON SCHEMA ft_mig_trusted TO ft_mig_delegate, ft_mig_leaf, ft_mig_outsider;
+
+        SET ROLE ft_mig_ext_owner;
+        CREATE EXTENSION fasttrun WITH SCHEMA ft_mig_trusted VERSION '2.0';
+        RESET ROLE;
+
+        ALTER FUNCTION ft_mig_trusted.fasttruncate(text) RENAME TO fasttruncate_c;
+        IF mode = 1 THEN
+            REVOKE EXECUTE ON FUNCTION ft_mig_trusted.fasttruncate_c(text) FROM PUBLIC;
+            GRANT EXECUTE ON FUNCTION ft_mig_trusted.fasttruncate_c(text) TO ft_mig_delegate WITH GRANT OPTION;
+            SET ROLE ft_mig_delegate;
+            GRANT EXECUTE ON FUNCTION ft_mig_trusted.fasttruncate_c(text) TO ft_mig_leaf;
+            RESET ROLE;
+        ELSIF mode = 2 THEN
+            CREATE FUNCTION ft_mig_trusted.fasttruncate(text) RETURNS void LANGUAGE plpgsql AS $fn$
+            BEGIN
+                PERFORM ft_mig_trusted.fasttruncate_c($1);
+            END;
+            $fn$;
+        END IF;
+
+        SET ROLE ft_mig_ext_owner;
+        ALTER EXTENSION fasttrun UPDATE;
+        RESET ROLE;
+
+        SELECT proowner INTO STRICT canon_owner
+          FROM pg_catalog.pg_proc
+         WHERE oid = 'ft_mig_trusted.fasttruncate(text)'::regprocedure;
+        SELECT proowner INTO STRICT alias_owner
+          FROM pg_catalog.pg_proc
+         WHERE oid = 'ft_mig_trusted.fasttruncate_c(text)'::regprocedure;
+        IF canon_owner <> alias_owner THEN
+            RAISE EXCEPTION 'trusted upgrade changed owner in mode %: % vs %',
+                mode, canon_owner, alias_owner;
+        END IF;
+        IF to_regprocedure('ft_mig_trusted._fasttrun_2_0_acl_replay_helper(text)') IS NOT NULL THEN
+            RAISE EXCEPTION 'trusted upgrade leaked helper function in mode %', mode;
+        END IF;
+
+        IF mode = 1 THEN
+            IF has_function_privilege('ft_mig_outsider', 'ft_mig_trusted.fasttruncate(text)', 'EXECUTE') OR
+               NOT has_function_privilege('ft_mig_leaf', 'ft_mig_trusted.fasttruncate(text)', 'EXECUTE') THEN
+                RAISE EXCEPTION 'trusted upgrade failed delegated ACL replay in mode 1';
+            END IF;
+        ELSE
+            IF NOT has_function_privilege('ft_mig_outsider', 'ft_mig_trusted.fasttruncate(text)', 'EXECUTE') THEN
+                RAISE EXCEPTION 'trusted upgrade lost PUBLIC EXECUTE in mode %', mode;
+            END IF;
+        END IF;
+
+        SET ROLE ft_mig_ext_owner;
+        DROP EXTENSION fasttrun;
+        RESET ROLE;
+        DROP SCHEMA ft_mig_trusted;
+    END LOOP;
+
+    EXECUTE format('REVOKE CREATE ON DATABASE %I FROM ft_mig_ext_owner', db_name);
+    DROP ROLE ft_mig_outsider;
+    DROP ROLE ft_mig_leaf;
+    DROP ROLE ft_mig_delegate;
+    DROP ROLE ft_mig_ext_owner;
+END
+$test_trusted_role_upgrade$;
+
+-- ----------------------------------------------------------------------
+-- 20. Upgrading from 2.7.0 or 2.7.1 to 2.7.2 revokes leftover PUBLIC EXECUTE
+--     on an extension-owned fasttruncate_c(text) alias when PUBLIC EXECUTE
+--     had been revoked from fasttruncate(text) under an earlier 2.0->2.1 step.
+-- ----------------------------------------------------------------------
+DO $test_272_leftover_alias_public_revoke$
+DECLARE
+    _src_ver text;
+BEGIN
+    CREATE ROLE ft_mig_272_outsider;
+    FOREACH _src_ver IN ARRAY ARRAY['2.7.0', '2.7.1'] LOOP
+        EXECUTE format('CREATE EXTENSION fasttrun VERSION %L', _src_ver);
+        CREATE OR REPLACE FUNCTION public.fasttruncate_c(text)
+            RETURNS void AS '$libdir/fasttrun', 'fasttruncate'
+            LANGUAGE C RETURNS NULL ON NULL INPUT VOLATILE;
+        ALTER EXTENSION fasttrun ADD FUNCTION public.fasttruncate_c(text);
+        REVOKE EXECUTE ON FUNCTION public.fasttruncate(text) FROM PUBLIC;
+
+        IF NOT has_function_privilege('ft_mig_272_outsider', 'public.fasttruncate_c(text)', 'EXECUTE') THEN
+            RAISE EXCEPTION 'fixture (%) did not leave PUBLIC EXECUTE on fasttruncate_c(text)', _src_ver;
+        END IF;
+
+        ALTER EXTENSION fasttrun UPDATE TO '2.7.2';
+
+        IF has_function_privilege('ft_mig_272_outsider', 'public.fasttruncate_c(text)', 'EXECUTE') THEN
+            RAISE EXCEPTION '%->2.7.2 upgrade left PUBLIC EXECUTE open on fasttruncate_c(text)', _src_ver;
+        END IF;
+
+        DROP EXTENSION fasttrun;
+    END LOOP;
+
+    -- Negative control: when fasttruncate(text) keeps PUBLIC EXECUTE,
+    -- 2.7.1 -> 2.7.2 leaves PUBLIC EXECUTE on fasttruncate_c(text) intact.
+    CREATE EXTENSION fasttrun VERSION '2.7.1';
+    CREATE OR REPLACE FUNCTION public.fasttruncate_c(text)
+        RETURNS void AS '$libdir/fasttrun', 'fasttruncate'
+        LANGUAGE C RETURNS NULL ON NULL INPUT VOLATILE;
+    ALTER EXTENSION fasttrun ADD FUNCTION public.fasttruncate_c(text);
+    ALTER EXTENSION fasttrun UPDATE TO '2.7.2';
+    IF NOT has_function_privilege('ft_mig_272_outsider', 'public.fasttruncate_c(text)', 'EXECUTE') THEN
+        RAISE EXCEPTION '2.7.1->2.7.2 upgrade unexpectedly revoked PUBLIC EXECUTE from fasttruncate_c(text)';
+    END IF;
+    DROP EXTENSION fasttrun;
+    DROP ROLE ft_mig_272_outsider;
+END
+$test_272_leftover_alias_public_revoke$;

@@ -50,8 +50,10 @@ second returns `0`, and the reset does nothing.
 | `fasttrun.prewarm_schema` | `dummy_tmp` | schema name | administrator | Schema containing template tables |
 | `fasttrun.track_schedule` | `mon-fri 08:00-18:00` | string | administrator | Time windows during which table-creation attempts are tracked |
 
-These parameters are useful only when fasttrun is loaded through
-`shared_preload_libraries`.
+Shared tracking and prewarming use these parameters only when fasttrun is loaded
+through `shared_preload_libraries`. `fasttrun.prewarm_schema` is also read
+during column-statistics collection when `fasttrun.template_stattarget` is on,
+even without shared preloading.
 
 The "user" and "administrator" contexts are explained in
 [statistics.md](statistics.md#settings).

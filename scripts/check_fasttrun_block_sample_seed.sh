@@ -14,7 +14,7 @@
 # двух бэкендов обязаны различаться.
 # Скрипт печатает PASS или FAIL и не требует cassert-сборки.
 #
-set -e
+set -eu
 # На macOS postmaster отказывается стартовать при неустановленной локали.
 : "${LC_ALL:=C}"
 export LC_ALL
@@ -75,6 +75,8 @@ WHERE staattnum = 1 AND stakind1 = 2;
 SQL
 }
 
+out1=""
+out2=""
 out1=$(session) || out1="$out1
 PSQL_FAILED"
 out2=$(session) || out2="$out2
@@ -87,7 +89,7 @@ count1=$(echo "$sample1" | tr ',' '\n' | grep -c '[0-9]' || true)
 count2=$(echo "$sample2" | tr ',' '\n' | grep -c '[0-9]' || true)
 blocks=$(echo "$out1$out2" | grep -c 'DEBUG:  fasttrun: block-sampling analyze scan' || true)
 pages=$(echo "$out1" | sed -n 's/^PAGES=//p')
-errors=$(grep -cE '\|(ERROR|FATAL|PANIC):|TRAP' "$LOG" || true)
+errors=$(grep -cE '\|(ERROR|FATAL|PANIC):|TRAP|FailedAssertion|leaked hash_seq_search' "$LOG" || true)
 echo "pages=${pages:-none}, block sampling scans=$blocks, sample sizes=$count1/$count2, server errors=$errors"
 if [ "$pages" = 300 ] && [ "$blocks" -eq 2 ] && [ "$count1" -eq 30 ] &&
 	[ "$count2" -eq 30 ] && [ "$sample1" != "$sample2" ] && [ "$errors" -eq 0 ]; then

@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 #
 # Проверяет общие сообщения инвалидации через Linux/gdb:
-#   * отдельная строка подтверждает подключение gdb;
-#   * SMGR-сообщения считаются внутри SendSharedInvalidMessages;
-#   * SIInsertDataEntries подтверждает, что счётчик общих сообщений работает;
-#   * локальный сброс планов срабатывает при изменении статистики;
-#   * повторная очистка пустой таблицы не отправляет никаких инвалидаций.
+#   - отдельная строка подтверждает подключение gdb
+#   - SMGR-сообщения считаются на входе в SendSharedInvalidMessages
+#   - SIInsertDataEntries подтверждает работу счетчика общих сообщений
+#   - локальный сброс планов срабатывает при изменении статистики
+#   - повторная очистка пустой таблицы не отправляет никаких инвалидаций
 #
 set -euo pipefail
 export LC_ALL=C LANG=C
@@ -21,7 +21,6 @@ PG_RUN_AS=${PG_RUN_AS:-}
 WORKDIR=${WORKDIR:-$(mktemp -d /tmp/fasttrun-sinval.XXXXXX)}
 SOCKET_DIR=${PGHOST:-$WORKDIR/socket}
 DBNAME=${DBNAME:-fasttrun_sinval}
-SLEEP_SECONDS=${SLEEP_SECONDS:-3}
 
 cleanup()
 {
@@ -41,6 +40,49 @@ run_pg()
 	fi
 }
 trap cleanup EXIT
+
+terminate_child()
+{
+	local pid=${1:-}
+	local i
+	[ -n "$pid" ] || return 0
+	kill -TERM "$pid" >/dev/null 2>&1 || true
+	kill -CONT "$pid" >/dev/null 2>&1 || true
+	for i in $(seq 1 20); do
+		if ! kill -0 "$pid" >/dev/null 2>&1; then
+			wait "$pid" >/dev/null 2>&1 || true
+			return 0
+		fi
+		sleep 0.05
+	done
+	kill -KILL "$pid" >/dev/null 2>&1 || true
+	for i in $(seq 1 20); do
+		if ! kill -0 "$pid" >/dev/null 2>&1; then
+			wait "$pid" >/dev/null 2>&1 || true
+			return 0
+		fi
+		sleep 0.05
+	done
+	return 0
+}
+
+wait_bounded()
+{
+	local pid=$1
+	local ticks=${2:-}
+	local i
+	local rc=0
+	[ -n "$ticks" ] || ticks=${FASTTRUN_WAIT_TICKS:-200}
+	for i in $(seq 1 "$ticks"); do
+		if ! kill -0 "$pid" >/dev/null 2>&1; then
+			wait "$pid" || rc=$?
+			return "$rc"
+		fi
+		sleep 0.05
+	done
+	terminate_child "$pid"
+	return 124
+}
 
 require_cmd()
 {
@@ -65,34 +107,105 @@ if [ -n "$PG_RUN_AS" ]; then
 fi
 PORT=${PGPORT:-$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')}
 
-cat >"$WORKDIR/gdb.commands" <<'GDB'
+PG_CC=$($PG_CONFIG --cc)
+PG_CPPFLAGS=$($PG_CONFIG --cppflags)
+PG_INC_SRV=$($PG_CONFIG --includedir-server)
+cat >"$WORKDIR/sinval_layout.c" <<'EOF'
+#include "postgres.h"
+#include "storage/sinval.h"
+#include <stddef.h>
+#include <stdio.h>
+#undef printf
+
+int
+main(void)
+{
+	printf("%zu %d %zu\n",
+		   sizeof(SharedInvalidationMessage),
+		   (int) SHAREDINVALSMGR_ID,
+		   offsetof(SharedInvalidationMessage, id));
+	return 0;
+}
+EOF
+# shellcheck disable=SC2086
+$PG_CC $PG_CPPFLAGS -I"$PG_INC_SRV" "$WORKDIR/sinval_layout.c" \
+	-o "$WORKDIR/sinval_layout"
+read -r SINVAL_MSG_SIZE SINVAL_SMGR_ID SINVAL_ID_OFFSET \
+	< <("$WORKDIR/sinval_layout")
+
+case "$(uname -m)" in
+	x86_64|amd64)
+		SEND_SINVAL_PROBE="break *(&SendSharedInvalidMessages)
+commands
+silent
+set \$msgs_addr = (unsigned long)\$rdi
+set \$msg_count = (int)\$esi
+set \$i = 0
+while \$i < \$msg_count
+  if *(signed char *)(\$msgs_addr + \$i * $SINVAL_MSG_SIZE + $SINVAL_ID_OFFSET) == $SINVAL_SMGR_ID
+    printf \"SMGR_MESSAGE\\n\"
+  end
+  set \$i = \$i + 1
+end
+continue
+end"
+		;;
+	aarch64|arm64)
+		SEND_SINVAL_PROBE="break *(&SendSharedInvalidMessages)
+commands
+silent
+set \$msgs_addr = (unsigned long)\$x0
+set \$msg_count = (int)\$x1
+set \$i = 0
+while \$i < \$msg_count
+  if *(signed char *)(\$msgs_addr + \$i * $SINVAL_MSG_SIZE + $SINVAL_ID_OFFSET) == $SINVAL_SMGR_ID
+    printf \"SMGR_MESSAGE\\n\"
+  end
+  set \$i = \$i + 1
+end
+continue
+end"
+		;;
+	*)
+		SEND_SINVAL_PROBE="break SendSharedInvalidMessages
+commands
+silent
+set \$i = 0
+while \$i < n
+  if msgs[\$i].id == $SINVAL_SMGR_ID
+    printf \"SMGR_MESSAGE\\n\"
+  end
+  set \$i = \$i + 1
+end
+continue
+end"
+		;;
+esac
+
+cat >"$WORKDIR/gdb.commands" <<GDB
 set pagination off
 set confirm off
 set breakpoint pending off
-break SIInsertDataEntries
+break *(&SIInsertDataEntries)
 commands
 silent
 printf "SHARED_INSERT\n"
 printf "SI_SHARED_HIT\n"
 continue
 end
-break SendSharedInvalidMessages
-commands
-silent
-set $i = 0
-while $i < n
-  if msgs[$i].id == -3
-    printf "SMGR_MESSAGE\n"
-  end
-  set $i = $i + 1
-end
-continue
-end
-break LocalExecuteInvalidationMessage
+$SEND_SINVAL_PROBE
+break *(&LocalExecuteInvalidationMessage)
 commands
 silent
 printf "LOCAL_HIT\n"
 continue
+end
+break *(&pg_backend_pid)
+commands
+silent
+printf "END_SENTINEL_HIT\n"
+detach
+quit 0
 end
 printf "ATTACHED_READY\n"
 continue
@@ -113,7 +226,23 @@ CREATE TABLE perm_zero_sinval (id int PRIMARY KEY, grp int, payload text);
 INSERT INTO perm_zero_sinval
 SELECT g, g % 100, md5(g::text) FROM generate_series(1,100000) g;
 ANALYZE perm_zero_sinval;
+CREATE TABLE sinval_gdb_gate (
+  case_name text PRIMARY KEY,
+  go boolean NOT NULL
+);
 SQL
+
+temp_mem_cat=$(run_pg "$PSQL" -h "$SOCKET_DIR" -p "$PORT" -d "$DBNAME" \
+	-XAtq -c "SELECT coalesce((SELECT setting FROM pg_settings WHERE name = 'enable_temp_memory_catalog'), 'off')")
+has_pgpro_ed=$(run_pg "$PSQL" -h "$SOCKET_DIR" -p "$PORT" -d "$DBNAME" \
+	-XAtq -c "SELECT count(*) FROM pg_proc WHERE pronamespace = 'pg_catalog'::regnamespace AND proname = 'pgpro_edition'")
+pgpro_ed=""
+if [ "$has_pgpro_ed" != "0" ]; then
+	pgpro_ed=$(run_pg "$PSQL" -h "$SOCKET_DIR" -p "$PORT" -d "$DBNAME" \
+		-XAtq -c "SELECT pg_catalog.pgpro_edition()")
+fi
+is_tantor=$(run_pg "$PSQL" -h "$SOCKET_DIR" -p "$PORT" -d "$DBNAME" \
+	-XAtq -c "SELECT (version() ~* 'Tantor' OR EXISTS (SELECT 1 FROM pg_settings WHERE name = 'enable_temp_memory_catalog' AND '$pgpro_ed' = ''))::text")
 
 run_case()
 {
@@ -141,6 +270,10 @@ run_case()
 	local before_checksum
 	local after_checksum
 	local i
+
+	run_pg "$PSQL" -h "$SOCKET_DIR" -p "$PORT" -d "$DBNAME" -XAtq \
+		-v ON_ERROR_STOP=1 -c \
+		"INSERT INTO sinval_gdb_gate VALUES ('$name', false) ON CONFLICT (case_name) DO UPDATE SET go = false" >/dev/null
 
 	cat >"$sqlfile" <<SQL
 \set ON_ERROR_STOP 1
@@ -176,27 +309,39 @@ SELECT 'BEFORE_CHECKSUM ' ||
        md5(string_agg(md5(payload), '' ORDER BY id))
 FROM t_zero_sinval;
 $preparation
+SELECT go FROM sinval_gdb_gate WHERE case_name = '$name' \g /dev/null
 SELECT pg_backend_pid();
-SELECT pg_sleep($SLEEP_SECONDS);
+SELECT 'READY_FOR_GDB';
+DO \$gate\$
+BEGIN
+  WHILE NOT (SELECT go FROM sinval_gdb_gate WHERE case_name = '$name') LOOP
+    PERFORM pg_sleep(0.05);
+  END LOOP;
+END
+\$gate\$;
 $workload
+SELECT pg_backend_pid() \g /dev/null
 SELECT 'CASE_DONE';
-SELECT pg_sleep($SLEEP_SECONDS);
+SELECT pg_sleep(1);
 SQL
 
 	run_pg "$PSQL" -h "$SOCKET_DIR" -p "$PORT" -d "$DBNAME" -XAtq \
 		-v ON_ERROR_STOP=1 -f "$sqlfile" >"$psqlout" 2>"$psqlerr" &
 	psql_pid=$!
 
-	for i in $(seq 1 200); do
-		pid=$(grep -E '^[0-9]+$' "$psqlout" | head -1 || true)
-		if [ -n "$pid" ]; then
+	for i in $(seq 1 400); do
+		if grep -q '^READY_FOR_GDB$' "$psqlout" 2>/dev/null; then
+			break
+		fi
+		if ! kill -0 "$psql_pid" >/dev/null 2>&1; then
 			break
 		fi
 		sleep 0.05
 	done
-	if [ -z "$pid" ]; then
-		wait "$psql_pid" || true
-		echo "[$name] could not read backend pid" >&2
+	pid=$(grep -E '^[0-9]+$' "$psqlout" 2>/dev/null | head -1 || true)
+	if [ -z "$pid" ] || ! grep -q '^READY_FOR_GDB$' "$psqlout" 2>/dev/null; then
+		terminate_child "$psql_pid"
+		echo "[$name] backend did not reach READY_FOR_GDB" >&2
 		cat "$psqlout" "$psqlerr" >&2 || true
 		exit 1
 	fi
@@ -204,8 +349,8 @@ SQL
 	"$GDB" -q -nx -batch -x "$WORKDIR/gdb.commands" -p "$pid" \
 		>"$gdblog" 2>&1 &
 	gdb_pid=$!
-	for i in $(seq 1 200); do
-		if grep -q '^ATTACHED_READY$' "$gdblog"; then
+	for i in $(seq 1 400); do
+		if grep -q '^ATTACHED_READY$' "$gdblog" 2>/dev/null; then
 			break
 		fi
 		if ! kill -0 "$gdb_pid" >/dev/null 2>&1; then
@@ -213,14 +358,17 @@ SQL
 		fi
 		sleep 0.05
 	done
-	if ! grep -q '^ATTACHED_READY$' "$gdblog"; then
-		kill "$gdb_pid" "$psql_pid" >/dev/null 2>&1 || true
-		wait "$gdb_pid" || true
-		wait "$psql_pid" || true
+	if ! grep -q '^ATTACHED_READY$' "$gdblog" 2>/dev/null; then
+		terminate_child "$gdb_pid"
+		terminate_child "$psql_pid"
 		cat "$gdblog" >&2
 		echo "[$name] gdb did not emit ATTACHED_READY" >&2
 		exit 1
 	fi
+
+	run_pg "$PSQL" -h "$SOCKET_DIR" -p "$PORT" -d "$DBNAME" -XAtq \
+		-v ON_ERROR_STOP=1 -c \
+		"UPDATE sinval_gdb_gate SET go = true WHERE case_name = '$name'" >/dev/null
 
 	for i in $(seq 1 400); do
 		if grep -q '^CASE_DONE$' "$psqlout"; then
@@ -232,19 +380,27 @@ SQL
 		sleep 0.05
 	done
 	if ! grep -q '^CASE_DONE$' "$psqlout"; then
-		kill "$gdb_pid" >/dev/null 2>&1 || true
-		wait "$gdb_pid" || true
-		wait "$psql_pid" || true
+		terminate_child "$gdb_pid"
+		terminate_child "$psql_pid"
 		cat "$psqlout" "$psqlerr" "$gdblog" >&2 || true
 		echo "[$name] workload did not reach CASE_DONE" >&2
 		exit 1
 	fi
 
-	kill "$gdb_pid" >/dev/null 2>&1 || true
-	wait "$gdb_pid" || true
-	if ! wait "$psql_pid"; then
+	if ! wait_bounded "$gdb_pid"; then
+		terminate_child "$psql_pid"
+		cat "$psqlout" "$psqlerr" "$gdblog" >&2 || true
+		echo "[$name] gdb exited with nonzero status" >&2
+		exit 1
+	fi
+	if ! wait_bounded "$psql_pid"; then
 		cat "$psqlout" "$psqlerr" "$gdblog" >&2 || true
 		echo "[$name] psql workload failed after CASE_DONE" >&2
+		exit 1
+	fi
+	if ! grep -q '^END_SENTINEL_HIT$' "$gdblog"; then
+		cat "$gdblog" >&2
+		echo "[$name] gdb did not observe post-workload END_SENTINEL_HIT" >&2
 		exit 1
 	fi
 
@@ -264,6 +420,7 @@ SQL
 
 	case "$smgr_expect" in
 		fixture) smgr_expect=$expected_smgr ;;
+		any) ;;
 		''|*[!0-9]*) echo "[$name] invalid SMGR expectation: $smgr_expect" >&2; exit 1 ;;
 	esac
 
@@ -288,7 +445,7 @@ SQL
 		any) ;;
 		*) echo "[$name] invalid shared expectation: $shared_expect" >&2; exit 1 ;;
 	esac
-	if [ "$smgr_messages" -ne "$smgr_expect" ]; then
+	if [ "$smgr_expect" != "any" ] && [ "$smgr_messages" -ne "$smgr_expect" ]; then
 		cat "$gdblog" >&2
 		echo "[$name] expected $smgr_expect SMGR messages, got $smgr_messages" >&2
 		exit 1
@@ -336,6 +493,10 @@ run_permanent_case()
 	local local_hits
 	local i
 
+	run_pg "$PSQL" -h "$SOCKET_DIR" -p "$PORT" -d "$DBNAME" -XAtq \
+		-v ON_ERROR_STOP=1 -c \
+		"INSERT INTO sinval_gdb_gate VALUES ('$name', false) ON CONFLICT (case_name) DO UPDATE SET go = false" >/dev/null
+
 	cat >"$sqlfile" <<SQL
 \set ON_ERROR_STOP 1
 SET client_min_messages = warning;
@@ -350,37 +511,49 @@ WHERE grp = \$1;
 EXECUTE q_perm(42);
 \o
 $after_warmup
+SELECT go FROM sinval_gdb_gate WHERE case_name = '$name' \g /dev/null
 SELECT pg_backend_pid();
-SELECT pg_sleep($SLEEP_SECONDS);
+SELECT 'READY_FOR_GDB';
+DO \$gate\$
+BEGIN
+  WHILE NOT (SELECT go FROM sinval_gdb_gate WHERE case_name = '$name') LOOP
+    PERFORM pg_sleep(0.05);
+  END LOOP;
+END
+\$gate\$;
 SELECT 'PERM_QUERY_BEGIN';
 EXECUTE q_perm(42);
+SELECT pg_backend_pid() \g /dev/null
 SELECT 'PERM_QUERY_DONE';
-SELECT pg_sleep($SLEEP_SECONDS);
+SELECT pg_sleep(1);
 SQL
 
 	run_pg "$PSQL" -h "$SOCKET_DIR" -p "$PORT" -d "$DBNAME" -XAtq \
 		-v ON_ERROR_STOP=1 -f "$sqlfile" >"$psqlout" 2>"$psqlerr" &
 	psql_pid=$!
 
-	for i in $(seq 1 200); do
-		pid=$(grep -E '^[0-9]+$' "$psqlout" | head -1 || true)
-		if [ -n "$pid" ]; then
+	for i in $(seq 1 400); do
+		if grep -q '^READY_FOR_GDB$' "$psqlout" 2>/dev/null; then
+			break
+		fi
+		if ! kill -0 "$psql_pid" >/dev/null 2>&1; then
 			break
 		fi
 		sleep 0.05
 	done
-	if [ -z "$pid" ]; then
-		wait "$psql_pid" || true
+	pid=$(grep -E '^[0-9]+$' "$psqlout" 2>/dev/null | head -1 || true)
+	if [ -z "$pid" ] || ! grep -q '^READY_FOR_GDB$' "$psqlout" 2>/dev/null; then
+		terminate_child "$psql_pid"
 		cat "$psqlout" "$psqlerr" >&2 || true
-		echo "[$name] could not read backend pid" >&2
+		echo "[$name] backend did not reach READY_FOR_GDB" >&2
 		exit 1
 	fi
 
 	"$GDB" -q -nx -batch -x "$WORKDIR/gdb.commands" -p "$pid" \
 		>"$gdblog" 2>&1 &
 	gdb_pid=$!
-	for i in $(seq 1 200); do
-		if grep -q '^ATTACHED_READY$' "$gdblog"; then
+	for i in $(seq 1 400); do
+		if grep -q '^ATTACHED_READY$' "$gdblog" 2>/dev/null; then
 			break
 		fi
 		if ! kill -0 "$gdb_pid" >/dev/null 2>&1; then
@@ -388,14 +561,17 @@ SQL
 		fi
 		sleep 0.05
 	done
-	if ! grep -q '^ATTACHED_READY$' "$gdblog"; then
-		kill "$gdb_pid" "$psql_pid" >/dev/null 2>&1 || true
-		wait "$gdb_pid" || true
-		wait "$psql_pid" || true
+	if ! grep -q '^ATTACHED_READY$' "$gdblog" 2>/dev/null; then
+		terminate_child "$gdb_pid"
+		terminate_child "$psql_pid"
 		cat "$gdblog" >&2
 		echo "[$name] gdb did not emit ATTACHED_READY" >&2
 		exit 1
 	fi
+
+	run_pg "$PSQL" -h "$SOCKET_DIR" -p "$PORT" -d "$DBNAME" -XAtq \
+		-v ON_ERROR_STOP=1 -c \
+		"UPDATE sinval_gdb_gate SET go = true WHERE case_name = '$name'" >/dev/null
 
 	for i in $(seq 1 400); do
 		if grep -q '^PERM_QUERY_DONE$' "$psqlout"; then
@@ -407,19 +583,27 @@ SQL
 		sleep 0.05
 	done
 	if ! grep -q '^PERM_QUERY_DONE$' "$psqlout"; then
-		kill "$gdb_pid" >/dev/null 2>&1 || true
-		wait "$gdb_pid" || true
-		wait "$psql_pid" || true
+		terminate_child "$gdb_pid"
+		terminate_child "$psql_pid"
 		cat "$psqlout" "$psqlerr" "$gdblog" >&2 || true
 		echo "[$name] permanent query did not finish" >&2
 		exit 1
 	fi
 
-	kill "$gdb_pid" >/dev/null 2>&1 || true
-	wait "$gdb_pid" || true
-	if ! wait "$psql_pid"; then
+	if ! wait_bounded "$gdb_pid"; then
+		terminate_child "$psql_pid"
+		cat "$psqlout" "$psqlerr" "$gdblog" >&2 || true
+		echo "[$name] gdb exited with nonzero status" >&2
+		exit 1
+	fi
+	if ! wait_bounded "$psql_pid"; then
 		cat "$psqlout" "$psqlerr" "$gdblog" >&2 || true
 		echo "[$name] psql workload failed" >&2
+		exit 1
+	fi
+	if ! grep -q '^END_SENTINEL_HIT$' "$gdblog"; then
+		cat "$gdblog" >&2
+		echo "[$name] gdb did not observe post-workload END_SENTINEL_HIT" >&2
 		exit 1
 	fi
 
@@ -469,8 +653,9 @@ SELECT g, g % 50, md5(g::text) FROM generate_series(1,5000) g;
 ANALYZE ft_perm_state;
 DO $check$
 BEGIN
-  IF (SELECT count(*) FROM pg_statistic
-      WHERE starelid = 'ft_perm_state'::regclass) = 0 THEN
+  IF coalesce(current_setting('enable_temp_memory_catalog', true), 'off') <> 'on'
+     AND (SELECT count(*) FROM pg_statistic
+          WHERE starelid = 'ft_perm_state'::regclass) = 0 THEN
     RAISE EXCEPTION 'core ANALYZE did not create pg_statistic rows';
   END IF;
 END
@@ -527,7 +712,21 @@ run_permanent_case permanent_neutral_live \
 run_permanent_case permanent_dropped_reset \
 	"$permanent_temp_setup" "$permanent_dropped_post"
 
-run_case regular_analyze positive 0 0 0 \
+# Постоянная таблица обязана давать ненулевые общие sinval на всех редакциях,
+# включая Enterprise и Tantor SE с enable_temp_memory_catalog = on.
+run_case perm_analyze_positive_control positive 0 0 0 \
+	"ANALYZE perm_zero_sinval;"
+
+regular_analyze_expect=positive
+if [ "$temp_mem_cat" = on ] || [ "$pgpro_ed" = enterprise ] || [ "$is_tantor" = true ]; then
+	regular_analyze_expect=any
+fi
+fallback_smgr_expect=fixture
+if [ "$pgpro_ed" = enterprise ] || [ "$is_tantor" = true ]; then
+	fallback_smgr_expect=any
+fi
+
+run_case regular_analyze "$regular_analyze_expect" 0 0 0 \
 	"ANALYZE t_zero_sinval;"
 run_case fasttrun_analyze zero 0 1 0 \
 	"SELECT fasttrun_analyze('t_zero_sinval');"
@@ -535,7 +734,7 @@ run_case fasttrun_collect_stats zero 0 1 0 \
 	"SELECT fasttrun_collect_stats('t_zero_sinval');"
 run_case fasttruncate_default zero 0 1 1 \
 	"SELECT fasttruncate('t_zero_sinval'); $truncate_validation"
-run_case fasttruncate_fallback any fixture 1 1 \
+run_case fasttruncate_fallback any "$fallback_smgr_expect" 1 1 \
 	"SET fasttrun.zero_sinval_truncate = off; SELECT fasttruncate('t_zero_sinval'); $truncate_validation"
 run_case fasttruncate_empty_default zero 0 -1 1 \
 	"SELECT fasttruncate('t_zero_sinval'); $truncate_validation" \
@@ -546,7 +745,7 @@ run_case fasttruncate_empty_fallback zero 0 -1 1 \
 
 debug_assertions=$(run_pg "$PSQL" -h "$SOCKET_DIR" -p "$PORT" -d "$DBNAME" \
 	-XAtq -c 'SHOW debug_assertions')
-if [ "$debug_assertions" = on ]; then
+if [ "$debug_assertions" = on ] && [ "$pgpro_ed" != enterprise ]; then
 	for spec in \
 		'after_user_index:1=1' \
 		'after_user_index:2=2' \

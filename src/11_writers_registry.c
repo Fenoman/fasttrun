@@ -273,7 +273,8 @@ fasttrun_stats_snapshot_predates_writes(Relation rel)
 static bool
 fasttrun_stats_relation_written_now(Relation rel)
 {
-	return fasttrun_stats_relid_in_flight(RelationGetRelid(rel)) ||
+	return (fasttrun_unobserved_writers && rel->rd_refcnt != 1) ||
+		fasttrun_stats_relid_in_flight(RelationGetRelid(rel)) ||
 		fasttrun_stats_snapshot_predates_writes(rel);
 }
 

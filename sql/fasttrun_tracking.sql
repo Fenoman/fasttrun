@@ -377,11 +377,9 @@ BEGIN
     END IF;
     RAISE NOTICE '3i OK: schedule outside now does not track';
 
-    -- 3j. Schedule: ошибочный формат -> WARNING и fallback на always-on
+    -- 3j. Schedule: ошибочный формат -> WARNING на SET, fallback на always-on.
     PERFORM fasttrun_reset_temp_stats();
-    SET LOCAL client_min_messages = error;  -- подавляем WARNING в expected output
     SET LOCAL fasttrun.track_schedule = 'garbage';
-    RESET client_min_messages;
     -- После ошибки парсинга должен работать always-on режим
     CREATE TEMP TABLE IF NOT EXISTS temp_calc_main (LIKE dummy_tmp.temp_calc_main);
     DROP TABLE temp_calc_main;
@@ -410,6 +408,15 @@ BEGIN
     DROP TABLE IF EXISTS temp_calc_main;
     DROP TABLE IF EXISTS temp_calc_detail;
 END $$;
+
+-- Откат подтранзакции не должен повторно печатать WARNING для невалидного GUC
+-- (отдельная транзакция исключает предшествующий DDL временных таблиц).
+BEGIN;
+SET LOCAL fasttrun.track_schedule = 'garbage';
+SAVEPOINT sp_sched;
+SET LOCAL fasttrun.track_schedule = 'mon, 08:00-18:00';
+ROLLBACK TO SAVEPOINT sp_sched;
+COMMIT;
 
 -- ======================================================================
 -- 4. Многократный цикл create_temp_table - fasttruncate path
