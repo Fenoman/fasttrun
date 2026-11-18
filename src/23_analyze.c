@@ -905,6 +905,7 @@ fasttrun_analyze(PG_FUNCTION_ARGS)
 	Relation	rel;
 
 	fasttrun_reject_in_atx("fasttrun_analyze");
+	fasttrun_statement_seq++;
 	relvar = fasttrun_make_rangevar(name);
 	relOid = RangeVarGetRelid(relvar, AccessShareLock, true);
 	if (!OidIsValid(relOid))
@@ -927,8 +928,7 @@ fasttrun_analyze(PG_FUNCTION_ARGS)
 	 * fasttruncate: local inh=false stats would hide core inherited
 	 * stats during appendrel planning.
 	 */
-	if (rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE ||
-		rel->rd_rel->relhassubclass)
+	if (fasttrun_relation_is_parent(rel))
 	{
 		table_close(rel, NoLock);
 		ereport(ERROR,
@@ -1005,6 +1005,7 @@ fasttrun_analyze_bulk(PG_FUNCTION_ARGS)
 	int			i;
 
 	fasttrun_reject_in_atx("fasttrun_analyze_bulk");
+	fasttrun_statement_seq++;
 	if (PG_ARGISNULL(0))
 		PG_RETURN_VOID();
 
@@ -1042,8 +1043,7 @@ fasttrun_analyze_bulk(PG_FUNCTION_ARGS)
 					 errmsg("fasttrun_analyze_bulk: relation \"%s\" is not a local temporary table",
 							RelationGetRelationName(rel))));
 		}
-		if (rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE ||
-			rel->rd_rel->relhassubclass)
+		if (fasttrun_relation_is_parent(rel))
 		{
 			table_close(rel, NoLock);
 			ereport(ERROR,

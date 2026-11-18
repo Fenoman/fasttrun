@@ -6,11 +6,12 @@
 --   3. Inspect APPLIED/SKIP results, then COMMIT or ROLLBACK.
 --
 -- Safety:
---   Bodies containing single quotes, dollar signs, or comment delimiters are
---   skipped in full. Review their function DDL manually. Double-quoted
---   identifiers are supported unless they contain a semicolon, a backslash,
---   or are unclosed. Replacement calls are schema-qualified with the schema
---   of extension fasttrun (or public when the extension is not yet installed).
+--   Bodies containing single quotes, dollar signs, comment delimiters,
+--   autonomous transaction blocks (BEGIN AUTONOMOUS), or references to FOUND
+--   or ROW_COUNT are skipped in full. Review their function DDL manually.
+--   Double-quoted identifiers are supported unless they contain a semicolon,
+--   a backslash, or are unclosed. Replacement calls are schema-qualified with
+--   the schema of extension fasttrun (or public when not yet installed).
 --
 -- Matching:
 --   A statement starts after BEGIN/THEN/ELSE/LOOP, ';', or the start of the body.
@@ -30,7 +31,7 @@ WITH ext AS MATERIALIZED (
         ),
         E'\\', E'\\\\'
     ) AS schema_repl
-), candidates AS MATERIALIZED (
+), raw_candidates AS MATERIALIZED (
     SELECT p.oid AS function_oid,
            p.oid::regprocedure::text AS function_name,
            p.prosrc AS original_body,
@@ -52,28 +53,91 @@ WITH ext AS MATERIALIZED (
                ) THEN 'backslash in quoted identifier'
                WHEN regexp_replace(p.prosrc, '"(?:[^"]|"")*"', '', 'g') ~ '"'
                    THEN 'unclosed quoted identifier'
-           END AS skip_reason
+           END AS base_skip_reason
     FROM pg_proc p
     JOIN pg_namespace n ON n.oid = p.pronamespace
     JOIN pg_language l ON l.oid = p.prolang
     CROSS JOIN ext
     WHERE l.lanname = 'plpgsql'
-      AND p.prosrc ~* E'\\mANALYZE\\s+(?:\\([^)]*\\)\\s*)?(?:[[:alnum:]_"]+\\s*\\.\\s*)?"?temp[ _]'
+      AND p.prosrc ~* E'\\mANALY[SZ]E\\M[^;]*(?:\\mtemp_|"temp[ _])'
       AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+), candidates AS MATERIALIZED (
+    SELECT rc.function_oid,
+           rc.function_name,
+           rc.original_body,
+           rc.schema_repl,
+           coalesce(rc.base_skip_reason,
+               CASE
+                   WHEN unq.body ~* E'\\mBEGIN\\s+AUTONOMOUS\\M'
+                       THEN 'autonomous transaction block'
+                   WHEN unq.body ~* E'\\m(?:FOUND|ROW_COUNT)\\M'
+                       THEN 'uses FOUND or ROW_COUNT'
+               END
+           ) AS skip_reason
+    FROM raw_candidates rc
+    CROSS JOIN LATERAL (
+        SELECT coalesce(
+                   string_agg(
+                       CASE
+                           WHEN left(t.parts[1], 1) = '"' THEN ' __ft_qident__ '
+                           ELSE t.parts[1]
+                       END,
+                       '' ORDER BY t.ord
+                   ),
+                   ''
+               ) AS body
+        FROM regexp_matches(
+            CASE WHEN rc.base_skip_reason IS NULL THEN rc.original_body ELSE '' END,
+            '"(?:[^"]|"")*"|[^"]+',
+            'g'
+        ) WITH ORDINALITY AS t(parts, ord)
+    ) unq
 ), proposals AS (
     SELECT *, CASE WHEN skip_reason IS NULL THEN regexp_replace(
         original_body,
-        E'(^|;|\\m(?:BEGIN|THEN|ELSE|LOOP)\\M)(\\s*)ANALYZE\\s+("temp[ _](?:[^"]|"")+"|temp_\\w+)(?=\\s*;)',
+        E'(^|;|\\m(?:BEGIN|THEN|ELSE|LOOP)\\M)(\\s*)ANALY[SZ]E\\s+("temp[ _](?:[^"]|"")+"|temp_\\w+)(?=\\s*;)',
         E'\\1\\2PERFORM ' || schema_repl || E'.fasttrun_analyze(''\\3'')',
         'gi'
     ) ELSE original_body END AS proposed_body
     FROM candidates
 ), assessed AS (
-    SELECT *, coalesce(skip_reason,
-        CASE WHEN proposed_body ~* E'\\mANALYZE\\s+(?:\\([^)]*\\)\\s*)?(?:[[:alnum:]_"]+\\s*\\.\\s*)?"?temp[ _]'
-             THEN 'unsupported ANALYZE statement position or identifier' END
+    SELECT p.*, coalesce(p.skip_reason,
+        CASE
+            WHEN norm.body ~* E'(?:^|;|>>|\\m(?:BEGIN|THEN|ELSE|LOOP)\\M)\\s*ANALY[SZ]E\\M[^;]*(?:^|[\\s;(),.*])temp_[^\\s;(),.*"''\\\\]*(?=$|[\\s;(),*])(?!\\s*\\.)'
+                THEN 'unsupported ANALYZE statement position or identifier'
+            WHEN p.proposed_body = p.original_body
+                THEN 'no replaceable ANALYZE temp_* statement'
+        END
     ) AS reason
-    FROM proposals
+    FROM proposals p
+    CROSS JOIN LATERAL (
+        SELECT regexp_replace(
+                   regexp_replace(
+                       regexp_replace(
+                           coalesce(
+                               string_agg(
+                                   CASE
+                                       WHEN left(t.parts[1], 1) = chr(39) THEN ' __ft_sconst__ '
+                                       WHEN t.parts[1] ~* E'^"temp[ _]' THEN ' temp_qtarget '
+                                       WHEN left(t.parts[1], 1) = '"' THEN ' __ft_qident__ '
+                                       ELSE t.parts[1]
+                                   END,
+                                   '' ORDER BY t.ord
+                               ),
+                               ''
+                           ),
+                           E'(^|[^.\\w])ONLY\\s*\\(([^);()]*)\\)', E'\\1ONLY \\2 ', 'gi'
+                       ),
+                       E'\\([^);()]*\\)', ' ', 'g'
+                   ),
+                   E'\\([^);()]*\\)', ' ', 'g'
+               ) AS body
+        FROM regexp_matches(
+            CASE WHEN p.skip_reason IS NULL THEN p.proposed_body ELSE '' END,
+            E'''(?:[^'']|'''')*''|"(?:[^"]|"")*"|[^"'']+',
+            'g'
+        ) WITH ORDINALITY AS t(parts, ord)
+    ) norm
 )
 SELECT function_oid, function_name,
        CASE WHEN reason IS NULL THEN 'READY' ELSE 'SKIP' END AS status,
@@ -97,7 +161,7 @@ ORDER BY function_name;
 --         ),
 --         E'\\', E'\\\\'
 --     ) AS schema_repl
--- ), candidates AS MATERIALIZED (
+-- ), raw_candidates AS MATERIALIZED (
 --     SELECT p.oid AS function_oid,
 --            p.oid::regprocedure::text AS function_name,
 --            p.prosrc AS original_body,
@@ -119,28 +183,91 @@ ORDER BY function_name;
 --                ) THEN 'backslash in quoted identifier'
 --                WHEN regexp_replace(p.prosrc, '"(?:[^"]|"")*"', '', 'g') ~ '"'
 --                    THEN 'unclosed quoted identifier'
---            END AS skip_reason
+--            END AS base_skip_reason
 --     FROM pg_proc p
 --     JOIN pg_namespace n ON n.oid = p.pronamespace
 --     JOIN pg_language l ON l.oid = p.prolang
 --     CROSS JOIN ext
 --     WHERE l.lanname = 'plpgsql'
---       AND p.prosrc ~* E'\\mANALYZE\\s+(?:\\([^)]*\\)\\s*)?(?:[[:alnum:]_"]+\\s*\\.\\s*)?"?temp[ _]'
+--       AND p.prosrc ~* E'\\mANALY[SZ]E\\M[^;]*(?:\\mtemp_|"temp[ _])'
 --       AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+-- ), candidates AS MATERIALIZED (
+--     SELECT rc.function_oid,
+--            rc.function_name,
+--            rc.original_body,
+--            rc.schema_repl,
+--            coalesce(rc.base_skip_reason,
+--                CASE
+--                    WHEN unq.body ~* E'\\mBEGIN\\s+AUTONOMOUS\\M'
+--                        THEN 'autonomous transaction block'
+--                    WHEN unq.body ~* E'\\m(?:FOUND|ROW_COUNT)\\M'
+--                        THEN 'uses FOUND or ROW_COUNT'
+--                END
+--            ) AS skip_reason
+--     FROM raw_candidates rc
+--     CROSS JOIN LATERAL (
+--         SELECT coalesce(
+--                    string_agg(
+--                        CASE
+--                            WHEN left(t.parts[1], 1) = '"' THEN ' __ft_qident__ '
+--                            ELSE t.parts[1]
+--                        END,
+--                        '' ORDER BY t.ord
+--                    ),
+--                    ''
+--                ) AS body
+--         FROM regexp_matches(
+--             CASE WHEN rc.base_skip_reason IS NULL THEN rc.original_body ELSE '' END,
+--             '"(?:[^"]|"")*"|[^"]+',
+--             'g'
+--         ) WITH ORDINALITY AS t(parts, ord)
+--     ) unq
 -- ), proposals AS (
 --     SELECT *, CASE WHEN skip_reason IS NULL THEN regexp_replace(
 --         original_body,
---         E'(^|;|\\m(?:BEGIN|THEN|ELSE|LOOP)\\M)(\\s*)ANALYZE\\s+("temp[ _](?:[^"]|"")+"|temp_\\w+)(?=\\s*;)',
+--         E'(^|;|\\m(?:BEGIN|THEN|ELSE|LOOP)\\M)(\\s*)ANALY[SZ]E\\s+("temp[ _](?:[^"]|"")+"|temp_\\w+)(?=\\s*;)',
 --         E'\\1\\2PERFORM ' || schema_repl || E'.fasttrun_analyze(''\\3'')',
 --         'gi'
 --     ) ELSE original_body END AS proposed_body
 --     FROM candidates
 -- ), assessed AS (
---     SELECT *, coalesce(skip_reason,
---         CASE WHEN proposed_body ~* E'\\mANALYZE\\s+(?:\\([^)]*\\)\\s*)?(?:[[:alnum:]_"]+\\s*\\.\\s*)?"?temp[ _]'
---              THEN 'unsupported ANALYZE statement position or identifier' END
+--     SELECT p.*, coalesce(p.skip_reason,
+--         CASE
+--             WHEN norm.body ~* E'(?:^|;|>>|\\m(?:BEGIN|THEN|ELSE|LOOP)\\M)\\s*ANALY[SZ]E\\M[^;]*(?:^|[\\s;(),.*])temp_[^\\s;(),.*"''\\\\]*(?=$|[\\s;(),*])(?!\\s*\\.)'
+--                 THEN 'unsupported ANALYZE statement position or identifier'
+--             WHEN p.proposed_body = p.original_body
+--                 THEN 'no replaceable ANALYZE temp_* statement'
+--         END
 --     ) AS reason
---     FROM proposals
+--     FROM proposals p
+--     CROSS JOIN LATERAL (
+--         SELECT regexp_replace(
+--                    regexp_replace(
+--                        regexp_replace(
+--                            coalesce(
+--                                string_agg(
+--                                    CASE
+--                                        WHEN left(t.parts[1], 1) = chr(39) THEN ' __ft_sconst__ '
+--                                        WHEN t.parts[1] ~* E'^"temp[ _]' THEN ' temp_qtarget '
+--                                        WHEN left(t.parts[1], 1) = '"' THEN ' __ft_qident__ '
+--                                        ELSE t.parts[1]
+--                                    END,
+--                                    '' ORDER BY t.ord
+--                                ),
+--                                ''
+--                            ),
+--                            E'(^|[^.\\w])ONLY\\s*\\(([^);()]*)\\)', E'\\1ONLY \\2 ', 'gi'
+--                        ),
+--                        E'\\([^);()]*\\)', ' ', 'g'
+--                    ),
+--                    E'\\([^);()]*\\)', ' ', 'g'
+--                ) AS body
+--         FROM regexp_matches(
+--             CASE WHEN p.skip_reason IS NULL THEN p.proposed_body ELSE '' END,
+--             E'''(?:[^'']|'''')*''|"(?:[^"]|"")*"|[^"'']+',
+--             'g'
+--         ) WITH ORDINALITY AS t(parts, ord)
+--     ) norm
 -- ), updated AS (
 --     UPDATE pg_proc p
 --     SET prosrc = a.proposed_body

@@ -526,17 +526,544 @@ RESET fasttrun.sample_rows;
 SELECT 'PUBLICATION_OK cancel';
 SQL
 
+cat >"$WORKDIR/template_memo.sql" <<SQL
+SELECT pg_advisory_lock(424242), pg_advisory_lock(424244), pg_advisory_lock(424246);
+CREATE SCHEMA ftq_schema_live;
+CREATE SCHEMA ftq_schema_next;
+CREATE TABLE ftq_schema_live.ftq_dataset(a int);
+CREATE TABLE ftq_schema_next.ftq_dataset(a int);
+ALTER TABLE ftq_schema_live.ftq_dataset ALTER COLUMN a SET STATISTICS 0;
+ALTER TABLE ftq_schema_next.ftq_dataset ALTER COLUMN a SET STATISTICS 100;
+CREATE TEMP TABLE ftq_dataset(a int);
+INSERT INTO ftq_dataset SELECT generate_series(1, 200);
+SET fasttrun.template_stattarget = on;
+SET fasttrun.prewarm_schema = 'ftq_schema_live';
+BEGIN ISOLATION LEVEL READ COMMITTED;
+SELECT fasttrun_collect_stats('ftq_dataset');
+DO \$\$
+BEGIN
+  IF (SELECT count(*) FROM fasttrun_inspect_stats('ftq_dataset')) <> 0 THEN
+    RAISE EXCEPTION 'expected 0 stats columns before schema swap';
+  END IF;
+END \$\$;
+\\! "$PSQL" -h "$SOCKET_DIR" -p "$PORT" -d "$DBNAME" -XAtq -v ON_ERROR_STOP=1 -c 'BEGIN; ALTER SCHEMA ftq_schema_live RENAME TO ftq_schema_old; ALTER SCHEMA ftq_schema_next RENAME TO ftq_schema_live; COMMIT;'
+SELECT fasttrun_collect_stats('ftq_dataset');
+DO \$\$
+BEGIN
+  IF (SELECT count(*) FROM fasttrun_inspect_stats('ftq_dataset')) <> 1 THEN
+    RAISE EXCEPTION 'stale template OID survived concurrent schema swap in READ COMMITTED';
+  END IF;
+END \$\$;
+COMMIT;
+-- Verify consecutive simple-expression calls (IF fn(...) IS NULL, evaluated via
+-- exec_eval_simple_expr with zero ExecutorStart calls) advance statement_seq
+-- in fasttrun_collect_stats, fasttrun_analyze, and fasttrun_analyze_bulk.
+CREATE SCHEMA ftq_schema_s0;
+CREATE SCHEMA ftq_schema_s100a;
+CREATE SCHEMA ftq_schema_s0b;
+CREATE TABLE ftq_schema_s0.ftq_dataset(a int);
+CREATE TABLE ftq_schema_s100a.ftq_dataset(a int);
+CREATE TABLE ftq_schema_s0b.ftq_dataset(a int);
+ALTER TABLE ftq_schema_s0.ftq_dataset ALTER COLUMN a SET STATISTICS 0;
+ALTER TABLE ftq_schema_s100a.ftq_dataset ALTER COLUMN a SET STATISTICS 100;
+ALTER TABLE ftq_schema_s0b.ftq_dataset ALTER COLUMN a SET STATISTICS 0;
+SELECT set_config('app.s0_oid', ('ftq_schema_s0.ftq_dataset'::regclass::oid)::text, false);
+SELECT set_config('app.s100a_oid', ('ftq_schema_s100a.ftq_dataset'::regclass::oid)::text, false);
+SELECT set_config('app.s0b_oid', ('ftq_schema_s0b.ftq_dataset'::regclass::oid)::text, false);
+
+-- 1) fasttrun_collect_stats: 1 -> 0 columns inside one simple-expr DO block
+BEGIN ISOLATION LEVEL READ COMMITTED;
+DO \$\$
+DECLARE
+  step int;
+  ready boolean := false;
+BEGIN
+  IF fasttrun_collect_stats('ftq_dataset') IS NULL THEN NULL; END IF;
+  FOR step IN 1..250 LOOP
+    IF NOT pg_try_advisory_lock(424241) THEN
+      ready := true;
+      EXIT;
+    END IF;
+    IF pg_advisory_unlock(424241) IS NULL THEN NULL; END IF;
+    IF pg_sleep(0.02) IS NULL THEN NULL; END IF;
+  END LOOP;
+  IF NOT ready THEN
+    RAISE EXCEPTION 'timeout waiting for schema swap worker 1';
+  END IF;
+  IF pg_advisory_unlock(424242) IS NULL THEN NULL; END IF;
+  ready := false;
+  FOR step IN 1..250 LOOP
+    IF pg_try_advisory_lock(424241) THEN
+      ready := true;
+      EXIT;
+    END IF;
+    IF pg_sleep(0.02) IS NULL THEN NULL; END IF;
+  END LOOP;
+  IF NOT ready THEN
+    RAISE EXCEPTION 'timeout waiting for schema swap worker 1 completion';
+  END IF;
+  IF pg_advisory_unlock(424241) IS NULL THEN NULL; END IF;
+  IF pg_relation_size(current_setting('app.s0_oid')::oid) < 0 THEN NULL; END IF;
+  IF fasttrun_collect_stats('ftq_dataset') IS NULL THEN NULL; END IF;
+END \$\$;
+DO \$\$
+BEGIN
+  IF (SELECT count(*) FROM fasttrun_inspect_stats('ftq_dataset')) <> 0 THEN
+    RAISE EXCEPTION 'stale template OID survived simple-expr fasttrun_collect_stats';
+  END IF;
+END \$\$;
+COMMIT;
+
+-- 2) fasttrun_analyze: 0 -> 1 column inside one simple-expr DO block
+--    (fresh ftq_dataset has no analyze-cache entry yet, so fasttrun_collect_stats
+--    populates template_memo while leaving scan_needed=true for fasttrun_analyze).
+DROP TABLE ftq_dataset;
+CREATE TEMP TABLE ftq_dataset(a int);
+INSERT INTO ftq_dataset SELECT generate_series(1, 200);
+BEGIN ISOLATION LEVEL READ COMMITTED;
+DO \$\$
+DECLARE
+  step int;
+  ready boolean := false;
+BEGIN
+  IF fasttrun_collect_stats('ftq_dataset') IS NULL THEN NULL; END IF;
+  FOR step IN 1..250 LOOP
+    IF NOT pg_try_advisory_lock(424243) THEN
+      ready := true;
+      EXIT;
+    END IF;
+    IF pg_advisory_unlock(424243) IS NULL THEN NULL; END IF;
+    IF pg_sleep(0.02) IS NULL THEN NULL; END IF;
+  END LOOP;
+  IF NOT ready THEN
+    RAISE EXCEPTION 'timeout waiting for schema swap worker 2';
+  END IF;
+  IF pg_advisory_unlock(424244) IS NULL THEN NULL; END IF;
+  ready := false;
+  FOR step IN 1..250 LOOP
+    IF pg_try_advisory_lock(424243) THEN
+      ready := true;
+      EXIT;
+    END IF;
+    IF pg_sleep(0.02) IS NULL THEN NULL; END IF;
+  END LOOP;
+  IF NOT ready THEN
+    RAISE EXCEPTION 'timeout waiting for schema swap worker 2 completion';
+  END IF;
+  IF pg_advisory_unlock(424243) IS NULL THEN NULL; END IF;
+  IF pg_relation_size(current_setting('app.s100a_oid')::oid) < 0 THEN NULL; END IF;
+  IF fasttrun_analyze('ftq_dataset') IS NULL THEN NULL; END IF;
+END \$\$;
+DO \$\$
+BEGIN
+  IF (SELECT count(*) FROM fasttrun_inspect_stats('ftq_dataset')) <> 1 THEN
+    RAISE EXCEPTION 'stale template OID survived simple-expr fasttrun_analyze';
+  END IF;
+END \$\$;
+COMMIT;
+
+-- 3) fasttrun_analyze_bulk: 1 -> 0 columns inside one simple-expr DO block
+DROP TABLE ftq_dataset;
+CREATE TEMP TABLE ftq_dataset(a int);
+INSERT INTO ftq_dataset SELECT generate_series(1, 200);
+BEGIN ISOLATION LEVEL READ COMMITTED;
+DO \$\$
+DECLARE
+  step int;
+  ready boolean := false;
+BEGIN
+  IF fasttrun_collect_stats('ftq_dataset') IS NULL THEN NULL; END IF;
+  FOR step IN 1..250 LOOP
+    IF NOT pg_try_advisory_lock(424245) THEN
+      ready := true;
+      EXIT;
+    END IF;
+    IF pg_advisory_unlock(424245) IS NULL THEN NULL; END IF;
+    IF pg_sleep(0.02) IS NULL THEN NULL; END IF;
+  END LOOP;
+  IF NOT ready THEN
+    RAISE EXCEPTION 'timeout waiting for schema swap worker 3';
+  END IF;
+  IF pg_advisory_unlock(424246) IS NULL THEN NULL; END IF;
+  ready := false;
+  FOR step IN 1..250 LOOP
+    IF pg_try_advisory_lock(424245) THEN
+      ready := true;
+      EXIT;
+    END IF;
+    IF pg_sleep(0.02) IS NULL THEN NULL; END IF;
+  END LOOP;
+  IF NOT ready THEN
+    RAISE EXCEPTION 'timeout waiting for schema swap worker 3 completion';
+  END IF;
+  IF pg_advisory_unlock(424245) IS NULL THEN NULL; END IF;
+  IF pg_relation_size(current_setting('app.s0b_oid')::oid) < 0 THEN NULL; END IF;
+  IF fasttrun_analyze_bulk('ftq_dataset') IS NULL THEN NULL; END IF;
+END \$\$;
+DO \$\$
+BEGIN
+  IF (SELECT count(*) FROM fasttrun_inspect_stats('ftq_dataset')) <> 0 THEN
+    RAISE EXCEPTION 'stale template OID survived simple-expr fasttrun_analyze_bulk';
+  END IF;
+END \$\$;
+COMMIT;
+DROP TABLE ftq_dataset;
+DROP SCHEMA ftq_schema_old, ftq_schema_prev1, ftq_schema_prev2, ftq_schema_prev3, ftq_schema_live CASCADE;
+RESET fasttrun.template_stattarget;
+RESET fasttrun.prewarm_schema;
+SELECT 'PUBLICATION_OK template_memo';
+SQL
+
+cat >"$WORKDIR/template_memo_worker.sql" <<'SQL'
+SET lock_timeout = '5s';
+DO $$
+DECLARE step int; ready boolean := false;
+BEGIN
+  FOR step IN 1..250 LOOP
+    IF EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory' AND objid = 424242) THEN
+      ready := true;
+      EXIT;
+    END IF;
+    PERFORM pg_sleep(0.02);
+  END LOOP;
+  IF NOT ready THEN RAISE EXCEPTION 'worker did not observe main advisory lock 424242'; END IF;
+END $$;
+SELECT pg_advisory_lock(424241);
+SELECT pg_advisory_lock(424242);
+BEGIN;
+ALTER SCHEMA ftq_schema_live RENAME TO ftq_schema_prev1;
+ALTER SCHEMA ftq_schema_s0 RENAME TO ftq_schema_live;
+COMMIT;
+SELECT pg_advisory_unlock(424242);
+SELECT pg_advisory_unlock(424241);
+
+SELECT pg_advisory_lock(424243);
+SELECT pg_advisory_lock(424244);
+BEGIN;
+ALTER SCHEMA ftq_schema_live RENAME TO ftq_schema_prev2;
+ALTER SCHEMA ftq_schema_s100a RENAME TO ftq_schema_live;
+COMMIT;
+SELECT pg_advisory_unlock(424244);
+SELECT pg_advisory_unlock(424243);
+
+SELECT pg_advisory_lock(424245);
+SELECT pg_advisory_lock(424246);
+BEGIN;
+ALTER SCHEMA ftq_schema_live RENAME TO ftq_schema_prev3;
+ALTER SCHEMA ftq_schema_s0b RENAME TO ftq_schema_live;
+COMMIT;
+SELECT pg_advisory_unlock(424246);
+SELECT pg_advisory_unlock(424245);
+SQL
+
+terminate_memo_worker()
+{
+	local pid=${1:-}
+	local i
+	[ -n "$pid" ] || return 0
+	kill -TERM "$pid" >/dev/null 2>&1 || true
+	kill -CONT "$pid" >/dev/null 2>&1 || true
+	for i in $(seq 1 20); do
+		if ! kill -0 "$pid" >/dev/null 2>&1; then
+			wait "$pid" >/dev/null 2>&1 || true
+			return 0
+		fi
+		sleep 0.05
+	done
+	kill -KILL "$pid" >/dev/null 2>&1 || true
+	kill -CONT "$pid" >/dev/null 2>&1 || true
+	for i in $(seq 1 20); do
+		if ! kill -0 "$pid" >/dev/null 2>&1; then
+			wait "$pid" >/dev/null 2>&1 || true
+			return 0
+		fi
+		sleep 0.05
+	done
+	return 0
+}
+
+wait_memo_worker()
+{
+	local pid=$1
+	local ticks=${2:-}
+	local state_file=${3:-}
+	local i
+	local rc=0
+	local pstate=""
+	[ -n "$ticks" ] || ticks=${FASTTRUN_WAIT_TICKS:-200}
+	for i in $(seq 1 "$ticks"); do
+		if ! kill -0 "$pid" >/dev/null 2>&1; then
+			wait "$pid" || rc=$?
+			return "$rc"
+		fi
+		sleep 0.05
+	done
+	if [ -n "$state_file" ]; then
+		pstate=$(ps -o state= -p "$pid" 2>/dev/null | tr -d '[:space:]' || true)
+		printf 'pid=%s state=%s\n' "$pid" "$pstate" >"$state_file"
+	fi
+	terminate_memo_worker "$pid"
+	return 124
+}
+
+run_memo_pair()
+{
+	local label=$1
+	local main_sql=$2
+	local worker_sql=$3
+	local out=$4
+	local err=$5
+	local wout=$6
+	local werr=$7
+	local wait_ticks=${8:-}
+	local stop_marker=${9:-}
+	local state_file=${10:-}
+	local worker_pid=""
+	local stopper_pid=""
+	local worker_rc=0
+	local pstate=""
+
+	"$PSQL" -h "$SOCKET_DIR" -p "$PORT" -d "$DBNAME" -XAtq \
+		-v ON_ERROR_STOP=1 -f "$worker_sql" >"$wout" 2>"$werr" &
+	worker_pid=$!
+
+	if [ -n "$stop_marker" ]; then
+		(
+			for _ in $(seq 1 200); do
+				if grep -q "^${stop_marker}\$" "$wout" 2>/dev/null; then
+					kill -STOP "$worker_pid" >/dev/null 2>&1 || true
+					exit 0
+				fi
+				if ! kill -0 "$worker_pid" >/dev/null 2>&1; then
+					exit 0
+				fi
+				sleep 0.01
+			done
+		) &
+		stopper_pid=$!
+	fi
+
+	if ! "$PSQL" -h "$SOCKET_DIR" -p "$PORT" -d "$DBNAME" -XAtq \
+		-v ON_ERROR_STOP=1 -f "$main_sql" >"$out" 2>"$err"; then
+		if [ -n "$stopper_pid" ]; then
+			wait "$stopper_pid" >/dev/null 2>&1 || true
+		fi
+		if [ -n "$state_file" ]; then
+			pstate=$(ps -o state= -p "$worker_pid" 2>/dev/null | tr -d '[:space:]' || true)
+			printf 'pid=%s state=%s\n' "$worker_pid" "$pstate" >"$state_file"
+		fi
+		terminate_memo_worker "$worker_pid"
+		cat "$werr" >&2 || true
+		cat "$out" "$err" >&2
+		echo "FAIL: publication case $label" >&2
+		return 1
+	fi
+
+	wait_memo_worker "$worker_pid" "$wait_ticks" "$state_file" || worker_rc=$?
+	if [ -n "$stopper_pid" ]; then
+		wait "$stopper_pid" >/dev/null 2>&1 || true
+	fi
+	if [ "$worker_rc" -ne 0 ]; then
+		cat "$wout" "$werr" >&2 || true
+		echo "FAIL: $label worker exited with rc=$worker_rc" >&2
+		return 1
+	fi
+	return 0
+}
+
+verify_stopped_memo_worker()
+{
+	local hold_pid=""
+	local hold_state=""
+	local exit_pid=""
+	local exit_state=""
+
+	cat >"$WORKDIR/memo_stop_hold_worker.sql" <<'SQL'
+SET lock_timeout = '5s';
+DO $$
+DECLARE step int; ready boolean := false;
+BEGIN
+  FOR step IN 1..250 LOOP
+    IF EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory' AND objid = 424290) THEN
+      ready := true;
+      EXIT;
+    END IF;
+    PERFORM pg_sleep(0.01);
+  END LOOP;
+  IF NOT ready THEN RAISE EXCEPTION 'worker did not observe main advisory lock 424290'; END IF;
+END $$;
+SELECT pg_advisory_lock(424291);
+SELECT 'HOLD_READY';
+SELECT pg_sleep(0.06);
+SELECT pg_sleep(0.06);
+SELECT pg_advisory_unlock(424291);
+SQL
+	cat >"$WORKDIR/memo_stop_hold_main.sql" <<'SQL'
+SELECT pg_advisory_lock(424290);
+DO $$
+DECLARE
+  step int;
+  ready boolean := false;
+BEGIN
+  FOR step IN 1..200 LOOP
+    IF NOT pg_try_advisory_lock(424291) THEN
+      ready := true;
+      EXIT;
+    END IF;
+    PERFORM pg_advisory_unlock(424291);
+    PERFORM pg_sleep(0.01);
+  END LOOP;
+  PERFORM pg_advisory_unlock(424290);
+  IF NOT ready THEN
+    RAISE EXCEPTION 'timeout waiting for hold_ready worker';
+  END IF;
+  ready := false;
+  FOR step IN 1..40 LOOP
+    IF pg_try_advisory_lock(424291) THEN
+      ready := true;
+      EXIT;
+    END IF;
+    PERFORM pg_sleep(0.02);
+  END LOOP;
+  IF NOT ready THEN
+    RAISE EXCEPTION 'expected completion timeout on stopped worker';
+  END IF;
+  PERFORM pg_advisory_unlock(424291);
+END $$;
+SQL
+	if run_memo_pair "memo_stop_hold" \
+		"$WORKDIR/memo_stop_hold_main.sql" \
+		"$WORKDIR/memo_stop_hold_worker.sql" \
+		"$WORKDIR/memo_stop_hold.out" \
+		"$WORKDIR/memo_stop_hold.err" \
+		"$WORKDIR/memo_stop_hold_w.out" \
+		"$WORKDIR/memo_stop_hold_w.err" \
+		16 "HOLD_READY" "$WORKDIR/memo_stop_hold.state" >/dev/null 2>"$WORKDIR/memo_stop_hold.diag"; then
+		echo "FAIL: stopped worker during lock hold unexpectedly succeeded" >&2
+		return 1
+	fi
+	if ! grep -q "expected completion timeout on stopped worker" "$WORKDIR/memo_stop_hold.diag"; then
+		cat "$WORKDIR/memo_stop_hold.diag" >&2
+		echo "FAIL: missing expected completion timeout for stopped worker" >&2
+		return 1
+	fi
+	if ! grep -Eq '^pid=[0-9]+ state=T' "$WORKDIR/memo_stop_hold.state"; then
+		cat "$WORKDIR/memo_stop_hold.state" >&2 || true
+		echo "FAIL: memo_stop_hold worker was not observed in stopped state T before cleanup" >&2
+		return 1
+	fi
+	hold_pid=$(sed -n 's/^pid=\([0-9][0-9]*\) .*/\1/p' "$WORKDIR/memo_stop_hold.state")
+	hold_state=$(sed -n 's/^pid=[0-9][0-9]* state=\(.*\)/\1/p' "$WORKDIR/memo_stop_hold.state")
+	if [ -z "$hold_pid" ] || kill -0 "$hold_pid" >/dev/null 2>&1; then
+		echo "FAIL: memo_stop_hold worker pid=$hold_pid still alive after cleanup" >&2
+		return 1
+	fi
+
+	cat >"$WORKDIR/memo_stop_exit_worker.sql" <<'SQL'
+SET lock_timeout = '5s';
+DO $$
+DECLARE step int; ready boolean := false;
+BEGIN
+  FOR step IN 1..250 LOOP
+    IF EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory' AND objid = 424293) THEN
+      ready := true;
+      EXIT;
+    END IF;
+    PERFORM pg_sleep(0.01);
+  END LOOP;
+  IF NOT ready THEN RAISE EXCEPTION 'worker did not observe main advisory lock 424293'; END IF;
+END $$;
+SELECT pg_advisory_lock(424292);
+SELECT pg_advisory_lock(424293);
+SELECT pg_advisory_unlock(424293);
+SELECT CASE WHEN pg_advisory_unlock(424292) THEN 'EXIT_READY' END;
+SELECT pg_sleep(0.06);
+SELECT pg_sleep(0.06);
+SQL
+	cat >"$WORKDIR/memo_stop_exit_main.sql" <<'SQL'
+SELECT pg_advisory_lock(424293);
+DO $$
+DECLARE
+  step int;
+  ready boolean := false;
+BEGIN
+  FOR step IN 1..200 LOOP
+    IF NOT pg_try_advisory_lock(424292) THEN
+      ready := true;
+      EXIT;
+    END IF;
+    PERFORM pg_advisory_unlock(424292);
+    PERFORM pg_sleep(0.01);
+  END LOOP;
+  IF NOT ready THEN
+    RAISE EXCEPTION 'timeout waiting for exit_ready worker';
+  END IF;
+  PERFORM pg_advisory_unlock(424293);
+  ready := false;
+  FOR step IN 1..200 LOOP
+    IF pg_try_advisory_lock(424292) THEN
+      ready := true;
+      EXIT;
+    END IF;
+    PERFORM pg_sleep(0.01);
+  END LOOP;
+  IF NOT ready THEN
+    RAISE EXCEPTION 'worker did not unlock 424292 before stop';
+  END IF;
+  PERFORM pg_advisory_unlock(424292);
+END $$;
+SQL
+	if run_memo_pair "memo_stop_exit" \
+		"$WORKDIR/memo_stop_exit_main.sql" \
+		"$WORKDIR/memo_stop_exit_worker.sql" \
+		"$WORKDIR/memo_stop_exit.out" \
+		"$WORKDIR/memo_stop_exit.err" \
+		"$WORKDIR/memo_stop_exit_w.out" \
+		"$WORKDIR/memo_stop_exit_w.err" \
+		16 "EXIT_READY" "$WORKDIR/memo_stop_exit.state" >/dev/null 2>"$WORKDIR/memo_stop_exit.diag"; then
+		echo "FAIL: stopped worker after unlock unexpectedly succeeded" >&2
+		return 1
+	fi
+	if ! grep -q "FAIL: memo_stop_exit worker exited with rc=124" "$WORKDIR/memo_stop_exit.diag"; then
+		cat "$WORKDIR/memo_stop_exit.diag" >&2
+		echo "FAIL: missing rc=124 bounded wait failure for stopped worker" >&2
+		return 1
+	fi
+	if ! grep -Eq '^pid=[0-9]+ state=T' "$WORKDIR/memo_stop_exit.state"; then
+		cat "$WORKDIR/memo_stop_exit.state" >&2 || true
+		echo "FAIL: memo_stop_exit worker was not observed in stopped state T before cleanup" >&2
+		return 1
+	fi
+	exit_pid=$(sed -n 's/^pid=\([0-9][0-9]*\) .*/\1/p' "$WORKDIR/memo_stop_exit.state")
+	exit_state=$(sed -n 's/^pid=[0-9][0-9]* state=\(.*\)/\1/p' "$WORKDIR/memo_stop_exit.state")
+	if [ -z "$exit_pid" ] || kill -0 "$exit_pid" >/dev/null 2>&1; then
+		echo "FAIL: memo_stop_exit worker pid=$exit_pid still alive after cleanup" >&2
+		return 1
+	fi
+	echo "ok: stopped template_memo worker bounded cleanup verified (hold pid=$hold_pid state=$hold_state, exit pid=$exit_pid state=$exit_state)"
+}
+
 run_case()
 {
 	local name=$1
 	local out="$WORKDIR/$name.out"
 	local err="$WORKDIR/$name.err"
 
-	if ! "$PSQL" -h "$SOCKET_DIR" -p "$PORT" -d "$DBNAME" -XAtq \
-		-v ON_ERROR_STOP=1 -f "$WORKDIR/$name.sql" >"$out" 2>"$err"; then
-		cat "$out" "$err" >&2
-		echo "FAIL: publication case $name" >&2
-		return 1
+	if [ "$name" = "template_memo" ]; then
+		run_memo_pair "$name" \
+			"$WORKDIR/$name.sql" \
+			"$WORKDIR/template_memo_worker.sql" \
+			"$out" "$err" \
+			"$WORKDIR/template_memo_worker.out" \
+			"$WORKDIR/template_memo_worker.err" || return 1
+		verify_stopped_memo_worker || return 1
+	else
+		if ! "$PSQL" -h "$SOCKET_DIR" -p "$PORT" -d "$DBNAME" -XAtq \
+			-v ON_ERROR_STOP=1 -f "$WORKDIR/$name.sql" >"$out" 2>"$err"; then
+			cat "$out" "$err" >&2
+			echo "FAIL: publication case $name" >&2
+			return 1
+		fi
 	fi
 	if ! grep -q "^PUBLICATION_OK $name$" "$out"; then
 		cat "$out" "$err" >&2
@@ -554,8 +1081,9 @@ case "$CASE_NAME" in
 		run_case policy
 		run_case miss
 		run_case cancel
+		run_case template_memo
 		;;
-	reserve|index|column|policy|miss|cancel)
+	reserve|index|column|policy|miss|cancel|template_memo)
 		run_case "$CASE_NAME"
 		;;
 	*)

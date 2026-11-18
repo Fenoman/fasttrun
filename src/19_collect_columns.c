@@ -109,6 +109,7 @@ fasttrun_read_attstattarget(Oid relid, AttrNumber attnum)
 static Oid	fasttrun_template_memo_relid = InvalidOid;
 static Oid	fasttrun_template_memo_template = InvalidOid;
 static uint64 fasttrun_template_memo_epoch = 0;
+static uint64 fasttrun_template_memo_stmt_seq = 0;
 static CommandId fasttrun_template_memo_cid = InvalidCommandId;
 static char fasttrun_template_memo_schema[NAMEDATALEN] = "";
 
@@ -128,6 +129,7 @@ fasttrun_template_attstattarget(Relation rel, AttrNumber attnum)
 		return -1;
 	if (fasttrun_template_memo_relid != relid ||
 		fasttrun_template_memo_epoch != fasttrun_xact_epoch ||
+		fasttrun_template_memo_stmt_seq != fasttrun_statement_seq ||
 		fasttrun_template_memo_cid != cid ||
 		strncmp(fasttrun_template_memo_schema, fasttrun_prewarm_schema,
 				NAMEDATALEN) != 0)
@@ -138,6 +140,7 @@ fasttrun_template_attstattarget(Relation rel, AttrNumber attnum)
 			get_relname_relid(RelationGetRelationName(rel), nspid) : InvalidOid;
 		fasttrun_template_memo_relid = relid;
 		fasttrun_template_memo_epoch = fasttrun_xact_epoch;
+		fasttrun_template_memo_stmt_seq = fasttrun_statement_seq;
 		fasttrun_template_memo_cid = cid;
 		strlcpy(fasttrun_template_memo_schema, fasttrun_prewarm_schema,
 				sizeof(fasttrun_template_memo_schema));

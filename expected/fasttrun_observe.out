@@ -3,6 +3,15 @@
 -- цель статистики из шаблона.
 -- ======================================================================
 SET client_min_messages = warning;
+SELECT NOT EXISTS (
+    SELECT 1 FROM pg_settings
+    WHERE name = 'fasttrun.passthrough' AND vartype = 'bool'
+) AS library_not_loaded;
+ library_not_loaded 
+--------------------
+ t
+(1 row)
+
 CREATE EXTENSION IF NOT EXISTS fasttrun;
 -- ----------------------------------------------------------------------
 -- 1. Счетчики считают вызовы по путям: холодный проход, вызов без изменений,
@@ -270,6 +279,32 @@ SELECT relname, column_stats, delta_state
 (1 row)
 
 SELECT 'obs_c'::regclass::oid AS obs_c_oid \gset
+SELECT fasttrun_analyze('obs_c');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+BEGIN;
+DISCARD TEMP;
+SELECT relname IS NULL AS dropped_relname_null, reltuples, column_stats,
+       hidden_columns
+  FROM fasttrun_cached_tables()
+ WHERE relid = :obs_c_oid;
+ dropped_relname_null | reltuples | column_stats | hidden_columns 
+----------------------+-----------+--------------+----------------
+ t                    |      1000 |            2 |              0
+(1 row)
+
+ROLLBACK;
+SELECT relname, column_stats, hidden_columns
+  FROM fasttrun_cached_tables()
+ WHERE relid = :obs_c_oid;
+ relname | column_stats | hidden_columns 
+---------+--------------+----------------
+ obs_c   |            2 |              0
+(1 row)
+
 DROP TABLE obs_c;
 SELECT count(*) AS dropped_table_rows
   FROM fasttrun_cached_tables() WHERE relid = :obs_c_oid;

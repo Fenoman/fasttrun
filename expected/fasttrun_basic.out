@@ -640,6 +640,64 @@ SELECT fasttrun_collect_stats('t_part');
 ERROR:  fasttrun_collect_stats: relation "t_part" is partitioned or an inheritance parent
 HINT:  Use core SQL ANALYZE for inheritance or partition traversal.
 DROP TABLE t_part;
+-- Бывший родитель наследования после удаления последнего потомка сохраняет
+-- ленивый pg_class.relhassubclass = true при пустом pg_inherits.
+CREATE TEMP TABLE t_former_parent (a int);
+CREATE TEMP TABLE t_former_child () INHERITS (t_former_parent);
+INSERT INTO t_former_parent VALUES (1), (2);
+SELECT fasttruncate('t_former_parent');
+ERROR:  fasttruncate does not support partitioned or inheritance-parent temporary tables
+HINT:  Use core SQL TRUNCATE for inheritance or partition traversal.
+SELECT fasttrun_analyze('t_former_parent');
+ERROR:  fasttrun_analyze: relation "t_former_parent" is partitioned or an inheritance parent
+HINT:  Use core SQL ANALYZE for inheritance or partition traversal.
+SELECT fasttrun_analyze_bulk('t_former_parent');
+ERROR:  fasttrun_analyze_bulk: relation "t_former_parent" is partitioned or an inheritance parent
+HINT:  Use core SQL ANALYZE for inheritance or partition traversal.
+SELECT fasttrun_collect_stats('t_former_parent');
+ERROR:  fasttrun_collect_stats: relation "t_former_parent" is partitioned or an inheritance parent
+HINT:  Use core SQL ANALYZE for inheritance or partition traversal.
+DROP TABLE t_former_child;
+SELECT coalesce(bool_and(relhassubclass),
+                coalesce(current_setting('enable_temp_memory_catalog', true), 'off') = 'on')
+       AS relhassubclass
+FROM pg_class WHERE oid = 't_former_parent'::regclass;
+ relhassubclass 
+----------------
+ t
+(1 row)
+
+SELECT fasttrun_analyze('t_former_parent');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+SELECT fasttrun_analyze_bulk('t_former_parent');
+ fasttrun_analyze_bulk 
+-----------------------
+ 
+(1 row)
+
+SELECT fasttrun_collect_stats('t_former_parent');
+ fasttrun_collect_stats 
+------------------------
+ 
+(1 row)
+
+SELECT fasttruncate('t_former_parent');
+ fasttruncate 
+--------------
+ 
+(1 row)
+
+SELECT count(*) AS former_parent_rows FROM ONLY t_former_parent;
+ former_parent_rows 
+--------------------
+                  0
+(1 row)
+
+DROP TABLE t_former_parent;
 -- ----------------------------------------------------------------------
 -- 12. fasttrun_analyze_bulk(VARIADIC text[]): batch wrapper над
 --     fasttrun_analyze для нескольких temp таблиц за один вызов.

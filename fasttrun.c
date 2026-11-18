@@ -49,10 +49,13 @@
 #include "common/pg_prng.h"
 #include "common/relpath.h"
 #include "executor/executor.h"
+#ifdef USE_ASSERT_CHECKING
 #include "libpq/libpq.h"
+#endif
 #include "miscadmin.h"
 #include "mb/pg_wchar.h"
 #include "storage/proc.h"
+#include "storage/procarray.h"
 #include "nodes/makefuncs.h"
 #include "parser/parse_relation.h"
 #include "nodes/nodeFuncs.h"
@@ -93,7 +96,6 @@
 #include "pgtime.h"
 #include "utils/timestamp.h"
 #include "utils/varlena.h"
-#include "storage/procarray.h"
 #if PG_VERSION_NUM >= 170000
 #include "storage/read_stream.h"		/* PG17+ rewrote analyze scan on ReadStream */
 #endif

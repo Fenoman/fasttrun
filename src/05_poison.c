@@ -242,9 +242,7 @@ fasttrun_poison_check_relation(Relation rel, const char *operation,
 		entry->root_rlb.backend != rel->rd_backend)
 	{
 		/* A committed file cannot roll back to the damaged one. */
-		if (!fasttrun_outer_xact_saw_atx &&
-			fasttrun_rel_create_subid(rel) == InvalidSubTransactionId &&
-			rel->rd_firstRelfilelocatorSubid == InvalidSubTransactionId)
+		if (fasttrun_rel_locator_committed_before_xact(rel))
 		{
 			fasttrun_poison_forget_relid(root_relid);
 			return;

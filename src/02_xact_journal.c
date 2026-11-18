@@ -342,6 +342,106 @@ fasttrun_xact_note_file_birth(Relation rel)
 		entry->file_birth_locator = rel->rd_locator;
 }
 
+static inline TransactionId
+fasttrun_tuple_xmin(HeapTuple tup)
+{
+#if defined(TANTOR_VERSION) || defined(PGPRO_EE)
+	return HeapTupleGetXmin(tup);
+#else
+	return HeapTupleHeaderGetXmin(tup->t_data);
+#endif
+}
+
+static bool
+fasttrun_tuple_committed_before_xact(HeapTuple tup)
+{
+	HeapTupleHeader hdr = tup->t_data;
+	TransactionId xmin;
+
+	if (HeapTupleHeaderXminInvalid(hdr))
+		return false;
+	if (HeapTupleHeaderXminFrozen(hdr))
+		return true;
+	xmin = fasttrun_tuple_xmin(tup);
+	if (!TransactionIdIsValid(xmin) ||
+		TransactionIdIsCurrentTransactionId(xmin))
+		return false;
+	if (HeapTupleHeaderXminCommitted(hdr))
+		return true;
+	if (!TransactionIdIsNormal(xmin))
+		return TransactionIdEquals(xmin, BootstrapTransactionId) ||
+			TransactionIdEquals(xmin, FrozenTransactionId);
+	if (TransactionIdIsInProgress(xmin))
+		return false;
+	return TransactionIdDidCommit(xmin);
+}
+
+static bool
+fasttrun_pg_class_matches_locator(Form_pg_class form, RelFileLocator locator)
+{
+	Oid			tup_spc = OidIsValid(form->reltablespace)
+		? form->reltablespace : MyDatabaseTableSpace;
+	RelFileNumber tup_num = OidIsValid(form->relfilenode)
+		? form->relfilenode : (RelFileNumber) form->oid;
+
+	return tup_spc == locator.spcOid && tup_num == locator.relNumber;
+}
+
+static bool
+fasttrun_rel_locator_committed_before_xact(Relation rel)
+{
+	Oid			relid = RelationGetRelid(rel);
+	HeapTuple	tp;
+	Relation	pg_class_rel;
+	SysScanDesc scan;
+	ScanKeyData skey;
+	bool		committed = false;
+
+	if (fasttrun_rel_create_subid(rel) != InvalidSubTransactionId ||
+		rel->rd_newRelfilelocatorSubid != InvalidSubTransactionId ||
+		rel->rd_firstRelfilelocatorSubid != InvalidSubTransactionId)
+		return false;
+	if (!fasttrun_outer_xact_saw_atx)
+		return true;
+
+	tp = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
+	if (HeapTupleIsValid(tp))
+	{
+		Form_pg_class form = (Form_pg_class) GETSTRUCT(tp);
+		bool		ok = fasttrun_tuple_committed_before_xact(tp) &&
+			fasttrun_pg_class_matches_locator(form, rel->rd_locator);
+
+		ReleaseSysCache(tp);
+		if (ok)
+			return true;
+	}
+
+	/*
+	 * Non-rewriting DDL in the outer transaction (e.g. CREATE INDEX, GRANT or
+	 * RENAME) updates pg_class with the current XID while keeping the old
+	 * RelFileLocator.  Check committed pg_class versions of this OID.
+	 */
+	pg_class_rel = table_open(RelationRelationId, AccessShareLock);
+	ScanKeyInit(&skey, Anum_pg_class_oid, BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(relid));
+	scan = systable_beginscan(pg_class_rel, ClassOidIndexId, true,
+							  SnapshotAny, 1, &skey);
+	while (HeapTupleIsValid(tp = systable_getnext(scan)))
+	{
+		Form_pg_class form = (Form_pg_class) GETSTRUCT(tp);
+
+		if (fasttrun_tuple_committed_before_xact(tp) &&
+			fasttrun_pg_class_matches_locator(form, rel->rd_locator))
+		{
+			committed = true;
+			break;
+		}
+	}
+	systable_endscan(scan);
+	table_close(pg_class_rel, AccessShareLock);
+	return committed;
+}
+
 static SubTransactionId
 fasttrun_xact_file_birth(Relation rel, bool *known)
 {
@@ -373,6 +473,9 @@ fasttrun_xact_file_birth(Relation rel, bool *known)
 		return rel->rd_newRelfilelocatorSubid;
 	if (fasttrun_rel_on_create_file(rel, &create_file_subid))
 		return create_file_subid;
+	if (fasttrun_outer_xact_saw_atx &&
+		fasttrun_rel_locator_committed_before_xact(rel))
+		return InvalidSubTransactionId;
 	*known = false;
 	return InvalidSubTransactionId;
 }

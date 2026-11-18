@@ -44,6 +44,7 @@ fasttrun_collect_stats(PG_FUNCTION_ARGS)
 	FasttrunCollectResult collect_result = {0};
 
 	fasttrun_reject_in_atx("fasttrun_collect_stats");
+	fasttrun_statement_seq++;
 	relvar = fasttrun_make_rangevar(name);
 	relOid = RangeVarGetRelid(relvar, AccessShareLock, true);
 
@@ -62,8 +63,7 @@ fasttrun_collect_stats(PG_FUNCTION_ARGS)
 						RelationGetRelationName(rel))));
 	}
 
-	if (rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE ||
-		rel->rd_rel->relhassubclass)
+	if (fasttrun_relation_is_parent(rel))
 	{
 		table_close(rel, NoLock);
 		ereport(ERROR,

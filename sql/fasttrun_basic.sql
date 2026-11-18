@@ -324,6 +324,27 @@ SELECT * FROM fasttrun_relstats('t_part');
 SELECT fasttrun_collect_stats('t_part');
 DROP TABLE t_part;
 
+-- Бывший родитель наследования после удаления последнего потомка сохраняет
+-- ленивый pg_class.relhassubclass = true при пустом pg_inherits.
+CREATE TEMP TABLE t_former_parent (a int);
+CREATE TEMP TABLE t_former_child () INHERITS (t_former_parent);
+INSERT INTO t_former_parent VALUES (1), (2);
+SELECT fasttruncate('t_former_parent');
+SELECT fasttrun_analyze('t_former_parent');
+SELECT fasttrun_analyze_bulk('t_former_parent');
+SELECT fasttrun_collect_stats('t_former_parent');
+DROP TABLE t_former_child;
+SELECT coalesce(bool_and(relhassubclass),
+                coalesce(current_setting('enable_temp_memory_catalog', true), 'off') = 'on')
+       AS relhassubclass
+FROM pg_class WHERE oid = 't_former_parent'::regclass;
+SELECT fasttrun_analyze('t_former_parent');
+SELECT fasttrun_analyze_bulk('t_former_parent');
+SELECT fasttrun_collect_stats('t_former_parent');
+SELECT fasttruncate('t_former_parent');
+SELECT count(*) AS former_parent_rows FROM ONLY t_former_parent;
+DROP TABLE t_former_parent;
+
 -- ----------------------------------------------------------------------
 -- 12. fasttrun_analyze_bulk(VARIADIC text[]): batch wrapper над
 --     fasttrun_analyze для нескольких temp таблиц за один вызов.

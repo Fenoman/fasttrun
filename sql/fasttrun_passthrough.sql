@@ -63,9 +63,26 @@ INSERT INTO pt_inh_p VALUES (1);
 INSERT INTO pt_inh_c VALUES (2);
 CREATE TEMP TABLE pt_part_p (id int) PARTITION BY RANGE (id);
 SELECT fasttruncate('pt_inh_p');
+SELECT fasttrun_analyze('pt_inh_p');
+SELECT fasttrun_analyze_bulk('pt_inh_p');
+SELECT fasttrun_collect_stats('pt_inh_p');
 SELECT fasttruncate('pt_part_p');
 SELECT count(*) = 1 AS pt_inh_parent_intact FROM ONLY pt_inh_p;
-DROP TABLE pt_inh_p CASCADE;
+DROP TABLE pt_inh_c;
+SELECT coalesce(bool_and(relhassubclass),
+                coalesce(current_setting('enable_temp_memory_catalog', true), 'off') = 'on')
+       AS relhassubclass
+FROM pg_class WHERE oid = 'pt_inh_p'::regclass;
+SELECT fasttruncate('pt_inh_p');
+SELECT count(*) = 0 AS pt_former_parent_cleared FROM ONLY pt_inh_p;
+SELECT coalesce(bool_and(relhassubclass),
+                coalesce(current_setting('enable_temp_memory_catalog', true), 'off') = 'on')
+       AS relhassubclass
+FROM pg_class WHERE oid = 'pt_inh_p'::regclass;
+SELECT fasttrun_analyze('pt_inh_p');
+SELECT fasttrun_analyze_bulk('pt_inh_p');
+SELECT fasttrun_collect_stats('pt_inh_p');
+DROP TABLE pt_inh_p;
 DROP TABLE pt_part_p;
 
 -- Режим задается на весь сеанс.

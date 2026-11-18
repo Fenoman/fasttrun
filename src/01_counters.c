@@ -344,6 +344,7 @@ static bool fasttrun_outer_xact_saw_atx = false;
 static SubTransactionId fasttrun_rel_create_subid(Relation rel);
 static bool fasttrun_rel_on_create_file(Relation rel,
 										SubTransactionId *subid_out);
+static bool fasttrun_rel_locator_committed_before_xact(Relation rel);
 
 static inline bool
 fasttrun_in_atx(void)

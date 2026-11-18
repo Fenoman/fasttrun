@@ -3,6 +3,10 @@
 -- цель статистики из шаблона.
 -- ======================================================================
 SET client_min_messages = warning;
+SELECT NOT EXISTS (
+    SELECT 1 FROM pg_settings
+    WHERE name = 'fasttrun.passthrough' AND vartype = 'bool'
+) AS library_not_loaded;
 CREATE EXTENSION IF NOT EXISTS fasttrun;
 
 -- ----------------------------------------------------------------------
@@ -103,6 +107,17 @@ SELECT relname, column_stats, delta_state
   FROM fasttrun_cached_tables()
  WHERE relname = 'obs_c';
 SELECT 'obs_c'::regclass::oid AS obs_c_oid \gset
+SELECT fasttrun_analyze('obs_c');
+BEGIN;
+DISCARD TEMP;
+SELECT relname IS NULL AS dropped_relname_null, reltuples, column_stats,
+       hidden_columns
+  FROM fasttrun_cached_tables()
+ WHERE relid = :obs_c_oid;
+ROLLBACK;
+SELECT relname, column_stats, hidden_columns
+  FROM fasttrun_cached_tables()
+ WHERE relid = :obs_c_oid;
 DROP TABLE obs_c;
 SELECT count(*) AS dropped_table_rows
   FROM fasttrun_cached_tables() WHERE relid = :obs_c_oid;

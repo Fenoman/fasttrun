@@ -134,6 +134,15 @@ CREATE TEMP TABLE pt_part_p (id int) PARTITION BY RANGE (id);
 SELECT fasttruncate('pt_inh_p');
 ERROR:  fasttruncate does not support partitioned or inheritance-parent temporary tables
 HINT:  Use core SQL TRUNCATE for inheritance or partition traversal.
+SELECT fasttrun_analyze('pt_inh_p');
+ERROR:  fasttrun_analyze: relation "pt_inh_p" is partitioned or an inheritance parent
+HINT:  Use core SQL ANALYZE for inheritance or partition traversal.
+SELECT fasttrun_analyze_bulk('pt_inh_p');
+ERROR:  fasttrun_analyze_bulk: relation "pt_inh_p" is partitioned or an inheritance parent
+HINT:  Use core SQL ANALYZE for inheritance or partition traversal.
+SELECT fasttrun_collect_stats('pt_inh_p');
+ERROR:  fasttrun_collect_stats: relation "pt_inh_p" is partitioned or an inheritance parent
+HINT:  Use core SQL ANALYZE for inheritance or partition traversal.
 SELECT fasttruncate('pt_part_p');
 ERROR:  fasttruncate does not support partitioned or inheritance-parent temporary tables
 HINT:  Use core SQL TRUNCATE for inheritance or partition traversal.
@@ -143,8 +152,56 @@ SELECT count(*) = 1 AS pt_inh_parent_intact FROM ONLY pt_inh_p;
  t
 (1 row)
 
-DROP TABLE pt_inh_p CASCADE;
-NOTICE:  drop cascades to table pt_inh_c
+DROP TABLE pt_inh_c;
+SELECT coalesce(bool_and(relhassubclass),
+                coalesce(current_setting('enable_temp_memory_catalog', true), 'off') = 'on')
+       AS relhassubclass
+FROM pg_class WHERE oid = 'pt_inh_p'::regclass;
+ relhassubclass 
+----------------
+ t
+(1 row)
+
+SELECT fasttruncate('pt_inh_p');
+ fasttruncate 
+--------------
+ 
+(1 row)
+
+SELECT count(*) = 0 AS pt_former_parent_cleared FROM ONLY pt_inh_p;
+ pt_former_parent_cleared 
+--------------------------
+ t
+(1 row)
+
+SELECT coalesce(bool_and(relhassubclass),
+                coalesce(current_setting('enable_temp_memory_catalog', true), 'off') = 'on')
+       AS relhassubclass
+FROM pg_class WHERE oid = 'pt_inh_p'::regclass;
+ relhassubclass 
+----------------
+ t
+(1 row)
+
+SELECT fasttrun_analyze('pt_inh_p');
+ fasttrun_analyze 
+------------------
+ 
+(1 row)
+
+SELECT fasttrun_analyze_bulk('pt_inh_p');
+ fasttrun_analyze_bulk 
+-----------------------
+ 
+(1 row)
+
+SELECT fasttrun_collect_stats('pt_inh_p');
+ fasttrun_collect_stats 
+------------------------
+ 
+(1 row)
+
+DROP TABLE pt_inh_p;
 DROP TABLE pt_part_p;
 -- Режим задается на весь сеанс.
 SET fasttrun.passthrough = off;

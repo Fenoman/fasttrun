@@ -1925,12 +1925,275 @@ echo "pg_cancel_backend mid-truncate poison and repair passed"
 # creation birth in fasttrun_temp_is_ours and uncommitted storage replacement
 # over a poisoned locator must both survive RelationCacheInvalidate().
 # ----------------------------------------------------------------------
+mkdir -p "$WORKDIR/atx_space"
+if [ -n "$PG_RUN_AS" ]; then
+	chown "$PG_RUN_AS" "$WORKDIR/atx_space"
+fi
 if ! run_pg "$PSQL" -h "$SOCKET_DIR" -p "$PORT" -d "$DBNAME" -XAtq \
-	-v ON_ERROR_STOP=1 >"$WORKDIR/atx_relcache.out" 2>"$WORKDIR/atx_relcache.err" <<'SQL'
+	-v ON_ERROR_STOP=1 -v atx_space_dir="$WORKDIR/atx_space" \
+	>"$WORKDIR/atx_relcache.out" 2>"$WORKDIR/atx_relcache.err" <<'SQL'
 CREATE EXTENSION IF NOT EXISTS fasttrun;
+CREATE TABLESPACE ft_atx_space LOCATION :'atx_space_dir';
 CREATE FUNCTION pg_temp.ft_sim_atx_reset() RETURNS void
   AS '$libdir/fasttrun', 'fasttrun_test_simulate_atx_relcache_reset'
   LANGUAGE C VOLATILE;
+CREATE FUNCTION pg_temp.must_reject(relname text) RETURNS void
+LANGUAGE plpgsql AS $f$
+BEGIN
+  BEGIN
+    PERFORM fasttruncate(relname);
+  EXCEPTION WHEN SQLSTATE '55000' THEN
+    IF SQLERRM <> 'fasttrun: table files can roll back independently' THEN
+      RAISE;
+    END IF;
+    RETURN;
+  END;
+  RAISE EXCEPTION 'unsafe storage reset was accepted: %', relname;
+END $f$;
+
+-- Pool temp table committed in an earlier transaction (with PK index and
+-- external incompressible TOAST) truncated in an outer transaction after ATX
+-- reset relcache and rd_newRelfilelocatorSubid.
+CREATE TEMP TABLE ft_atx_pool(id int PRIMARY KEY, payload text);
+ALTER TABLE ft_atx_pool ALTER COLUMN payload SET STORAGE EXTERNAL;
+INSERT INTO ft_atx_pool
+SELECT 1, string_agg(md5(('atx1_' || g)::text), '')
+  FROM generate_series(1, 150) g;
+
+BEGIN;
+SELECT pg_temp.ft_sim_atx_reset();
+SELECT fasttruncate('ft_atx_pool');
+DO $$
+BEGIN
+  IF (SELECT count(*) FROM ft_atx_pool) <> 0 THEN
+    RAISE EXCEPTION 'pool table still has rows after post-ATX fasttruncate';
+  END IF;
+END $$;
+COMMIT;
+
+-- Non-rewriting MVCC catalog updates in the outer transaction (GRANT + RENAME)
+-- advance pg_class.xmin to the current XID while keeping the committed
+-- RelFileLocator, so SnapshotAny history lookup must confirm pre-xact birth.
+INSERT INTO ft_atx_pool
+SELECT 2, string_agg(md5(('atx2_' || g)::text), '')
+  FROM generate_series(1, 150) g;
+BEGIN;
+DO $$
+DECLARE
+  fn_before oid := pg_relation_filenode('ft_atx_pool');
+  xmin_after text;
+BEGIN
+  GRANT SELECT ON ft_atx_pool TO PUBLIC;
+  ALTER TABLE ft_atx_pool RENAME TO ft_atx_pool_mvcc;
+  SELECT xmin::text INTO xmin_after
+    FROM pg_class WHERE oid = 'ft_atx_pool_mvcc'::regclass;
+  IF xmin_after <> (pg_current_xact_id()::xid)::text THEN
+    RAISE EXCEPTION 'expected MVCC pg_class update in current xid, got xmin=%', xmin_after;
+  END IF;
+  IF pg_relation_filenode('ft_atx_pool_mvcc') <> fn_before THEN
+    RAISE EXCEPTION 'GRANT/RENAME unexpectedly changed relfilenode';
+  END IF;
+END $$;
+SELECT pg_temp.ft_sim_atx_reset();
+SELECT fasttruncate('ft_atx_pool_mvcc');
+DO $$
+BEGIN
+  IF (SELECT count(*) FROM ft_atx_pool_mvcc) <> 0 THEN
+    RAISE EXCEPTION 'MVCC-updated pool table still has rows after post-ATX fasttruncate';
+  END IF;
+END $$;
+ROLLBACK;
+
+-- Pool temp table committed in a non-default tablespace must also pass
+-- pre-xact RelFileLocator verification after ATX relcache reset.
+SET temp_tablespaces = 'ft_atx_space';
+CREATE TEMP TABLE ft_atx_spc(id int PRIMARY KEY, payload text);
+ALTER TABLE ft_atx_spc ALTER COLUMN payload SET STORAGE EXTERNAL;
+INSERT INTO ft_atx_spc
+SELECT 1, string_agg(md5(('spc_' || g)::text), '')
+  FROM generate_series(1, 150) g;
+RESET temp_tablespaces;
+DO $$
+BEGIN
+  IF (SELECT reltablespace FROM pg_class WHERE oid = 'ft_atx_spc'::regclass)
+     <> (SELECT oid FROM pg_tablespace WHERE spcname = 'ft_atx_space') THEN
+    RAISE EXCEPTION 'ft_atx_spc was not created in ft_atx_space';
+  END IF;
+END $$;
+BEGIN;
+SELECT pg_temp.ft_sim_atx_reset();
+SELECT fasttruncate('ft_atx_spc');
+DO $$
+BEGIN
+  IF (SELECT count(*) FROM ft_atx_spc) <> 0 THEN
+    RAISE EXCEPTION 'custom-tablespace pool table still has rows after post-ATX fasttruncate';
+  END IF;
+END $$;
+COMMIT;
+
+-- Committed RelFileNumber with mismatched tablespace OID in pg_class must not
+-- match fasttrun_pg_class_matches_locator across ATX relcache reset.
+INSERT INTO ft_atx_spc
+SELECT 2, string_agg(md5(('spc2_' || g)::text), '')
+  FROM generate_series(1, 150) g;
+BEGIN;
+SAVEPOINT sp_spcmis;
+UPDATE pg_class
+   SET reltablespace = 0
+ WHERE oid = 'ft_atx_spc'::regclass;
+SELECT pg_temp.ft_sim_atx_reset();
+SELECT pg_temp.must_reject('ft_atx_spc');
+ROLLBACK TO SAVEPOINT sp_spcmis;
+SELECT pg_temp.ft_sim_atx_reset();
+SELECT fasttruncate('ft_atx_spc');
+DO $$
+BEGIN
+  IF (SELECT count(*) FROM ft_atx_spc) <> 0 THEN
+    RAISE EXCEPTION 'restored custom-tablespace pool table failed post-ATX fasttruncate';
+  END IF;
+END $$;
+COMMIT;
+DROP TABLE ft_atx_spc;
+DROP TABLESPACE ft_atx_space;
+
+-- Independent component rewrite in a savepoint before ATX must fail 55000 with
+-- the independent-files diagnostic, while full workset CLUSTER in a savepoint
+-- records all births in the journal so post-ATX fasttruncate succeeds and
+-- ROLLBACK TO SAVEPOINT restores both index scan and external TOAST chunks.
+TRUNCATE ft_atx_pool;
+INSERT INTO ft_atx_pool
+SELECT 3, string_agg(md5(('atx3_' || g)::text), '')
+  FROM generate_series(1, 150) g;
+BEGIN;
+SAVEPOINT sp_reidx;
+REINDEX INDEX ft_atx_pool_pkey;
+SELECT pg_temp.ft_sim_atx_reset();
+SELECT pg_temp.must_reject('ft_atx_pool');
+ROLLBACK TO SAVEPOINT sp_reidx;
+
+SAVEPOINT sp_cl;
+CLUSTER ft_atx_pool USING ft_atx_pool_pkey;
+SELECT pg_temp.ft_sim_atx_reset();
+SELECT fasttruncate('ft_atx_pool');
+DO $$
+BEGIN
+  IF (SELECT count(*) FROM ft_atx_pool) <> 0 THEN
+    RAISE EXCEPTION 'pool table not empty after post-CLUSTER ATX fasttruncate';
+  END IF;
+END $$;
+ROLLBACK TO SAVEPOINT sp_cl;
+DO $$
+DECLARE
+  expected_md5 text;
+  got_md5 text;
+  plan_txt text;
+  toast_chunks bigint;
+BEGIN
+  SELECT md5(string_agg(md5(('atx3_' || g)::text), ''))
+    INTO expected_md5
+    FROM generate_series(1, 150) g;
+  PERFORM set_config('enable_seqscan', 'off', true);
+  EXECUTE 'EXPLAIN (COSTS OFF) SELECT md5(payload) FROM ft_atx_pool WHERE id = 3'
+    INTO plan_txt;
+  SELECT md5(payload) INTO got_md5 FROM ft_atx_pool WHERE id = 3;
+  PERFORM set_config('enable_seqscan', 'on', true);
+  EXECUTE format('SELECT count(*) FROM %s',
+                 (SELECT reltoastrelid::regclass
+                    FROM pg_class
+                   WHERE oid = 'ft_atx_pool'::regclass))
+    INTO toast_chunks;
+  IF plan_txt NOT LIKE '%Index%Scan%' OR
+     got_md5 IS DISTINCT FROM expected_md5 OR toast_chunks <= 0 THEN
+    RAISE EXCEPTION 'savepoint rollback after post-CLUSTER ATX fasttruncate corrupted index or TOAST: plan=% got=% want=% chunks=%',
+      plan_txt, got_md5, expected_md5, toast_chunks;
+  END IF;
+END $$;
+
+SAVEPOINT sp_alt;
+DO $$
+DECLARE
+  fn_before oid := pg_relation_filenode('ft_atx_pool');
+BEGIN
+  ALTER TABLE ft_atx_pool ALTER COLUMN payload TYPE text USING payload || '';
+  IF pg_relation_filenode('ft_atx_pool') = fn_before THEN
+    RAISE EXCEPTION 'expected rewriting ALTER TABLE to allocate a new relfilenode';
+  END IF;
+END $$;
+SELECT pg_temp.ft_sim_atx_reset();
+SELECT fasttruncate('ft_atx_pool');
+DO $$
+BEGIN
+  IF (SELECT count(*) FROM ft_atx_pool) <> 0 THEN
+    RAISE EXCEPTION 'pool table not empty after post-ALTER-REWRITE ATX fasttruncate';
+  END IF;
+END $$;
+ROLLBACK TO SAVEPOINT sp_alt;
+DO $$
+DECLARE
+  expected_md5 text;
+  got_md5 text;
+  plan_txt text;
+  toast_chunks bigint;
+BEGIN
+  SELECT md5(string_agg(md5(('atx3_' || g)::text), ''))
+    INTO expected_md5
+    FROM generate_series(1, 150) g;
+  PERFORM set_config('enable_seqscan', 'off', true);
+  EXECUTE 'EXPLAIN (COSTS OFF) SELECT md5(payload) FROM ft_atx_pool WHERE id = 3'
+    INTO plan_txt;
+  SELECT md5(payload) INTO got_md5 FROM ft_atx_pool WHERE id = 3;
+  PERFORM set_config('enable_seqscan', 'on', true);
+  EXECUTE format('SELECT count(*) FROM %s',
+                 (SELECT reltoastrelid::regclass
+                    FROM pg_class
+                   WHERE oid = 'ft_atx_pool'::regclass))
+    INTO toast_chunks;
+  IF plan_txt NOT LIKE '%Index%Scan%' OR
+     got_md5 IS DISTINCT FROM expected_md5 OR toast_chunks <= 0 THEN
+    RAISE EXCEPTION 'savepoint rollback after post-ALTER-REWRITE ATX fasttruncate corrupted index or TOAST: plan=% got=% want=% chunks=%',
+      plan_txt, got_md5, expected_md5, toast_chunks;
+  END IF;
+END $$;
+
+SAVEPOINT sp_rtoast;
+DO $$
+BEGIN
+  EXECUTE format('REINDEX TABLE %s',
+                 (SELECT reltoastrelid::regclass
+                    FROM pg_class
+                   WHERE oid = 'ft_atx_pool'::regclass));
+END $$;
+SELECT pg_temp.ft_sim_atx_reset();
+SELECT pg_temp.must_reject('ft_atx_pool');
+ROLLBACK TO SAVEPOINT sp_rtoast;
+DO $$
+DECLARE
+  expected_md5 text;
+  got_md5 text;
+  plan_txt text;
+  toast_chunks bigint;
+BEGIN
+  SELECT md5(string_agg(md5(('atx3_' || g)::text), ''))
+    INTO expected_md5
+    FROM generate_series(1, 150) g;
+  PERFORM set_config('enable_seqscan', 'off', true);
+  EXECUTE 'EXPLAIN (COSTS OFF) SELECT md5(payload) FROM ft_atx_pool WHERE id = 3'
+    INTO plan_txt;
+  SELECT md5(payload) INTO got_md5 FROM ft_atx_pool WHERE id = 3;
+  PERFORM set_config('enable_seqscan', 'on', true);
+  EXECUTE format('SELECT count(*) FROM %s',
+                 (SELECT reltoastrelid::regclass
+                    FROM pg_class
+                   WHERE oid = 'ft_atx_pool'::regclass))
+    INTO toast_chunks;
+  IF plan_txt NOT LIKE '%Index%Scan%' OR
+     got_md5 IS DISTINCT FROM expected_md5 OR toast_chunks <= 0 THEN
+    RAISE EXCEPTION 'rejected REINDEX TABLE on TOAST damaged index or TOAST: plan=% got=% want=% chunks=%',
+      plan_txt, got_md5, expected_md5, toast_chunks;
+  END IF;
+END $$;
+COMMIT;
+DROP TABLE ft_atx_pool;
 
 BEGIN;
 CREATE TEMP TABLE ft_atx_born(id int PRIMARY KEY);

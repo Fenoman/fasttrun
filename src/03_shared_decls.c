@@ -402,3 +402,34 @@ static void fasttrun_poison_check_plan(PlannedStmt *plan);
 static void fasttrun_poison_check_relation(Relation rel,
 										   const char *operation,
 										   bool allow_repair);
+
+/*
+ * True when rel is partitioned or currently has at least one live child in
+ * pg_inherits.  pg_class.relhassubclass stays true after the last child is
+ * dropped until core VACUUM or ANALYZE clears it, so check pg_inherits under
+ * the caller's relation lock when the hint bit is set.
+ */
+static bool
+fasttrun_relation_is_parent(Relation rel)
+{
+	Relation	inhrel;
+	SysScanDesc scan;
+	ScanKeyData skey;
+	bool		has_child;
+
+	if (rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
+		return true;
+	if (!rel->rd_rel->relhassubclass)
+		return false;
+
+	inhrel = table_open(InheritsRelationId, AccessShareLock);
+	ScanKeyInit(&skey, Anum_pg_inherits_inhparent,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(RelationGetRelid(rel)));
+	scan = systable_beginscan(inhrel, InheritsParentIndexId, true,
+							  NULL, 1, &skey);
+	has_child = HeapTupleIsValid(systable_getnext(scan));
+	systable_endscan(scan);
+	table_close(inhrel, AccessShareLock);
+	return has_child;
+}

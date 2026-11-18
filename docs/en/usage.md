@@ -134,13 +134,15 @@ change for the rest of the session. A superuser sets it in `postgresql.conf`
 
 The price is the core's work. In PostgreSQL and PostgresPro a core `TRUNCATE`
 or `ANALYZE` of a temp table changes catalog rows and sends shared invalidation
-messages to every process of the cluster. Tantor SE 18.6.3 keeps the messages
-of `TRUNCATE` and `ANALYZE` of a temp table inside its own process and does not
-write them to the shared queue, with `enable_temp_memory_catalog` both `on` and
-`off` (measured on 18.6.3 by the shared queue counter: 0 messages per 10 calls
-of each command). There the price is catalog writes with
-`enable_temp_memory_catalog = off` and a full `ANALYZE` instead of the delta
-update. `fasttruncate()` and `fasttrun_analyze()` in the normal mode send none.
+messages to every process of the cluster. In Tantor SE 18.6.3, under both settings
+of `enable_temp_memory_catalog`, core `RelationTruncate` of a temp table
+(`fasttruncate()` with `zero_sinval_truncate = off`) sends `0` shared SMGR
+messages, SQL `TRUNCATE` still updates `pg_class` when
+`enable_temp_memory_catalog = off`, and core `ANALYZE` of a temp table calls
+`SIInsertDataEntries` (`8` calls when `off` and `2` when `on`), writes catalog
+rows with `enable_temp_memory_catalog = off`, and runs a full `ANALYZE` instead of
+the delta update. `fasttruncate()` and `fasttrun_analyze()` in the normal mode on
+tables without `CREATE STATISTICS` objects send `0` shared invalidation messages.
 
 ## Functions
 
@@ -150,7 +152,7 @@ The public API contains 16 SQL functions.
 
 | Function | Purpose | Shared invalidation messages |
 |---|---|---|
-| `fasttruncate(text)` | Clears one local temporary heap table, its indexes, TOAST table, and TOAST indexes | None with `zero_sinval_truncate=on`, while with `off`, one shared storage-manager message is sent for every cleared relation |
+| `fasttruncate(text)` | Clears one local temporary heap table, its indexes, TOAST table, and TOAST indexes | None with `zero_sinval_truncate=on`, while with `off`, standard PostgreSQL sends one shared storage-manager message for every cleared relation (Postgres Pro Enterprise and Tantor SE suppress shared SMGR messages for temporary tables in the kernel) |
 | `fasttrun_analyze(text)` | Updates local size estimates and, when needed, column statistics | None, except for tables with `CREATE STATISTICS` objects: regular `ANALYZE` handles them |
 | `fasttrun_analyze_bulk(VARIADIC text[])` | Runs `fasttrun_analyze` sequentially for an array of tables | As for `fasttrun_analyze` |
 | `fasttrun_collect_stats(text)` | Explicitly rebuilds local column statistics | None |
@@ -311,7 +313,7 @@ checkout by a pooler. The result fields:
 
 | Field | Meaning |
 |---|---|
-| `relid`, `relname` | The relation. `relname` is empty if the relation is already dropped |
+| `relid`, `relname` | The relation. While the transaction or subtransaction with `DROP` or `DISCARD TEMP` remains open (before `COMMIT`, `ROLLBACK`, or `ROLLBACK TO SAVEPOINT`), `relname` is `NULL`: explicit `DROP` of the table unpublishes size estimates into undo (a child dropped via `DROP ... CASCADE` is marked dropped until commit), whereas `DISCARD TEMP` retains the published estimates and stored samples with `hidden_columns = 0` until transaction end |
 | `kind` | `table` or `index` |
 | `relpages`, `reltuples` | The published size estimate |
 | `count_exact` | The row count comes from a full scan or an exact delta, not from a block sample. Empty for an index |

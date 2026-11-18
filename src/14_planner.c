@@ -19,6 +19,348 @@
 #error "src/14_planner.c is included only from fasttrun.c"
 #endif /* FASTTRUN_UNITY */
 /*
+ * Self-contained equivalent of PostgreSQL 16.10+/17.6+ core row-selectability
+ * check (CVE-2025-8713), implemented over PlannerInfo/RelOptInfo/AppendRelInfo
+ * so fasttrun compiles and loads on every PostgreSQL 16.0+/17.0+/18.0+ SDK.
+ * Upstream added all_rows_selectable and planner-startup view permission
+ * checks in 16.10 / 17.6 / 18.0 (CVE-2025-8713).  Every underlying field and
+ * ACL helper already exists in PostgreSQL 16.0+, so implement the full view,
+ * inheritance/partition, RLS, and column-ACL checks locally without requiring
+ * the newer core symbols.  The single-attribute entry point avoids allocating
+ * a temporary Bitmapset on every column-stats hook call.
+ */
+static bool
+fasttrun_check_perms_modified(Oid relOid, Oid userid, Bitmapset *modifiedCols,
+							  AclMode requiredPerms)
+{
+	int			col = -1;
+
+	if (bms_is_empty(modifiedCols))
+	{
+		if (pg_attribute_aclcheck_all(relOid, userid, requiredPerms,
+									  ACLMASK_ANY) != ACLCHECK_OK)
+			return false;
+	}
+
+	while ((col = bms_next_member(modifiedCols, col)) >= 0)
+	{
+		AttrNumber	attno = col + FirstLowInvalidHeapAttributeNumber;
+
+		if (attno == InvalidAttrNumber)
+			return false;
+		if (pg_attribute_aclcheck(relOid, attno, userid,
+								  requiredPerms) != ACLCHECK_OK)
+			return false;
+	}
+
+	return true;
+}
+
+static bool
+fasttrun_check_one_rel_perms(RTEPermissionInfo *perminfo)
+{
+	AclMode		requiredPerms = perminfo->requiredPerms;
+	AclMode		relPerms;
+	AclMode		remainingPerms;
+	Oid			userid;
+	Oid			relOid = perminfo->relid;
+
+	if (requiredPerms == 0)
+		return true;
+
+	userid = OidIsValid(perminfo->checkAsUser) ?
+		perminfo->checkAsUser : GetUserId();
+
+	relPerms = pg_class_aclmask(relOid, userid, requiredPerms, ACLMASK_ALL);
+	remainingPerms = requiredPerms & ~relPerms;
+	if (remainingPerms != 0)
+	{
+		int			col = -1;
+
+		if (remainingPerms & ~(ACL_SELECT | ACL_INSERT | ACL_UPDATE))
+			return false;
+
+		if (remainingPerms & ACL_SELECT)
+		{
+			if (bms_is_empty(perminfo->selectedCols))
+			{
+				if (pg_attribute_aclcheck_all(relOid, userid, ACL_SELECT,
+											  ACLMASK_ANY) != ACLCHECK_OK)
+					return false;
+			}
+
+			while ((col = bms_next_member(perminfo->selectedCols, col)) >= 0)
+			{
+				AttrNumber	attno = col + FirstLowInvalidHeapAttributeNumber;
+
+				if (attno == InvalidAttrNumber)
+				{
+					if (pg_attribute_aclcheck_all(relOid, userid, ACL_SELECT,
+												  ACLMASK_ALL) != ACLCHECK_OK)
+						return false;
+				}
+				else if (pg_attribute_aclcheck(relOid, attno, userid,
+											   ACL_SELECT) != ACLCHECK_OK)
+					return false;
+			}
+		}
+
+		if ((remainingPerms & ACL_INSERT) &&
+			!fasttrun_check_perms_modified(relOid, userid,
+										   perminfo->insertedCols,
+										   ACL_INSERT))
+			return false;
+
+		if ((remainingPerms & ACL_UPDATE) &&
+			!fasttrun_check_perms_modified(relOid, userid,
+										   perminfo->updatedCols,
+										   ACL_UPDATE))
+			return false;
+	}
+
+	return true;
+}
+
+static bool
+fasttrun_planner_views_selectable(PlannerInfo *root)
+{
+	PlannerInfo *p;
+
+	for (p = root; p != NULL; p = p->parent_root)
+	{
+		ListCell   *lc;
+		int			nperms;
+
+		if (p->parse == NULL || p->parse->rteperminfos == NIL)
+			continue;
+
+		nperms = list_length(p->parse->rteperminfos);
+		foreach(lc, p->parse->rtable)
+		{
+			RangeTblEntry *view_rte = lfirst_node(RangeTblEntry, lc);
+
+			if (view_rte->perminfoindex != 0 &&
+				view_rte->relkind == RELKIND_VIEW)
+			{
+				if ((int) view_rte->perminfoindex > nperms)
+					return false;
+				if (!fasttrun_check_one_rel_perms(
+						getRTEPermissionInfo(p->parse->rteperminfos,
+											 view_rte)))
+					return false;
+			}
+		}
+	}
+
+	return true;
+}
+
+static Oid
+fasttrun_rte_check_userid(PlannerInfo *root, Index varno, RangeTblEntry *rte)
+{
+	Oid			userid = InvalidOid;
+
+	if (root->simple_rel_array != NULL && varno > 0 &&
+		(int) varno < root->simple_rel_array_size &&
+		root->simple_rel_array[varno] != NULL)
+		userid = root->simple_rel_array[varno]->userid;
+	else if (rte->perminfoindex != 0 && root->parse != NULL &&
+			 root->parse->rteperminfos != NIL)
+		userid = getRTEPermissionInfo(root->parse->rteperminfos,
+									  rte)->checkAsUser;
+
+	return OidIsValid(userid) ? userid : GetUserId();
+}
+
+static bool
+fasttrun_att_rows_selectable(PlannerInfo *root, Index varno, AttrNumber attno)
+{
+	RangeTblEntry *rte;
+	Oid			userid;
+
+	if (root == NULL || varno == 0 || attno == InvalidAttrNumber)
+		return false;
+	rte = planner_rt_fetch(varno, root);
+	if (rte == NULL || rte->rtekind != RTE_RELATION)
+		return false;
+
+	if (root->append_rel_array != NULL)
+	{
+		AppendRelInfo *appinfo = root->append_rel_array[varno];
+
+		while (appinfo != NULL &&
+			   planner_rt_fetch(appinfo->parent_relid,
+								root)->rtekind == RTE_RELATION)
+		{
+			if (attno > 0)
+			{
+				if (attno > appinfo->num_child_cols)
+					return false;
+				attno = appinfo->parent_colnos[attno - 1];
+				if (attno == 0)
+					return false;
+			}
+			varno = appinfo->parent_relid;
+			appinfo = root->append_rel_array[varno];
+		}
+
+		rte = planner_rt_fetch(varno, root);
+		if (rte == NULL || rte->rtekind != RTE_RELATION)
+			return false;
+	}
+
+	if (rte->securityQuals != NIL)
+		return false;
+
+	if (!fasttrun_planner_views_selectable(root))
+		return false;
+
+	userid = fasttrun_rte_check_userid(root, varno, rte);
+
+	if (pg_class_aclcheck(rte->relid, userid, ACL_SELECT) == ACLCHECK_OK)
+		return true;
+
+	return pg_attribute_aclcheck(rte->relid, attno, userid,
+								 ACL_SELECT) == ACLCHECK_OK;
+}
+
+static bool
+fasttrun_all_rows_selectable(PlannerInfo *root, Index varno,
+							 Bitmapset *varattnos)
+{
+	RangeTblEntry *rte;
+	Oid			userid;
+	Bitmapset  *mapped_varattnos = NULL;
+	int			varattno;
+	bool		ok = true;
+
+	if (root == NULL || varno == 0)
+		return false;
+	rte = planner_rt_fetch(varno, root);
+	if (rte == NULL || rte->rtekind != RTE_RELATION)
+		return false;
+
+	if (root->append_rel_array != NULL)
+	{
+		AppendRelInfo *appinfo = root->append_rel_array[varno];
+
+		while (appinfo != NULL &&
+			   planner_rt_fetch(appinfo->parent_relid,
+								root)->rtekind == RTE_RELATION)
+		{
+			Bitmapset  *parent_varattnos = NULL;
+
+			varattno = -1;
+			while ((varattno = bms_next_member(varattnos, varattno)) >= 0)
+			{
+				AttrNumber	attno =
+					varattno + FirstLowInvalidHeapAttributeNumber;
+				AttrNumber	parent_attno;
+
+				if (attno == InvalidAttrNumber)
+				{
+					for (attno = 1; attno <= appinfo->num_child_cols; attno++)
+					{
+						parent_attno = appinfo->parent_colnos[attno - 1];
+						if (parent_attno == 0)
+						{
+							bms_free(parent_varattnos);
+							bms_free(mapped_varattnos);
+							return false;
+						}
+						parent_varattnos =
+							bms_add_member(parent_varattnos,
+										   parent_attno - FirstLowInvalidHeapAttributeNumber);
+					}
+				}
+				else
+				{
+					if (attno < 0)
+						parent_attno = attno;
+					else
+					{
+						if (attno > appinfo->num_child_cols)
+						{
+							bms_free(parent_varattnos);
+							bms_free(mapped_varattnos);
+							return false;
+						}
+						parent_attno = appinfo->parent_colnos[attno - 1];
+						if (parent_attno == 0)
+						{
+							bms_free(parent_varattnos);
+							bms_free(mapped_varattnos);
+							return false;
+						}
+					}
+					parent_varattnos =
+						bms_add_member(parent_varattnos,
+									   parent_attno - FirstLowInvalidHeapAttributeNumber);
+				}
+			}
+
+			bms_free(mapped_varattnos);
+			mapped_varattnos = parent_varattnos;
+			varattnos = mapped_varattnos;
+			varno = appinfo->parent_relid;
+			appinfo = root->append_rel_array[varno];
+		}
+
+		rte = planner_rt_fetch(varno, root);
+		if (rte == NULL || rte->rtekind != RTE_RELATION)
+		{
+			bms_free(mapped_varattnos);
+			return false;
+		}
+	}
+
+	if (rte->securityQuals != NIL || !fasttrun_planner_views_selectable(root))
+	{
+		bms_free(mapped_varattnos);
+		return false;
+	}
+
+	userid = fasttrun_rte_check_userid(root, varno, rte);
+
+	if (pg_class_aclcheck(rte->relid, userid, ACL_SELECT) == ACLCHECK_OK)
+	{
+		bms_free(mapped_varattnos);
+		return true;
+	}
+
+	if (varattnos == NULL)
+		return false;
+
+	varattno = -1;
+	while ((varattno = bms_next_member(varattnos, varattno)) >= 0)
+	{
+		AttrNumber	attno = varattno + FirstLowInvalidHeapAttributeNumber;
+
+		if (attno == InvalidAttrNumber)
+		{
+			if (pg_attribute_aclcheck_all(rte->relid, userid, ACL_SELECT,
+										  ACLMASK_ALL) != ACLCHECK_OK)
+			{
+				ok = false;
+				break;
+			}
+		}
+		else
+		{
+			if (pg_attribute_aclcheck(rte->relid, attno, userid,
+									  ACL_SELECT) != ACLCHECK_OK)
+			{
+				ok = false;
+				break;
+			}
+		}
+	}
+
+	bms_free(mapped_varattnos);
+	return ok;
+}
+
+/*
  * Resolve the range-table index of rte inside root without reading vardata:
  * index cost estimators such as brincostestimate pass an uninitialized
  * VariableStatData struct on the stack.
@@ -62,15 +404,7 @@ fasttrun_relation_stats_acl_ok(PlannerInfo *root, RangeTblEntry *rte,
 	}
 
 	if (rti > 0)
-	{
-		Bitmapset  *varattnos =
-			bms_make_singleton(attnum - FirstLowInvalidHeapAttributeNumber);
-		bool		ok;
-
-		ok = all_rows_selectable(root, rti, varattnos);
-		bms_free(varattnos);
-		return ok;
-	}
+		return fasttrun_att_rows_selectable(root, rti, attnum);
 	return false;
 }
 
@@ -424,7 +758,7 @@ fasttrun_index_stats_acl_ok(PlannerInfo *root, Oid indexOid,
 					(Node *) list_nth(index->indextlist, indexattnum - 1);
 
 				pull_varattnos(indexpr, rel->relid, &varattnos);
-				if (!all_rows_selectable(root, rel->relid, varattnos))
+				if (!fasttrun_all_rows_selectable(root, rel->relid, varattnos))
 					acl_ok = false;
 				bms_free(varattnos);
 			}

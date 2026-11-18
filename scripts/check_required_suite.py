@@ -503,6 +503,44 @@ def main() -> int:
         require(errors, os.access(prerelease_path, os.X_OK),
                 "scripts/check_fasttrun_prerelease.sh: файл не исполняемый")
 
+    fasttrun_c = (ROOT / "fasttrun.c").read_text(encoding="utf-8")
+    fasttrun_c_spliced = re.sub(r"\\\r?\n", "", fasttrun_c)
+    fasttrun_c_nocomment = re.sub(
+        r"/\*.*?\*/|//[^\n]*", "", fasttrun_c_spliced, flags=re.DOTALL
+    )
+    libpq_includes = re.findall(
+        r'^[ \t]*#[ \t]*include[ \t]*[<"]libpq/libpq\.h[>"]',
+        fasttrun_c_nocomment,
+        flags=re.MULTILINE,
+    )
+    require(
+        errors,
+        len(libpq_includes) == 1
+        and re.search(
+            r'^[ \t]*#[ \t]*ifdef[ \t]+USE_ASSERT_CHECKING(?:[ \t]*\r?\n)+'
+            r'[ \t]*#[ \t]*include[ \t]*[<"]libpq/libpq\.h[>"](?:[ \t]*\r?\n)+'
+            r'[ \t]*#[ \t]*endif\b',
+            fasttrun_c_nocomment,
+            flags=re.MULTILINE,
+        ) is not None,
+        "fasttrun.c: единственный #include \"libpq/libpq.h\" должен быть закрыт "
+        "#ifdef USE_ASSERT_CHECKING, иначе релизная сборка на минимальном SDK "
+        "требует openssl/ssl.h",
+    )
+    planner_c = (ROOT / "src" / "14_planner.c").read_text(encoding="utf-8")
+    planner_c_nocomment = re.sub(
+        r"/\*.*?\*/|//[^\n]*", "", planner_c, flags=re.DOTALL
+    )
+    require(
+        errors,
+        re.search(
+            r"(?<![A-Za-z0-9_])(?:all_rows_selectable|ExecCheckOneRelPerms|ExecCheckPermissionsModified)\s*\(",
+            planner_c_nocomment,
+        ) is None,
+        "src/14_planner.c: вызов ядерных all_rows_selectable / ExecCheckOneRelPerms "
+        "ломает сборку на SDK PostgreSQL 16.0..16.9 и 17.0..17.5",
+    )
+
     # Обязательный прогон сверяет число пройденных наборов с числом в
     # Makefile. Хранить его отдельным числом нельзя: добавленный набор тогда
     # превращает зеленый прогон в "регрессию".

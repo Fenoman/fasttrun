@@ -328,12 +328,7 @@ fasttrun_prepare_truncate_workset(Relation heaprel,
 	int			i = 0;
 
 	memset(opened, 0, sizeof(*opened));
-	if (heaprel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE ||
-		heaprel->rd_rel->relhassubclass)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("fasttruncate does not support partitioned or inheritance-parent temporary tables"),
-				 errhint("Use core SQL TRUNCATE for inheritance or partition traversal.")));
+	Assert(heaprel->rd_rel->relkind == RELKIND_RELATION);
 
 	CheckTableNotInUse(heaprel, "fasttruncate");
 	index_oids = RelationGetIndexList(heaprel);
@@ -558,6 +553,8 @@ fasttrun_allocate_truncate_operation(Relation heaprel,
 		Relation	component = opened->slot_relations[i];
 		SubTransactionId component_subid;
 
+		if (component == heaprel)
+			continue;
 		component_subid = fasttrun_xact_file_birth(component, &birth_known);
 		if (!birth_known)
 			goto independent_files;
@@ -1047,8 +1044,7 @@ fasttruncate(PG_FUNCTION_ARGS)
 						RelationGetRelationName(rel))));
 	}
 
-	if (rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE ||
-		rel->rd_rel->relhassubclass)
+	if (fasttrun_relation_is_parent(rel))
 	{
 		table_close(rel, NoLock);
 		ereport(ERROR,

@@ -3773,6 +3773,291 @@ END$$;
 RESET ROLE;
 DROP VIEW v_acl_secret;
 DROP TABLE t_acl_secret;
+
+CREATE ROLE ft_acl_owner;
+SET ROLE ft_acl_owner;
+CREATE TEMP TABLE t_acl_matrix(pub text, secret text);
+CREATE INDEX t_acl_matrix_sec_expr ON t_acl_matrix ((lower(secret)));
+CREATE INDEX t_acl_matrix_pub_expr ON t_acl_matrix ((lower(pub)));
+CREATE INDEX t_acl_matrix_mix_expr ON t_acl_matrix ((lower(pub || secret)));
+INSERT INTO t_acl_matrix(pub, secret)
+  SELECT 'pub_' || (g % 3), 'sec_' || (g % 3) FROM generate_series(1, 300) g;
+DO $$BEGIN PERFORM public.fasttrun_analyze('t_acl_matrix'); END$$;
+
+-- Plain view and un-pulled-up view without GRANT SELECT must never leak MCV
+-- on either 16.10+/17.6+/18+ (42501) or older 16.0..16.9 / 17.0..17.5 runtimes.
+CREATE TEMP VIEW v_acl_plain AS SELECT secret, pub FROM t_acl_matrix;
+CREATE TEMP VIEW v_acl_unpulled AS SELECT secret, lower(secret) AS lsec, pub FROM t_acl_matrix OFFSET 0;
+CREATE TEMP VIEW v_acl_unpulled_expr AS
+  SELECT secret, pub FROM t_acl_matrix
+  WHERE lower(secret) OPERATOR(public.~=~) 'x' OFFSET 0;
+SET ROLE ft_acl_reader;
+DO $$
+DECLARE
+  p json;
+  q text;
+BEGIN
+  FOREACH q IN ARRAY ARRAY[
+    'EXPLAIN (FORMAT JSON) SELECT * FROM pg_temp.v_acl_plain WHERE secret OPERATOR(public.~=~) ''x''',
+    'EXPLAIN (FORMAT JSON) SELECT * FROM pg_temp.v_acl_plain WHERE lower(secret) OPERATOR(public.~=~) ''x''',
+    'EXPLAIN (FORMAT JSON) SELECT * FROM pg_temp.v_acl_unpulled WHERE secret OPERATOR(public.~=~) ''x''',
+    'EXPLAIN (FORMAT JSON) SELECT * FROM pg_temp.v_acl_unpulled_expr'
+  ] LOOP
+    BEGIN
+      EXECUTE q INTO p;
+    EXCEPTION WHEN insufficient_privilege THEN
+      NULL;
+    END;
+  END LOOP;
+END$$;
+SET ROLE ft_acl_owner;
+GRANT SELECT (secret) ON v_acl_plain TO ft_acl_reader;
+GRANT SELECT (secret) ON v_acl_unpulled TO ft_acl_reader;
+GRANT SELECT (secret) ON v_acl_unpulled_expr TO ft_acl_reader;
+SET ROLE ft_acl_reader;
+DO $$
+DECLARE
+  p json;
+  q text;
+  hit int := 0;
+BEGIN
+  FOREACH q IN ARRAY ARRAY[
+    'EXPLAIN (FORMAT JSON) SELECT secret FROM pg_temp.v_acl_plain WHERE secret OPERATOR(public.~=~) ''x''',
+    'EXPLAIN (FORMAT JSON) SELECT secret FROM pg_temp.v_acl_plain WHERE lower(secret) OPERATOR(public.~=~) ''x''',
+    'EXPLAIN (FORMAT JSON) SELECT secret FROM pg_temp.v_acl_unpulled WHERE secret OPERATOR(public.~=~) ''x''',
+    'EXPLAIN (FORMAT JSON) SELECT secret FROM pg_temp.v_acl_unpulled_expr'
+  ] LOOP
+    BEGIN
+      EXECUTE q INTO p;
+    EXCEPTION WHEN raise_exception THEN
+      IF SQLERRM LIKE 'leaked MCV value: sec_%' THEN hit := hit + 1; ELSE RAISE; END IF;
+    END;
+  END LOOP;
+  IF hit <> 4 THEN
+    RAISE EXCEPTION 'granted views did not expose owner MCV to authorized reader: hit=%', hit;
+  END IF;
+END$$;
+
+-- Column-level GRANT SELECT (pub) without table-level SELECT: pub and
+-- lower(pub) get acl_ok=true, while secret, lower(secret), and mixed
+-- expression index lower(pub || secret) (with granted pub first!) get acl_ok=false.
+SET ROLE ft_acl_owner;
+DROP VIEW v_acl_unpulled_expr;
+DROP VIEW v_acl_unpulled;
+DROP VIEW v_acl_plain;
+GRANT SELECT (pub) ON t_acl_matrix TO ft_acl_reader;
+SET ROLE ft_acl_reader;
+DO $$
+DECLARE
+  p json;
+  q text;
+  hit int := 0;
+BEGIN
+  FOREACH q IN ARRAY ARRAY[
+    'EXPLAIN (FORMAT JSON) SELECT pub FROM pg_temp.t_acl_matrix WHERE pub OPERATOR(public.~=~) ''x''',
+    'EXPLAIN (FORMAT JSON) SELECT pub FROM pg_temp.t_acl_matrix WHERE lower(pub) OPERATOR(public.~=~) ''x'''
+  ] LOOP
+    BEGIN
+      EXECUTE q INTO p;
+    EXCEPTION WHEN raise_exception THEN
+      IF SQLERRM LIKE 'leaked MCV value: pub_%' THEN hit := hit + 1; ELSE RAISE; END IF;
+    END;
+  END LOOP;
+  IF hit <> 2 THEN
+    RAISE EXCEPTION 'column-level GRANT SELECT (pub) failed to enable acl_ok: hit=%', hit;
+  END IF;
+  FOREACH q IN ARRAY ARRAY[
+    'EXPLAIN (FORMAT JSON) SELECT pub FROM pg_temp.t_acl_matrix WHERE secret OPERATOR(public.~=~) ''x''',
+    'EXPLAIN (FORMAT JSON) SELECT pub FROM pg_temp.t_acl_matrix WHERE lower(secret) OPERATOR(public.~=~) ''x''',
+    'EXPLAIN (FORMAT JSON) SELECT pub FROM pg_temp.t_acl_matrix WHERE lower(pub || secret) OPERATOR(public.~=~) ''x'''
+  ] LOOP
+    BEGIN
+      EXECUTE q INTO p;
+    EXCEPTION WHEN insufficient_privilege THEN
+      NULL;
+    END;
+  END LOOP;
+END$$;
+SET ROLE ft_acl_owner;
+GRANT SELECT (secret) ON t_acl_matrix TO ft_acl_reader;
+SET ROLE ft_acl_reader;
+DO $$
+DECLARE p json; hit int := 0;
+BEGIN
+  BEGIN
+    EXECUTE 'EXPLAIN (FORMAT JSON) SELECT pub FROM pg_temp.t_acl_matrix WHERE lower(pub || secret) OPERATOR(public.~=~) ''x''' INTO p;
+  EXCEPTION WHEN raise_exception THEN
+    IF SQLERRM LIKE 'leaked MCV value: pub_%sec_%' THEN hit := 1; ELSE RAISE; END IF;
+  END;
+  IF hit <> 1 THEN
+    RAISE EXCEPTION 'mixed expression index did not enable acl_ok after granting both columns';
+  END IF;
+END$$;
+
+-- Plain inheritance with child-local column (parent_colnos[0]=0), shifted
+-- column numbers (child pub attnum=2 -> parent pub attnum=3), whole-row child
+-- expression index blocked by local_only (parent_colnos[0]=0), direct GRANT on
+-- child ignored when queried via parent, view owner check after climb, and RLS.
+SET ROLE ft_acl_owner;
+CREATE TEMP TABLE t_acl_inh_p(secret text, pad text, pub text);
+CREATE TEMP TABLE t_acl_inh_c(local_only text, pub text, secret text, pad text);
+ALTER TABLE t_acl_inh_c INHERIT t_acl_inh_p;
+CREATE FUNCTION pg_temp.ft_acl_row_tag(r pg_temp.t_acl_inh_p)
+RETURNS text LANGUAGE plpgsql IMMUTABLE AS $$
+BEGIN
+  RETURN lower(r.pub);
+END$$;
+CREATE INDEX t_acl_inh_c_pub ON t_acl_inh_c ((lower(pub)));
+CREATE INDEX t_acl_inh_c_sec ON t_acl_inh_c ((lower(secret)));
+CREATE INDEX t_acl_inh_c_convrow ON t_acl_inh_c ((pg_temp.ft_acl_row_tag((t_acl_inh_c.*)::pg_temp.t_acl_inh_p)));
+INSERT INTO t_acl_inh_c(local_only, pub, secret, pad)
+  SELECT 'loc_' || (g % 3), 'pub_' || (g % 3), 'sec_' || (g % 3), 'pad'
+  FROM generate_series(1, 300) g;
+DO $$BEGIN PERFORM public.fasttrun_analyze('t_acl_inh_c'); END$$;
+GRANT SELECT ON t_acl_inh_c TO ft_acl_reader;
+GRANT SELECT (pub) ON t_acl_inh_p TO ft_acl_reader;
+SET ROLE ft_acl_reader;
+DO $$
+DECLARE
+  p json;
+  q text;
+  hit int := 0;
+BEGIN
+  FOREACH q IN ARRAY ARRAY[
+    'EXPLAIN (FORMAT JSON) SELECT pub FROM pg_temp.t_acl_inh_p WHERE pub OPERATOR(public.~=~) ''x''',
+    'EXPLAIN (FORMAT JSON) SELECT pub FROM pg_temp.t_acl_inh_p WHERE lower(pub) OPERATOR(public.~=~) ''x''',
+    'EXPLAIN (FORMAT JSON) SELECT pub FROM pg_temp.t_acl_inh_c WHERE pg_temp.ft_acl_row_tag((t_acl_inh_c.*)::pg_temp.t_acl_inh_p) OPERATOR(public.~=~) ''x'''
+  ] LOOP
+    BEGIN
+      EXECUTE q INTO p;
+    EXCEPTION WHEN raise_exception THEN
+      IF SQLERRM LIKE 'leaked MCV value: pub_%' THEN hit := hit + 1; ELSE RAISE; END IF;
+    END;
+  END LOOP;
+  IF hit <> 3 THEN
+    RAISE EXCEPTION 'inherited shifted pub (2->3) or direct convrow index did not enable acl_ok: hit=%', hit;
+  END IF;
+  FOREACH q IN ARRAY ARRAY[
+    'EXPLAIN (FORMAT JSON) SELECT pub FROM pg_temp.t_acl_inh_p WHERE secret OPERATOR(public.~=~) ''x''',
+    'EXPLAIN (FORMAT JSON) SELECT pub FROM pg_temp.t_acl_inh_p WHERE lower(secret) OPERATOR(public.~=~) ''x'''
+  ] LOOP
+    BEGIN
+      EXECUTE q INTO p;
+    EXCEPTION WHEN insufficient_privilege THEN
+      NULL;
+    END;
+  END LOOP;
+END$$;
+SET ROLE ft_acl_owner;
+GRANT SELECT ON t_acl_inh_p TO ft_acl_reader;
+SET ROLE ft_acl_reader;
+DO $$
+DECLARE p json;
+BEGIN
+  -- Even with full SELECT on parent, whole-row ConvertRowtypeExpr index on child
+  -- expands varattno=0 across child attributes including local_only (parent_colnos[0]=0),
+  -- so fasttrun_all_rows_selectable must return false when queried via parent.
+  EXECUTE 'EXPLAIN (FORMAT JSON) SELECT pub FROM pg_temp.t_acl_inh_p WHERE pg_temp.ft_acl_row_tag(t_acl_inh_p.*) OPERATOR(public.~=~) ''x''' INTO p;
+END$$;
+SET ROLE ft_acl_owner;
+REVOKE SELECT ON t_acl_inh_p FROM ft_acl_reader;
+CREATE TEMP VIEW v_acl_inh AS SELECT pub, secret FROM t_acl_inh_p;
+GRANT SELECT (pub) ON v_acl_inh TO ft_acl_reader;
+SET ROLE ft_acl_reader;
+DO $$
+DECLARE p json; hit int := 0;
+BEGIN
+  BEGIN
+    EXECUTE 'EXPLAIN (FORMAT JSON) SELECT pub FROM pg_temp.v_acl_inh WHERE lower(pub) OPERATOR(public.~=~) ''x''' INTO p;
+  EXCEPTION WHEN raise_exception THEN
+    IF SQLERRM LIKE 'leaked MCV value: pub_%' THEN hit := 1; ELSE RAISE; END IF;
+  END;
+  IF hit <> 1 THEN
+    RAISE EXCEPTION 'column-granted view over inheritance hierarchy did not use view owner userid';
+  END IF;
+  BEGIN
+    EXECUTE 'EXPLAIN (FORMAT JSON) SELECT pub FROM pg_temp.v_acl_inh WHERE lower(secret) OPERATOR(public.~=~) ''x''' INTO p;
+  EXCEPTION WHEN insufficient_privilege THEN
+    NULL;
+  END;
+END$$;
+SET ROLE ft_acl_owner;
+DROP VIEW v_acl_inh;
+GRANT SELECT (pub) ON t_acl_inh_p TO ft_acl_reader;
+ALTER TABLE t_acl_inh_p ENABLE ROW LEVEL SECURITY;
+CREATE POLICY p_acl_inh ON t_acl_inh_p FOR SELECT TO ft_acl_reader USING (pub <> 'never');
+SET ROLE ft_acl_reader;
+DO $$
+DECLARE p json;
+BEGIN
+  EXECUTE 'EXPLAIN (FORMAT JSON) SELECT pub FROM pg_temp.t_acl_inh_p WHERE pub OPERATOR(public.~=~) ''x''' INTO p;
+  EXECUTE 'EXPLAIN (FORMAT JSON) SELECT pub FROM pg_temp.t_acl_inh_p WHERE lower(pub) OPERATOR(public.~=~) ''x''' INTO p;
+END$$;
+
+-- Two-level partitioning with distinct pub column numbers at leaf (2), mid (1),
+-- and root (3) plus RLS on the root partitioned table.
+SET ROLE ft_acl_owner;
+CREATE TEMP TABLE t_acl_part_root(secret text, pad text, pub text, k int) PARTITION BY RANGE (k);
+CREATE TEMP TABLE t_acl_part_mid(pub text, secret text, pad text, k int) PARTITION BY RANGE (k);
+ALTER TABLE t_acl_part_root ATTACH PARTITION t_acl_part_mid FOR VALUES FROM (1) TO (1000);
+CREATE TEMP TABLE t_acl_part_leaf(k int, pub text, secret text, pad text);
+CREATE INDEX t_acl_part_leaf_pub ON t_acl_part_leaf ((lower(pub)));
+CREATE INDEX t_acl_part_leaf_sec ON t_acl_part_leaf ((lower(secret)));
+ALTER TABLE t_acl_part_mid ATTACH PARTITION t_acl_part_leaf FOR VALUES FROM (1) TO (1000);
+INSERT INTO t_acl_part_leaf(k, pub, secret, pad)
+  SELECT (g % 500) + 1, 'pub_' || (g % 3), 'sec_' || (g % 3), 'pad'
+  FROM generate_series(1, 300) g;
+DO $$BEGIN PERFORM public.fasttrun_analyze('t_acl_part_leaf'); END$$;
+GRANT SELECT (pub, k) ON t_acl_part_root TO ft_acl_reader;
+SET ROLE ft_acl_reader;
+DO $$
+DECLARE
+  p json;
+  q text;
+  hit int := 0;
+BEGIN
+  FOREACH q IN ARRAY ARRAY[
+    'EXPLAIN (FORMAT JSON) SELECT pub FROM pg_temp.t_acl_part_root WHERE pub OPERATOR(public.~=~) ''x''',
+    'EXPLAIN (FORMAT JSON) SELECT pub FROM pg_temp.t_acl_part_root WHERE lower(pub) OPERATOR(public.~=~) ''x'''
+  ] LOOP
+    BEGIN
+      EXECUTE q INTO p;
+    EXCEPTION WHEN raise_exception THEN
+      IF SQLERRM LIKE 'leaked MCV value: pub_%' THEN hit := hit + 1; ELSE RAISE; END IF;
+    END;
+  END LOOP;
+  IF hit <> 2 THEN
+    RAISE EXCEPTION 'two-level partitioned pub column did not enable acl_ok: hit=%', hit;
+  END IF;
+  FOREACH q IN ARRAY ARRAY[
+    'EXPLAIN (FORMAT JSON) SELECT pub FROM pg_temp.t_acl_part_root WHERE secret OPERATOR(public.~=~) ''x''',
+    'EXPLAIN (FORMAT JSON) SELECT pub FROM pg_temp.t_acl_part_root WHERE lower(secret) OPERATOR(public.~=~) ''x'''
+  ] LOOP
+    BEGIN
+      EXECUTE q INTO p;
+    EXCEPTION WHEN insufficient_privilege THEN
+      NULL;
+    END;
+  END LOOP;
+END$$;
+SET ROLE ft_acl_owner;
+ALTER TABLE t_acl_part_root ENABLE ROW LEVEL SECURITY;
+CREATE POLICY p_acl_part ON t_acl_part_root FOR SELECT TO ft_acl_reader USING (k > 0);
+SET ROLE ft_acl_reader;
+DO $$
+DECLARE p json;
+BEGIN
+  EXECUTE 'EXPLAIN (FORMAT JSON) SELECT pub FROM pg_temp.t_acl_part_root WHERE pub OPERATOR(public.~=~) ''x''' INTO p;
+  EXECUTE 'EXPLAIN (FORMAT JSON) SELECT pub FROM pg_temp.t_acl_part_root WHERE lower(pub) OPERATOR(public.~=~) ''x''' INTO p;
+END$$;
+
+RESET ROLE;
+DROP TABLE t_acl_part_root;
+DROP TABLE t_acl_inh_c;
+DROP FUNCTION pg_temp.ft_acl_row_tag(pg_temp.t_acl_inh_p);
+DROP TABLE t_acl_inh_p;
+DROP TABLE t_acl_matrix;
+DROP ROLE ft_acl_owner;
 DROP OPERATOR public.~=~ (text, text);
 DROP FUNCTION public.ft_acl_probe_op(text, text);
 DROP ROLE ft_acl_reader;

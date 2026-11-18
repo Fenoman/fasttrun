@@ -2,8 +2,7 @@
 #
 # Проверяет общие сообщения инвалидации через Linux/gdb:
 #   - отдельная строка подтверждает подключение gdb
-#   - SMGR-сообщения считаются на входе в SendSharedInvalidMessages
-#   - SIInsertDataEntries подтверждает работу счетчика общих сообщений
+#   - SMGR-сообщения и общие вставки считаются на входе в SIInsertDataEntries
 #   - локальный сброс планов срабатывает при изменении статистики
 #   - повторная очистка пустой таблицы не отправляет никаких инвалидаций
 #
@@ -135,9 +134,11 @@ read -r SINVAL_MSG_SIZE SINVAL_SMGR_ID SINVAL_ID_OFFSET \
 
 case "$(uname -m)" in
 	x86_64|amd64)
-		SEND_SINVAL_PROBE="break *(&SendSharedInvalidMessages)
+		SI_INSERT_PROBE="break *(&SIInsertDataEntries)
 commands
 silent
+printf \"SHARED_INSERT\\n\"
+printf \"SI_SHARED_HIT\\n\"
 set \$msgs_addr = (unsigned long)\$rdi
 set \$msg_count = (int)\$esi
 set \$i = 0
@@ -151,9 +152,11 @@ continue
 end"
 		;;
 	aarch64|arm64)
-		SEND_SINVAL_PROBE="break *(&SendSharedInvalidMessages)
+		SI_INSERT_PROBE="break *(&SIInsertDataEntries)
 commands
 silent
+printf \"SHARED_INSERT\\n\"
+printf \"SI_SHARED_HIT\\n\"
 set \$msgs_addr = (unsigned long)\$x0
 set \$msg_count = (int)\$x1
 set \$i = 0
@@ -167,12 +170,14 @@ continue
 end"
 		;;
 	*)
-		SEND_SINVAL_PROBE="break SendSharedInvalidMessages
+		SI_INSERT_PROBE="break SIInsertDataEntries
 commands
 silent
+printf \"SHARED_INSERT\\n\"
+printf \"SI_SHARED_HIT\\n\"
 set \$i = 0
 while \$i < n
-  if msgs[\$i].id == $SINVAL_SMGR_ID
+  if data[\$i].id == $SINVAL_SMGR_ID
     printf \"SMGR_MESSAGE\\n\"
   end
   set \$i = \$i + 1
@@ -186,14 +191,7 @@ cat >"$WORKDIR/gdb.commands" <<GDB
 set pagination off
 set confirm off
 set breakpoint pending off
-break *(&SIInsertDataEntries)
-commands
-silent
-printf "SHARED_INSERT\n"
-printf "SI_SHARED_HIT\n"
-continue
-end
-$SEND_SINVAL_PROBE
+$SI_INSERT_PROBE
 break *(&LocalExecuteInvalidationMessage)
 commands
 silent
@@ -213,7 +211,7 @@ GDB
 
 run_pg "$INITDB" -D "$WORKDIR/data" --no-locale -E UTF8 >/dev/null
 run_pg "$PG_CTL" -D "$WORKDIR/data" \
-	-o "-k $SOCKET_DIR -p $PORT -c listen_addresses='' -c track_counts=on" \
+	-o "-k $SOCKET_DIR -p $PORT -c listen_addresses='' -c track_counts=on ${PG_SERVER_OPTS:-}" \
 	-l "$WORKDIR/postgres.log" -w start >/dev/null
 run_pg "$CREATEDB" -h "$SOCKET_DIR" -p "$PORT" "$DBNAME"
 
@@ -226,6 +224,8 @@ CREATE TABLE perm_zero_sinval (id int PRIMARY KEY, grp int, payload text);
 INSERT INTO perm_zero_sinval
 SELECT g, g % 100, md5(g::text) FROM generate_series(1,100000) g;
 ANALYZE perm_zero_sinval;
+CREATE TABLE perm_smgr_control (id int PRIMARY KEY);
+INSERT INTO perm_smgr_control VALUES (1);
 CREATE TABLE sinval_gdb_gate (
   case_name text PRIMARY KEY,
   go boolean NOT NULL
@@ -292,19 +292,28 @@ FROM generate_series(1, 200) g
 CROSS JOIN LATERAL generate_series(1, 450) s
 GROUP BY g;
 SELECT 'EXPECTED_SMGR ' ||
-       (1
-        + (SELECT count(*) FROM pg_index
-            WHERE indrelid = 't_zero_sinval'::regclass)
-        + CASE WHEN c.reltoastrelid <> 0 THEN
-            1 + (SELECT count(*) FROM pg_index
-                 WHERE indrelid = c.reltoastrelid)
-          ELSE 0 END)
-FROM pg_class c
-WHERE c.oid = 't_zero_sinval'::regclass;
-SELECT format('SELECT ''TOAST_BEFORE '' || count(*) FROM %s',
-              c.reltoastrelid::regclass)
-FROM pg_class c
-WHERE c.oid = 't_zero_sinval'::regclass \gexec
+       coalesce(
+         (SELECT 1
+                 + (SELECT count(*) FROM pg_index
+                    WHERE indrelid = 't_zero_sinval'::regclass)
+                 + CASE WHEN c.reltoastrelid <> 0 THEN
+                     1 + (SELECT count(*) FROM pg_index
+                          WHERE indrelid = c.reltoastrelid)
+                   ELSE 0 END
+            FROM pg_class c
+           WHERE c.oid = 't_zero_sinval'::regclass),
+         5);
+SELECT format(
+  'SELECT ''TOAST_BEFORE '' || count(*) FROM %s',
+  coalesce(
+    (SELECT c.reltoastrelid::regclass
+       FROM pg_class c
+      WHERE c.oid = 't_zero_sinval'::regclass),
+    to_regclass(replace(pg_my_temp_schema()::regnamespace::text,
+                        'pg_temp_', 'pg_toast_temp_') ||
+                '.pg_toast_' || ('t_zero_sinval'::regclass::oid)::text)
+  )
+) \gexec
 SELECT 'BEFORE_CHECKSUM ' ||
        md5(string_agg(md5(payload), '' ORDER BY id))
 FROM t_zero_sinval;
@@ -420,7 +429,7 @@ SQL
 
 	case "$smgr_expect" in
 		fixture) smgr_expect=$expected_smgr ;;
-		any) ;;
+		any|positive) ;;
 		''|*[!0-9]*) echo "[$name] invalid SMGR expectation: $smgr_expect" >&2; exit 1 ;;
 	esac
 
@@ -445,7 +454,13 @@ SQL
 		any) ;;
 		*) echo "[$name] invalid shared expectation: $shared_expect" >&2; exit 1 ;;
 	esac
-	if [ "$smgr_expect" != "any" ] && [ "$smgr_messages" -ne "$smgr_expect" ]; then
+	if [ "$smgr_expect" = "positive" ]; then
+		if [ "$smgr_messages" -le 0 ]; then
+			cat "$gdblog" >&2
+			echo "[$name] контрольная операция не отправила SMGR-сообщение" >&2
+			exit 1
+		fi
+	elif [ "$smgr_expect" != "any" ] && [ "$smgr_messages" -ne "$smgr_expect" ]; then
 		cat "$gdblog" >&2
 		echo "[$name] expected $smgr_expect SMGR messages, got $smgr_messages" >&2
 		exit 1
@@ -626,10 +641,17 @@ SQL
 }
 
 truncate_validation=$(cat <<'SQL'
-SELECT format('SELECT ''TOAST_AFTER '' || count(*) FROM %s',
-              c.reltoastrelid::regclass)
-FROM pg_class c
-WHERE c.oid = 't_zero_sinval'::regclass \gexec
+SELECT format(
+  'SELECT ''TOAST_AFTER '' || count(*) FROM %s',
+  coalesce(
+    (SELECT c.reltoastrelid::regclass
+       FROM pg_class c
+      WHERE c.oid = 't_zero_sinval'::regclass),
+    to_regclass(replace(pg_my_temp_schema()::regnamespace::text,
+                        'pg_temp_', 'pg_toast_temp_') ||
+                '.pg_toast_' || ('t_zero_sinval'::regclass::oid)::text)
+  )
+) \gexec
 INSERT INTO t_zero_sinval
 SELECT 1000 + g, g % 31,
        string_agg(md5((900000 + g * 1000 + s)::text), '')
@@ -639,10 +661,17 @@ GROUP BY g;
 SELECT 'AFTER_CHECKSUM ' ||
        md5(string_agg(md5(payload), '' ORDER BY id))
 FROM t_zero_sinval;
-SELECT format('SELECT ''TOAST_REFILL '' || count(*) FROM %s',
-              c.reltoastrelid::regclass)
-FROM pg_class c
-WHERE c.oid = 't_zero_sinval'::regclass \gexec
+SELECT format(
+  'SELECT ''TOAST_REFILL '' || count(*) FROM %s',
+  coalesce(
+    (SELECT c.reltoastrelid::regclass
+       FROM pg_class c
+      WHERE c.oid = 't_zero_sinval'::regclass),
+    to_regclass(replace(pg_my_temp_schema()::regnamespace::text,
+                        'pg_temp_', 'pg_toast_temp_') ||
+                '.pg_toast_' || ('t_zero_sinval'::regclass::oid)::text)
+  )
+) \gexec
 SQL
 )
 
@@ -712,10 +741,12 @@ run_permanent_case permanent_neutral_live \
 run_permanent_case permanent_dropped_reset \
 	"$permanent_temp_setup" "$permanent_dropped_post"
 
-# Постоянная таблица обязана давать ненулевые общие sinval на всех редакциях,
-# включая Enterprise и Tantor SE с enable_temp_memory_catalog = on.
+# Постоянная таблица обязана давать ненулевые общие sinval и SMGR-сообщения
+# на всех редакциях, включая stripped-сборки Enterprise и Tantor SE.
 run_case perm_analyze_positive_control positive 0 0 0 \
 	"ANALYZE perm_zero_sinval;"
+run_case perm_truncate_positive_control positive positive 0 0 \
+	"TRUNCATE perm_smgr_control;"
 
 regular_analyze_expect=positive
 if [ "$temp_mem_cat" = on ] || [ "$pgpro_ed" = enterprise ] || [ "$is_tantor" = true ]; then
@@ -723,7 +754,7 @@ if [ "$temp_mem_cat" = on ] || [ "$pgpro_ed" = enterprise ] || [ "$is_tantor" = 
 fi
 fallback_smgr_expect=fixture
 if [ "$pgpro_ed" = enterprise ] || [ "$is_tantor" = true ]; then
-	fallback_smgr_expect=any
+	fallback_smgr_expect=0
 fi
 
 run_case regular_analyze "$regular_analyze_expect" 0 0 0 \

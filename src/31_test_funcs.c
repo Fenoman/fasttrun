@@ -158,6 +158,33 @@ fasttrun_test_call_attavgwidth(PG_FUNCTION_ARGS)
 Datum
 fasttrun_test_simulate_atx_relcache_reset(PG_FUNCTION_ARGS)
 {
+	Relation	classrel;
+	TableScanDesc scan;
+	HeapTuple	tup;
+	List	   *temp_relids = NIL;
+	ListCell   *lc;
+
+	classrel = table_open(RelationRelationId, AccessShareLock);
+	scan = table_beginscan_catalog(classrel, 0, NULL);
+	while ((tup = heap_getnext(scan, ForwardScanDirection)) != NULL)
+	{
+		Form_pg_class form = (Form_pg_class) GETSTRUCT(tup);
+
+		if (isTempOrTempToastNamespace(form->relnamespace))
+			temp_relids = lappend_oid(temp_relids, form->oid);
+	}
+	table_endscan(scan);
+	table_close(classrel, AccessShareLock);
+
+	foreach(lc, temp_relids)
+	{
+		Relation	rel = relation_open(lfirst_oid(lc), AccessShareLock);
+
+		rel->rd_newRelfilelocatorSubid = InvalidSubTransactionId;
+		relation_close(rel, AccessShareLock);
+	}
+	list_free(temp_relids);
+
 	RelationCacheInvalidate(false);
 	fasttrun_outer_xact_saw_atx = true;
 	PG_RETURN_VOID();

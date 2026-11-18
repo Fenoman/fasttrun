@@ -284,7 +284,7 @@ With an 8 KB page size, `max_analyze_pages=100000` corresponds to approximately
 
 Keep `fasttrun.zero_sinval_truncate=on` in production. The `off` value is meant
 for diagnostics and compatibility testing. It does not make cleanup safer and
-re-enables shared invalidation messages. An error inside a PostgreSQL core
+re-enables shared invalidation messages on standard PostgreSQL. An error inside a PostgreSQL core
 critical section in this mode can trigger a `PANIC` that terminates every
 server session in the PostgreSQL instance. Automatic process reinitialization
 then depends on `restart_after_crash`.
