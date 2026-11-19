@@ -121,11 +121,15 @@ fasttrun_check_one_rel_perms(RTEPermissionInfo *perminfo)
 	return true;
 }
 
+/* Number of view permission walks, read by fasttrun_test_view_acl_walks. */
+static uint64 fasttrun_view_acl_walks = 0;
+
 static bool
-fasttrun_planner_views_selectable(PlannerInfo *root)
+fasttrun_planner_views_walk(PlannerInfo *root)
 {
 	PlannerInfo *p;
 
+	fasttrun_view_acl_walks++;
 	for (p = root; p != NULL; p = p->parent_root)
 	{
 		ListCell   *lc;
@@ -153,6 +157,100 @@ fasttrun_planner_views_selectable(PlannerInfo *root)
 	}
 
 	return true;
+}
+
+/*
+ * Memo of fasttrun_planner_views_walk for the current planner frame.
+ *
+ * Why.  One plan asks the stats hooks dozens of times, and every answer needs
+ * the view check.  Its result depends on the range tables along the
+ * parent_root chain and on the current user, who checks a top-level view.
+ * Without the memo a three-way join through nested views takes 80 walks per
+ * plan.
+ *
+ * Key.  The frame number, the current user, the root pointer and the number
+ * of range-table entries along the chain.
+ *  - fasttrun_planner_hook starts a new frame number when it opens a frame
+ *    and when it restores the outer one, so an entry of a finished or nested
+ *    plan never matches, even when a new PlannerInfo lands at the same address.
+ *  - The user changes inside a SECURITY DEFINER estimator or after SET ROLE
+ *    in an operator function, and an entry of another user does not match.
+ *  - A range table that grew after the first check is checked again.
+ * Outside a frame the walk runs directly.
+ *
+ * What it does not see.  A GRANT or REVOKE on a view made during the same
+ * planning, which only the view owner can run there.  Core 16.10+, 17.6+ and
+ * 18 also check views once, at the start of subquery_planner.
+ */
+#define FASTTRUN_VIEW_ACL_MEMO_SLOTS 8
+
+typedef struct FasttrunViewAclMemo
+{
+	uint64		frame;
+	Oid			userid;
+	PlannerInfo *root;
+	int			nrtes;
+	bool		ok;
+} FasttrunViewAclMemo;
+
+static FasttrunViewAclMemo fasttrun_view_acl_memo[FASTTRUN_VIEW_ACL_MEMO_SLOTS];
+static int	fasttrun_view_acl_memo_used = 0;
+static int	fasttrun_view_acl_memo_next = 0;
+static uint64 fasttrun_view_acl_memo_frame = 0;
+
+static void
+fasttrun_view_acl_memo_reset(void)
+{
+	fasttrun_view_acl_memo_frame++;
+	fasttrun_view_acl_memo_used = 0;
+	fasttrun_view_acl_memo_next = 0;
+}
+
+static bool
+fasttrun_planner_views_selectable(PlannerInfo *root)
+{
+	PlannerInfo *p;
+	FasttrunViewAclMemo *slot;
+	Oid			userid;
+	int			nrtes = 0;
+	int			i;
+	bool		ok;
+
+	if (!fasttrun_in_planner)
+		return fasttrun_planner_views_walk(root);
+
+	userid = GetUserId();
+
+	for (p = root; p != NULL; p = p->parent_root)
+	{
+		if (p->parse != NULL)
+			nrtes += list_length(p->parse->rtable);
+	}
+	for (i = 0; i < fasttrun_view_acl_memo_used; i++)
+	{
+		if (fasttrun_view_acl_memo[i].frame == fasttrun_view_acl_memo_frame &&
+			fasttrun_view_acl_memo[i].userid == userid &&
+			fasttrun_view_acl_memo[i].root == root &&
+			fasttrun_view_acl_memo[i].nrtes == nrtes)
+			return fasttrun_view_acl_memo[i].ok;
+	}
+
+	ok = fasttrun_planner_views_walk(root);
+
+	if (fasttrun_view_acl_memo_used < FASTTRUN_VIEW_ACL_MEMO_SLOTS)
+		slot = &fasttrun_view_acl_memo[fasttrun_view_acl_memo_used++];
+	else
+	{
+		slot = &fasttrun_view_acl_memo[fasttrun_view_acl_memo_next];
+		fasttrun_view_acl_memo_next =
+			(fasttrun_view_acl_memo_next + 1) % FASTTRUN_VIEW_ACL_MEMO_SLOTS;
+	}
+	slot->frame = fasttrun_view_acl_memo_frame;
+	slot->userid = userid;
+	slot->root = root;
+	slot->nrtes = nrtes;
+	slot->ok = ok;
+	return ok;
 }
 
 static Oid
@@ -1117,6 +1215,8 @@ fasttrun_restore_planner_frame(bool saved_in_planner,
 							  int saved_cache_used, int saved_next_evict)
 {
 	fasttrun_in_planner = saved_in_planner;
+	/* Roots of the finished plan must not match the outer or the next plan. */
+	fasttrun_view_acl_memo_reset();
 	if (saved_in_planner)
 	{
 		/* A nested planner overwrote the array: the outer cache re-reads. */
@@ -1336,6 +1436,7 @@ fasttrun_planner_hook(Query *parse, const char *query_string,
 	fasttrun_in_planner = true;
 	fasttrun_freshness_cache_used = 0;
 	fasttrun_freshness_cache_next_evict = 0;
+	fasttrun_view_acl_memo_reset();
 
 	PG_TRY();
 	{

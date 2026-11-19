@@ -220,3 +220,13 @@ fasttrun_test_relation_bytes(PG_FUNCTION_ARGS)
 	relation_close(rel, AccessShareLock);
 	PG_RETURN_INT64(bytes);
 }
+
+/*
+ * Test helper: number of view permission walks the planner stats hooks have
+ * run in this backend.
+ */
+Datum
+fasttrun_test_view_acl_walks(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_INT64((int64) fasttrun_view_acl_walks);
+}

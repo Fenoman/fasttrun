@@ -6113,6 +6113,41 @@ DROP SCHEMA ft_tmpl_s1 CASCADE;
 NOTICE:  drop cascades to table ft_tmpl_s1.t_memo_sw
 DROP SCHEMA ft_tmpl_s2 CASCADE;
 NOTICE:  drop cascades to table ft_tmpl_s2.t_memo_sw
+-- The view permission check of the stats hooks runs once per planning, not on
+-- every stats lookup, and the next planning checks the views again.
+CREATE FUNCTION pg_temp.view_acl_walks() RETURNS bigint
+  AS '$libdir/fasttrun', 'fasttrun_test_view_acl_walks' LANGUAGE C STRICT;
+CREATE TEMP TABLE t_vacl (id int, k int, v int);
+INSERT INTO t_vacl SELECT g, g % 111, g % 19 FROM generate_series(1, 20000) g;
+CREATE INDEX ON t_vacl (id);
+CREATE INDEX ON t_vacl (k);
+DO $$ BEGIN PERFORM fasttrun_analyze('t_vacl'); END $$;
+CREATE TEMP VIEW v_vacl1 AS SELECT * FROM t_vacl WHERE v < 18;
+CREATE TEMP VIEW v_vacl2 AS SELECT * FROM v_vacl1 WHERE id > 5;
+CREATE TEMP VIEW v_vacl3 AS SELECT * FROM v_vacl2 WHERE k < 90;
+DO $$
+DECLARE
+  p text;
+  w0 bigint;
+  w1 bigint;
+  w2 bigint;
+  q text := 'EXPLAIN SELECT a.k, b.v FROM v_vacl3 a JOIN v_vacl2 b ON a.id = b.id '
+            'JOIN v_vacl1 c ON c.id = b.id WHERE a.k = 10 AND b.v = 3 AND c.k < 40';
+BEGIN
+  w0 := pg_temp.view_acl_walks();
+  EXECUTE q INTO p;
+  w1 := pg_temp.view_acl_walks();
+  EXECUTE q INTO p;
+  w2 := pg_temp.view_acl_walks();
+  IF w1 - w0 <> 1 OR w2 - w1 <> 1 THEN
+    RAISE EXCEPTION 'view permission walks per planning: % and %, expected 1 and 1',
+      w1 - w0, w2 - w1;
+  END IF;
+END$$;
+DROP VIEW v_vacl3;
+DROP VIEW v_vacl2;
+DROP VIEW v_vacl1;
+DROP TABLE t_vacl;
 DROP FUNCTION ft_rows_est(text, text);
 \pset format aligned
 DROP EXTENSION fasttrun;
